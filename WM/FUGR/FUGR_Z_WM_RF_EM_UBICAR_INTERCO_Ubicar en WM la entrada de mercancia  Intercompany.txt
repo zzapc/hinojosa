@@ -1,0 +1,216 @@
+FUNCTION z_wm_rf_em_ubicar_interco.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(VP_VBELN) TYPE  VBELN_VL
+*"  EXCEPTIONS
+*"      ERROR
+*"      CONF_UBIC_CANCEL
+*"      TO_NOT_CREATED
+*"----------------------------------------------------------------------
+  TYPES: BEGIN OF st_datos_ot,
+           lgnum TYPE mseg-lgnum,
+           tbnum TYPE mseg-tbnum,
+           matnr TYPE matnr.
+           INCLUDE TYPE l03b_trite.
+         TYPES: END OF st_datos_ot.
+
+  DATA: tl_datos_ot TYPE TABLE OF st_datos_ot,
+        wl_datos_ot LIKE LINE OF tl_datos_ot.
+
+  DATA: tl_trite TYPE l03b_trite_t,
+        wl_trite LIKE LINE OF tl_trite.
+  DATA: vl_tanum TYPE ltak-tanum,
+        vl_teilk TYPE t340d-teilv.
+  DATA vl_zeile TYPE mseg-zeile.
+  "
+  " Recuperamos lecturas
+  "
+  SELECT *
+    FROM zwm_rf_em_lect
+    INTO TABLE @DATA(tl_zwm_rf_em_lect)
+    WHERE vbeln_em = @vp_vbeln.
+  "
+  " Recuperamos los movimientos de mercancía
+  "
+  SELECT *
+    INTO TABLE @DATA(tl_vbfa)
+    FROM vbfa
+    WHERE vbelv = @vp_vbeln AND
+          vbtyp_n = 'R'.
+
+  LOOP AT tl_vbfa ASSIGNING FIELD-SYMBOL(<fs_vbfa>).
+    vl_zeile = <fs_vbfa>-posnn.
+    SELECT *
+      INTO TABLE @DATA(tl_mseg)
+      FROM mseg
+      WHERE mblnr = @<fs_vbfa>-vbeln AND
+            mjahr = @<fs_vbfa>-mjahr AND
+            zeile = @vl_zeile AND
+            lgnum <> '' AND
+            tbnum <> ''.
+    LOOP AT tl_mseg ASSIGNING FIELD-SYMBOL(<fs_mseg>).
+      READ TABLE tl_zwm_rf_em_lect ASSIGNING FIELD-SYMBOL(<fs_lectura>) WITH KEY ebeln = <fs_mseg>-ebeln
+                                                                                 ebelp = <fs_mseg>-ebelp
+                                                                                 vbeln_em = <fs_mseg>-vbeln_im
+                                                                                 posnr_em = <fs_mseg>-vbelp_im.
+      CLEAR wl_datos_ot.
+      "
+      " Asignamos bobina.
+      "
+      IF <fs_lectura>-bobina IS NOT INITIAL.
+        wl_datos_ot-nlenr = <fs_lectura>-bobina.
+      ENDIF.
+      wl_datos_ot-anfme = <fs_mseg>-menge.
+      "
+      " Generamos posición para la OT
+      "
+      SELECT SINGLE *
+        FROM mara
+        INTO @DATA(wl_mara)
+        WHERE matnr EQ @<fs_mseg>-matnr AND
+              zzlargo GT 0.
+      IF sy-subrc EQ 0.
+        wl_datos_ot-letyp =  'PL'.
+      ELSE.
+        wl_datos_ot-letyp =  'BB'.
+      ENDIF.
+
+      IF <fs_lectura>-nlpla IS NOT INITIAL.
+        wl_datos_ot-nltyp = <fs_lectura>-nltyp.
+        wl_datos_ot-nlpla = <fs_lectura>-nlpla.
+      ENDIF.
+      SELECT SINGLE lgber
+        INTO wl_datos_ot-nlber
+        FROM lagp
+        WHERE lgtyp = wl_datos_ot-nltyp AND
+              lgpla = wl_datos_ot-nlpla AND
+              lgnum = <fs_mseg>-lgnum.
+
+      wl_datos_ot-tbpos = <fs_mseg>-tbpos.
+*        wl_datos_ot-anfme = <fs_mseg>-menge.
+      wl_datos_ot-altme = <fs_mseg>-meins.
+
+      wl_datos_ot-lgnum = <fs_mseg>-lgnum.
+      wl_datos_ot-tbnum = <fs_mseg>-tbnum.
+
+      wl_datos_ot-matnr = <fs_mseg>-matnr.
+      wl_datos_ot-charg = <fs_mseg>-charg.
+
+*    wl_trite-nlenr = sscc
+*    wl_trite-letyp = tipo UA
+      APPEND wl_datos_ot TO tl_datos_ot.
+
+      "
+      " Hacemos los cálculos para SEGUNDA
+      "
+      DATA: l_vcode       TYPE qvcode,
+            l_memoria(30).
+      CLEAR l_vcode.
+      PERFORM caract_lote IN PROGRAM sapmz_wm_rf USING <fs_mseg>-matnr
+                                <fs_mseg>-charg
+               CHANGING l_vcode.
+      CLEAR l_memoria.
+      CONCATENATE 'CERTIFICADO' <fs_mseg>-charg INTO l_memoria.
+
+      IF l_vcode EQ 'DE R'.
+        EXPORT p1 = 'SEGUNDA' TO MEMORY ID l_memoria.
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+  SORT tl_datos_ot BY lgnum tbnum.
+
+  LOOP AT tl_datos_ot INTO wl_datos_ot.
+    AT NEW tbnum.
+      CLEAR tl_trite.
+    ENDAT.
+    MOVE-CORRESPONDING wl_datos_ot TO wl_trite.
+    APPEND wl_trite TO tl_trite.
+    AT END OF tbnum.
+      CALL FUNCTION 'L_TO_CREATE_TR'
+        EXPORTING
+          i_lgnum                        = wl_datos_ot-lgnum
+          i_tbnum                        = wl_datos_ot-tbnum
+          i_commit_work                  = 'X'
+          i_bname                        = sy-uname
+          it_trite                       = tl_trite
+        IMPORTING
+          e_tanum                        = vl_tanum
+          e_teilk                        = vl_teilk
+        EXCEPTIONS
+          foreign_lock                   = 1
+          qm_relevant                    = 2
+          tr_completed                   = 3
+          xfeld_wrong                    = 4
+          ldest_wrong                    = 5
+          drukz_wrong                    = 6
+          tr_wrong                       = 7
+          squit_forbidden                = 8
+          no_to_created                  = 9
+          update_without_commit          = 10
+          no_authority                   = 11
+          preallocated_stock             = 12
+          partial_transfer_req_forbidden = 13
+          input_error                    = 14
+          error_message                  = 99   " mensaje de error a pantalla enviado por el módulo
+          OTHERS                         = 15.
+      IF sy-subrc = 0.
+        "
+        " Insertamos registro en la tabla Z de relaciones.
+        "
+        DATA wl_zwm_rf_em_ot TYPE zwm_rf_em_ot.
+        CLEAR wl_zwm_rf_em_ot.
+        wl_zwm_rf_em_ot-vbeln_em = vp_vbeln.
+        wl_zwm_rf_em_ot-lgnum = wl_datos_ot-lgnum.
+        wl_zwm_rf_em_ot-tanum = vl_tanum.
+        wl_zwm_rf_em_ot-ernam = sy-uname.
+        wl_zwm_rf_em_ot-erdat = sy-datum.
+        wl_zwm_rf_em_ot-erzet = sy-uzeit.
+        INSERT zwm_rf_em_ot FROM wl_zwm_rf_em_ot.
+
+*          CALL FUNCTION 'Z_WM_CONFIRMAR_OT'
+*            EXPORTING
+*              vp_lgnum = <fs_mseg>-lgnum
+*              vp_tanum = vl_tanum
+*            EXCEPTIONS
+*              error    = 1
+*              OTHERS   = 2.
+*          IF sy-subrc <> 0.
+*            DATA tl_ltap_cancl TYPE TABLE OF ltap_cancl.
+*            FREE tl_ltap_cancl.
+*            CALL FUNCTION 'L_TO_CANCEL'
+*              EXPORTING
+*                i_lgnum                      = <fs_mseg>-lgnum
+*                i_tanum                      = vl_tanum
+*                i_cancl                      = 'X'
+*                i_qname                      = sy-uname
+*                i_commit_work                = 'X'
+*              TABLES
+*                t_ltap_cancl                 = tl_ltap_cancl
+*              EXCEPTIONS
+*                to_confirmed                 = 1
+*                to_doesnt_exist              = 2
+*                item_confirmed               = 3
+*                item_doesnt_exist            = 4
+*                foreign_lock                 = 5
+*                double_lines                 = 6
+*                nothing_to_do                = 7
+*                xfeld_wrong                  = 8
+*                su_movement_partly_confirmed = 9
+*                update_without_commit        = 10
+*                no_authority                 = 11
+*                OTHERS                       = 12.
+*            IF sy-subrc <> 0.
+*              MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 RAISING conf_ubic_cancel.
+*            ENDIF.
+*          ENDIF.
+      ELSE.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 RAISING to_not_created.
+      ENDIF.
+    ENDAT.
+  ENDLOOP.
+
+
+
+
+ENDFUNCTION.

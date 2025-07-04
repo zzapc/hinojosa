@@ -1,0 +1,273 @@
+FUNCTION zssd01_mod_pedido.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IT_PEDIDO) TYPE  ZSSDTT01A
+*"----------------------------------------------------------------------
+
+  DATA:
+    gv_vbeln       TYPE vbeln,
+    ls_header      TYPE bapisdh1,
+    ls_headerx     TYPE bapisdh1x,
+    it_item        TYPE TABLE OF bapisditm,
+    ls_item        TYPE bapisditm,
+    it_item_d      TYPE TABLE OF bapisditm,
+    it_itemx_d     TYPE TABLE OF bapisditmx,
+    it_item_i      TYPE TABLE OF bapisditm,
+    it_itemx_i     TYPE TABLE OF bapisditmx,
+    it_itemx       TYPE TABLE OF bapisditmx,
+    ls_itemx       TYPE bapisditmx,
+    it_schedule    TYPE TABLE OF bapischdl,
+    ls_schedule    TYPE bapischdl,
+    it_schedulex   TYPE TABLE OF bapischdlx,
+    ls_schedulex   TYPE bapischdlx,
+    it_extension   TYPE TABLE OF bapiparex,
+    ls_extension   TYPE bapiparex,
+    it_extensionex TYPE TABLE OF bapiparex,
+    ls_extensionex TYPE bapiparex,
+    t_return       TYPE bapiret2_t,
+    ls_return      TYPE bapiret2,
+    lv_line        TYPE i,
+    log            TYPE balloghndl.
+
+  DATA: l_lfimg  TYPE lfimg,
+        l_kwmeng TYPE kwmeng.
+
+  IF it_pedido IS NOT INITIAL.
+
+    SELECT a~vbeln ,a~posnr ,b~lfimg , a~kwmeng
+      INTO TABLE @DATA(t_posiciones)
+      FROM vbap AS a
+      LEFT OUTER JOIN lips AS b ON a~vbeln = b~vgbel AND a~posnr = b~vgpos
+      FOR ALL ENTRIES IN @it_pedido
+      WHERE a~vbeln = @it_pedido-vbeln_va
+        AND a~posnr = @it_pedido-posnr_va.
+
+
+    SELECT * FROM vbap
+      INTO TABLE @DATA(t_vbap)
+      FOR ALL ENTRIES IN @it_pedido
+      WHERE vbeln = @it_pedido-vbeln_va
+        AND posnr = @it_pedido-posnr_va.
+
+
+  ENDIF.
+
+  DATA(t_pos_aux) = t_posiciones.
+
+  SORT t_pos_aux BY vbeln posnr.
+  DELETE ADJACENT DUPLICATES FROM t_pos_aux COMPARING vbeln posnr.
+  LOOP AT t_pos_aux ASSIGNING FIELD-SYMBOL(<fs_pos_aux>).
+    CLEAR <fs_pos_aux>-lfimg.
+  ENDLOOP.
+
+* Acumulamos las cantidades en entrega para cada posición de pedido
+  LOOP AT t_posiciones INTO DATA(l_posiciones).
+    READ TABLE t_pos_aux ASSIGNING FIELD-SYMBOL(<fs>) WITH KEY vbeln = l_posiciones-vbeln posnr = l_posiciones-posnr.
+    IF sy-subrc = 0.
+      <fs>-lfimg = <fs>-lfimg + l_posiciones-lfimg.
+    ENDIF.
+  ENDLOOP.
+
+  READ TABLE it_pedido WITH KEY vbeln_vl = '' TRANSPORTING NO FIELDS.
+  IF sy-subrc = 0.
+    LOOP AT t_pos_aux ASSIGNING <fs>.
+      LOOP AT it_pedido INTO DATA(lw_pedido) WHERE vbeln_va = <fs>-vbeln AND posnr_va = <fs>-posnr.
+        ADD lw_pedido-lfimg TO <fs>-lfimg.
+      ENDLOOP.
+    ENDLOOP.
+  ENDIF.
+
+  DATA:l_vbeln       TYPE vbeln,
+       ls_bape_vbap  TYPE bape_vbap,
+       ls_bape_vbapx TYPE bape_vbapx.
+
+  LOOP AT t_pos_aux INTO DATA(l_pos_aux)
+    GROUP BY ( vbeln = l_pos_aux-vbeln ) ASSIGNING FIELD-SYMBOL(<group>).
+
+    l_vbeln = <group>-vbeln.
+    CLEAR: ls_item.
+    LOOP AT GROUP <group> ASSIGNING FIELD-SYMBOL(<gs>).
+      ls_itemx-itm_number = ls_item-itm_number = <gs>-posnr.
+      ls_itemx-updateflag = 'U'.
+
+      IF <fs>-lfimg < <fs>-kwmeng.
+        "Caso 02: Entrega parcial
+        "Hay que modificar el pedido
+        ls_item-target_qty = <fs>-lfimg.
+        ls_itemx-target_qty = 'X'.
+*        ls_itemx-itm_number = 'X'.
+
+        APPEND ls_item TO it_item.
+        APPEND ls_itemx TO it_itemx.
+
+        l_lfimg = <fs>-kwmeng - <fs>-lfimg.
+
+        "Esto añade la posicion nueva
+        PERFORM simular_posicion USING <gs>-vbeln <gs>-posnr l_lfimg CHANGING it_item it_itemx.
+
+        CLEAR:ls_extension.
+        ls_extension-structure = 'BAPE_VBAP'.
+        ls_extension-valuepart1(10) = ls_bape_vbap-vbeln = <gs>-vbeln.
+        ls_extension-valuepart1+10(6) = <gs>-posnr.
+        ls_extension-valuepart1+16(1) = 'X'.
+*            ls_extension+30 = ls_bape_vbap.
+        APPEND ls_extension TO it_extension.
+
+        CLEAR:ls_extensionex.
+        ls_extensionex-structure = 'BAPE_VBAPX'.
+        ls_extensionex-valuepart1(10) = ls_bape_vbap-vbeln = <gs>-vbeln.
+        ls_extensionex-valuepart1+10(6) = <gs>-posnr.
+        ls_extensionex-valuepart1+16(1) = 'X'.
+        APPEND ls_extensionex TO it_extensionex.
+
+      ELSE.
+        "Caso 01: Actualizar precios
+
+        CLEAR:ls_extension.
+        ls_extension-structure = 'BAPE_VBAP'.
+        ls_extension-valuepart1(10) = ls_bape_vbap-vbeln = <gs>-vbeln.
+        ls_extension-valuepart1+10(6) = <gs>-posnr.
+        ls_extension-valuepart1+16(1) = 'X'.
+*            ls_extension+30 = ls_bape_vbap.
+        APPEND ls_extension TO it_extension.
+
+        CLEAR:ls_extensionex.
+        ls_extension-structure = 'BAPE_VBAPX'.
+        ls_extensionex-valuepart1(10) = ls_bape_vbap-vbeln = <gs>-vbeln.
+        ls_extensionex-valuepart1+10(6) = <gs>-posnr.
+        ls_extensionex-valuepart1+16(1) = 'X'.
+        APPEND ls_extensionex TO it_extensionex.
+      ENDIF.
+    ENDLOOP.
+
+
+    DATA: l_logic_switch TYPE bapisdls.
+    l_logic_switch-cond_handl = 'X'.
+    l_logic_switch-pricing = 'C'.
+    ls_headerx-updateflag = 'U'.
+
+    CLEAR: it_schedule[], it_schedulex[].
+    LOOP AT it_item INTO ls_item.
+      READ TABLE it_itemx INTO ls_itemx WITH KEY itm_number = ls_item-itm_number.
+      IF sy-subrc = 0.
+        CLEAR: ls_schedule, ls_schedulex.
+
+        ls_schedule-itm_number = ls_item-itm_number.
+        IF ls_itemx-updateflag = 'U'.
+          ls_schedule-sched_line = 1.
+        ENDIF.
+        ls_schedule-req_qty = ls_item-target_qty.
+        APPEND ls_schedule TO it_schedule.
+        ls_schedulex-itm_number = ls_item-itm_number.
+        IF ls_itemx-updateflag = 'U'.
+          ls_schedulex-sched_line = 1.
+        ENDIF.
+        ls_schedulex-req_qty = 'X'.
+        ls_schedulex-updateflag = ls_itemx-updateflag.
+        APPEND ls_schedulex TO it_schedulex.
+      ENDIF.
+    ENDLOOP.
+
+    DATA: lw_bape_vbap TYPE bape_vbap,
+          lv_vbeln like vbap-vbeln,
+          lv_posnr like vbap-posnr,
+          lv_zzmontaje like vbap-zzmontaje.
+
+    LOOP AT it_extension INTO ls_extension.
+      "ASC >>> 13.03.24 La sigueinte linea da un dump
+*      lw_bape_vbap = ls_extension-valuepart1.
+
+       lv_vbeln     = ls_extension-valuepart1(10).
+       lv_posnr     = ls_extension-valuepart1+10(6).
+       lv_zzmontaje = ls_extension-valuepart1+16(1).
+
+      UPDATE vbap
+        SET zzmontaje = lv_zzmontaje
+        WHERE vbeln = lv_vbeln
+          AND posnr = lv_posnr.
+
+*      UPDATE vbap
+*        SET zzmontaje = lw_bape_vbap-zzmontaje
+*        WHERE vbeln = lw_bape_vbap-vbeln
+*          AND posnr = lw_bape_vbap-posnr.
+      "ASC <<< 13.03.24
+      COMMIT WORK.
+    ENDLOOP.
+
+
+    CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+      EXPORTING
+        salesdocument    = l_vbeln
+*       order_header_in  = ls_header
+        order_header_inx = ls_headerx
+        logic_switch     = l_logic_switch
+      TABLES
+        return           = t_return
+        order_item_in    = it_item
+        order_item_inx   = it_itemx
+*       extensionin      = it_extension
+*       extensionex      = it_extensionex
+        schedule_lines   = it_schedule
+        schedule_linesx  = it_schedulex.
+
+    LOOP AT t_return TRANSPORTING NO FIELDS WHERE type = 'E' OR type = 'A' OR type = 'X'.
+    ENDLOOP.
+    IF sy-subrc = 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      WAIT UP TO 1 SECONDS.
+      LOOP AT it_extension INTO ls_extension.
+*        lw_bape_vbap = ls_extension-valuepart1.
+        UPDATE vbap
+          SET zzmontaje = ''
+          WHERE vbeln = lv_vbeln
+            AND posnr = lv_posnr.
+        COMMIT WORK.
+      ENDLOOP.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+      WAIT UP TO 1 SECONDS.
+    ENDIF.
+
+
+***    CLEAR t_return[].
+***    ls_headerx-updateflag = 'I'.
+***    CLEAR: it_schedule[], it_schedulex[].
+***    LOOP AT it_item_i INTO ls_item.
+***      ls_schedule-itm_number = ls_item-itm_number.
+***      ls_schedule-req_qty = ls_item-target_qty.
+***      APPEND ls_schedule TO it_schedule.
+***      ls_schedulex-itm_number = ls_item-itm_number.
+***      ls_schedulex-req_qty = 'X'.
+***      ls_schedulex-updateflag = 'I'.
+***      APPEND ls_schedulex TO it_schedulex.
+***    ENDLOOP.
+***
+
+***    DATA: l_logic_switch TYPE bapisdls.
+***    l_logic_switch-cond_handl = 'X'.
+***    l_logic_switch-pricing = 'C'.
+***    CLEAR t_return[].
+***    CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+***      EXPORTING
+***        salesdocument    = l_vbeln
+****       order_header_in  = ls_header
+***        order_header_inx = ls_headerx
+***        logic_switch     = l_logic_switch
+***      TABLES
+***        return           = t_return.
+****        order_item_in    = it_item_i
+****        order_item_inx   = it_itemx_i
+****        schedule_lines   = it_schedule
+****        schedule_linesx  = it_schedulex.
+***
+***    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+***    WAIT UP TO 1 SECONDS.
+
+
+  ENDLOOP.
+
+
+
+
+ENDFUNCTION.

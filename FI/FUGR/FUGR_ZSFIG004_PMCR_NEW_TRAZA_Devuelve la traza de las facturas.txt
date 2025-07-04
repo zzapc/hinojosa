@@ -1,0 +1,254 @@
+FUNCTION ZSFIG004_PMCR_NEW_TRAZA.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_BUKRS) TYPE  BUKRS
+*"     REFERENCE(I_BELNR) TYPE  BELNR_D
+*"     REFERENCE(I_GJAHR) TYPE  GJAHR
+*"     REFERENCE(I_BUZEI) TYPE  BUZEI OPTIONAL
+*"     REFERENCE(I_VALUT) TYPE  VALUT OPTIONAL
+*"     REFERENCE(I_FIRST) TYPE  FLAG
+*"  EXPORTING
+*"     REFERENCE(E_ANULADO) TYPE  FLAG
+*"  CHANGING
+*"     REFERENCE(CT_TRAZA) TYPE  ZTTSDCOM_TRAZA_OR
+*"     REFERENCE(CT_TRAZADOS) TYPE  ZTTSDCOM_TRAZA_OR
+*"----------------------------------------------------------------------
+  DATA: ls_traza    TYPE zssdcom_traza_or.
+  DATA: v_stblg  LIKE bkpf-stblg.
+  DATA: lv_gjahr TYPE gjahr.
+  DATA: lv_monat TYPE monat.
+  DATA: lti_bseg     TYPE TABLE OF zssdcom_bseg WITH HEADER LINE.
+  DATA: lti_bseg_com TYPE TABLE OF zssdcom_bseg WITH HEADER LINE.
+
+  CLEAR v_stblg.
+
+* 1.Chequear que no sea una Anulación
+  SELECT SINGLE stblg INTO v_stblg FROM bkpf
+        WHERE bukrs  = i_bukrs
+        AND   belnr  = i_belnr
+        AND   gjahr  = i_gjahr.
+  IF v_stblg IS NOT INITIAL.
+    e_anulado = 'X'.
+    RETURN.
+  ENDIF.
+
+* 2.Añadimos el Documento a la tabla interna
+  CLEAR: lti_bseg.
+  IF i_buzei IS NOT INITIAL.
+    SELECT SINGLE
+           bukrs belnr gjahr buzei augdt augcp augbl disbn disbj disbz kunnr
+           koart rebzg rebzj rebzz bschl umskz umsks zumsk hkont shkzg dmbtr
+           wrbtr valut INTO lti_bseg
+        FROM  bseg
+        WHERE bukrs  = i_bukrs
+        AND   belnr  = i_belnr
+        AND   gjahr  = i_gjahr
+        AND   buzei  = i_buzei.
+    IF sy-subrc = 0.
+      IF lti_bseg-augbl <> lti_bseg-belnr.
+        IF lti_bseg-augdt <= i_valut.
+          APPEND lti_bseg. CLEAR lti_bseg.
+        ENDIF.
+      ELSE.
+*     Factura con Anulación factura
+        IF ct_traza[] IS INITIAL.
+          IF lti_bseg-bschl = '01' OR lti_bseg-bschl = '11' OR
+             lti_bseg-bschl = '02' OR lti_bseg-bschl = '12' OR
+             lti_bseg-bschl = '04' OR lti_bseg-bschl = '14'.
+            IF lti_bseg-augdt <= i_valut.
+              APPEND lti_bseg. CLEAR lti_bseg.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ELSE.
+    DATA lti_bseg_aux TYPE TABLE OF zssdcom_bseg WITH HEADER LINE.
+    CLEAR lti_bseg_aux[].
+    SELECT
+       bukrs belnr gjahr buzei augdt augcp augbl disbn disbj disbz kunnr
+       koart rebzg rebzj rebzz bschl umskz umsks zumsk hkont shkzg dmbtr
+       wrbtr valut INTO TABLE lti_bseg_aux
+    FROM  bseg
+    WHERE bukrs  = i_bukrs
+    AND   belnr  = i_belnr
+    AND   gjahr  = i_gjahr.
+    IF sy-subrc = 0.
+      LOOP AT lti_bseg_aux.
+        IF lti_bseg_aux-augbl <> lti_bseg_aux-belnr.
+          IF lti_bseg_aux-augdt <= i_valut.
+            APPEND lti_bseg_aux TO lti_bseg.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+* 3. Búsqueda de impagados
+  IF i_first = 'X'.
+    CALL FUNCTION 'ZSDCOM_COMPROBAR_IMPAGADOS_ORG'
+      EXPORTING
+        i_valut = i_valut
+      TABLES
+        it_bseg = lti_bseg.
+  ENDIF.
+
+* 4. Busqueda de documentos de compensación
+  LOOP AT lti_bseg WHERE augbl IS NOT INITIAL.
+    CLEAR: lv_gjahr, lv_monat.
+    CALL FUNCTION 'FI_PERIOD_DETERMINE'
+      EXPORTING
+        i_budat        = lti_bseg-augdt
+        i_bukrs        = i_bukrs
+      IMPORTING
+        e_gjahr        = lv_gjahr
+        e_monat        = lv_monat
+      EXCEPTIONS
+        fiscal_year    = 1
+        period         = 2
+        period_version = 3
+        posting_period = 4
+        special_period = 5
+        version        = 6
+        posting_date   = 7
+        OTHERS         = 8.
+
+*   Sacamos las posiciones con el documento de compensación
+    CLEAR lti_bseg_com[].
+*   EN SML NO STA
+    DATA o_bseg LIKE LINE OF lti_bseg.
+    READ TABLE lti_bseg INTO o_bseg WITH KEY bukrs = lti_bseg-bukrs
+                                 belnr = lti_bseg-augbl
+                                 gjahr = lv_gjahr.
+*   FSML
+    IF sy-subrc <> 0.
+
+    SELECT bukrs belnr gjahr buzei augdt augcp augbl disbn disbj disbz kunnr
+           koart rebzg rebzj rebzz bschl umskz umsks zumsk hkont shkzg dmbtr
+           wrbtr valut INTO TABLE lti_bseg_com
+        FROM  bseg
+        WHERE bukrs  = lti_bseg-bukrs
+        AND   gjahr  = lv_gjahr
+        AND   belnr  = lti_bseg-augbl.
+
+*   Recorremos los documentos sacados añadiendo los que no estén ya en la tabla
+    LOOP AT lti_bseg_com.
+      READ TABLE lti_bseg WITH KEY bukrs = lti_bseg_com-bukrs
+                                   belnr = lti_bseg_com-belnr
+                                   buzei = lti_bseg_com-buzei
+                                   gjahr = lti_bseg_com-gjahr.
+      IF sy-subrc <> 0.
+        APPEND lti_bseg_com TO lti_bseg.
+      ENDIF.
+    ENDLOOP.
+
+    ENDIF.
+
+  ENDLOOP.
+
+* 5. Sacamos la utilización del pago de todos los documentos
+  CALL FUNCTION 'ZSFIG004_PMCR_NEW_UTILIZ_PAGO'
+    EXPORTING
+      i_bukrs     = i_bukrs
+      i_belnr     = i_belnr
+      i_gjahr     = i_gjahr
+      i_buzei     = i_buzei
+    TABLES
+      et_bseg     = lti_bseg[]
+    CHANGING
+      ct_trazados = ct_trazados[].
+
+
+* 6. Busqueda recursiva de documentos asociados...
+  LOOP AT lti_bseg.
+    CLEAR ls_traza.
+*   Chequeamos si el documento ya está en la traza
+    READ TABLE ct_traza INTO ls_traza WITH KEY belnr = lti_bseg-belnr
+                                               gjahr = lti_bseg-gjahr
+                                               buzei = lti_bseg-buzei.
+    CHECK sy-subrc <> 0.
+*   Añadimos el documento a la traza
+    CLEAR ls_traza.
+    MOVE-CORRESPONDING lti_bseg TO ls_traza.
+    APPEND ls_traza TO ct_traza.
+
+*   Trazamos su compensacion
+    IF lti_bseg-augbl IS NOT INITIAL.
+      CALL FUNCTION 'FI_PERIOD_DETERMINE'
+        EXPORTING
+          i_budat        = lti_bseg-augdt
+          i_bukrs        = i_bukrs
+        IMPORTING
+          e_gjahr        = lv_gjahr
+          e_monat        = lv_monat
+        EXCEPTIONS
+          fiscal_year    = 1
+          period         = 2
+          period_version = 3
+          posting_period = 4
+          special_period = 5
+          version        = 6
+          posting_date   = 7
+          OTHERS         = 8.
+      CALL FUNCTION 'ZSFIG004_PMCR_NEW_TRAZA'
+        EXPORTING
+          i_bukrs     = lti_bseg-bukrs
+          i_belnr     = lti_bseg-augbl
+          i_gjahr     = lv_gjahr
+          i_valut     = i_valut
+          i_first     = space
+        CHANGING
+          ct_traza    = ct_traza
+          ct_trazados = ct_trazados.
+      READ TABLE ct_traza INTO ls_traza WITH KEY bukrs = lti_bseg-bukrs
+                                                 belnr = lti_bseg-augbl
+                                                 gjahr = lv_gjahr
+                                                 buzei = lti_bseg-buzei.
+*     Lo añadimos a la tabla de la traza
+      IF sy-subrc <> 0.
+        CLEAR ls_traza.
+        SELECT SINGLE * INTO CORRESPONDING FIELDS OF ls_traza
+            FROM  bseg
+            WHERE bukrs  = lti_bseg-bukrs
+            AND   belnr  = lti_bseg-augbl
+            AND   gjahr  = lv_gjahr
+            AND   buzei  = lti_bseg-buzei
+            AND   augbl <> lti_bseg-augbl.
+        IF sy-subrc = 0.
+          APPEND ls_traza TO ct_traza.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Recorremos los documentos añadiendo los que no estén
+  DATA: ls_bseg TYPE zssdcom_bseg.
+  LOOP AT lti_bseg INTO ls_bseg.
+    READ TABLE ct_traza INTO ls_traza WITH KEY belnr = ls_bseg-belnr
+                                               gjahr = ls_bseg-gjahr
+                                               buzei = ls_bseg-buzei.
+    CHECK sy-subrc <> 0.
+    CLEAR ls_traza.
+    MOVE-CORRESPONDING ls_bseg TO ls_traza.
+    APPEND ls_traza TO ct_traza.
+  ENDLOOP.
+
+* Descartamos aquellas líneas cuya fecha de documento sea mayor que la indicada
+  DATA: lv_bldat TYPE bldat.
+  DATA: lv_ind       TYPE i.
+
+  LOOP AT ct_traza INTO ls_traza.
+    lv_ind = sy-tabix.
+*   Sacamos la fecha de documento
+    SELECT SINGLE bldat waers INTO (ls_traza-bldat, ls_traza-waers) FROM bkpf
+        WHERE bukrs = ls_traza-bukrs
+        AND   gjahr = ls_traza-gjahr
+        AND   belnr = ls_traza-belnr.
+    IF ls_traza-bldat <= i_valut.
+      MODIFY ct_traza FROM ls_traza INDEX lv_ind.
+    ELSE.
+      DELETE ct_traza INDEX lv_ind.
+    ENDIF.
+  ENDLOOP.
+ENDFUNCTION.

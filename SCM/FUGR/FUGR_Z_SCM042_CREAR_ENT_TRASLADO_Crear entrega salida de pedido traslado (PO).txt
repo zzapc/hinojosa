@@ -1,0 +1,107 @@
+FUNCTION z_scm042_crear_ent_traslado.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_EBELN) TYPE  EBELN
+*"  EXPORTING
+*"     REFERENCE(ET_RETURN) TYPE  BAPIRET2_TT
+*"     REFERENCE(E_VBELN_VL) TYPE  VBELN_VL
+*"----------------------------------------------------------------------
+* JGM 02.2024 GAPCM042 Aplicativo Gestión de Desvíos:
+* Crear entrega de salida de traslado a partir de pedido de traslado (PO).
+*--------------------------------------------------------------------*
+  DATA: lv_delivery   TYPE bapishpdelivnumb-deliv_numb,
+        lv_structname TYPE c LENGTH 20 VALUE 'ZSCM042_ST_APPEND'.
+
+  DATA: lt_trans_items  TYPE TABLE OF bapidlvreftosto,
+        lt_return       TYPE bapiret2_tt,
+        lt_extension_in TYPE TABLE OF bapiparex.
+
+  DATA: ls_trans_items  TYPE bapidlvreftosto,
+        ls_extension_in TYPE bapiparex,
+        ls_likp_app     TYPE zscm042_st_append.
+
+  DATA: lr_type_error TYPE RANGE OF bapi_mtype.
+
+
+  lr_type_error = VALUE #( sign = 'I' option = 'EQ' ( low = 'E' ) ( low = 'A' ) ( low = 'X' ) ).
+
+  IF i_ebeln IS NOT INITIAL.
+
+    SELECT ebeln, ebelp, menge, meins
+      INTO TABLE @DATA(lt_ekpo)
+      FROM ekpo
+      WHERE ebeln EQ @i_ebeln.
+
+    IF sy-subrc EQ 0.
+      LOOP AT lt_ekpo INTO DATA(ls_ekpo).
+        ls_trans_items-ref_doc    = ls_ekpo-ebeln.
+        ls_trans_items-ref_item   = ls_ekpo-ebelp.
+        ls_trans_items-dlv_qty    = ls_ekpo-menge.
+        ls_trans_items-sales_unit = ls_ekpo-meins.
+
+        APPEND ls_trans_items TO lt_trans_items.
+        CLEAR ls_trans_items.
+      ENDLOOP.
+
+      "Marcar flag a nivel de LIKP “DESVIO” para controlar las entregas generadas para el caso de desvíos.
+      "Opción: extension_in con BADI_DLV_CREATE_STO_EXTIN (*STO*) y LE_SHP_DELIVERY_PROC
+      "Otra opción: include MV50AFZ1, FORM userexit_move_field_to_likp.
+
+      ls_likp_app-zzdesvio = 'X'.
+      ls_extension_in-structure = lv_structname.  "BAPI_TE_*, BAPE_* ?
+      cl_abap_container_utilities=>fill_container_c(
+      EXPORTING
+        im_value     = ls_likp_app
+      IMPORTING
+        ex_container = ls_extension_in+30 ).
+
+      APPEND ls_extension_in TO lt_extension_in.
+      CLEAR ls_extension_in.
+
+
+      CALL FUNCTION 'BAPI_OUTB_DELIVERY_CREATE_STO'
+        IMPORTING
+          delivery          = lv_delivery
+        TABLES
+          stock_trans_items = lt_trans_items
+          extension_in      = lt_extension_in
+          return            = lt_return.
+
+      LOOP AT lt_return TRANSPORTING NO FIELDS WHERE type IN lr_type_error.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc EQ 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+
+        e_vbeln_vl = lv_delivery.
+
+        "Mensaje creación Entrega.
+        et_return = VALUE #( FOR wa_ret IN lt_return WHERE ( type EQ 'S' AND id EQ 'VL' AND number EQ '311')
+                           ( CORRESPONDING #( wa_ret ) ) ).
+
+        "Chequeo: En algunos casos se puede haber creado la entrega traslado con cantidad cero en las posiciones,
+        "por errores de stock WM u otros problemas.
+        SELECT vbeln, posnr, matnr, charg, lfimg, meins
+          INTO TABLE @DATA(lt_lips)
+          FROM lips
+          WHERE vbeln EQ @lv_delivery.
+
+        IF sy-subrc EQ 0 AND line_exists( lt_lips[ lfimg = 0 ] ).
+          "Error: entrega con cantidad cero".
+          PERFORM fill_return USING 'E' 'ZSCM042' '030' lv_delivery space space space CHANGING et_return.
+        ENDIF.
+      ENDIF.
+
+      "Mensajes de error de la bapi.
+      DELETE lt_return WHERE type NOT IN lr_type_error.
+
+      APPEND LINES OF lt_return TO et_return.
+    ENDIF.
+  ENDIF.
+
+ENDFUNCTION.

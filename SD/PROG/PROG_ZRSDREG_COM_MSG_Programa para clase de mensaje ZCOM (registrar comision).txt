@@ -1,0 +1,365 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRSDREG_COM_MSG
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  zrsdreg_com_msg MESSAGE-ID e0.
+
+
+* Declaración de datos del diccionario
+* ---------------------------------------------------------------------
+TABLES: nast,                          "Messages
+        *nast,                         "Messages
+        tnapr,                         "Programs & Forms
+        itcpo,                         "Communicationarea for Spool
+        arc_params,                    "Archive parameters
+        toa_dara,                      "Archive parameters
+        addr_key.                      "Adressnumber for ADDRESS
+
+TYPE-POOLS szadr.
+
+
+* Constantes
+* ---------------------------------------------------------------------
+CONSTANTS: gc_dev_aut     TYPE zstat_pos VALUE '01', "devengo automático
+           gc_dev_man     TYPE zstat_pos VALUE '02'. "devengo manual
+
+
+* Tablas internas
+* --------------------------------------------------------------------
+DATA: gti_vbrp TYPE TABLE OF vbrp,
+      gti_vbpa TYPE TABLE OF vbpa,
+      gti_konv TYPE TABLE OF konv.
+
+
+* Tablas internas
+* --------------------------------------------------------------------
+DATA: gs_vbrk  TYPE vbrk.
+
+
+* Variables globales
+* --------------------------------------------------------------------
+DATA: xscreen(1) TYPE c,               "Output on printer or screen
+      gv_belnr   TYPE belnr_d,
+      gv_gjahr   TYPE gjahr.
+
+
+
+
+
+*---------------------------------------------------------------------*
+*       FORM REG_COM                                                  *
+*---------------------------------------------------------------------*
+*       Form de entrada para clase de mensaje: función especial (8)   *
+*---------------------------------------------------------------------*
+*  -->  US_SCREEN for use in future                                   *
+*  <--  RC      returncode                                            *
+*---------------------------------------------------------------------*
+FORM reg_com USING return_code
+                   us_screen.
+
+  DATA: lv_retcode TYPE sysubrc,
+        lv_vbeln   TYPE vbeln_vf.
+
+* Inicializamos
+  xscreen = us_screen.
+
+* Sacamos el número de factura de ventas
+  lv_vbeln = nast-objky.
+
+* Sacamos los datos de la factura
+  lv_retcode = 0.
+  PERFORM sacar_datos_factura USING    lv_vbeln
+                              CHANGING lv_retcode.
+
+* Si no hay error -> Seguimos
+  IF lv_retcode = 0.
+*   Si no hay clases de condición -> NO hacemos nada más
+    IF gti_konv[] IS INITIAL.
+      return_code = 0.
+      syst-msgid = 'ZSDCOM'.
+      syst-msgno = '002'.
+      syst-msgty = 'S'.
+      PERFORM protocol_update.
+      EXIT.
+    ENDIF.
+
+*   Si no hay interlocutores -> NO hacemos nada más
+    IF gti_vbpa[] IS INITIAL.
+      return_code = 0.
+      syst-msgid = 'ZSDCOM'.
+      syst-msgno = '003'.
+      syst-msgty = 'S'.
+      PERFORM protocol_update.
+      EXIT.
+    ENDIF.
+
+*   Registramos las posiciones de las comisiones en las tablas Z
+    PERFORM registrar_comisiones CHANGING lv_retcode.
+
+*   Si no hay error -> Añadimos un mensaje de éxito
+    IF lv_retcode = 0.
+      syst-msgid = 'ZSDCOM'.
+      syst-msgno = '004'.
+      syst-msgty = 'S'.
+      PERFORM protocol_update.
+    ENDIF.
+  ENDIF.
+
+* Devolvemos el status del mensaje
+  IF lv_retcode NE 0.
+    return_code = 1.
+  ELSE.
+    return_code = 0.
+  ENDIF.
+
+ENDFORM. "END REG_COM
+
+
+*&---------------------------------------------------------------------*
+*&      Form  SACAR_DATOS_FACTURA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_VBELN  text
+*----------------------------------------------------------------------*
+FORM sacar_datos_factura  USING    p_vbeln
+                          CHANGING p_retcode.
+
+  DATA: lr_kschl   TYPE RANGE OF kschl,
+        lr_parvw   TYPE RANGE OF parvw.
+  DATA: lti_clcond TYPE TABLE OF ztsdcom001.
+  DATA: ls_kschl   LIKE LINE  OF lr_kschl,
+        ls_parvw   LIKE LINE  OF lr_parvw,
+        ls_clcond  TYPE          ztsdcom001.
+
+* Inicializamos datos globales
+  CLEAR: gs_vbrk.
+  REFRESH: gti_vbrp, gti_konv, gti_vbpa.
+
+* Sacamos los datos de cabecera de la factura
+  SELECT SINGLE * INTO gs_vbrk
+      FROM  vbrk
+      WHERE vbeln = p_vbeln.
+  IF sy-subrc <> 0.
+    p_retcode = sy-subrc.
+    syst-msgid = 'ZSDCOM'.
+    syst-msgno = '001'.
+    syst-msgty = 'E'.
+    syst-msgv1 = p_vbeln.
+    PERFORM protocol_update.
+    EXIT.
+  ENDIF.
+
+* Sacamos las posiciones de la factura
+  SELECT * INTO TABLE gti_vbrp
+      FROM  vbrp
+      WHERE vbeln = p_vbeln.
+
+* Primero sacamos el customizing de las clases de condición de la factura / comisionistas
+  SELECT * INTO TABLE lti_clcond
+      FROM  ztsdcom001
+      WHERE bukrs = gs_vbrk-bukrs.
+
+* Separamos en rangos: las clases de condición y las funciones de interlocutor
+  LOOP AT lti_clcond INTO ls_clcond.
+*   Clase de condición
+    ls_kschl-sign   = 'I'.
+    ls_kschl-option = 'EQ'.
+    ls_kschl-low    = ls_clcond-kschl.
+    COLLECT ls_kschl INTO lr_kschl.
+*   Funciones de interlocutor
+    ls_parvw-sign   = 'I'.
+    ls_parvw-option = 'EQ'.
+    ls_parvw-low    = ls_clcond-parvw.
+    COLLECT ls_parvw INTO lr_parvw.
+  ENDLOOP.
+
+* Sacamos las funciones de interlocutor de la factura que estén en la tabla de custo
+  IF lr_parvw[] IS NOT INITIAL.
+    SELECT * INTO TABLE gti_vbpa
+        FROM  vbpa
+        WHERE vbeln  = p_vbeln
+        AND   parvw IN lr_parvw.
+  ENDIF.
+
+* Sacamos las condiciones de precio de comisiones de la factura
+  IF lr_kschl[] IS NOT INITIAL.
+    SELECT * INTO TABLE gti_konv
+        FROM  konv
+        WHERE knumv  = gs_vbrk-knumv
+        AND   kschl IN lr_kschl.
+  ENDIF.
+
+* Sacamos el documento financiero de la factura de ventas
+* hacemos un bucle por si todavía no se ha grabado
+  DO 20 TIMES.
+*   Buscamos en la BKPF la factura de ventas
+    CLEAR: gv_belnr, gv_gjahr.
+    SELECT SINGLE belnr gjahr
+        INTO (gv_belnr, gv_gjahr)
+        FROM  bkpf
+        WHERE awtyp = 'VBRK'
+        AND   awkey = gs_vbrk-vbeln.
+    IF sy-subrc = 0.
+      EXIT.
+    ELSE.
+      WAIT UP TO 1 SECONDS.
+    ENDIF.
+  ENDDO.
+
+* Si no hay documento financiero -> ERROR
+  IF gv_belnr IS INITIAL.
+    p_retcode  = 4.
+    syst-msgid = 'ZSDCOM'.
+    syst-msgno = '005'.
+    syst-msgty = 'E'.
+    syst-msgv1 = p_vbeln.
+    PERFORM protocol_update.
+  ENDIF.
+
+ENDFORM.                    " SACAR_DATOS_FACTURA
+
+
+*&---------------------------------------------------------------------*
+*&      Form  REGISTRAR_COMISIONES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_RETCODE  text
+*----------------------------------------------------------------------*
+FORM registrar_comisiones  CHANGING p_retcode.
+
+  DATA: lr_kschl   TYPE RANGE OF kschl,
+        lr_parvw   TYPE RANGE OF parvw.
+
+  DATA: lti_clcond TYPE TABLE OF ztsdcom001.
+
+  DATA: ls_kschl   LIKE LINE  OF lr_kschl,
+        ls_parvw   LIKE LINE  OF lr_parvw,
+        ls_clcond  TYPE          ztsdcom001,
+        ls_vbrp    TYPE          vbrp,
+        ls_vbpa    TYPE          vbpa,
+        ls_konv    TYPE          konv,
+        ls_poscom  TYPE          ztsdcom_pos.
+
+  DATA: lv_mult    TYPE i.
+
+* Sacamos un rango con las funciones de interlocutor de comisionistas
+  LOOP AT gti_vbpa INTO ls_vbpa.
+    ls_parvw-sign   = 'I'.
+    ls_parvw-option = 'EQ'.
+    ls_parvw-low    = ls_vbpa-parvw.
+    COLLECT ls_parvw INTO lr_parvw.
+  ENDLOOP.
+
+* Sacamos un rango con las clases de condición
+  LOOP AT gti_konv INTO ls_konv.
+    ls_kschl-sign   = 'I'.
+    ls_kschl-option = 'EQ'.
+    ls_kschl-low    = ls_konv-kschl.
+    COLLECT ls_kschl INTO lr_kschl.
+  ENDLOOP.
+
+* Primero sacamos el customizing de las clases de condición de la factura / comisionistas
+  SELECT * INTO TABLE lti_clcond
+      FROM  ztsdcom001
+      WHERE bukrs  = gs_vbrk-bukrs
+      AND   kschl IN lr_kschl
+      AND   parvw IN lr_parvw.
+
+* Dependiendo del tipo de factura: factura, abono, cargo,... ponemos un factor
+* multiplicador para que pasen a la tabla en positivo o negativo
+* Las facturas y cargos llevan el factor mult. -1 porque la clase de condición
+* viene en negativo y hay que ponerla en positivo
+  IF gs_vbrk-vbtyp = 'M' OR gs_vbrk-vbtyp = 'P' OR gs_vbrk-vbtyp = 'S'.
+    lv_mult = -1.
+* Los abonos, anulaciones,... llevan el factor 1 porque la clase de condición
+* va en negativo, por tanto se quedan igual
+  ELSE.
+    lv_mult = 1.
+  ENDIF.
+
+* Recorremos las clases de condición del customizing
+  LOOP AT lti_clcond INTO ls_clcond.
+*   Recorremos las funciones de interlocutor de la factura
+    LOOP AT gti_vbpa INTO ls_vbpa WHERE parvw = ls_clcond-parvw.
+*     Cargamos los datos de cabecera
+      CLEAR ls_poscom.
+      ls_poscom-bukrs     = gs_vbrk-bukrs.
+      ls_poscom-belnr_vf  = gv_belnr.
+      ls_poscom-gjahr     = gv_gjahr.
+      ls_poscom-vbeln     = gs_vbrk-vbeln.
+      DATA v_lifnr TYPE lifnr. CLEAR v_lifnr.
+      SELECT SINGLE lifnr INTO v_lifnr FROM kna1 WHERE kunnr = ls_vbpa-kunnr.
+        IF sy-subrc = 0.
+          ls_poscom-lifnr     =  v_lifnr.
+      "ls_poscom-lifnr     = ls_vbpa-lifnr.
+      ENDIF.
+      ls_poscom-erdat     = sy-datum.
+      ls_poscom-fkdat     = gs_vbrk-fkdat.
+      ls_poscom-kunnr     = gs_vbrk-kunrg.
+      ls_poscom-knumv     = gs_vbrk-knumv.
+      ls_poscom-belnr_man = gv_belnr.
+      ls_poscom-gjahr_man = gv_gjahr.
+*     Recorremos las clases de condición de la factura
+      LOOP AT gti_konv INTO ls_konv WHERE kschl = ls_clcond-kschl.
+*       Sacamos la posición de la factura
+        READ TABLE gti_vbrp INTO ls_vbrp WITH KEY posnr = ls_konv-kposn.
+*       Cargamos los datos de posición
+        ls_poscom-posnr     = ls_vbrp-posnr.
+        ls_poscom-kschl     = ls_konv-kschl.
+        ls_poscom-matnr     = ls_vbrp-matnr.
+        ls_poscom-werks     = ls_vbrp-werks.
+        ls_poscom-kawrt     = ls_konv-kawrt.
+        ls_poscom-kbetr     = lv_mult * ( ls_konv-kbetr / 10 ).
+        ls_poscom-kwert     = lv_mult * ls_konv-kwert.
+        ls_poscom-waerk     = gs_vbrk-waerk.
+        ls_poscom-sakn1     = ls_konv-sakn1.
+        ls_poscom-sakn2     = ls_konv-sakn2.
+        ls_poscom-zstat_pos = gc_dev_aut.
+*       Chequeamos que la clase de condición haya determinado cuenta
+*        excepto empleado
+
+
+      if LS_CLCOND-KSCHL(3) ne 'ZCE'.
+
+        CHECK ls_poscom-sakn1 IS NOT INITIAL.
+        CHECK ls_poscom-sakn2 IS NOT INITIAL.
+
+      endif.
+
+*       Realizamos el registro/modificación de la bbdd
+        MODIFY ztsdcom_pos FROM ls_poscom.
+      ENDLOOP. "clases de condición de la factura
+    ENDLOOP. "interlocutores de la factura
+  ENDLOOP. "clases de condición del customizing
+
+ENDFORM.                    " REGISTRAR_COMISIONES
+
+
+*---------------------------------------------------------------------*
+*       FORM PROTOCOL_UPDATE                                          *
+*---------------------------------------------------------------------*
+*       The messages are collected for the processing protocol.       *
+*---------------------------------------------------------------------*
+
+FORM protocol_update.
+
+  CHECK xscreen = space.
+  CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+    EXPORTING
+      msg_arbgb = syst-msgid
+      msg_nr    = syst-msgno
+      msg_ty    = syst-msgty
+      msg_v1    = syst-msgv1
+      msg_v2    = syst-msgv2
+      msg_v3    = syst-msgv3
+      msg_v4    = syst-msgv4
+    EXCEPTIONS
+      OTHERS    = 1.
+
+ENDFORM.                    "PROTOCOL_UPDATE

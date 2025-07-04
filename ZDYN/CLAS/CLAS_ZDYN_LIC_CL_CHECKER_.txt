@@ -1,0 +1,200 @@
+INCLUDE ZDYN_LIC_I_MESSAGE_MACROS.
+class ZDYN_LIC_CL_CHECKER definition
+  public
+  create public .
+
+public section.
+
+  class-methods CHECK_LICENSE
+    importing
+      !IC_PRODUCT type ZDYN_LIC_D_COMPONENT
+    exporting
+      !EB_LICENSE_VALID type BOOLE_D
+      !ES_LICENSE type ZDYN_LIC_S_LICENSE
+    changing
+      !CT_MESSAGES type BAPIRETTAB .
+  class-methods CHECK_LICENSE_AND_SHOW_MSGS
+    importing
+      !IC_PRODUCT type ZDYN_LIC_D_COMPONENT
+      !IB_ERROR_AS_WARNING type ABAP_BOOL default ABAP_FALSE
+    exporting
+      !EB_CORRECT type ABAP_BOOL .
+protected section.
+private section.
+
+  class-methods CALC_HASH_FOR_CHAR
+    importing
+      !I_DATA type ANY
+    returning
+      value(EC_HASH) type CHAR40 .
+  class-methods GET_PRODUCT_TEXT
+    importing
+      !IC_PRODUCT type ANY
+    returning
+      value(EC_TEXT) type STRING .
+  class-methods ENCRYPT_VALUES
+    importing
+      !IST_LICENSE type ZDYN_LIC_S_LICENSE
+      !IC_SAP_INSTALL_NUM type SLIC_INST
+      !IC_SAP_VER type SAPRL default SY-SAPRL
+      !IC_SAP_SYS_ID type SY-SYSID default SY-SYSID
+    returning
+      value(EC_KEY) type ZDYN_LIC_D_LICENSE_KEY .
+  class-methods GET_LICENSE
+    importing
+      !IC_MANDT type MANDT default SY-MANDT
+      !IC_PRODUCT type ZDYN_LIC_D_COMPONENT
+      !IC_SAP_INSTALL_NUM type SLIC_INST
+    returning
+      value(RST_LICENSE) type ZDYN_LIC_S_LICENSE .
+endclass. "ZDYN_LIC_CL_CHECKER definition
+class ZDYN_LIC_CL_CHECKER implementation.
+METHOD calc_hash_for_char.
+
+  DATA: lc_inputvalue     TYPE string,
+        lc_result_key(40) TYPE c.
+
+  lc_inputvalue = i_data.
+
+  CALL FUNCTION 'CALCULATE_HASH_FOR_CHAR'
+    EXPORTING
+      data           = lc_inputvalue
+    IMPORTING
+      hash           = lc_result_key
+    EXCEPTIONS
+      unknown_alg    = 1
+      param_error    = 2
+      internal_error = 3.
+  CHECK sy-subrc = 0.
+  ec_hash = lc_result_key.
+
+ENDMETHOD.
+METHOD check_license.
+
+  DATA: lc_key             TYPE zdyn_lic_d_license_key,
+        lc_sap_install_num TYPE slic_inst,
+        ls_license         TYPE zdyn_lic_s_license,
+        lc_product         TYPE string.
+
+  eb_license_valid = abap_true.
+  lc_product = get_product_text( ic_product ).
+
+*--   get sap installation number
+  CALL FUNCTION 'SLIC_GET_LICENCE_NUMBER'
+    IMPORTING
+      license_number = lc_sap_install_num.
+
+*-- Get license info
+  ls_license = get_license(  ic_mandt = sy-mandt
+                             ic_product = ic_product
+                             ic_sap_install_num = lc_sap_install_num ).
+  es_license = ls_license.
+  IF ls_license IS INITIAL.
+*   MESSAGE e001(ZDYN_LICENSE).
+    msg1 e 001 zdyn_license lc_product ct_messages.
+    eb_license_valid = abap_false.
+    exit.
+  ENDIF.
+
+  IF  ls_license-expr_date IS NOT INITIAL
+  AND ls_license-expr_date < sy-datum.
+*   MESSAGE e002(ZDYN_LICENSE).
+    msg1 e 002 zdyn_license lc_product ct_messages.
+    eb_license_valid = abap_false.
+  ENDIF.
+
+*-- Get keys
+  lc_key = encrypt_values( ist_license        = ls_license
+                           ic_sap_ver         = sy-saprl
+                           ic_sap_install_num = lc_sap_install_num ).
+
+  CHECK ls_license-lic_key <> lc_key.
+* MESSAGE e001(zdyn_license) WITH lc_text.
+  msg1 e 001 zdyn_license lc_product ct_messages.
+  eb_license_valid = abap_false.
+
+ENDMETHOD.
+METHOD check_license_and_show_msgs.
+
+  DATA:
+    lb_valid_license TYPE boole_d,
+    lt_messages      TYPE TABLE OF bapiret2,
+    lst_msg          TYPE bapiret2.
+
+*-- Check if license is valid
+  zdyn_lic_cl_checker=>check_license( EXPORTING ic_product       = ic_product
+                                      IMPORTING eb_license_valid = eb_correct
+                                      CHANGING  ct_messages      = lt_messages ).
+
+  CHECK lb_valid_license = abap_false.
+
+  IF ib_error_as_warning = abap_true.
+*-- Replace messages with warnings
+    lst_msg-type = 'W'.
+    MODIFY lt_messages FROM lst_msg TRANSPORTING type WHERE type = 'E'.
+  ENDIF.
+
+  LOOP AT lt_messages INTO lst_msg.
+    MESSAGE ID lst_msg-id  TYPE lst_msg-type NUMBER lst_msg-number WITH lst_msg-message_v1
+                                                                        lst_msg-message_v2
+                                                                        lst_msg-message_v3
+                                                                        lst_msg-message_v4.
+  ENDLOOP.
+
+ENDMETHOD.
+METHOD encrypt_values.
+
+  DATA:
+*   length of input value is sum of leght of all encrypting parameters.
+    lc_inputvalue(41)       TYPE c,
+    lc_tmpforconversion(10) TYPE c,
+    lc_tmpexprdate(8)       TYPE c,
+    lc_fun_name(40)         TYPE c.
+
+  lc_tmpexprdate = ist_license-expr_date.
+  IF ( ist_license-expr_date EQ space ).
+    lc_tmpexprdate = '00000000'.
+  ENDIF.
+
+  lc_tmpforconversion = ist_license-lic_number.
+
+  CONCATENATE ist_license-component     " 1
+              ist_license-lic_mandt     " 3
+              lc_tmpexprdate            " 8
+              lc_tmpforconversion       " 10
+              ist_license-lic_type      " 1
+              ic_sap_install_num        " 10
+              ic_sap_sys_id             " 8
+                                        " sum = 41
+  INTO lc_inputvalue.
+
+  ec_key = calc_hash_for_char( lc_inputvalue ).
+  TRANSLATE ec_key TO UPPER CASE.             "#EC SYNTCHAR
+
+ENDMETHOD.
+METHOD get_license.
+*-- Search for product license in specified mandt
+  SELECT SINGLE *  FROM zdyn_t_tlic INTO rst_license WHERE component       = ic_product
+                                                     AND   sap_install_num = ic_sap_install_num
+                                                     AND   sap_sys_id      = sy-sysid
+                                                     AND   lic_mandt       = ic_mandt.
+
+*-- If no license is installed in ic_mandt then check for general license
+  IF NOT sy-subrc IS INITIAL OR
+     rst_license   IS INITIAL.
+    SELECT SINGLE *  FROM zdyn_t_tlic INTO rst_license WHERE component       = ic_product
+                                                       AND   sap_install_num = ic_sap_install_num
+                                                       AND   sap_sys_id      = sy-sysid
+                                                       AND   lic_mandt       = zdyn_lic_if_con=>char_space.
+  ENDIF.
+ENDMETHOD.
+METHOD get_product_text.
+
+  DATA: lr_tools    TYPE REF TO zdyn_lic_cl_tools.
+
+  CREATE OBJECT lr_tools.
+  lr_tools->get_domain_text( EXPORTING ic_domain = 'ZDYN_LIC_M_COMPONENT'
+                                       ic_domval = ic_product
+                             IMPORTING ec_text   = ec_text ).
+
+ENDMETHOD.

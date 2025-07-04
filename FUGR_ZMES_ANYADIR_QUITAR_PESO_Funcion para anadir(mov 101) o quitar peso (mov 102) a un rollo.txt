@@ -1,0 +1,341 @@
+FUNCTION zmes_anyadir_quitar_peso.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_AUFNR) TYPE  AUFNR
+*"     REFERENCE(I_WERKS) TYPE  WERKS_D
+*"     REFERENCE(I_CHARG) TYPE  CHARG_D
+*"     REFERENCE(I_PESO) TYPE  STRING
+*"     REFERENCE(I_ID_ROLLO_MES) TYPE  STRING OPTIONAL
+*"     REFERENCE(IW_INCREM_DECREM) TYPE  CHAR1
+*"  EXPORTING
+*"     REFERENCE(E_MBLNR) TYPE  MBLNR
+*"     REFERENCE(E_MJAHR) TYPE  MJAHR
+*"     REFERENCE(E_ERROR) TYPE  XFELD
+*"----------------------------------------------------------------------
+
+  DATA: ls_header  TYPE bapi2017_gm_head_01,
+        lt_return  LIKE bapiret2 OCCURS 0,
+        ls_return  TYPE bapiret2,
+        lt_item    LIKE bapi2017_gm_item_create OCCURS 0,
+        ls_item    TYPE bapi2017_gm_item_create,
+        ls_headret TYPE bapi2017_gm_head_ret.
+
+
+  DATA: lv_extnumber TYPE balnrext.
+
+  DATA: i_string      TYPE  char30,
+        ld_e_float    TYPE f,
+        ld_e_dec      TYPE string,
+        ld_e_decimals TYPE i.
+
+* DTM
+
+  DATA: lti_times       TYPE STANDARD TABLE OF bapi_pi_timeticket1,
+        lti_goodmov     TYPE TABLE OF bapi2017_gm_item_create WITH HEADER LINE,
+        lti_link        TYPE TABLE OF bapi_link_conf_goodsmov WITH HEADER LINE,
+        lti_detail      TYPE TABLE OF bapi_coru_return WITH HEADER LINE,
+        lti_resb        TYPE TABLE OF resb,
+        ls_propose      TYPE bapi_pp_conf_prop,
+        ls_ret2         TYPE bapiret1,
+        ls_return1      TYPE bapiret1,
+        ls_times        LIKE LINE OF lti_times,
+        ls_aufm         TYPE aufm,
+        lv_gamng        TYPE gamng,
+        lv_rsnum        TYPE rsnum,
+        lv_peso_p       TYPE p DECIMALS 0 VALUE '0',
+        lv_error        TYPE xfeld,
+        lv_peso_del     TYPE string,
+        lv_nuevo_peso_p TYPE p DECIMALS 0 VALUE '0',
+        lv_peso_tot     TYPE zpeso.
+
+* DTM
+
+  CLEAR: lt_item,
+         ls_header,
+         ls_item, e_error.
+
+  REFRESH: lt_item,
+           lt_return.
+
+* DTM
+
+  CLEAR: lti_times[], lti_goodmov[], lti_link[], lti_detail[], lti_resb[].
+  CLEAR: ls_propose, ls_times, ls_ret2, ls_return1.
+  CLEAR: lv_gamng, lv_rsnum, lv_peso_p, lv_nuevo_peso_p, lv_peso_del.
+
+* DTM
+
+* cabecera
+  ls_header-pstng_date =  sy-datum.
+  ls_header-doc_date   =  sy-datum.
+  ls_header-pr_uname = sy-uname.
+
+  ls_header-header_txt = 'Cambio peso MES'.
+
+  SELECT SINGLE plnbez FROM afko
+    INTO ls_item-material
+    WHERE aufnr =  i_aufnr.
+
+* DTM Se recoge el peso total de la orden antes de ser tratada
+
+  SELECT SINGLE clabs FROM mchb
+    WHERE matnr EQ @ls_item-material
+      AND werks EQ @i_werks
+      AND lgort EQ '1020'
+      AND charg EQ @i_charg
+  INTO @DATA(lv_peso_t).
+
+* DTM
+
+  ls_item-plant = i_werks.
+
+  SELECT SINGLE lgort INTO ls_item-stge_loc
+   FROM afpo
+   WHERE aufnr = i_aufnr .
+
+  CASE iw_increm_decrem.
+    WHEN 'I'.  ls_item-move_type = '101'.
+    WHEN 'D'.  ls_item-move_type = '102'.
+    WHEN OTHERS.
+  ENDCASE.
+
+  i_string = i_peso.
+
+  CALL FUNCTION 'C14DG_CHAR_NUMBER_CONVERSION'
+    EXPORTING
+      i_string                   = i_string
+    IMPORTING
+      e_float                    = ld_e_float
+      e_dec                      = ld_e_dec
+      e_decimals                 = ld_e_decimals
+    EXCEPTIONS
+      wrong_characters           = 1
+      first_character_wrong      = 2
+      arithmetic_sign            = 3
+      multiple_decimal_separator = 4
+      thousandsep_in_decimal     = 5
+      thousand_separator         = 6
+      number_too_big             = 7
+      OTHERS                     = 8.
+  IF sy-subrc <> 0.
+*       Implement suitable error handling here
+  ELSE.
+    MOVE ld_e_dec TO ls_item-entry_qnt.
+  ENDIF.
+
+  ls_item-batch     = i_charg.
+  ls_item-entry_uom = 'KG'.
+  ls_item-orderid =  i_aufnr.
+  ls_item-mvt_ind = 'F'.
+*  ls_item-item_text = i_input-id_rollo_mes.
+  ls_item-item_text = i_id_rollo_mes.
+  APPEND ls_item TO lt_item.
+
+
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header  = ls_header
+      goodsmvt_code    = '02'
+*     TESTRUN          = ' '
+*     GOODSMVT_REF_EWM =
+    IMPORTING
+      goodsmvt_headret = ls_headret
+      materialdocument = e_mblnr
+      matdocumentyear  = e_mjahr
+    TABLES
+      goodsmvt_item    = lt_item
+*     GOODSMVT_SERIALNUMBER         =
+      return           = lt_return
+*     GOODSMVT_SERV_PART_DATA       =
+*     EXTENSIONIN      =
+    .
+
+  READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+
+  IF sy-subrc <> 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = abap_true.
+
+* DTM Se calculan los pesos con incremento o decremento
+
+    IF lv_peso_t IS NOT INITIAL.
+
+      lv_peso_p = lv_peso_t.
+
+      IF ls_item-move_type EQ '101'.
+
+        lv_nuevo_peso_p = lv_peso_p + i_peso.
+
+      ELSEIF ls_item-move_type EQ '102'.
+
+        lv_peso_tot = lv_peso_p.
+
+        CALL FUNCTION 'ZMES_ELIMINAR_TIEMPOS'
+          EXPORTING
+            iv_aufnr    = i_aufnr
+            iv_peso_tot = lv_peso_tot
+            iv_peso     = i_peso
+          CHANGING
+            ev_peso_del = lv_peso_del
+            ev_error    = lv_error.
+
+        CHECK lv_error IS INITIAL.
+
+        WAIT UP TO 3 SECONDS.
+
+        IF lv_peso_del IS INITIAL.
+
+          lv_nuevo_peso_p = lv_peso_p - i_peso.
+
+        ELSE.
+
+          DATA(lv_peso_not) = lv_peso_del - i_peso.
+
+        ENDIF.
+
+      ENDIF.
+
+    ENDIF.
+
+* Cuando se han sobrepasado los kg. de la OF, la BAPI devuelve activity1 y activity2 (tiempos de MO y Máquina) a blancos.
+* Se realiza la llamada con el flag ls_propose-quantity a blancos.
+
+    CLEAR: ls_propose, ls_ret2.
+    ls_propose-goodsmovement = abap_true.
+    ls_propose-quantity      = ' '. "No informar cantidad
+    ls_propose-activity      = abap_true.
+    ls_propose-personnel     = abap_true.
+
+* Se recuperan los datos de la notificación
+
+    CLEAR: ls_return, lti_times[] , ls_times.
+    ls_times-orderid        = i_aufnr.
+    ls_times-phase          = '0040'.
+    ls_times-fin_conf       = '1'.
+    ls_times-plant          = i_werks.
+
+    IF ls_item-move_type EQ '102'.
+
+      IF lv_peso_not IS INITIAL.
+
+        ls_times-yield        = lv_nuevo_peso_p.
+
+      ELSE.
+
+        ls_times-yield        = lv_peso_not.
+
+      ENDIF.
+
+    ELSEIF ls_item-move_type EQ '101'.
+
+      ls_times-yield        = i_peso.
+
+    ENDIF.
+
+    ls_times-conf_quan_unit = 'KG'.
+    ls_times-clear_res      = abap_true.
+    INSERT ls_times INTO TABLE lti_times.
+
+* Se recuperan los datos de la BAPI que notifica
+
+    CALL FUNCTION 'BAPI_PROCORDCONF_GET_TT_PROP'
+      EXPORTING
+        propose            = ls_propose
+      IMPORTING
+        return             = ls_ret2
+      TABLES
+        timetickets        = lti_times
+        goodsmovements     = lti_goodmov
+        link_conf_goodsmov = lti_link.
+
+    IF lti_goodmov IS NOT INITIAL.
+
+      REFRESH: lti_resb. CLEAR: lti_resb.
+
+      " Se recuperan la reserva y la cantidad total para calcular la proporción
+      CLEAR: lv_gamng, lv_rsnum.
+
+      SELECT SINGLE gamng rsnum INTO (lv_gamng, lv_rsnum)
+        FROM caufv
+        WHERE aufnr = i_aufnr.
+
+      SELECT * INTO CORRESPONDING FIELDS OF TABLE lti_resb
+        FROM resb
+        WHERE rsnum = lv_rsnum
+          AND rgekz = abap_true.
+
+      LOOP AT lti_goodmov.
+
+        READ TABLE lti_resb ASSIGNING FIELD-SYMBOL(<lfs_resb>) WITH KEY rsnum = lti_goodmov-reserv_no
+                                                                        rspos = lti_goodmov-res_item
+                                                                        matnr = lti_goodmov-material
+                                                                        werks = lti_goodmov-plant.
+
+        IF <lfs_resb> IS NOT INITIAL.
+
+          lti_goodmov-entry_qnt = ( <lfs_resb>-bdmng * lv_peso_p ) / lv_gamng.
+          MODIFY lti_goodmov.
+
+        ENDIF.
+
+      ENDLOOP.
+
+    ENDIF.
+
+    CALL FUNCTION 'BAPI_PROCORDCONF_CREATE_TT'
+      IMPORTING
+        return             = ls_return1
+      TABLES
+        timetickets        = lti_times
+        goodsmovements     = lti_goodmov
+        link_conf_goodsmov = lti_link
+        detail_return      = lti_detail.
+
+    READ TABLE lti_detail ASSIGNING FIELD-SYMBOL(<lfs_return>) WITH KEY type = 'E'.
+
+    IF sy-subrc EQ 0.
+
+      RETURN.
+
+    ELSE.
+
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = abap_true.
+
+      CLEAR: lti_times[], lti_goodmov[], lti_link[], lti_detail[], lti_resb[].
+      CLEAR: ls_propose, ls_times, ls_ret2, ls_return1.
+      CLEAR: lv_gamng, lv_rsnum, lv_peso_p, lv_nuevo_peso_p, lv_peso_not, lv_peso_del,
+             lv_peso_t.
+
+    ENDIF.
+
+* DTM
+
+  ELSE.
+
+    e_error = 'X'.
+
+    CLEAR lv_extnumber.
+    lv_extnumber = |Error en la notificación OF: { i_aufnr }|.
+
+    DATA: l_subobj TYPE balsubobj.
+
+    CASE iw_increm_decrem.
+      WHEN 'I'. l_subobj = 'ZALTA_STOCK'.
+      WHEN 'D'. l_subobj = 'ZBAJA_STOCK'.
+      WHEN OTHERS.
+    ENDCASE.
+
+    CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+      EXPORTING
+        objeto    = 'ZSAP_MES'
+        subobjeto = l_subobj
+        mensajes  = lt_return[]
+        extnumber = lv_extnumber.
+  ENDIF.
+
+
+ENDFUNCTION.

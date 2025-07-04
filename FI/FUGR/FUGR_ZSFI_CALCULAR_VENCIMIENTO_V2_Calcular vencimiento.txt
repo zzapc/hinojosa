@@ -1,0 +1,374 @@
+FUNCTION zsfi_calcular_vencimiento_v2.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(ZTERM) LIKE  T052-ZTERM
+*"     REFERENCE(BLDAT) LIKE  BKPF-BLDAT
+*"     REFERENCE(WRBTR) LIKE  BSEG-WRBTR
+*"     REFERENCE(KUNNR) LIKE  KNB1-KUNNR
+*"     REFERENCE(BUKRS) LIKE  KNB1-BUKRS
+*"  EXPORTING
+*"     REFERENCE(E_OUTPUT)
+*"  TABLES
+*"      T_OUTPUT STRUCTURE  ZSFI_CONDS_PAGO
+*"----------------------------------------------------------------------
+
+*  TABLES: zsfi_conds_pago.
+  DATA: zsfi_conds_pago TYPE zsfi_conds_pago.
+
+  DATA: BEGIN OF t_rattab OCCURS 0.
+          INCLUDE STRUCTURE irattab.
+        DATA: END   OF t_rattab.
+
+  DATA: calendario  LIKE casdayattr OCCURS 0 WITH HEADER LINE.
+
+  CLEAR:   t_rattab.
+  REFRESH: t_rattab.
+  DATA: sklin LIKE  sklin.
+  DATA: i_shkzg  LIKE  bseg-shkzg.
+  DATA: i_rebzg  LIKE  bseg-rebzg.
+  DATA: i_zbd1t  LIKE  bseg-zbd1t.
+  DATA: i_zbd2t  LIKE  bseg-zbd2t.
+  DATA: i_zbd3t  LIKE  bseg-zbd3t.
+
+  DATA: lt_t052 TYPE TABLE OF t052,
+        ls_t052 TYPE t052.
+
+  DATA: lv_datum TYPE sy-datum.
+
+  DATA: t_bseg    LIKE bseg OCCURS 0 WITH HEADER LINE,
+        t_bsegsub LIKE bseg_subst OCCURS 0 WITH HEADER LINE.
+
+  PERFORM leer_calendario TABLES calendario
+                            USING bldat bukrs kunnr .
+
+  t_rattab-zterm = zterm.
+  t_rattab-wrbtr = wrbtr.
+  APPEND t_rattab.
+
+  REFRESH t_output.
+
+  CALL FUNCTION 'FI_INVOICE_SPLIT'
+    TABLES
+      t_rattab      = t_rattab
+    EXCEPTIONS
+      rules_missing = 1
+      rules_wrong   = 2
+      OTHERS        = 3.
+  IF sy-subrc = 1.
+    APPEND t_rattab.
+  ELSEIF sy-subrc NE 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  LOOP AT t_rattab.
+    CLEAR: zsfi_conds_pago.
+    CALL FUNCTION 'FI_FIND_PAYMENT_CONDITIONS'
+      EXPORTING
+        i_zterm            = t_rattab-zterm
+        i_bldat            = bldat
+        i_budat            = bldat
+      IMPORTING
+        e_zfbdt            = zsfi_conds_pago-zfbdt
+        e_sklin            = sklin
+      EXCEPTIONS
+        terms_incorrect    = 1
+        terms_not_found    = 2
+        no_date_entered    = 3
+        no_day_limit_found = 4
+        OTHERS             = 5.
+
+    IF sy-subrc = 0.
+*      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+
+      zsfi_conds_pago-zterm  = zterm.
+      zsfi_conds_pago-zterm2 = t_rattab-zterm.
+      zsfi_conds_pago-wrbtr  = t_rattab-wrbtr.
+
+
+      IF sklin IS NOT INITIAL.
+        i_zbd1t                  = sklin-ztag1.
+        i_zbd2t                  = sklin-ztag2.
+        i_zbd3t                  = sklin-ztag3.
+
+*      CALL FUNCTION 'FM_GET_PPA_NET_DUE_DATE'
+        CALL FUNCTION 'NET_DUE_DATE_GET'
+          EXPORTING
+            i_zfbdt = zsfi_conds_pago-zfbdt
+            i_zbd1t = i_zbd1t
+            i_zbd2t = i_zbd2t
+            i_zbd3t = i_zbd3t
+            i_shkzg = i_shkzg
+            i_rebzg = i_rebzg
+*           I_KOART = 'D'
+          IMPORTING
+            e_faedt = zsfi_conds_pago-zfbdt.
+      ENDIF.
+
+      REFRESH: t_bseg, t_bsegsub.
+      t_bseg-bukrs = bukrs.
+      t_bseg-koart = 'D'.
+      t_bseg-kunnr = kunnr.
+      t_bseg-zfbdt = zsfi_conds_pago-zfbdt.
+      t_bseg-shkzg = i_shkzg.
+      t_bseg-rebzg = i_rebzg.
+      APPEND t_bseg.
+      MOVE-CORRESPONDING t_bseg TO t_bsegsub.
+      APPEND t_bsegsub.
+
+*     Colocar aqui el Calculo de acuerdo vacacional, en caso de que se necesite.
+      READ TABLE t_bsegsub INDEX 1.
+      IF sy-subrc EQ 0.
+        zsfi_conds_pago-zfbdt = t_bsegsub-zfbdt.
+      ENDIF.
+      CLEAR sklin.
+      APPEND zsfi_conds_pago TO t_output.
+
+    ENDIF.
+
+  ENDLOOP.
+
+
+  "Falta aplicar a los vencimientos la fecha de vacaciones.
+* Aplico el calendario
+  LOOP AT t_output.
+    DATA fecha TYPE sy-datum.
+*   Nos quedamos con el primer dia laborable a partir de la fecha
+    SORT calendario.
+    LOOP AT calendario WHERE freeday EQ space AND date GE t_output-zfbdt .
+      fecha = calendario-date.
+      EXIT.
+    ENDLOOP.
+    IF fecha <> t_output-zfbdt.
+      PERFORM modifica_fecha_v2 USING bukrs kunnr
+                              CHANGING t_output-zfbdt.
+      MODIFY t_output.
+    ENDIF.
+  ENDLOOP.
+
+  "Comentado por incidencia con vencimientos.
+**    IF sy-subrc EQ 0.
+**      clear lt_t052[].
+**
+**       SELECT *
+**         FROM t052
+**         INTO CORRESPONDING FIELDS OF TABLE lt_t052
+**         WHERE zterm = t_bseg-zterm
+**           AND ( zstg1 GE  calendario-date+6(2)
+**           OR    zsmn1 NE '1' ).
+**       IF sy-subrc = 0.
+**         SORT lt_t052 BY zsmn1 zstg1 ASCENDING.
+**         READ TABLE lt_t052 INTO ls_t052 INDEX 1.
+**         IF sy-subrc = 0.
+**           IF ls_t052-zstg1 NE calendario-date+6(2) AND ls_t052-zstg1 IS NOT INITIAL.
+**             calendario-date+6(2) = ls_t052-zstg1.
+**
+***             DATA: lv_datum TYPE sy-datum.
+**
+**             lv_datum = calendario-date.
+**
+**             IF ls_t052-zsmn1 > 1.
+**               ls_t052-zsmn1 = ls_t052-zsmn1 - 1.
+**               CALL FUNCTION 'RE_ADD_MONTH_TO_DATE'
+**                 EXPORTING
+**                   months  = ls_t052-zsmn1
+**                   olddate = lv_datum
+**                 IMPORTING
+**                   newdate = lv_datum.
+**
+**               calendario-date = lv_datum.
+**             ENDIF.
+**           ENDIF.
+**         ENDIF.
+**       ENDIF.
+**      t_output-zfbdt = calendario-date.
+**    ENDIF.
+**    MODIFY t_output.
+**  ENDLOOP.
+  "Comentado por incidencia con vencimientos.
+
+ENDFUNCTION.
+
+**&---------------------------------------------------------------------*
+**&      Form  leer_calendario
+**&---------------------------------------------------------------------*
+*
+**&---------------------------------------------------------------------*
+**&      Form  leer_calendario
+**&---------------------------------------------------------------------*
+**       text
+**----------------------------------------------------------------------*
+*FORM leer_calendario TABLES calendario STRUCTURE casdayattr
+*                     USING i_bldat i_bukrs i_kunnr .
+** Buscamos el calendario.
+*  DATA: calendario1 LIKE casdayattr OCCURS 0 WITH HEADER LINE,
+*        vurlid      LIKE knb1-urlid,
+*        vbdatu      LIKE t052r-bdatu,
+*        vvdatu      LIKE t052r-vdatu,
+*        fechaini    LIKE sy-datum,
+*        fechafin    LIKE sy-datum.
+*  fechaini = i_bldat.
+*  fechafin = fechaini + 360.
+*
+** Buscamos el calendario de la org. de ventas
+*  DATA: ttvko LIKE tvko.
+*  SELECT SINGLE * FROM  tvko CLIENT SPECIFIED
+*    INTO ttvko
+*         WHERE  mandt  = sy-mandt
+*         AND    vkorg  = i_bukrs.
+*  IF ttvko-vkokl IS INITIAL.
+**    ttvko-vkokl = 'ZZ'.
+*    ttvko-vkokl = 'ES'.
+*  ENDIF.
+*
+*  REFRESH: calendario1, calendario.
+*
+*  CALL FUNCTION 'DAY_ATTRIBUTES_GET'
+*    EXPORTING
+*      factory_calendar           = ttvko-vkokl
+**     HOLIDAY_CALENDAR           = ' '
+*      date_from                  = fechaini
+*      date_to                    = fechafin
+**     LANGUAGE                   = SY-LANGU
+**     NON_ISO                    = ' '
+**     IMPORTING
+**     YEAR_OF_VALID_FROM         =
+**     YEAR_OF_VALID_TO           =
+**     RETURNCODE                 =
+*    TABLES
+*      day_attributes             = calendario
+*    EXCEPTIONS
+*      factory_calendar_not_found = 1
+*      holiday_calendar_not_found = 2
+*      date_has_invalid_format    = 3
+*      date_inconsistency         = 4
+*      OTHERS                     = 5.
+*  IF sy-subrc <> 0.
+**     MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+**             WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+*  ENDIF.
+*
+**   Marco como festivos los acuerdos de vacaciones
+*  CLEAR vurlid.
+*  SELECT SINGLE urlid FROM  knb1 CLIENT SPECIFIED
+*    INTO vurlid
+*         WHERE  mandt  = sy-mandt
+*         AND    kunnr  = i_kunnr
+*         AND    bukrs  = i_bukrs.
+*
+*  CHECK vurlid IS NOT INITIAL.
+*
+**   Obtenemos el rango de fechas de vacaciones
+*  SELECT  bdatu vdatu FROM t052r CLIENT SPECIFIED
+*    INTO (vbdatu, vvdatu)
+*    WHERE mandt = sy-mandt
+*      AND urlid = vurlid.
+*
+*    LOOP AT calendario WHERE date+4(4) GE vvdatu+4(4) AND date+4(4) LE vbdatu+4(4).
+*      calendario-freeday = 'X'.
+*      MODIFY calendario.
+*    ENDLOOP.
+*  ENDSELECT.
+*
+*ENDFORM.                    "leer_calendario
+*
+*FORM modifica_fecha_v2 USING i_bukrs i_kunnr
+*                     CHANGING zfbdt.
+*
+*  DATA: vurlid LIKE knb1-urlid,
+*        vbdatu LIKE t052r-bdatu,
+*        vvdatu LIKE t052r-vdatu.
+**   Marco como festivos los acuerdos de vacaciones
+*  CLEAR vurlid.
+*  SELECT SINGLE urlid FROM  knb1 CLIENT SPECIFIED
+*    INTO vurlid
+*         WHERE  mandt  = sy-mandt
+*         AND    kunnr  = i_kunnr
+*         AND    bukrs  = i_bukrs.
+*
+*  CHECK vurlid IS NOT INITIAL.
+*
+**   Obtenemos el rango de fechas de vacaciones
+*  SELECT  SINGLE bdatu vdatu FROM t052r CLIENT SPECIFIED
+*    INTO (vbdatu, vvdatu)
+*    WHERE mandt = sy-mandt
+*      AND urlid = vurlid.
+*
+*  vvdatu = zfbdt(4) && vvdatu+4(4).
+*  vbdatu = zfbdt(4) && vbdatu+4(4).
+*
+*  IF zfbdt BETWEEN vvdatu AND vbdatu.
+*    DATA lv_free_check TYPE xfeld.
+*    DATA lv_no_working TYPE boole_d.
+*    DATA lv_freeday TYPE datum.
+*    DATA lv_weekday TYPE week_day.
+*    lv_freeday = vbdatu.
+*    WHILE lv_free_check IS INITIAL.
+*
+*      ADD 1 TO lv_freeday.
+*
+*      CALL FUNCTION 'BKK_CHECK_HOLIDAY'
+*        EXPORTING
+*          i_date            = lv_freeday
+*          i_calendar1       = 'Y1'
+**         I_CALENDAR2       =
+*        IMPORTING
+*          e_x_no_workingday = lv_no_working
+**         E_X_IS_HOLIDAY    =
+*        EXCEPTIONS
+*          not_found         = 1
+*          calendar_error    = 2
+*          OTHERS            = 3.
+*      IF sy-subrc <> 0.
+** Implement suitable error handling here
+*
+*      ELSE.
+*
+*        IF lv_no_working IS INITIAL.
+*
+*          lv_free_check = 'X'.
+*          zfbdt = lv_freeday.
+*
+*        ENDIF.
+*      ENDIF.
+*
+**      CALL FUNCTION 'DATE_CHECK_PLAUSIBILITY'
+**        EXPORTING
+**          date                      = lv_freeday
+**        EXCEPTIONS
+**          plausibility_check_failed = 1
+**          OTHERS                    = 2.
+**      IF sy-subrc <> 0.
+*** Implement suitable error handling here
+**      ELSE.
+**        CALL FUNCTION 'DATE_TO_DAY'
+**          EXPORTING
+**            date    = lv_freeday
+**          IMPORTING
+**            weekday = lv_weekday.
+**        IF lv_weekday = 'Sat.'.
+**          " no es válido.
+**        ELSEIF  lv_weekday = 'Sunday'.
+**          " no es válido.
+**        ELSE.
+**          lv_free_check = 'X'.
+**          zfbdt = lv_freeday.
+**        ENDIF.
+**      ENDIF.
+*
+*    ENDWHILE.
+*
+*  ENDIF.
+*
+**  IF zfbdt+4(2) = vvdatu+4(2).
+**    CALL FUNCTION 'BKK_ADD_MONTH_TO_DATE'
+**      EXPORTING
+**        months  = 1
+**        olddate = zfbdt
+**      IMPORTING
+**        newdate = zfbdt.
+**  ENDIF.
+*
+*ENDFORM.

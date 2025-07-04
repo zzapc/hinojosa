@@ -1,0 +1,382 @@
+*&---------------------------------------------------------------------*
+*& Report  ZSSDD002
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+REPORT zssdd002.
+
+INCLUDE zssdd002_cl_log.
+
+INITIALIZATION.
+  CREATE OBJECT gr_log.
+
+  TYPES: BEGIN OF ty_zpp0002,
+           werks           TYPE werks_d,
+           aufnr           TYPE aufnr,
+           kdauf           TYPE kdauf,
+           kdpos           TYPE kdpos,
+           gstrp           TYPE pm_ordgstrp,
+           status_correcto TYPE flag.
+  TYPES: END OF ty_zpp0002.
+  DATA: lt_zpp0002 TYPE TABLE OF ty_zpp0002.
+
+  DATA: lv_hay_mensajes TYPE flag,
+        lv_status       TYPE j_status,
+        lv_desbloqueo   TYPE flag,
+        lv_caso_2       TYPE flag,
+        lv_hay_stock    TYPE flag,
+        lv_lognumber    TYPE balognr.
+
+  "Obtenemos todos los pedidos bloqueados
+  SELECT vbak~vbeln, vbak~auart, lifsk,
+         vbap~posnr, vbap~werks, vbap~pstyv, vbap~matnr, vbap~kwmeng,
+         vbep~edatu,
+         aufk~aufnr, aufk~autyp, aufk~kdauf, aufk~kdpos,
+         jest~stat,
+         zpp0001~istat,
+         zpp0001~werks AS werks_zpp0001,
+         ' ' AS status_correcto,
+         ' ' AS hay_cantidad
+    FROM vbak
+    INNER JOIN vbap ON vbak~vbeln = vbap~vbeln
+    INNER JOIN vbep ON vbep~vbeln = vbap~vbeln
+                   AND vbep~posnr = vbap~posnr
+    LEFT JOIN aufk  ON kdauf = vbap~vbeln
+                   AND kdpos = vbap~posnr
+                   AND aufk~autyp = '10'
+    LEFT JOIN jest ON jest~objnr = aufk~objnr
+                  AND jest~inact EQ @space
+    LEFT JOIN zpp0001 ON zpp0001~werks = aufk~werks
+    INTO TABLE @DATA(lt_vbak)
+    WHERE vbak~auart = 'ZTA2'
+      AND vbak~lifsk = 'Z3'
+      AND vbap~abgru = @space.
+
+  IF 1 = 2.
+    DATA: lv_vbeln TYPE vbeln.
+    lv_vbeln = '0000011101'.
+    DELETE lt_vbak WHERE vbeln NE lv_vbeln.
+  ENDIF.
+
+  "Obtenemos la cantidad de libre de cada material de esos pedidos
+  IF lt_vbak[] IS NOT INITIAL.
+    SELECT matnr, werks, lgort, charg, clabs
+      FROM mchb
+      INTO TABLE @DATA(lt_mchb)
+      FOR ALL ENTRIES IN @lt_vbak[]
+      WHERE matnr = @lt_vbak-matnr
+        AND werks = @lt_vbak-werks.
+
+
+    SORT lt_vbak BY edatu vbeln posnr.
+
+    "Marcamos la posición de pedido para ver si tendrá o no suficiente cantidad
+    LOOP AT lt_vbak ASSIGNING FIELD-SYMBOL(<fs_vbak>) WHERE pstyv EQ 'ZT0S'.
+      READ TABLE lt_mchb ASSIGNING FIELD-SYMBOL(<fs_mchb>) WITH KEY matnr = <fs_vbak>-matnr
+                                                                    werks = <fs_vbak>-werks.
+      IF sy-subrc = 0.
+        <fs_mchb>-clabs = <fs_mchb>-clabs - <fs_vbak>-kwmeng.
+        IF <fs_mchb>-clabs >= 0.
+          <fs_vbak>-hay_cantidad = 'X'.
+        ELSE.
+          <fs_mchb>-clabs = <fs_mchb>-clabs + <fs_vbak>-kwmeng.
+          CLEAR <fs_vbak>-hay_cantidad.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    "Revisión de OFs
+    DATA(lt_vbak_aux) = lt_vbak.
+    DATA(lt_vbak_no_stock) = lt_vbak.
+
+    SORT lt_vbak_aux BY vbeln.
+    DELETE ADJACENT DUPLICATES FROM lt_vbak_aux COMPARING vbeln.
+
+    LOOP AT lt_vbak_aux INTO DATA(ls_vbap_aux).
+      "Para cada pedido comprobamos que todo el pedido tenga el status de la tabla ZPP0001
+      lv_desbloqueo = abap_true.
+      lv_caso_2     = abap_true.
+      lv_hay_stock  = abap_true.
+      LOOP AT lt_vbak ASSIGNING <fs_vbak> WHERE vbeln = ls_vbap_aux-vbeln.
+        "Chequeo para el caso 2
+        IF <fs_vbak>-pstyv <> 'ZT0S'.
+          CLEAR lv_caso_2.
+        ENDIF.
+        IF <fs_vbak>-hay_cantidad IS INITIAL.
+          CLEAR lv_hay_stock.
+        ENDIF.
+
+        "Chequeo para el caso 1
+        READ TABLE lt_vbak WITH KEY vbeln = ls_vbap_aux-vbeln
+                                    aufnr = <fs_vbak>-aufnr
+                                    stat  = <fs_vbak>-istat TRANSPORTING NO FIELDS.
+        IF sy-subrc = 0.
+          IF <fs_vbak>-aufnr IS NOT INITIAL.
+            <fs_vbak>-status_correcto = 'X'.
+          ELSE. "Pueden haber pedidos sin orden
+            CLEAR: lv_desbloqueo, <fs_vbak>-status_correcto.
+          ENDIF.
+        ELSE.
+          CLEAR: lv_desbloqueo, <fs_vbak>-status_correcto.
+          EXIT.
+        ENDIF.
+      ENDLOOP.
+
+*    CASO 1
+*--------------------------------------------------------------------*
+      IF lv_desbloqueo = abap_true.
+        lv_hay_mensajes = abap_true.
+        PERFORM desbloquear_pedido USING ls_vbap_aux-vbeln.
+      ELSE.
+
+*    CASO 2
+*--------------------------------------------------------------------*
+        "CASO 2.1
+        IF lv_caso_2    EQ abap_true AND
+           lv_hay_stock EQ abap_true.
+          lv_hay_mensajes = abap_true.
+          PERFORM desbloquear_pedido USING ls_vbap_aux-vbeln.
+          "CASO 2.2
+        ELSEIF lv_caso_2    EQ abap_true AND
+               lv_hay_stock EQ abap_false.
+
+          "Nos quedamos con las posiciones del pedido que no había cantidad suficiente de stock libre
+          lt_vbak_no_stock = VALUE #( FOR ls_vbak_no_stock IN lt_vbak WHERE ( vbeln        = ls_vbap_aux-vbeln AND
+                                                                              hay_cantidad = ' ') ( ls_vbak_no_stock ) ).
+          IF lt_vbak_no_stock[] IS NOT INITIAL.
+            "Obtenemos las OF de los pedidos que no pueden ser cubiertos
+            SELECT werks, aufnr, kdauf, kdpos, gstrp
+              FROM zpp0002
+              INTO CORRESPONDING FIELDS OF TABLE @lt_zpp0002
+              FOR ALL ENTRIES IN @lt_vbak_no_stock[]
+              WHERE kdauf = @lt_vbak_no_stock-vbeln
+                AND kdpos = @lt_vbak_no_stock-posnr
+                AND werks = @lt_vbak_no_stock-werks.
+
+            "Obtenemos el status de esas OF
+            IF lt_zpp0002[] IS NOT INITIAL.
+
+              "Obtenemos el status de la orden
+              SELECT aufk~aufnr, aufk~autyp, aufk~werks, aufk~kdauf, aufk~kdpos,
+                     jest~stat
+                FROM aufk
+                INNER JOIN jest ON jest~objnr = aufk~objnr
+                               AND jest~inact EQ @space
+                FOR ALL ENTRIES IN @lt_zpp0002[]
+                WHERE aufk~autyp = '10'
+                  AND aufk~aufnr = @lt_zpp0002-aufnr
+                INTO TABLE @DATA(lt_aufk_status).
+
+              DATA(lt_zpp0002_aux) = lt_zpp0002.
+
+              SORT lt_zpp0002_aux BY werks aufnr kdauf kdpos.
+              DELETE ADJACENT DUPLICATES FROM lt_zpp0002_aux COMPARING werks aufnr kdauf kdpos.
+
+              LOOP AT lt_zpp0002_aux ASSIGNING FIELD-SYMBOL(<fs_zpp0002_aux>).
+                "Damos por hecho que el status es correcto
+                <fs_zpp0002_aux>-status_correcto = abap_true.
+                "Buscamos el status que debería tener para comprobarlo
+                SELECT SINGLE istat FROM zpp0001 INTO @DATA(lv_status_correcto) WHERE werks = @<fs_zpp0002_aux>-werks.
+                LOOP AT lt_zpp0002 INTO DATA(ls_zpp0002) WHERE kdauf = <fs_zpp0002_aux>-kdauf
+                                                           AND kdpos = <fs_zpp0002_aux>-kdpos
+                                                           AND werks = <fs_zpp0002_aux>-werks
+                                                           AND aufnr = <fs_zpp0002_aux>-aufnr.
+                  READ TABLE lt_aufk_status INTO DATA(ls_aufk_status) WITH KEY werks = <fs_zpp0002_aux>-werks
+                                                                               aufnr = <fs_zpp0002_aux>-aufnr
+                                                                               stat  = lv_status_correcto.
+                  IF sy-subrc <> 0.
+                    CLEAR <fs_zpp0002_aux>-status_correcto.
+                  ENDIF.
+                ENDLOOP.
+                "Si es correcto, desbloqueamos.
+                IF <fs_zpp0002_aux>-status_correcto EQ abap_true.
+                  lv_hay_mensajes = abap_true.
+                  PERFORM desbloquear_pedido USING <fs_zpp0002_aux>-kdauf.
+                ENDIF.
+              ENDLOOP.
+
+
+            ENDIF.
+          ENDIF.
+        ELSE.
+
+          "*     CASO 3
+          "*--------------------------------------------------------------------*
+          DATA(lt_vbak_zt0s) = lt_vbak.
+          DATA(lt_vbak_zt00) = lt_vbak.
+          CLEAR: lt_vbak_zt0s, lt_vbak_zt00.
+          "Nos quedamos todas las lineas de ese pedido separadas por tipo de linea
+          lt_vbak_zt0s = VALUE #( FOR ls_vbak_zt0s IN lt_vbak WHERE ( vbeln = ls_vbap_aux-vbeln AND
+                                                                      pstyv = 'ZT0S')
+                                                              ( ls_vbak_zt0s ) ).
+
+          lt_vbak_zt00 = VALUE #( FOR ls_vbak_zt00 IN lt_vbak WHERE ( vbeln = ls_vbap_aux-vbeln AND
+                                                                      pstyv = 'ZT00')
+                                                              ( ls_vbak_zt00 ) ).
+
+          "Que no haya ningún pedido contra OF con el aufnr vacío
+          "Si todas tienen el aufnr relleno, deberiamos tener en cuenta su estado.
+          DATA: lv_aufnr TYPE aufnr.
+          CLEAR lv_aufnr.
+          LOOP AT lt_vbak_zt00 TRANSPORTING NO FIELDS WHERE vbeln = ls_vbap_aux-vbeln
+                                                        AND aufnr = lv_aufnr.
+          ENDLOOP.
+          IF sy-subrc = 0.
+            CONTINUE.
+          ELSE.
+            "Sino comprobamos su estado
+            SELECT SINGLE istat FROM zpp0001 INTO @lv_status_correcto WHERE werks = @ls_vbap_aux-werks.
+
+            "Obtenemos el status de la orden
+            DATA(lt_vbak_zt00_aux) = lt_vbak_zt00.
+            SORT lt_vbak_zt00_aux BY vbeln posnr.
+            DELETE ADJACENT DUPLICATES FROM lt_vbak_zt00_aux COMPARING vbeln posnr.
+
+            LOOP AT lt_vbak_zt00_aux ASSIGNING FIELD-SYMBOL(<fs_vbak_zt00_aux>).
+              <fs_vbak_zt00_aux>-status_correcto = 'X'.
+              READ TABLE lt_vbak_zt00 WITH KEY werks = <fs_vbak_zt00_aux>-werks
+                                               aufnr = <fs_vbak_zt00_aux>-aufnr
+                                               stat  = lv_status_correcto TRANSPORTING NO FIELDS.
+              IF sy-subrc <> 0.
+                CLEAR <fs_vbak_zt00_aux>-status_correcto.
+              ENDIF.
+            ENDLOOP.
+
+            "Si alguna no tiene el status, pasamos al siguiente pedido
+            READ TABLE lt_vbak_zt00_aux WITH KEY status_correcto = space TRANSPORTING NO FIELDS.
+            IF sy-subrc = 0.
+              CONTINUE.
+            ENDIF.
+
+            "Ahora revisamos las ordenes que van contra stock
+*--------------------------------------------------------------------*
+            IF lt_vbak_zt0s[] IS NOT INITIAL.
+              REFRESH lt_zpp0002.
+              "Obtenemos las OF de los pedidos que no pueden ser cubiertos
+              SELECT werks, aufnr, kdauf, kdpos, gstrp
+                FROM zpp0002
+                INTO CORRESPONDING FIELDS OF TABLE @lt_zpp0002
+                FOR ALL ENTRIES IN @lt_vbak_zt0s[]
+                WHERE kdauf = @lt_vbak_zt0s-vbeln
+                  AND kdpos = @lt_vbak_zt0s-posnr
+                  AND werks = @lt_vbak_zt0s-werks.
+
+              "Obtenemos el status de esas OF
+              IF lt_zpp0002[] IS NOT INITIAL.
+                REFRESH lt_aufk_status.
+
+                "Obtenemos el status de la orden
+                SELECT aufk~aufnr, aufk~autyp, aufk~werks, aufk~kdauf, aufk~kdpos,
+                       jest~stat
+                  FROM aufk
+                  INNER JOIN jest ON jest~objnr = aufk~objnr
+                                 AND jest~inact EQ @space
+                  FOR ALL ENTRIES IN @lt_zpp0002[]
+                  WHERE aufk~autyp = '10'
+                    AND aufk~aufnr = @lt_zpp0002-aufnr
+                  INTO TABLE @lt_aufk_status.
+
+                lt_zpp0002_aux = lt_zpp0002.
+
+                SORT lt_zpp0002_aux BY werks aufnr kdauf kdpos.
+                DELETE ADJACENT DUPLICATES FROM lt_zpp0002_aux COMPARING werks aufnr kdauf kdpos.
+
+                LOOP AT lt_zpp0002_aux ASSIGNING <fs_zpp0002_aux>.
+                  "Damos por hecho que el status es correcto
+                  <fs_zpp0002_aux>-status_correcto = abap_true.
+                  "Buscamos el status que debería tener para comprobarlo
+                  SELECT SINGLE istat FROM zpp0001 INTO @lv_status_correcto WHERE werks = @<fs_zpp0002_aux>-werks.
+                  LOOP AT lt_zpp0002 INTO ls_zpp0002 WHERE kdauf = <fs_zpp0002_aux>-kdauf
+                                                       AND kdpos = <fs_zpp0002_aux>-kdpos
+                                                       AND werks = <fs_zpp0002_aux>-werks
+                                                       AND aufnr = <fs_zpp0002_aux>-aufnr.
+                    READ TABLE lt_aufk_status INTO ls_aufk_status WITH KEY werks = <fs_zpp0002_aux>-werks
+                                                                           aufnr = <fs_zpp0002_aux>-aufnr
+                                                                           stat  = lv_status_correcto.
+                    IF sy-subrc <> 0.
+                      CLEAR <fs_zpp0002_aux>-status_correcto.
+                    ENDIF.
+                  ENDLOOP.
+                ENDLOOP.
+
+                "Si es correcto, desbloqueamos.
+                READ TABLE lt_zpp0002_aux WITH KEY status_correcto = abap_false TRANSPORTING NO FIELDS.
+                IF sy-subrc <> 0.
+                  lv_hay_mensajes = abap_true.
+                  PERFORM desbloquear_pedido USING <fs_zpp0002_aux>-kdauf.
+                ENDIF.
+
+              ENDIF.
+            ENDIF.
+*--------------------------------------------------------------------*
+
+          ENDIF.
+
+        ENDIF.
+      ENDIF.
+
+    ENDLOOP.
+
+    IF lv_hay_mensajes = abap_true.
+      CALL METHOD gr_log->guardar_log
+        EXPORTING
+          objeto    = 'ZSSDD002'
+          subobjeto = 'ZSSDD002'
+*         extnumber =
+        IMPORTING
+          lognumber = lv_lognumber.
+
+*    COMMIT WORK AND WAIT.
+
+      IF sy-batch NE abap_true.
+        CALL METHOD gr_log->mostrar_log
+          EXPORTING
+            lognumber = lv_lognumber.
+      ENDIF.
+    ENDIF.
+
+  ENDIF.
+
+FORM desbloquear_pedido USING p_vbeln     TYPE vbeln.
+
+  DATA: order_header_in  TYPE bapisdh1,
+        order_header_inx TYPE bapisdh1x,
+        lt_return        TYPE TABLE OF bapiret2.
+
+  order_header_in-dlv_block  = ''.
+
+  order_header_inx-dlv_block  = 'X'.
+  order_header_inx-updateflag = 'U'.
+
+  CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+    EXPORTING
+      salesdocument    = p_vbeln
+      order_header_in  = order_header_in
+      order_header_inx = order_header_inx
+    TABLES
+      return           = lt_return.
+
+  LOOP AT lt_return TRANSPORTING NO FIELDS WHERE type = 'E' OR type = 'A' OR type = 'X'.
+  ENDLOOP.
+  IF sy-subrc = 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+  ENDIF.
+  WAIT UP TO 1 SECONDS.
+
+  LOOP AT lt_return INTO DATA(l_bapiret2).
+    CALL METHOD gr_log->guardar_mensaje
+      EXPORTING
+        i_type       = l_bapiret2-type
+        i_id         = l_bapiret2-id
+        i_number     = l_bapiret2-number
+        i_message_v1 = l_bapiret2-message_v1
+        i_message_v2 = l_bapiret2-message_v2
+        i_message_v3 = l_bapiret2-message_v3
+        i_message_v4 = l_bapiret2-message_v4.
+  ENDLOOP.
+
+ENDFORM.

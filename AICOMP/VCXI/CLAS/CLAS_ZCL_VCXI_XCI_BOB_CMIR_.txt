@@ -1,0 +1,287 @@
+
+class ZCL_VCXI_XCI_BOB_CMIR definition
+  public
+  create public .
+
+public section.
+
+  data F_KUNNR type KUNNR read-only .
+  data F_VKORG type VKORG read-only .
+  data F_SPART type SPART read-only .
+  data F_VTWEG type VTWEG read-only .
+
+  methods DEQUEUE
+    raising
+      /VCXI/CX_CKX .
+  methods UPDATE
+    importing
+      !IF_MATNR type MATNR
+      !IF_KDMAT type KDMAT
+      !IF_KDPTX type KDPTX optional
+      !IF_UNTTO type UNTTO optional
+      !IF_UEBTO type UEBTO optional
+      !IF_UEBTK type UEBTK_V optional
+      !IF_KZTLF type KZTLF optional
+      !IF_ANTLF type ANTLF optional
+    raising
+      /VCXI/CX_CKX .
+  methods CONSTRUCTOR
+    importing
+      !IF_KUNNR type KUNNR
+      !IF_VKORG type VKORG
+      !IF_SPART type SPART optional
+      !IF_VTWEG type VTWEG .
+  methods ENQUEUE
+    raising
+      /VCXI/CX_CKX .
+  methods GET_KNMT
+    importing
+      !IF_KDMAT type KDMAT optional
+      !IF_MATNR type MATNR optional
+    returning
+      value(RS_KNMT) type KNMT
+    raising
+      /VCXI/CX_CKX .
+  methods GET_TEXT
+    importing
+      !IF_MATNR type MATNR
+    returning
+      value(ET_TEXT) type TEXT_LH
+    raising
+      /VCXI/CX_CKX .
+protected section.
+
+  constants C_TDOBJECT type THEAD-TDOBJECT value 'KNMT' ##NO_TEXT.
+private section.
+endclass. "ZCL_VCXI_XCI_BOB_CMIR definition
+class ZCL_VCXI_XCI_BOB_CMIR implementation.
+  method CONSTRUCTOR.
+
+    ME->F_KUNNR = IF_KUNNR.
+    ME->F_VKORG = IF_VKORG.
+    ME->F_SPART = IF_SPART.
+    ME->F_VTWEG = IF_VTWEG.
+
+  endmethod.
+  method DEQUEUE.
+
+    call function 'DEQUEUE_EVKNMT'
+      exporting
+        VKORG = ME->F_VKORG
+        VTWEG = ME->F_VTWEG
+        KUNNR = ME->F_KUNNR.
+
+  endmethod.
+  method ENQUEUE.
+
+*** Lock for Customer
+    call function 'ENQUEUE_EVKNMT'
+      exporting
+        VKORG          = ME->F_VKORG
+        VTWEG          = ME->F_VTWEG
+        KUNNR          = ME->F_KUNNR
+        _WAIT          = ABAP_TRUE
+      exceptions
+        FOREIGN_LOCK   = 1
+        SYSTEM_FAILURE = 2
+        others         = 3.
+
+    if SY-SUBRC ne 0.
+***   Info for customer &1 sales org. &2 dist.channel &3 locked by user &4
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( exporting IF_MSGTY = 'E'
+                                                      IF_MSGID = 'VS'
+                                                      IF_MSGNO = '016'
+                                                      IF_MSGV1 = ME->F_KUNNR
+                                                      IF_MSGV2 = ME->F_VKORG
+                                                      IF_MSGV3 = ME->F_VTWEG
+                                                      IF_MSGV4 = SY-MSGV1
+                                                      IF_TEMP  = ABAP_TRUE ).
+    endif.
+
+  endmethod.
+  method GET_KNMT.
+
+    call function 'RV_CUSTOMER_MATERIAL_READ'
+      exporting
+        CMR_KDMAT      = IF_KDMAT
+        CMR_MATNR      = IF_MATNR
+        CMR_KUNNR      = ME->F_KUNNR
+        CMR_SPART      = ME->F_SPART    "used to determine Reference distrib.channel for cust.and material masters
+        CMR_VKORG      = ME->F_VKORG
+        CMR_VTWEG      = ME->F_VTWEG
+      importing
+        CMR_KNMT       = RS_KNMT
+      exceptions
+        KNMT_NOT_FOUND = 1
+        others         = 2.
+
+    if SY-SUBRC ne 0.
+      clear RS_KNMT.
+    endif.
+
+  endmethod.
+  method GET_TEXT.
+
+    types: begin of YS_KNMTKEY,          "// Application key of KNMT
+             VKORG type VKORG,
+             VTWEG type VTWEG,
+             KUNNR type KUNNR,
+             MATNR type MATNR,
+           end of YS_KNMTKEY.
+
+    data: LF_TDNAME type THEAD-TDNAME.
+    data: LT_ERROR_TABLE type TEXT_LH.
+
+
+*** Build Text Key
+    LF_TDNAME = value YS_KNMTKEY( VKORG = ME->F_VKORG
+                                  VTWEG = ME->F_VTWEG
+                                  KUNNR = ME->F_KUNNR
+                                  MATNR = IF_MATNR ) .
+
+*** Read Text
+    call function 'READ_MULTIPLE_TEXTS'
+      exporting
+        OBJECT      = C_TDOBJECT
+        NAME        = LF_TDNAME
+      importing
+        TEXT_TABLE  = ET_TEXT
+        ERROR_TABLE = LT_ERROR_TABLE.
+
+  endmethod.
+  method UPDATE.
+
+    data: LS_KNMT     type KNMT,
+          LS_XKNMT    type VKNMT,
+          LS_YKNMT    type VKNMT,
+          LS_TCATALOG type TCATALOG.
+    data: LT_XKNMT    type standard table of VKNMT,
+          LT_YKNMT    type standard table of VKNMT,
+          LT_TCATALOG type standard table of TCATALOG,    "Longtext, not update/created here
+          LT_PRE01    type standard table of PRE01.
+
+***--------------------------------------------------------------------------------------
+*** Enqueue Customer-Material Info Record
+    ME->ENQUEUE( ).
+
+*** Get current Customer-Material Info Record (prevent duplicates)
+    LS_KNMT = ME->GET_KNMT( IF_KDMAT = IF_KDMAT ).
+    if LS_KNMT-MATNR is not initial and
+       LS_KNMT-MATNR ne IF_MATNR.
+***   Customer material &1 has already been used in info &2
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGID = 'VS'
+                                            IF_MSGTY = 'E'
+                                            IF_MSGNO = '003'
+                                            IF_MSGV1 = IF_KDMAT
+                                            IF_MSGV2 = LS_KNMT-MATNR ).
+
+    endif.
+
+*** Get current Customer-Material Info Record by Material (ensure updates)
+    LS_KNMT = ME->GET_KNMT( IF_MATNR = IF_MATNR ).
+
+
+***--------------------------------------------------------------------------------------
+*** Prepare parameters for customer info record save
+
+    if LS_KNMT is not initial.
+***   Old Entry
+      move-corresponding LS_KNMT to LS_YKNMT.
+      append LS_YKNMT to LT_YKNMT.
+    endif.
+
+    if LS_KNMT is initial.
+***   New Entry
+      LS_XKNMT-MANDT = SY-MANDT.
+      LS_XKNMT-VKORG = ME->F_VKORG.
+      LS_XKNMT-VTWEG = ME->F_VTWEG.
+      LS_XKNMT-KUNNR = ME->F_KUNNR.
+      LS_XKNMT-MATNR = IF_MATNR.
+
+      LS_XKNMT-ERNAM = SY-UNAME.
+      LS_XKNMT-ERDAT = SY-DATUM.
+
+      select single MEINS
+             from MARA
+             into LS_XKNMT-MEINS
+            where MATNR eq IF_MATNR.
+
+      LS_XKNMT-UPDKZ = 'I'.
+    else.
+***   Update Entry
+      move-corresponding LS_KNMT to LS_XKNMT.
+      LS_XKNMT-UPDKZ = 'U'.
+    endif.
+
+    LS_XKNMT-KDMAT = IF_KDMAT.
+
+*** Update supplied Values
+    if IF_KDPTX is supplied.
+      LS_XKNMT-POSTX = IF_KDPTX.
+    endif.
+    if IF_UNTTO is supplied.
+      LS_XKNMT-UNTTO = IF_UNTTO.
+    endif.
+    if IF_UEBTO is supplied.
+      LS_XKNMT-UEBTO = IF_UEBTO.
+    endif.
+    if IF_UEBTK is supplied.
+      LS_XKNMT-UEBTK = IF_UEBTK.
+    endif.
+    if IF_KZTLF is supplied.
+      LS_XKNMT-KZTLF = IF_KZTLF.
+    endif.
+    if IF_ANTLF is supplied.
+      LS_XKNMT-ANTLF = IF_ANTLF.
+    endif.
+
+    append LS_XKNMT to LT_XKNMT.
+
+*** Customer Info-Record Save
+    call function 'RV_CUSTOMER_MATERIAL_UPDATE'
+      in update task
+      tables
+        XKNMT_TAB     = LT_XKNMT
+        YKNMT_TAB     = LT_YKNMT
+        TCATALOG_TAB  = LT_TCATALOG
+      exceptions
+        ERROR_MESSAGE = 1.
+    case SY-SUBRC.
+      when 1.
+***     Error-Message from CALL FUNCTION
+        /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+    endcase.
+
+*** Commit Text
+    loop at LT_TCATALOG into LS_TCATALOG where TDOBJECT = 'KNMT'.
+      call function 'COMMIT_TEXT'
+        exporting
+          OBJECT = C_TDOBJECT
+          NAME   = LS_TCATALOG-TDNAME
+          KEEP   = 'X'.
+    endloop.
+
+    commit work and wait.
+
+***--------------------------------------------------------------------------------------
+*** Dequeue Customer-Material Info Record
+    ME->DEQUEUE( ).
+
+*** Refresh Buffer before checking Customer-Material Info Record
+    LT_PRE01 = value #( ( MATNR = IF_MATNR ) ).
+    call function 'RV_CUSTOMER_MATERIAL_PRE_READ'
+      exporting
+        CMP_KUNNR = ME->F_KUNNR
+        CMP_VKORG = ME->F_VKORG
+        CMP_VTWEG = ME->F_VTWEG
+      tables
+        MATNR_TAB = LT_PRE01.
+
+    if ME->GET_KNMT( IF_MATNR = IF_MATNR )-KDMAT ne IF_KDMAT.
+***   Customer-Material Info Record can't be saved.
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGID = 'ZVCXI_XCI'
+                                            IF_MSGTY = 'E'
+                                            IF_MSGNO = '401' ).
+    endif.
+
+  endmethod.

@@ -1,0 +1,181 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRMM0014
+*&
+*&---------------------------------------------------------------------*
+*& Ticket:  46358
+*& Autor:   Carlos Vivó
+*& Fecha:   06.02.2018
+*&
+*& Descripción: listado que verifique, tras la integración de los iDOCS
+*& del tipo de mensaje WMMBXY, que el stock SAP está cuadrado con lo
+*& que se ha recibido de AS400 en esos mensajes.
+*&---------------------------------------------------------------------*
+REPORT zrmm0014 MESSAGE-ID zmm.
+
+INCLUDE zrmm0014_top.
+INCLUDE zrmm0014_sel.
+INCLUDE zrmm0014_f01.
+INCLUDE zrmm0014_m01.
+
+INITIALIZATION.
+
+
+START-OF-SELECTION.
+
+  IF check IS NOT INITIAL. " verificamos que hace al menos 3 minutos
+    "que haya finalizado la interfase
+    DO.
+      from_time = sy-uzeit - 300. " restamos 3 minutos de la hora
+
+      SELECT COUNT(*) FROM mseg
+        WHERE cputm_mkpf BETWEEN from_time AND sy-uzeit
+          AND ( bwart EQ '991' OR  bwart EQ '992' )
+          AND budat_mkpf EQ sy-datum
+          AND mjahr EQ sy-datum(4)
+          AND usnam_mkpf EQ 'PI_USER'.
+
+      IF sy-subrc EQ 0.
+        WAIT UP TO 300 SECONDS.
+      ELSE.
+        EXIT.
+      ENDIF.
+    ENDDO.
+  ENDIF.
+
+  SELECT * FROM ztmm0024 INTO TABLE t_ztmm0024
+    WHERE matnr IN matnr
+      AND werks IN werks
+      AND lgort IN lgort
+      AND charg IN charg
+      AND datum IN datum
+      AND uzeit IN uzeit.
+
+  SORT t_ztmm0024 BY werks lgort datum uzeit DESCENDING.
+
+  LOOP AT t_ztmm0024. " cogemos todos los centros con integración
+    CLEAR t_location.
+    AT NEW lgort.
+      t_location-werks = t_ztmm0024-werks.
+      t_location-lgort = t_ztmm0024-lgort.
+      APPEND t_location.
+    ENDAT.
+  ENDLOOP.
+
+  CHECK t_location[] IS NOT INITIAL.
+
+  SELECT mard~matnr werks lgort labst meins "stock mat. sin lote
+    FROM mard INNER JOIN mara
+      ON mard~matnr EQ mara~matnr
+      INTO CORRESPONDING FIELDS OF TABLE t_mard
+      FOR ALL ENTRIES IN t_location
+      WHERE werks EQ t_location-werks
+        AND lgort EQ t_location-lgort
+        AND mard~matnr IN matnr " incluir filtrado de pantalla de selección
+        AND xchpf EQ space.
+
+  SELECT mchb~matnr werks lgort charg clabs meins "stock mat. con lote
+    FROM mchb INNER JOIN mara
+      ON mchb~matnr EQ mara~matnr
+      INTO CORRESPONDING FIELDS OF TABLE t_mchb
+      FOR ALL ENTRIES IN t_location
+      WHERE werks EQ t_location-werks
+        AND lgort EQ t_location-lgort
+        AND mchb~matnr IN matnr " incluir filtrado de pantalla de selección
+        AND charg IN charg " incluir filtrado de pantalla de selección
+        AND xchpf NE space.
+
+END-OF-SELECTION.
+
+  LOOP AT t_mard.
+    CLEAR t_lines.
+    t_lines-matnr = t_mard-matnr.
+    t_lines-werks = t_mard-werks.
+    t_lines-lgort = t_mard-lgort.
+    t_lines-act_erfmg = t_mard-labst.
+
+    READ TABLE t_ztmm0024 WITH KEY  matnr = t_mard-matnr
+                                    werks = t_mard-werks
+                                    lgort = t_mard-lgort.
+    IF sy-subrc EQ 0.
+      t_lines-erp_erfmg = t_ztmm0024-erp_erfmg.
+      t_lines-sap_erfmg = t_ztmm0024-sap_erfmg.
+      t_lines-meins = t_ztmm0024-meins.
+      t_lines-docnum = t_ztmm0024-docnum.
+      t_lines-bwart = t_ztmm0024-bwart.
+      IF t_ztmm0024-docnum IS NOT INITIAL AND t_ztmm0024-bwart EQ '992'.
+        " si viene de idoc con mov 992, algo pasa, vemos si es puerto
+        SELECT SINGLE lgort FROM mard
+          INTO t_lines-lgort_new
+          WHERE matnr = t_mchb-matnr
+            AND werks = t_mchb-werks
+            AND lgort NE t_mchb-lgort
+            AND labst GT 0.
+      ENDIF.
+    ELSE.
+      t_lines-meins = t_mard-meins.
+    ENDIF.
+
+    t_lines-diff = t_lines-act_erfmg - t_lines-erp_erfmg.
+    IF t_lines-diff EQ 0 AND filter IS NOT INITIAL.
+    ELSE.
+      APPEND t_lines.
+    ENDIF.
+  ENDLOOP.
+
+  LOOP AT t_mchb.
+    CLEAR t_lines.
+    t_lines-matnr = t_mchb-matnr.
+    t_lines-werks = t_mchb-werks.
+    t_lines-lgort = t_mchb-lgort.
+    t_lines-charg = t_mchb-charg.
+    t_lines-act_erfmg = t_mchb-clabs.
+
+    READ TABLE t_ztmm0024 WITH KEY  matnr = t_mchb-matnr
+                                    werks = t_mchb-werks
+                                    lgort = t_mchb-lgort
+                                    charg = t_mchb-charg.
+    IF sy-subrc EQ 0.
+      t_lines-erp_erfmg = t_ztmm0024-erp_erfmg.
+      t_lines-sap_erfmg = t_ztmm0024-sap_erfmg.
+      t_lines-meins = t_ztmm0024-meins.
+      t_lines-docnum = t_ztmm0024-docnum.
+      t_lines-bwart = t_ztmm0024-bwart.
+      IF t_ztmm0024-docnum IS NOT INITIAL AND t_ztmm0024-bwart EQ '992'.
+        " si viene de idoc con mov 992, algo pasa, vemos si es puerto
+        SELECT SINGLE lgort FROM mchb
+          INTO t_lines-lgort_new
+          WHERE matnr = t_mchb-matnr
+            AND werks = t_mchb-werks
+            AND lgort NE t_mchb-lgort
+            AND charg = t_mchb-charg
+            AND clabs GT 0.
+      ENDIF.
+    ELSE.
+      t_lines-meins = t_mchb-meins.
+    ENDIF.
+
+    t_lines-diff = t_lines-act_erfmg - t_lines-erp_erfmg.
+    IF t_lines-diff EQ 0 AND filter IS NOT INITIAL.
+    ELSE.
+      APPEND t_lines.
+    ENDIF.
+  ENDLOOP.
+
+  PERFORM fieldcat.
+  PERFORM layout.
+  PERFORM variant.
+
+  IF delete IS NOT INITIAL.
+    DELETE FROM ztmm0024  WHERE matnr IN matnr
+                            AND werks IN werks
+                            AND lgort IN lgort
+                            AND charg IN charg
+                            AND datum IN datum
+                            AND uzeit IN uzeit.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+  ENDIF.
+
+  PERFORM alv_show.

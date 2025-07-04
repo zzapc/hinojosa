@@ -1,0 +1,285 @@
+FUNCTION z_aic_mri_out.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(OBJKEY) TYPE  ZWHS_CLAVE
+*"     REFERENCE(MENSAJE) TYPE  ZWHS_MENSAJE
+*"     REFERENCE(SIMULACION) TYPE  OAF_AGENT_SIMULATION_RUN DEFAULT ''
+*"     REFERENCE(SIMULAR) TYPE  OAF_AGENT_SIMULATION_RUN DEFAULT ''
+*"     REFERENCE(VAR1) TYPE  ANY DEFAULT ''
+*"     REFERENCE(VAR2) TYPE  ANY DEFAULT ''
+*"     REFERENCE(MODO_CT) TYPE  BDCMODE DEFAULT 'N'
+*"  EXPORTING
+*"     REFERENCE(CONTENIDO) TYPE  ZCONTENIDO_FICHERO
+*"     REFERENCE(MESSAGE) TYPE  BAPI_MSG
+*"  CHANGING
+*"     REFERENCE(COLA) TYPE  ZWHS_COLA
+*"----------------------------------------------------------------------
+  DATA: eina          TYPE eina,
+        eine          TYPE eine,
+        td310         TYPE yhp_idx_td310,
+        i_escalas     TYPE zvcxi_xcsr_tt_pscale,
+        i_escalas_sap TYPE zcl_ap_registro_info=>tt_escalas.
+
+  DEFINE break_simular.
+    if simular = 'D'.
+      break sy-uname.
+    endif.
+  END-OF-DEFINITION.
+  IF objkey IS INITIAL.
+    message = 'Indique CUOBJ o material$centro'.
+    RETURN.
+  ENDIF.
+
+  IF objkey CS '$'.
+    SPLIT objkey AT '$' INTO cola-matnr cola-werks.
+    __formatear_material cola-matnr.
+    SELECT SINGLE cuobj FROM marc
+      INTO @cola-cuobj
+     WHERE matnr = @cola-matnr
+       AND werks = @cola-werks.
+    IF sy-subrc NE 0.
+      message = condense( |No se encuentra nº objeto intero en tabla MARC para { cola-matnr ALPHA = OUT } { cola-werks }| ).
+      RETURN.
+    ELSEIF cola-cuobj IS INITIAL.
+      message = condense( |No hay nº objeto intero en tabla MARC para { cola-matnr ALPHA = OUT } { cola-werks }| ).
+      RETURN.
+    ENDIF.
+  ELSE.
+    IF objkey CS '|'.
+      DATA l_datos TYPE zwhs_cola-objkey.
+      SPLIT objkey AT '|' INTO cola-cuobj l_datos.
+    ELSE.
+      cola-cuobj = objkey.
+    ENDIF.
+
+    DO 50 TIMES.
+      SELECT SINGLE cuobj matnr werks FROM marc
+        INTO (cola-cuobj, cola-matnr, cola-werks)
+       WHERE cuobj = cola-cuobj.
+      IF sy-subrc = 0.
+        EXIT.
+      ELSE.
+        WAIT UP TO '0.1' SECONDS. "Es posible que este registro no esté creado, esperamos una decima segundo y reintentamos
+      ENDIF.
+    ENDDO.
+
+    IF cola-matnr IS INITIAL.
+      message = condense( |No se encuentra nº objeto interno CUOBJ en tabla MARC para { objkey }| ).
+      RETURN.
+    ELSEIF NOT l_datos IS INITIAL.
+* Si hay datos en la clave los descomponemos
+      td310-lifnr = l_datos(10).
+      IF l_datos+10(10) = 'SCALE'.
+        CLEAR td310.
+* Si es una escala, necesitamos siempre el registro, nos aseguramos de obtener el pendiente
+        IF sy-uname = 'WF-BATCH'. "Sólo para si es un workflow, en otro caso, que vaya por la clase
+          DO 3 TIMES.
+            SELECT * FROM yhp_idx_td310
+              INTO td310
+              UP TO 1 ROWS
+             WHERE cuobj = cola-cuobj
+               AND pendiente_msg = 'X'
+            ORDER BY cself DESCENDING.
+            ENDSELECT.
+            IF sy-subrc = 0.
+              UPDATE yhp_idx_td310
+                 SET pendiente_msg = ''
+               WHERE cuobj  = td310-cuobj
+                 AND cself  = td310-cself
+                 AND coper  = td310-coper.
+              EXIT.
+            ELSE.
+              WAIT UP TO 1 SECONDS.
+            ENDIF.
+          ENDDO.
+        ENDIF.
+      ELSE.
+        td310-price = l_datos+10(10).
+        td310-price_curr = l_datos+20(3).
+        td310-pricp = l_datos+23(5).
+        td310-pricp_uom = l_datos+28(3).
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  IF td310 IS INITIAL.
+    TRY.
+        DATA(o_idx_manager) = NEW zcl_hp_vcpp_idx_manager( i_cuobj = cola-cuobj ).
+        IF o_idx_manager IS INITIAL.
+          message = 'No se ha instanciando IDX MANAGER'.
+          RETURN.
+        ELSE.
+          DATA(i_td310) = o_idx_manager->get_td310_data_all( ).
+          IF i_td310 IS INITIAL.
+            message = condense( |No hay entradas en tabla YHP_IDX_TD310| ).
+            RETURN.
+          ELSE.
+            READ TABLE i_td310 INTO td310 WITH KEY outso = 'X'.
+            IF sy-subrc NE 0.
+              message = 'No hay entradas de subcontratación en tabla TD310'.
+              RETURN.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      CATCH cx_root INTO DATA(o_root).
+        message = |Error instanciando IDX MANAGER { o_root->get_text( ) }|.
+        RETURN.
+    ENDTRY.
+  ENDIF.
+
+  IF td310-lifnr IS INITIAL.
+    message = 'No han informado proveedor en tabla TD310'.
+    RETURN.
+  ELSEIF td310-price IS INITIAL AND td310-scale_xml IS INITIAL.
+    message = 'No han informado precio nI escalas en tabla TD310'.
+    RETURN.
+  ELSE.
+    cola-lifnr = td310-lifnr.
+    cola-importe = td310-price.
+    cola-waers = td310-price_curr.
+    cola-cantidad = td310-pricp.
+    cola-meins = td310-pricp_uom.
+    IF NOT td310-scale_xml IS INITIAL.
+      cola-entrega = 'SCALE'.
+      /ui2/cl_json=>deserialize( EXPORTING json = td310-scale_xml
+                                 CHANGING  data = i_escalas ).
+      IF i_escalas IS INITIAL.
+        message = 'Registro info indicado con escalas pero no se han recibido en tabla TD310'.
+      ELSE.
+        LOOP AT i_escalas ASSIGNING FIELD-SYMBOL(<escala>).
+          APPEND VALUE #( kstbm = <escala>-psqty           "Cantidad
+                          kpein = <escala>-pricp           "Ctd.Base
+                          kmein = <escala>-pricp_uom       "Unidad ctd.base
+                          kbetr = <escala>-price           "Precio
+                          koein = <escala>-price_curr      "Moneda
+                        ) TO i_escalas_sap.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+  DATA(o_ri) = NEW zcl_ap_registro_info( ).
+  SELECT SINGLE eina~infnr netpr FROM eina JOIN eine ON eina~infnr = eine~infnr
+  INTO (cola-infnr, eine-netpr)
+  WHERE matnr = cola-matnr
+  AND lifnr = td310-lifnr
+  AND werks = cola-werks
+  AND esokz  = '3'.
+  IF sy-subrc = 0.
+    IF NOT td310-scale_xml IS INITIAL.
+      DATA i_cond TYPE TABLE OF ekomd.
+      SELECT SINGLE matkl FROM mara
+        INTO @DATA(l_matkl)
+       WHERE matnr = @cola-matnr.
+      CALL FUNCTION 'ME_GET_INFORECORD_CONDITIONS'
+        EXPORTING
+          i_ekorg = '1000'
+          i_esokz = '3'
+          i_infnr = cola-infnr
+          i_lifnr = cola-lifnr
+          i_matnr = cola-matnr
+          i_matkl = l_matkl
+          i_werks = cola-werks
+        TABLES
+          tekomd  = i_cond.
+* Sólo el ultimo registro
+      IF NOT i_cond IS INITIAL.
+        DATA(l_knumh) = i_cond[ lines( i_cond ) ]-knumh.
+        DELETE i_cond WHERE knumh NE l_knumh.
+      ENDIF.
+
+      DATA(i_esc) = i_escalas_sap.
+      LOOP AT i_cond ASSIGNING FIELD-SYMBOL(<cond>).
+        READ TABLE i_esc ASSIGNING FIELD-SYMBOL(<esc>) WITH KEY kstbm = <cond>-kstbm
+                                                                kpein = <cond>-kpein
+                                                                kmein = <cond>-kmein
+                                                                kbetr = <cond>-kbetr
+                                                                koein = <cond>-koein.
+        IF sy-subrc = 0.
+          DELETE i_esc INDEX sy-tabix.
+          DELETE i_cond.
+        ENDIF.
+      ENDLOOP.
+      IF i_esc IS INITIAL AND lines( i_cond ) = 1.
+        IF i_cond[ 1 ]-kbetr = cola-importe.
+          CLEAR i_cond.
+        ENDIF.
+      ENDIF.
+      IF i_esc IS INITIAL AND i_cond IS INITIAL.
+        cola-estado = 'X'.
+        IF simulacion IS INITIAL.
+          zwhs=>inserta_log( idcola = cola-idcola tipo = 'I' mensaje = |No hay modificaciones en la escala. Salimos sin hacer nada| ).
+        ENDIF.
+        RETURN.
+      ENDIF.
+    ELSEIF td310-price = eine-netpr.
+      cola-estado = 'X'.
+      zwhs=>inserta_log( idcola = cola-idcola tipo = 'I' mensaje = |Se encuentra registro info { cola-infnr ALPHA = OUT } con el mismo importe a modificar { td310-price }. Salimos sin hacer nada| ).
+      RETURN.
+    ENDIF.
+
+
+    zwhs=>inserta_log( idcola = cola-idcola tipo = 'W' mensaje = |Se encuentra registro info { cola-infnr ALPHA = OUT } pero con importe { eine-netpr }| ).
+
+    SELECT SINGLE infnr matnr lifnr FROM eina
+      INTO CORRESPONDING FIELDS OF eina
+     WHERE infnr = cola-infnr.
+
+    SELECT SINGLE infnr ekorg werks esokz netpr peinh waers FROM eine
+      INTO CORRESPONDING FIELDS OF eine
+     WHERE infnr = cola-infnr
+       AND werks = cola-werks
+       AND esokz = '3'.
+    eine-netpr = td310-price.
+    IF simulacion IS INITIAL.
+
+* No queremos actualizar nunca los registros info en automático, sólo desde el report
+      IF sy-tcode IS INITIAL OR sy-uname = 'WF-BATCH'.
+        message = 'Hay modificaciones en registro info, pero cancelamos por ser proceso automático'.
+        RETURN.
+      ENDIF.
+
+      message = o_ri->modificar_precio( p_eina = eina
+                                        p_eine = eine
+                                        i_escalas = i_escalas_sap
+                                        modo   = modo_ct ).
+      IF NOT message IS INITIAL.
+        message = |Error creando registro info { message }|.
+      ELSE.
+        cola-estado = 'X'.
+        IF i_escalas_sap IS INITIAL.
+          zwhs=>inserta_log( idcola = cola-idcola tipo = 'S' mensaje = |Se ha modificado registro info { cola-infnr ALPHA = OUT } con nuevo precio { td310-price }| ).
+        ELSE.
+          zwhs=>inserta_log( idcola = cola-idcola tipo = 'S' mensaje = |Se ha modificado registro info { cola-infnr ALPHA = OUT } con escalas| ).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+  ELSE.
+    eina-matnr = cola-matnr.
+    eina-lifnr = td310-lifnr.
+    eine-werks = cola-werks.
+    eine-ekorg = '1000'.
+    eine-esokz = '3'.
+    eine-netpr = td310-price.
+    eine-waers = td310-price_curr.
+    eine-peinh = td310-pricp.
+    eine-bprme = td310-pricp_uom.
+    eine-mwskz = 'S3'.
+
+    cola-infnr = o_ri->crear( p_eina = eina
+                              p_eine = eine
+                              i_escalas = i_escalas_sap
+                              modo   = modo_ct ).
+    IF cola-infnr IS INITIAL.
+      message = |Error creando registro info { o_ri->mensaje }|.
+    ELSE.
+      cola-estado = 'X'.
+      zwhs=>inserta_log( idcola = cola-idcola tipo = 'S' mensaje = |Se ha creado registro info { cola-infnr ALPHA = OUT }| ).
+    ENDIF.
+  ENDIF.
+
+
+ENDFUNCTION.

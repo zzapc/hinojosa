@@ -1,0 +1,325 @@
+
+class YCL_HP_SMD_MBQ_BOB_PURIR definition
+  public
+  inheriting from ZCL_VCXI_XCI_BOB_PURIR
+  final
+  create public .
+
+public section.
+
+  data S_EXT type YHP_SMD_MBQ_S_ACTDAT_PURIR .
+  data F_NT_FINISHED type ABAP_BOOL .
+  data T_BAPIRET2 type BAPIRETTAB .
+  data F_INFNR type INFNR .
+
+  class-methods GET_MARA_HP
+    importing
+      !IF_MATNR type MATNR
+    exporting
+      !ES_MARM type MARM
+    returning
+      value(RS_MARA) type MARA
+    raising
+      /VCXI/CX_CKX .
+  methods SET_EXT
+    importing
+      !IS_EXT type YHP_SMD_MBQ_S_ACTDAT_PURIR
+    raising
+      /VCXI/CX_CKX .
+  methods RECEIVE_RFC_INFOREC
+    importing
+      !P_TASK type CLIKE .
+
+  methods CREATE_FOR_MATNR
+    redefinition .
+protected section.
+private section.
+endclass. "YCL_HP_SMD_MBQ_BOB_PURIR definition
+class YCL_HP_SMD_MBQ_BOB_PURIR implementation.
+  method CREATE_FOR_MATNR.
+    data: LF_DEST       type STRING.
+    data: LS_MARA       type MARA,
+          LS_MARM_BSTME type MARM,
+          LS_T405       type T405,
+          LS_LFM1       type LFM1,
+          LS_GENERAL    type BAPIEINA,
+          LS_PURCHORG   type BAPIEINE,
+          LS_MEWIEINA   type MEWIEINA,
+          LS_MEWIEINAX  type MEWIEINAX,
+          LS_MEWIEINE   type MEWIEINE,
+          LS_MEWIEINEX  type MEWIEINEX,
+          LS_CONDSCALE  type ZVCXI_XCI_S_CONDSCALE,
+          LS_RETURN     type BAPIRETURN,
+          LS_BAPIRET2   type BAPIRET2,
+          LS_EINA       type MEWIEINA,
+          LS_EINE       type MEWIEINE.
+    data: LT_COND_VALID type table of MEWIVALIDITY,
+          LT_CONDITION  type table of MEWICONDITION,
+          LT_SCALE_QUAN type table of MEWISCALEQUAN,
+          LT_RETURN     type          MEWI_T_RETURN.
+
+    clear ET_BAPIRET2.
+
+    if IF_WERKS is not initial and
+       IF_EKORG is     initial.
+***   Please also enter a purchasing organization
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                            IF_MSGID = '06'
+                                            IF_MSGNO = '301' ).
+    endif.
+
+**** Load Interface Work Areas for Condition Mainenance to avoid issues regarding syncronization
+    call function 'COND_MNT_LOAD'.
+
+***--------------------------------------------------------------------------------------
+*** Get Material Master Data
+    LS_MARA = ZCL_VCXI_XCI_BOB_PURIR=>GET_MARA( IF_MATNR = IF_MATNR ).
+
+    if IF_BSTME is not initial.
+      LS_MARA-BSTME = IF_BSTME.
+    endif.
+
+*** Get Purchase Order UoM
+    LS_MARM_BSTME = ZCL_VCXI_XCI_BOB_PURIR=>GET_MARM( IF_MATNR = IF_MATNR
+                                                      IF_MEINH = switch #( LS_MARA-BSTME when SPACE then LS_MARA-MEINS
+                                                                                                    else LS_MARA-BSTME ) ).
+*** Get Purchasing Data
+***JBL 03/10/2023 OPHJVC-398 call only when value exists
+    if ls_mara-ekwsl is not initial.
+    LS_T405 = GET_T405( IF_EKWSL = LS_MARA-EKWSL ).
+    endif.
+
+*** Get Vendor Data
+    if IF_EKORG is supplied.
+      LS_LFM1 = GET_LFM1( IF_LIFNR = ME->F_LIFNR
+                          IF_EKORG = IF_EKORG ).
+    endif.
+
+***--------------------------------------------------------------------------------------
+*** Get existing Record
+    ME->GET_RECORD( exporting IF_MATNR    = IF_MATNR
+                              IF_EKORG    = IF_EKORG
+                              IF_WERKS    = IF_WERKS
+                    importing ES_GENERAL  = LS_GENERAL
+                              ES_PURCHORG = LS_PURCHORG ).
+
+*** Check that the Record doesn't already exists
+    if ( IF_EKORG is     initial and LS_GENERAL  is not initial ) or
+       ( IF_EKORG is not initial and LS_PURCHORG is not initial ).
+      raise exception type /VCXI/CX_CKX.
+    endif.
+
+***--------------------------------------------------------------------------------------
+*** Purchasing Info Record: General Data
+    if LS_GENERAL is initial.
+      LS_MEWIEINA = value #( VENDOR     = ME->F_LIFNR
+                             MATERIAL   = IF_MATNR
+                             BASE_UOM   = LS_MARA-MEINS
+                             VAR_ORD_UN = LS_MARA-VABME
+                             PO_UNIT    = cond #( when IF_BSTME is not initial then IF_BSTME else LS_MARM_BSTME-MEINH )
+                             CONV_NUM1  = cond #( when IF_UMBSZ is not initial then IF_UMBSZ else LS_MARM_BSTME-UMREZ )
+                             CONV_DEN1  = cond #( when IF_UMBSN is not initial then IF_UMBSN else LS_MARM_BSTME-UMREN )
+                             REMINDER1  = LS_T405-MAHN1
+                             REMINDER2  = LS_T405-MAHN2
+                             REMINDER3  = LS_T405-MAHN3
+                             VEND_MAT   = IF_IDNLF
+                             SALES_PERS = LS_LFM1-VERKF
+                             TELEPHONE  = LS_LFM1-TELF1
+                            ).
+      /VCXI/CL_CKX_SERVICE=>FILL_X_STRUCT( exporting IS_DATA    = LS_MEWIEINA
+                                           changing  CS_X_STRUC = LS_MEWIEINAX ).
+    endif.
+
+***--------------------------------------------------------------------------------------
+    if IF_EKORG is not initial.
+***   Purchasing Info Record: Purchasing Organization Data
+      LS_MEWIEINE = value #( PURCH_ORG  = IF_EKORG
+                             PLANT      = IF_WERKS
+                             PUR_GROUP  = IF_EKGRP
+                             TAX_CODE   = ME->S_EXT-MWSKZ
+                             NRM_PO_QTY = '1'
+                             INFO_TYPE  = ME->F_ESOKZ
+                             PLND_DELRY = switch #( LS_LFM1-PLIFZ when 0 then 1
+                                                                         else LS_LFM1-PLIFZ )
+                             UNDER_TOL  = LS_T405-UNTTO
+                             OVERDELTOL = LS_T405-UEBTO
+                             UNLIMITED  = LS_T405-UEBTK
+                             CONF_CTRL  = LS_LFM1-BSTAE
+                             ACKN_REQD  = cond #( when LS_T405-KZABS eq ABAP_TRUE then ABAP_TRUE
+                                                  when LS_LFM1-KZABS eq ABAP_TRUE then ABAP_TRUE )
+                           ).
+      /VCXI/CL_CKX_SERVICE=>FILL_X_STRUCT( exporting IS_DATA    = LS_MEWIEINE
+                                           changing  CS_X_STRUC = LS_MEWIEINEX ).
+
+***   Condition Validity
+      LT_COND_VALID  = value #( ( VALID_FROM = IF_KODATAB
+                                  VALID_TO   = '99991231' ) ).
+
+***   Prepare Condition
+      LT_CONDITION = value #( ( COND_COUNT = '01'
+                                COND_TYPE  = 'PB00'
+                                COND_VALUE = IT_CONDSCALE[ 1 ]-KBETR   " Currency amount
+                                CURRENCY   = IF_KONWA                  " Condition unit (currency or percentage)
+                                COND_UNIT  = IF_KMEIN                  " Condition Unit
+                                COND_P_UNT = IF_KPEIN                  " Condition Pricing Unit
+                                BASE_UOM   = LS_MARA-MEINS             " Base Unit
+                                SCALE_UNIT = IF_KMEIN                  " Use Condition Unit as Price Unit
+                                SCALE_CURR = IF_KONWA ) ).             " Use Condition Currency for Scales
+
+***   Prepare Price Scales
+      loop at IT_CONDSCALE into LS_CONDSCALE.
+        append value #( COND_COUNT     = '01'
+                        LINE_NO        = SY-TABIX
+                        SCALE_BASE_QTY = LS_CONDSCALE-KSTBM
+                        COND_VALUE     = LS_CONDSCALE-KBETR
+                      ) to LT_SCALE_QUAN.
+      endloop.
+    endif.
+
+*** Execute PIR Creation via RFC call to avoid  commit errors due to pricing processing
+    data(LF_PTASK) = |PUPIR_| && |{ IF_MATNR alpha = out }|.
+    refresh LT_RETURN.
+    call function 'YHP_SMD_MBQ_INFOREC_MAINTAIN'
+      starting new task LF_PTASK destination in group default
+      calling ME->RECEIVE_RFC_INFOREC on end of task
+      exporting
+        I_EINA          = LS_MEWIEINA
+        I_EINAX         = LS_MEWIEINAX
+        I_EINE          = LS_MEWIEINE
+        I_EINEX         = LS_MEWIEINEX
+        TESTRUN         = SPACE
+      tables
+        COND_VALIDITY   = LT_COND_VALID
+        CONDITION       = LT_CONDITION
+        COND_SCALE_QUAN = LT_SCALE_QUAN.
+
+***     Wait until task is available
+    wait until ME->F_NT_FINISHED eq ABAP_TRUE.
+
+    ME->F_NT_FINISHED = ABAP_FALSE.
+
+    move ME->T_BAPIRET2 to ET_BAPIRET2.
+
+*** Return Info Recored Number
+    RF_INFNR = ME->F_INFNR.
+
+  endmethod.
+  method GET_MARA_HP.
+
+      data: LF_MEINH type MEINH.
+
+*** Get General Material Data
+    call function 'MARA_SINGLE_READ'
+      exporting
+        MATNR             = IF_MATNR
+      importing
+        WMARA             = RS_MARA
+      exceptions
+        LOCK_ON_MATERIAL  = 1
+        LOCK_SYSTEM_ERROR = 2
+        WRONG_CALL        = 3
+        NOT_FOUND         = 4
+        others            = 5.
+    if SY-SUBRC ne 0.
+      /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+    endif.
+
+
+    call function 'MARM_SINGLE_READ'
+      exporting
+        MATNR  = IF_MATNR
+        MEINH  = LF_MEINH
+      importing
+        WMARM  = ES_MARM
+      exceptions
+        others = 0.
+
+  endmethod.
+method RECEIVE_RFC_INFOREC.
+
+  data: LF_MSG_SYST type CHAR255,
+        LF_MSG_COMM type CHAR255.
+  data: LS_EINA     type MEWIEINA,
+        LS_EINE     type MEWIEINE,
+        LS_RETURN   type BAPIRETURN,
+        LS_BAPIRET2 type BAPIRET2.
+
+  data: LT_RETURN type MEWI_T_RETURN.
+
+
+*** Set the finished flag to true
+  ME->F_NT_FINISHED = ABAP_TRUE.
+
+*** Get all of the needed information from the relevant function module
+  receive results from function 'YHP_SMD_MBQ_INFOREC_MAINTAIN' keeping task
+                        importing E_EINA = LS_EINA
+                                  E_EINE = LS_EINE
+                        tables    RETURN = LT_RETURN
+                        exceptions
+                          SYSTEM_FAILURE        = 997 message LF_MSG_SYST
+                          COMMUNICATION_FAILURE = 998 message LF_MSG_COMM
+                          others                = 999.
+
+*** Convert Return Messages
+  loop at LT_RETURN into LS_RETURN.
+
+*** Get the message in the right form
+    call function 'BALW_RETURN_TO_RET2'
+      exporting
+        RETURN_IN = LS_RETURN
+      importing
+        RETURN_OU = LS_BAPIRET2.
+
+*** Filling of the ID if it's initial from the log number
+    if LS_BAPIRET2-ID is initial.
+      LS_BAPIRET2-ID = LS_BAPIRET2-LOG_NO.
+    endif.
+
+*** Filling of the return table
+    append LS_BAPIRET2 to ME->T_BAPIRET2.
+
+  endloop.
+
+*** Check that we have an error or nor
+  read table LT_RETURN into LS_RETURN with key TYPE = 'E'.
+
+*** There is no any error message during the PIR creation
+  if SY-SUBRC ne 0.
+
+*** Return Info Recored Number
+    ME->F_INFNR = LS_EINA-INFO_REC.
+
+  endif.
+
+***-------------------------------------------------------------------*
+*** Return additional error message if we didn't get an PIR#
+  if ME->F_INFNR is initial.
+    try.
+        "Purchasing Info Record was not created.
+        /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                              IF_MSGID = 'YHP_SMD_MBQ'
+                                              IF_MSGNO = '022' ).
+      catch /VCXI/CX_CKX into data(LR_CX).
+        append LR_CX->GET_BAPIRET2( ) to ME->T_BAPIRET2.
+    endtry.
+
+    if LF_MSG_SYST is not initial.
+      try.
+          /VCXI/CX_CKX=>RAISE_CKX_BY_STRING( IF_STRING = conv STRING( LF_MSG_SYST ) ).
+        catch /VCXI/CX_CKX into LR_CX.
+          append LR_CX->GET_BAPIRET2( ) to ME->T_BAPIRET2.
+      endtry.
+    endif.
+    if LF_MSG_COMM is not initial.
+      try.
+          /VCXI/CX_CKX=>RAISE_CKX_BY_STRING( IF_STRING = conv STRING( LF_MSG_COMM ) ).
+        catch /VCXI/CX_CKX into LR_CX.
+          append LR_CX->GET_BAPIRET2( ) to ME->T_BAPIRET2.
+      endtry.
+    endif.
+  endif.
+
+endmethod.
+  method SET_EXT.
+    ME->S_EXT = IS_EXT.
+  endmethod.

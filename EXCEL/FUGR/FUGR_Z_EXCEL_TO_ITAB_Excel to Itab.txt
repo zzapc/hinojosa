@@ -1,0 +1,255 @@
+FUNCTION z_excel_to_itab.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(IV_FILENAME) TYPE  LOCALFILE
+*"     REFERENCE(IV_STRUCTURE) TYPE  TABNAME
+*"     REFERENCE(IV_MANDT_AVL) TYPE  CHAR01 DEFAULT ' '
+*"     REFERENCE(IV_HDR_AVL) TYPE  CHAR01 DEFAULT 'X'
+*"  CHANGING
+*"     REFERENCE(CT_RETURN_TABLE) TYPE  TABLE
+*"  EXCEPTIONS
+*"      STRUCTURE_NOT_FOUND
+*"      FIELD_NOT_FOUND
+*"----------------------------------------------------------------------
+
+  DATA: lt_dd_field_list            TYPE STANDARD TABLE OF dfies,
+        lt_dyn_tab                  TYPE REF TO data,
+        lt_excel_itab_pre_conv_line TYPE STANDARD TABLE OF alsmex_tabline,
+        lt_excel_itab_pre_conv      TYPE STANDARD TABLE OF alsmex_tabline,
+
+        ls_excel_cell               TYPE alsmex_tabline,
+        ls_excel_cell_hdr           TYPE alsmex_tabline,
+        ls_dd_field                 TYPE dfies,
+        ls_dyn_line                 TYPE REF TO data,
+
+        lv_start_row                TYPE i,
+        lv_conv_exit_fm_name        TYPE string,
+
+        lv_min_col                  TYPE i,
+        lv_min_row                  TYPE i,
+        lv_max_col                  TYPE i,
+        lv_max_row                  TYPE i,
+        lv_file_name                TYPE dbmsgora-filename,
+        lv_file_type                TYPE sdbad-funct,
+        lv_col_num_inc              TYPE tabfdpos.
+
+  FIELD-SYMBOLS: <lfs_dyn_tab>  TYPE table,
+                 <lfs_dyn_line> TYPE any,
+                 <lfs_dyn_cell> TYPE any.
+
+  CONSTANTS: lc_min_col_xlsx TYPE i VALUE 1,
+             lc_min_row_xlsx TYPE i VALUE 1,
+             lc_max_col_xlsx TYPE i VALUE 16834,
+             lc_max_row_xlsx TYPE i VALUE 1048576,
+             lc_min_col_xls  TYPE i VALUE 1,
+             lc_min_row_xls  TYPE i VALUE 1,
+             lc_max_col_xls  TYPE i VALUE 256,
+             lc_max_row_xls  TYPE i VALUE 65536,
+             lc_fil_typ_xls  TYPE string VALUE 'XLS',
+             lc_fil_typ_xlsx TYPE string VALUE 'XLSX'.
+
+  IF iv_filename IS NOT INITIAL.
+
+    lv_file_name = iv_filename.
+
+    "Find the file extenstion
+    CALL FUNCTION 'SPLIT_FILENAME'
+      EXPORTING
+        long_filename  = lv_file_name
+      IMPORTING
+*       PURE_FILENAME  =
+        pure_extension = lv_file_type.
+
+    TRANSLATE lv_file_type TO UPPER CASE.
+
+    "Row, Column limits depends on file type
+    IF lv_file_type = lc_fil_typ_xls.
+      lv_min_col = lc_min_col_xls.
+      lv_min_row = lc_min_row_xls.
+      lv_max_col = lc_max_col_xls.
+      lv_max_row = lc_max_row_xls.
+    ELSEIF lv_file_type = lc_fil_typ_xlsx.
+      lv_min_col = lc_min_col_xlsx.
+      lv_min_row = lc_min_row_xlsx.
+      lv_max_col = lc_max_col_xlsx.
+      lv_max_row = lc_max_row_xlsx.
+    ELSE.
+    ENDIF.
+
+    "Retrieve the excel file content
+    data: lv_linea type i.
+    data: lv_mens type SYST_UCOMM.
+    WHILE sy-subrc <> 9.
+      add 1 to lv_linea.
+      lv_mens = 'Registro ' && lv_linea.
+
+CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+ EXPORTING
+   PERCENTAGE       = 0
+   TEXT             = lv_mens.
+
+      CALL FUNCTION 'ALSM_EXCEL_TO_INTERNAL_TABLE'
+        EXPORTING
+          filename                = iv_filename
+          i_begin_col             = lv_min_col
+          i_begin_row             = lv_linea "    lv_min_row
+          i_end_col               = lv_max_col
+          i_end_row               = lv_linea"     lv_max_row
+        TABLES
+          intern                  = lt_excel_itab_pre_conv_line
+        EXCEPTIONS
+          inconsistent_parameters = 1
+          upload_ole              = 2
+          OTHERS                  = 3.
+
+      IF lines( lt_excel_itab_pre_conv_line ) <> 0.
+        APPEND LINES OF lt_excel_itab_pre_conv_line TO lt_excel_itab_pre_conv.
+      ELSE.
+        sy-subrc = 9.
+      ENDIF.
+    ENDWHILE.
+  ENDIF.
+
+  "Get the list of fields in the structure
+  CALL FUNCTION 'DDIF_FIELDINFO_GET'
+    EXPORTING
+      tabname        = iv_structure
+    TABLES
+      dfies_tab      = lt_dd_field_list
+    EXCEPTIONS
+      not_found      = 1
+      internal_error = 2
+      OTHERS         = 3.
+  IF sy-subrc <> 0.
+* Implement suitable error handling here
+    RAISE structure_not_found.
+  ENDIF.
+
+***  SORT lt_excel_itab_pre_conv
+***                      BY row ASCENDING
+***                         col ASCENDING.
+
+  "If there are field names in headers, they should match the field names in the structure
+  IF iv_hdr_avl = abap_true.
+    "For each Field name in header
+    LOOP AT lt_excel_itab_pre_conv INTO ls_excel_cell
+                                   WHERE
+                                    row = 1.
+      CONDENSE ls_excel_cell-value.
+      TRANSLATE ls_excel_cell-value TO UPPER CASE.
+      "Check if it is valid
+      READ TABLE lt_dd_field_list TRANSPORTING NO FIELDS
+                                  WITH KEY
+                                    fieldname = ls_excel_cell-value.
+      IF sy-subrc <> 0.
+        RAISE field_not_found.
+      ENDIF.
+    ENDLOOP.
+    "If there is a header, data is available from second line
+    lv_start_row = 2.
+  ELSE.
+    IF iv_mandt_avl = abap_false.
+      "If MANDT is part of the structure, but not passed in the excel
+      "Do not attempt to read it
+      DELETE lt_dd_field_list WHERE fieldname = 'MANDT'.
+      IF sy-subrc = 0.
+        "If MANDT field was available in the structure, and deleted
+        "Make sure, we increment the column counters
+        lv_col_num_inc = 1.
+      ENDIF.
+    ENDIF.
+
+    "If there is no header, data is available from first line
+    lv_start_row = 1.
+  ENDIF.
+
+  "Generate work area
+  CREATE DATA ls_dyn_line TYPE (iv_structure).
+  "Generate table
+  CREATE DATA lt_dyn_tab TYPE TABLE OF (iv_structure).
+  ASSIGN lt_dyn_tab->* TO <lfs_dyn_tab>.
+
+  "Loop through the list of cells
+  LOOP AT lt_excel_itab_pre_conv INTO ls_excel_cell
+                                 WHERE
+                                  row >= lv_start_row.
+    "Assign the Work area to Field symbol
+    ASSIGN ls_dyn_line->* TO <lfs_dyn_line>.
+    CONDENSE ls_excel_cell-value. "Strip leading and trailing spaces from value
+    "If field names are available in headers
+    IF iv_hdr_avl = abap_true.
+      "Find the name of the field
+      READ TABLE lt_excel_itab_pre_conv INTO ls_excel_cell_hdr
+                                        WITH KEY
+                                          row = 1
+                                          col = ls_excel_cell-col.
+      IF sy-subrc = 0.
+        CONDENSE ls_excel_cell_hdr-value."Strip leading and trailing spaces from field name
+        TRANSLATE ls_excel_cell_hdr-value TO UPPER CASE.
+        ASSIGN COMPONENT ls_excel_cell_hdr-value OF STRUCTURE <lfs_dyn_line> TO <lfs_dyn_cell>."Assign the destination field of the work area
+        "Get the field details, based on field name
+        READ TABLE lt_dd_field_list INTO ls_dd_field
+                            WITH KEY
+                              fieldname = ls_excel_cell_hdr-value.
+
+      ENDIF.
+    ELSE.
+      "In case there is MANDT in structure, but not in excel, offset the column number by 1
+      ADD lv_col_num_inc TO ls_excel_cell-col.
+      "Get the field details, based on position
+      READ TABLE lt_dd_field_list INTO ls_dd_field
+                          WITH KEY
+                            position = ls_excel_cell-col.
+      ASSIGN COMPONENT ls_excel_cell-col OF STRUCTURE <lfs_dyn_line> TO <lfs_dyn_cell>."Assign the destination field of the work area
+    ENDIF.
+
+    IF ls_dd_field IS INITIAL.
+    ELSE.
+      "If a conversion exit is specified, use it
+      IF ls_dd_field-convexit IS NOT INITIAL.
+        CONCATENATE 'CONVERSION_EXIT_' ls_dd_field-convexit '_INPUT' INTO lv_conv_exit_fm_name.
+        CALL FUNCTION lv_conv_exit_fm_name
+          EXPORTING
+            input  = ls_excel_cell-value
+          IMPORTING
+            output = <lfs_dyn_cell>.
+      ELSE.
+        "Writing separate logic for DATE and Decimal fields with no conversion exits
+        "If needed add other fields with their respective conversion logic in this branch
+        IF ls_dd_field-datatype = 'DATS'.
+          CALL FUNCTION 'CONVERT_DATE_TO_INTERNAL'
+            EXPORTING
+              date_external            = ls_excel_cell-value
+            IMPORTING
+              date_internal            = <lfs_dyn_cell>
+            EXCEPTIONS
+              date_external_is_invalid = 1
+              OTHERS                   = 2.
+        ELSEIF ls_dd_field-datatype = 'DEC'.
+          "Below FM Code Courtesy:Created by Matthew Billingham, last modified on Sep 17, 2010
+          "URL:https://wiki.scn.sap.com/wiki/display/ABAP/Conversion+from+external+to+internal+number+format
+          CALL FUNCTION 'Y_CONVERSION_EXIT_DECS_INPUT'
+            EXPORTING
+              input                    = ls_excel_cell-value
+            IMPORTING
+              output                   = <lfs_dyn_cell>
+            EXCEPTIONS
+              date_external_is_invalid = 1
+              OTHERS                   = 2.
+        ELSE.
+          <lfs_dyn_cell> = ls_excel_cell-value.
+        ENDIF.
+      ENDIF.
+
+    ENDIF.
+    AT END OF row.
+      APPEND <lfs_dyn_line> TO <lfs_dyn_tab>.
+    ENDAT.
+  ENDLOOP.
+
+  ct_return_table[] = <lfs_dyn_tab>.
+
+
+
+ENDFUNCTION.

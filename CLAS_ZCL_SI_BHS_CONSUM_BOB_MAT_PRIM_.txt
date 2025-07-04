@@ -1,0 +1,1777 @@
+
+class ZCL_SI_BHS_CONSUM_BOB_MAT_PRIM definition
+  public
+  create public .
+
+public section.
+
+  interfaces ZII_SI_BHS_CONSUM_BOB_MAT_PRIM .
+
+  constants GA_BHS_BOBINA type REPID value 'INTF_BHS_BOBINA' ##NO_TEXT.
+  constants GA_PARAM1 type ZEPARAM value '01' ##NO_TEXT.
+
+  methods ENVIO_MAIL_NO_PROCESADO
+    importing
+      !P_DATOS type ZWM_INTF_BHS .
+  class-methods CONSUMO_CONTRA_ORDEN
+    importing
+      !INPUT type ZDT_BHS_CONSUM_BOB_MAT_PRIMA_I
+      !O_LOG type ref to ZCL_AP_LOG optional
+      !TEST type ABAP_BOOL default ''
+      !I_TEST_CONSUMOS_PREVIOS type MSEG-MENGE optional
+    exporting
+      !I_RESULT type ZHCL_PP_CORE=>ZCGTY_T_CINUMBER_CONS_RESULT
+    changing
+      !INTF_BHS type ZWM_INTF_BHS .
+  PROTECTED SECTION.
+private section.
+
+  data:
+    gat_hard TYPE STANDARD TABLE OF ztwm001 .
+  data GA_NEMESIS_APROV type REPID value 'INTF_APROV' ##NO_TEXT.
+  data GA_PARAM1_BWLVS_APROV type ZEPARAM value 'BWLVS' ##NO_TEXT.
+  data GA_PARAM2_NEMESIS_APROV type ZEPARAM value '01' ##NO_TEXT.
+  data GA_PARAM1_NLTYP_APROV type ZEPARAM value 'NLTYP' ##NO_TEXT.
+  data GA_PARAM1_TVARVC_NAME type ZEPARAM value 'ZWM_MOVER_PICO_CONS' ##NO_TEXT.
+
+  methods CREA_OT
+    importing
+      !PI_LQUA type LQUA
+      !PI_MBLNR type MBLNR
+      !PI_MJAHR type MJAHR
+      !PI_TBNUM type TBNUM optional
+    exporting
+      !PE_TBNUM type TBNUM
+      !PE_TANUM type TANUM
+      !PE_MESSAGE type BAPI_MSG .
+  methods F_CAMBIA_UNIDAD
+    importing
+      !PE_MATNR type MATNR
+      !PE_CANT type LQUA_VERME
+      !PE_GMEIN type GEWEI
+      !PE_UNIT_CONV type GEWEI
+    exporting
+      !PC_CANT type LEIN_MGEWI .
+  methods CREA_MOV_291
+    importing
+      !PI_LQUA type LQUA
+      !PI_ORDEN_BHS type ZWM_ORDEN_BHS
+      !PI_FECHA type DATS
+      !PI_CANT type ZWM_CANT_CONSUMO
+      !PI_GMEIN type GEWEI
+    exporting
+      !PE_MBLNR type MBLNR
+      !PE_MJAHR type MJAHR
+      !PE_MESSAGE type BAPI_MSG .
+endclass. "ZCL_SI_BHS_CONSUM_BOB_MAT_PRIM definition
+class ZCL_SI_BHS_CONSUM_BOB_MAT_PRIM implementation.
+  METHOD consumo_contra_orden.
+    DATA ztwm0001 TYPE ztwm0001.
+
+    SELECT SINGLE * FROM ztwm0001
+      INTO @ztwm0001
+     WHERE almacen = @input-almacen
+       AND centro = @input-centro
+       AND trabajo_interno_bhs = @input-trabajo_interno_bhs
+       AND codigo_consumo = @input-codigo_consumo
+       AND fecha_hora = @input-fecha_hora
+       AND codigo_etiqueta = @input-codigo_etiqueta
+       AND portabobinas = @input-portabobinas.
+
+    IF NOT o_log IS INITIAL.
+      DATA(o_logl) = o_log.
+    ELSE.
+      DATA l_clave TYPE zlog-clave.
+      IF NOT ztwm0001-msgguid IS INITIAL.
+        l_clave = ztwm0001-msgguid && '-' && ztwm0001-linea.
+      ELSE.
+        l_clave = input-codigo_etiqueta && '|' && input-trabajo_interno_bhs && '|' && input-fecha_hora.
+        REPLACE ALL OCCURRENCES OF '.' IN l_clave WITH ``.
+        CONDENSE l_clave NO-GAPS.
+      ENDIF.
+      o_logl = NEW zcl_ap_log( object = 'PROXY_BHS' clave = l_clave ).
+    ENDIF.
+
+    o_logl->no_grabar_log = test.
+
+    o_logl->log( p1 = 'UA' p2 = input-codigo_etiqueta p3 = input-trabajo_interno_bhs p4 = input-fecha_hora msgty = 'I' ).
+
+* APC20241028 Ahora ajustamos la cantidad a consumir
+    IF intf_bhs-manual IS INITIAL.
+      SELECT metros_desarrollados FROM ztwm0001
+        INTO @DATA(l_metros_inicio)
+        UP TO 1 ROWS
+       WHERE almacen = @input-almacen
+         AND centro = @input-centro
+         AND codigo_consumo IN ('01', '03')
+         AND codigo_etiqueta = @input-codigo_etiqueta
+         AND trabajo_interno_bhs = @input-trabajo_interno_bhs
+*       AND procesado = ''
+         AND fecha_hora <= @input-fecha_hora
+       ORDER BY fecha_hora DESCENDING.
+        intf_bhs-metros_des_inicio_ci = l_metros_inicio.
+      ENDSELECT.
+    ENDIF.
+
+    intf_bhs-consumo_notificar = intf_bhs-metros_desarrollados - intf_bhs-metros_des_inicio_ci.
+    IF NOT intf_bhs-metros_des_inicio_ci IS INITIAL.
+      o_logl->log( p1 = 'Metros des.=' p2 = intf_bhs-metros_desarrollados p3 = 'Se encuentran' p4 = intf_bhs-metros_des_inicio_ci p5 = 'consumos anteriores. Consumo a notificar=' p6 = intf_bhs-consumo_notificar msgty = 'I' ).
+
+      IF intf_bhs-consumo_notificar <= 0 AND test IS INITIAL.
+        o_logl->log( p1 = 'Marcamos registro como procesado por ser la cantidad resultante 0' p2 =  intf_bhs-consumo_notificar msgty = 'W' ).
+
+        intf_bhs-procesado = 'X'.
+        CLEAR intf_bhs-message.
+        DATA(l_reintentos) = 0.
+        TRY.
+* Marcamos como procesada el registro origen que realmente hemos consumido
+            UPDATE ztwm0001
+              SET procesado = intf_bhs-procesado
+                  id = intf_bhs-id
+                  fecha = intf_bhs-fecha
+                  hora  = intf_bhs-hora
+                  lgnum = intf_bhs-lgnum
+             WHERE almacen = input-almacen
+               AND centro = input-centro
+               AND trabajo_interno_bhs = input-trabajo_interno_bhs
+               AND codigo_consumo = input-codigo_consumo
+               AND fecha_hora = input-fecha_hora
+               AND codigo_etiqueta = input-codigo_etiqueta
+               AND portabobinas = input-portabobinas.
+
+            IF intf_bhs-procesado = 'X'.
+* Marcamos como procesados los registros previos que no se consumen
+              UPDATE ztwm0001
+                SET procesado = 'X'
+                    id_proceso = intf_bhs-id
+               WHERE almacen = input-almacen
+                 AND centro = input-centro
+                 AND NOT codigo_consumo IN ('02', '04')
+                 AND codigo_etiqueta = input-codigo_etiqueta
+                 AND trabajo_interno_bhs = input-trabajo_interno_bhs
+                 AND procesado = ''
+                 AND fecha_hora <= input-fecha_hora.
+            ENDIF.
+          CATCH cx_root INTO DATA(o_root).
+            IF l_reintentos < 3.
+              ADD 1 TO l_reintentos.
+              RETRY.
+            ENDIF.
+        ENDTRY.
+
+* No salimos ahora para poder actulizar otros datos
+        DATA(l_salir_ctd_0) = 'X'.
+*        RETURN.
+      ENDIF.
+    ELSE.
+      o_logl->log( p1 = 'Consumo a notificar=' p2 = intf_bhs-consumo_notificar p3 = 'M' msgty = 'I' ).
+    ENDIF.
+
+
+
+****TODO ESTO NO HACE FALTA, SE VUELVE A CALCULAR EN EL METODO CONSUMO_BOBINA
+*    "Cantidad consumo M
+**    IF ( intf_bhs-metros_desarrollados + intf_bhs-tolerancia >= intf_bhs-stock_sap ). "Stock a consumir + tolerancia
+*    IF ( intf_bhs-consumo_notificar + intf_bhs-tolerancia >= intf_bhs-stock_sap ). "Stock a consumir + tolerancia
+*      intf_bhs-cant_consumo = intf_bhs-stock_sap.
+*    ELSE.
+**      intf_bhs-cant_consumo = intf_bhs-metros_desarrollados.
+*      intf_bhs-cant_consumo = intf_bhs-consumo_notificar.
+*    ENDIF.
+*
+*    "Cantidad consumo a KG
+*    IF ( intf_bhs-cant_consumo > 0 ).
+*      intf_bhs-cant_consumo_kg = ceil( zcl_wm_nt_generic=>conv_matnr( iv_matnr = intf_bhs-matnr iv_meins_dest = zcl_wm_nt_generic=>gc_meins_kg iv_meins_orig = zcl_wm_nt_generic=>gc_meins_m iv_qty = intf_bhs-cant_consumo ) ).
+*      IF ( intf_bhs-cant_consumo_kg > intf_bhs-stock_sap_kg ).
+*        intf_bhs-cant_consumo_kg = intf_bhs-stock_sap_kg.
+*      ENDIF.
+*    ELSE.
+*      intf_bhs-cant_consumo_kg = intf_bhs-cant_consumo.
+*    ENDIF.
+*
+*    "Cantidad diferencia M
+*    intf_bhs-cant_dif = intf_bhs-stock_sap - intf_bhs-cant_consumo.
+*    IF ( intf_bhs-cant_dif < 0 ).
+*      intf_bhs-cant_dif = 0.
+*    ENDIF.
+*
+*    "Cantidad diferencia KG
+*    IF ( intf_bhs-cant_dif >= 0 ).
+*      intf_bhs-cant_dif_kg = intf_bhs-stock_sap_kg - intf_bhs-cant_consumo_kg.
+*    ELSE.
+*      intf_bhs-cant_dif_kg = 0.
+*    ENDIF.
+
+    DATA(l_almacen_im_consumo) = zcl_ap_parametros=>get_atributo1( clave = 'BHS' campo = 'ALMACEN_IM_CONSUMO' ).
+    DATA(l_tipo_almacen_wm) = zcl_ap_parametros=>get_atributo1( clave = 'BHS' campo = 'TIPO_ALMACEN_WM' ).
+
+    IF NOT input-trabajo_interno_bhs IS INITIAL AND intf_bhs-manual IS INITIAL.
+      DATA(lv_cinumber) = zhcl_pp_core=>s_conv_cinumber_2_internal( i_mjahr     = CONV #( input-fecha_hora(4) )
+                                                                    i_cinumber  = CONV #( input-trabajo_interno_bhs(9) ) ).
+    ELSEIF NOT intf_bhs-id IS INITIAL.
+      lv_cinumber = intf_bhs-id. "Viene por el reproceso
+    ENDIF.
+    IF lv_cinumber IS INITIAL.
+      IF l_salir_ctd_0 IS INITIAL.
+        intf_bhs-message = |Error calculando CINUMBER con { input-trabajo_interno_bhs(7) } { input-fecha_hora(4) } { input-fecha_hora+2(2) }|.
+        o_logl->log( p1 = intf_bhs-message msgty = 'E' ).
+      ENDIF.
+      RETURN.
+    ENDIF.
+
+    SELECT SINGLE *
+      FROM zwm_intf_omp_sap
+      INTO @DATA(ls_intf_omp_sap)
+     WHERE lgnum = @input-almacen
+       AND benum = @lv_cinumber.
+    IF sy-subrc NE 0.
+      IF l_salir_ctd_0 IS INITIAL.
+        intf_bhs-message = |Error buscando entrada en tabla ZWM_INTF_OEM_SAP { input-almacen } { lv_cinumber }|.
+        o_logl->log( p1 = intf_bhs-message msgty = 'E' ).
+      ENDIF.
+      RETURN.
+    ELSEIF NOT ls_intf_omp_sap-machine_code IS INITIAL.
+      intf_bhs-cod_maquina_principal = ls_intf_omp_sap-machine_code.
+    ELSEIF intf_bhs-manual = 'X' AND NOT intf_bhs-cod_maquina_principal IS INITIAL.
+      ls_intf_omp_sap-machine_code = intf_bhs-cod_maquina_principal.
+    ENDIF.
+
+
+    DATA(o_wm) = NEW zhcl_wm_core( i_werks = CONV #( intf_bhs-werks )
+                                   i_lgort = CONV #( l_almacen_im_consumo ) ).
+
+    DATA(l_portabobinas) = input-portabobinas.
+    IF strlen( l_portabobinas ) = 1 AND input-cod_maquina_principal CS '105'.
+      __poner_ceros l_portabobinas(2).
+    ENDIF.
+
+    o_logl->log( p1 = 'ls_intf_omp_sap-machine_code0' p2 =  ls_intf_omp_sap-machine_code msgty = 'I' ).
+    o_logl->log( p1 = 'l_portabobinas=' p2 =  l_portabobinas msgty = 'I' ).
+
+    DATA(lv_ablad) = o_wm->build_pp_wm_asp_ablad( i_arbpl        = CONV #( ls_intf_omp_sap-machine_code )
+                                                  i_portabobinas = CONV #( l_portabobinas ) ).
+
+    o_logl->log( p1 = 'lv_ablad=' p2 =  lv_ablad msgty = 'I' ).
+
+    IF ( lv_ablad IS INITIAL ).
+      IF l_salir_ctd_0 IS INITIAL.
+        intf_bhs-message = 'No se ha definido un puesto de descarga en el ASP'.
+        o_logl->log( p1 = intf_bhs-message msgty = 'E' ).
+      ENDIF.
+      RETURN.
+    ENDIF.
+
+    DATA(lt_asps) = o_wm->get_pp_wm_asp( i_r_t_ablad = VALUE #( ( sign = 'I' option = 'EQ' low = CONV #( lv_ablad ) ) ) ) .
+
+    IF ( lines( lt_asps ) <= 0 ).
+      IF l_salir_ctd_0 IS INITIAL.
+        intf_bhs-message = 'No existe ASP en SAP'.
+        o_logl->log( p1 = intf_bhs-message msgty = 'E' ).
+      ENDIF.
+      RETURN.
+    ENDIF.
+    o_logl->log( p1 = 'lt_asps[1]-prvbe=' p2 =  lt_asps[ 1 ]-prvbe msgty = 'I' ).
+
+*--> FCARDONA - Ajuste cantidades a realidad SAP
+
+
+
+*    intf_bhs-cant_consumo_kg =
+
+
+
+
+
+    "Volcamos también el ASP
+    intf_bhs-porta_bobinas = lt_asps[ 1 ]-prvbe.
+
+    IF test = 'Y' OR l_salir_ctd_0 = 'X'.
+      RETURN.
+    ENDIF.
+
+*<-- FCARDONA - Ajuste cantidades a realidad
+
+    IF intf_bhs-meinh IS INITIAL.
+      intf_bhs-meinh = zcl_wm_nt_generic=>gc_meins_m.
+    ENDIF.
+
+    DATA(rl_pp_core) = NEW zhcl_pp_core( ).
+
+    DO 3 TIMES.
+      DATA(l_excepcion) = ''.
+      TRY.
+          o_logl->log( p1 = 'Intentando consumo de' p2 =  intf_bhs-consumo_notificar p3 = 'M' msgty = 'I' ).
+
+          DATA(tg_consumos_pp) = rl_pp_core->consumo_bobina_cinumber_wm(
+          EXPORTING i_datum     = CONV #( |{ input-fecha_hora(4) }{ input-fecha_hora+5(2) }{ input-fecha_hora+8(2) }| )
+                                                         i_uzeit     = CONV #( |{ input-fecha_hora+11(2) }{ input-fecha_hora+14(2) }{ input-fecha_hora+17(2) }| )
+                                                         i_cinumber  = CONV #( lv_cinumber )
+                                                         i_werks     = lt_asps[ 1 ]-werks
+                                                         i_lgort     = lt_asps[ 1 ]-lgort
+                                                         i_lenum     = |{ intf_bhs-cod_etiqueta ALPHA = IN }|
+*                                                       i_menge     = CONV #( intf_bhs-metros_desarrollados )
+                                                         i_menge     = CONV #( intf_bhs-consumo_notificar )
+                                                         i_meins     = intf_bhs-meinh
+                                                         i_lgtyp     = CONV #( l_tipo_almacen_wm )
+                                                         i_lgpla     = intf_bhs-porta_bobinas
+                                                         i_cod_consumo = intf_bhs-cod_consumo
+                                                         o_log       = o_logl
+                                                         i_testrun   = test
+                                                         i_test_consumos_previos = i_test_consumos_previos
+         IMPORTING e_stock_wm_kg = intf_bhs-stock_sap_kg
+                   e_menge_kg = intf_bhs-consumo_notificar_kg
+                   e_ctd_consu_kg = intf_bhs-cant_consumo_kg
+                   e_tolerancia = intf_bhs-tolerancia
+                   e_tolerancia_meins = intf_bhs-meins_tol
+*                 e_meinh = intf_bhs-meinh
+                   ).
+
+          intf_bhs-cant_dif_kg = intf_bhs-cant_consumo_kg - intf_bhs-consumo_notificar_kg.
+
+
+          i_result = tg_consumos_pp.
+          READ TABLE tg_consumos_pp ASSIGNING FIELD-SYMBOL(<pp>) INDEX 1.
+          IF sy-subrc = 0.
+            intf_bhs-procesado = <pp>-proce.
+            intf_bhs-contabilizado = <pp>-conta.
+            intf_bhs-tbnum = <pp>-tbnum.
+            intf_bhs-tbpos = <pp>-tbpos.
+            intf_bhs-tanum = <pp>-tanum.
+            intf_bhs-tapos = <pp>-tapos.
+            IF intf_bhs-procesado = 'X' AND intf_bhs-contabilizado = 'X' AND NOT intf_bhs-tanum IS INITIAL.
+              CLEAR intf_bhs-message.
+              o_logl->log( p1 = 'Procesado OK' p2 = <pp>-tbnum p3 = <pp>-tanum msgty = 'I' ).
+            ELSE.
+              intf_bhs-message = <pp>-msgtx.
+              o_logl->log( p1 = intf_bhs-message msgty = 'E' ).
+            ENDIF.
+            IF intf_bhs-contabilizado = 'X'.
+              intf_bhs-mblnr = <pp>-mblnr.
+              intf_bhs-mjahr = <pp>-mjahr.
+              o_logl->log( p1 = 'Contabilizado OK' p2 = <pp>-mblnr p3 = <pp>-mblnr msgty = 'I' ).
+
+              SELECT aufnr, menge FROM mseg
+                INTO TABLE @DATA(i_mseg)
+               WHERE mblnr = @intf_bhs-mblnr
+                 AND mjahr = @intf_bhs-mjahr
+                 AND aufnr NE ''.
+              DATA n(1) TYPE n.
+              LOOP AT i_mseg ASSIGNING FIELD-SYMBOL(<mseg>).
+                n = sy-tabix.
+                ASSIGN COMPONENT 'AUFNR' && n OF STRUCTURE intf_bhs TO FIELD-SYMBOL(<fs>).
+                IF sy-subrc = 0.
+                  <fs> = <mseg>-aufnr.
+                  ASSIGN COMPONENT 'AUFNR' && n && '_MENGE' OF STRUCTURE intf_bhs TO <fs>.
+                  <fs> = <mseg>-menge.
+                ENDIF.
+              ENDLOOP.
+            ELSE.
+              LOOP AT i_result ASSIGNING FIELD-SYMBOL(<res>).
+                n = sy-tabix.
+                ASSIGN COMPONENT 'AUFNR' && n OF STRUCTURE intf_bhs TO <fs>.
+                IF sy-subrc = 0.
+                  <fs> = <res>-aufnr.
+                  ASSIGN COMPONENT 'AUFNR' && n && '_MENGE' OF STRUCTURE intf_bhs TO <fs>.
+                  <fs> = <res>-menge.
+                ENDIF.
+              ENDLOOP.
+            ENDIF.
+
+            l_reintentos = 0.
+            TRY.
+* Marcamos como procesada el registro origen que realmente hemos consumido
+                UPDATE ztwm0001
+                  SET procesado = intf_bhs-procesado
+                      id = intf_bhs-id
+                      fecha = intf_bhs-fecha
+                      hora  = intf_bhs-hora
+                      lgnum = intf_bhs-lgnum
+                 WHERE almacen = input-almacen
+                   AND centro = input-centro
+                   AND trabajo_interno_bhs = input-trabajo_interno_bhs
+                   AND codigo_consumo = input-codigo_consumo
+                   AND fecha_hora = input-fecha_hora
+                   AND codigo_etiqueta = input-codigo_etiqueta
+                   AND portabobinas = input-portabobinas.
+
+                IF intf_bhs-procesado = 'X'.
+* Marcamos como procesados los registros previos que no se consumen
+                  UPDATE ztwm0001
+                    SET procesado = 'X'
+                        id_proceso = intf_bhs-id
+                   WHERE almacen = input-almacen
+                     AND centro = input-centro
+                     AND NOT codigo_consumo IN ('02', '04')
+                     AND codigo_etiqueta = input-codigo_etiqueta
+                     AND trabajo_interno_bhs = input-trabajo_interno_bhs
+                     AND procesado = ''
+                     AND fecha_hora <= input-fecha_hora.
+                ENDIF.
+              CATCH cx_root INTO o_root.
+                IF l_reintentos < 3.
+                  ADD 1 TO l_reintentos.
+                  RETRY.
+                ENDIF.
+            ENDTRY.
+          ENDIF.
+
+        CATCH cx_root INTO o_root.
+          l_excepcion = 'X'.
+          intf_bhs-message = o_root->get_text( ).
+
+          IF NOT ls_intf_omp_sap IS INITIAL.
+            IF NOT ls_intf_omp_sap-upper_orderid IS INITIAL.
+              intf_bhs-aufnr1 = ls_intf_omp_sap-upper_orderid.
+            ENDIF.
+            IF NOT ls_intf_omp_sap-lower_orderid IS INITIAL.
+              IF intf_bhs-aufnr1 IS INITIAL.
+                intf_bhs-aufnr1 = ls_intf_omp_sap-lower_orderid.
+              ELSE.
+                intf_bhs-aufnr2 = ls_intf_omp_sap-lower_orderid.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+
+          IF intf_bhs-message CS ':'.
+            SPLIT intf_bhs-message AT ':' INTO DATA(l_msgty) DATA(l_msgid) DATA(l_msgno).
+            IF NOT l_msgid IS INITIAL AND NOT l_msgno IS INITIAL.
+              SPLIT l_msgno AT ` ` INTO l_msgno DATA(l_msgv1) DATA(l_msgv2) DATA(l_msgv3) DATA(l_msgv4).
+              MESSAGE ID l_msgid TYPE 'S' NUMBER l_msgno WITH l_msgv1 l_msgv2 l_msgv3 l_msgv4 INTO DATA(l_msg).
+              IF NOT l_msg CS ':'.
+                intf_bhs-message = l_msg.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+          o_logl->log( p1 = intf_bhs-message msgty = 'E' ).
+          intf_bhs-cant_dif_kg = intf_bhs-consumo_notificar_kg - intf_bhs-cant_consumo_kg.
+
+          IF test IS INITIAL.
+            l_reintentos = 0.
+            TRY.
+                UPDATE ztwm0001
+                  SET id = intf_bhs-id
+                      fecha = intf_bhs-fecha
+                      hora  = intf_bhs-hora
+                      lgnum = intf_bhs-lgnum
+                 WHERE almacen = input-almacen
+                   AND centro = input-centro
+                   AND trabajo_interno_bhs = input-trabajo_interno_bhs
+                   AND codigo_consumo = input-codigo_consumo
+                   AND fecha_hora = input-fecha_hora
+                   AND codigo_etiqueta = input-codigo_etiqueta
+                   AND portabobinas = input-portabobinas.
+              CATCH cx_root INTO o_root.
+                IF l_reintentos < 3.
+                  ADD 1 TO l_reintentos.
+                  RETRY.
+                ENDIF.
+            ENDTRY.
+          ENDIF.
+
+      ENDTRY.
+
+* En caso de bloqueos del usuario PI_USER, reintentamos hasta 3 veces.
+      IF l_excepcion IS INITIAL.
+        EXIT.
+      ELSE.
+        IF intf_bhs-message CS 'PI_USER' AND ( intf_bhs-message CS 'bloq' OR intf_bhs-message CS 'lock'  ).
+          o_logl->log( p1 = 'Reintentamos el proceso debido a error de bloqueo del usuario PI_USER' msgty = 'W' ).
+          WAIT UP TO 1 SECONDS.
+        ELSE.
+          EXIT.
+        ENDIF.
+      ENDIF.
+    ENDDO.
+
+    CALL FUNCTION 'DEQUEUE_ALL'.
+
+  ENDMETHOD.
+  METHOD crea_mov_291.
+    CONSTANTS: lc_03         TYPE gm_code VALUE '03'. " MB1A - Goods Issue
+
+    DATA: ls_header TYPE bapi2017_gm_head_01,
+          ls_code   TYPE bapi2017_gm_code,
+          ls_ewm    TYPE /spe/bapi2017_gm_ref_ewm,
+          lt_item   TYPE STANDARD TABLE OF bapi2017_gm_item_create,
+          ls_item   TYPE bapi2017_gm_item_create,
+          lt_ret    TYPE bapiret2_t,
+          lv_mein   TYPE meins,
+          l_garg    TYPE seqg3-garg,
+          t_enq     TYPE TABLE OF seqg3.
+
+    IF pi_lqua IS NOT INITIAL.
+      " 62657 - cvivo - Verificar si material bloqueado, y reintento
+      CONCATENATE sy-mandt pi_lqua-matnr pi_lqua-werks INTO l_garg.
+
+      DO 5 TIMES.
+
+        CALL FUNCTION 'ENQUEUE_READ'
+          EXPORTING
+            gclient = sy-mandt
+            gname   = 'MARC'
+            garg    = l_garg
+            guname  = sy-uname
+          TABLES
+            enq     = t_enq.
+
+        IF lines( t_enq ) GT 0.
+          WAIT UP TO 1 SECONDS.
+        ELSE.
+          EXIT.
+        ENDIF.
+      ENDDO.
+
+* cabecera de Movimiento con referencia a Orden BHS
+      ls_header-pstng_date = pi_fecha.
+      ls_header-doc_date   = pi_fecha.
+      ls_header-ref_doc_no = pi_orden_bhs.
+      ls_header-pr_uname   = sy-uname.
+      READ TABLE gat_hard ASSIGNING FIELD-SYMBOL(<hc>)
+                          WITH KEY param1 = 'HEADER_TEXT'.
+      IF sy-subrc EQ 0.
+        ls_header-header_txt = <hc>-valor1.
+      ENDIF.
+
+* codigo de tipo de movimiento de mercancias
+      ls_code-gm_code = lc_03.
+
+* datos de la UA que genera el movimiento
+      ls_item-plant    = pi_lqua-werks.
+      ls_item-stge_loc = pi_lqua-lgort.
+      ls_item-material = pi_lqua-matnr.
+      ls_item-batch    = pi_lqua-charg.
+      READ TABLE gat_hard ASSIGNING <hc>
+                          WITH KEY param1 = 'MOVEMENT_TYPE'.
+      IF sy-subrc EQ 0.
+        ls_item-move_type = <hc>-valor1.
+      ENDIF.
+
+      ls_item-entry_qnt = pi_cant. " pi_lqua-gesme.
+      ls_item-entry_uom = pi_gmein. " KG
+
+      APPEND ls_item TO lt_item.
+
+      CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+        EXPORTING
+          goodsmvt_header  = ls_header
+          goodsmvt_code    = ls_code
+        IMPORTING
+          materialdocument = pe_mblnr
+          matdocumentyear  = pe_mjahr
+        TABLES
+          goodsmvt_item    = lt_item
+          return           = lt_ret.
+
+      LOOP AT lt_ret INTO DATA(ls_ret) WHERE type = 'E' OR
+                                             type = 'A'.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc IS INITIAL.
+        pe_message = ls_ret-message.
+      ENDIF.
+      IF pe_mblnr IS NOT INITIAL AND pe_mjahr IS NOT INITIAL.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+      ENDIF.
+
+    ENDIF.
+  ENDMETHOD.
+  METHOD crea_ot.
+    DATA: ls_ltbk  TYPE ltbk,
+          lt_ltbp  TYPE STANDARD TABLE OF ltbp,
+          lt_trite TYPE l03b_trite_t,
+          ls_trite TYPE l03b_trite.
+
+    CLEAR: pe_tbnum, pe_tanum, pe_message.
+
+*APC20240422 Por si filtran por el nuevo parámetro opcional TBNUM
+    IF NOT pi_tbnum IS INITIAL.
+      DATA r_tbnum TYPE RANGE OF tbnum.
+      r_tbnum = VALUE #( ( option = 'EQ' sign = 'I' low = pi_tbnum ) ).
+    ENDIF.
+
+    SELECT SINGLE *
+     INTO ls_ltbk
+     FROM ltbk
+     WHERE lgnum = pi_lqua-lgnum AND
+           mblnr = pi_mblnr AND
+           mjahr = pi_mjahr
+      AND  tbnum IN r_tbnum. "APC20240422
+
+    IF sy-subrc EQ 0.
+      pe_tbnum = ls_ltbk-tbnum.
+
+      SELECT * INTO TABLE lt_ltbp
+                 FROM ltbp
+                 WHERE lgnum = pi_lqua-lgnum AND
+                       tbnum = pe_tbnum.
+
+      LOOP AT lt_ltbp INTO DATA(ls_ltbp).
+        ls_trite-tbpos = ls_ltbp-tbpos.
+        ls_trite-altme = ls_ltbp-meins.
+        ls_trite-anfme = ls_ltbp-menge.
+        ls_trite-charg = ls_ltbp-charg.
+        ls_trite-nltyp = ls_ltbk-nltyp.
+        ls_trite-nlpla = ls_ltbk-nlpla.
+
+        ls_trite-vlpla = pi_lqua-lgpla.
+        ls_trite-vltyp = pi_lqua-lgtyp.
+        ls_trite-letyp = pi_lqua-letyp.
+
+        APPEND ls_trite TO lt_trite.
+      ENDLOOP.
+
+      CALL FUNCTION 'L_TO_CREATE_TR'
+        EXPORTING
+          i_lgnum                        = pi_lqua-lgnum
+          i_tbnum                        = pe_tbnum
+*         i_bname                        = gst_zwm005-bname
+          i_squit                        = abap_true
+          i_tbeli                        = abap_true
+          it_trite                       = lt_trite
+        IMPORTING
+          e_tanum                        = pe_tanum
+        EXCEPTIONS
+          foreign_lock                   = 1
+          qm_relevant                    = 2
+          tr_completed                   = 3
+          xfeld_wrong                    = 4
+          ldest_wrong                    = 5
+          drukz_wrong                    = 6
+          tr_wrong                       = 7
+          squit_forbidden                = 8
+          no_to_created                  = 9
+          update_without_commit          = 10
+          no_authority                   = 11
+          preallocated_stock             = 12
+          partial_transfer_req_forbidden = 13
+          input_error                    = 14
+          error_message                  = 16
+          OTHERS                         = 15.
+
+      IF pe_tanum IS NOT INITIAL.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+*APC20240422 Controlamos el error
+      else.
+        message id sy-msgid type 'S' NUMBER sy-msgno with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4
+           into pe_message.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+  METHOD envio_mail_no_procesado.
+* ini - cvivo - 58201 Enviar mail al no procesar un consumo
+    TYPES: t_soli_t      TYPE TABLE OF soli.
+    DATA: li_addr         TYPE bcsy_smtpa,
+          lcl_send_email  TYPE REF TO cl_bcs,
+          li_message      TYPE t_soli_t,
+          lw_message      LIKE LINE OF li_message,
+          lv_subject      TYPE so_obj_des,
+          lcl_document    TYPE REF TO cl_document_bcs,
+          lcl_recipient   TYPE REF TO if_recipient_bcs,
+          lv_sent_to_all  TYPE os_boolean,
+          lcl_sender      TYPE REF TO cl_cam_address_bcs,
+          lv_sender       TYPE adr6-smtp_addr,
+          lw_ztmm0025     TYPE ztmm0025,
+          l_fecha         LIKE sy-datum,
+          l_hora          LIKE sy-uzeit,
+          l_hora_text(20),
+          l_id            LIKE p_datos-id,
+          l_rest          TYPE zwm_metros_restantes,
+          l_desa          TYPE zwm_metros_desa.
+    FIELD-SYMBOLS: <fs_addr> LIKE LINE OF li_addr.
+
+    SELECT SINGLE * FROM ztmm0025
+      INTO lw_ztmm0025
+      WHERE werks EQ p_datos-werks
+      AND proceso EQ '4'.
+
+    IF sy-subrc NE 0.
+      CLEAR lw_ztmm0025. " si no hay entrada para el centro lo limpiamos
+    ELSE.
+      IF lw_ztmm0025-email1 NE space.
+        APPEND lw_ztmm0025-email1 TO li_addr.
+      ENDIF.
+      IF lw_ztmm0025-email2 NE space.
+        APPEND lw_ztmm0025-email2 TO li_addr.
+      ENDIF.
+      IF lw_ztmm0025-email3 NE space.
+        APPEND lw_ztmm0025-email3 TO li_addr.
+      ENDIF.
+      IF lw_ztmm0025-email4 NE space.
+        APPEND lw_ztmm0025-email4 TO li_addr.
+      ENDIF.
+
+* Inicialización de la clase
+      lcl_send_email = cl_bcs=>create_persistent( ).
+
+* Cuerpo del email
+      lw_message = 'No se ha podido procesar el siguiente consumo desde BHS: <br><br>'.
+      APPEND lw_message TO li_message. CLEAR lw_message.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = p_datos-id
+        IMPORTING
+          output = l_id.
+      CONCATENATE 'ID:' l_id '<br>' INTO lw_message SEPARATED BY space.
+      APPEND lw_message TO li_message. CLEAR lw_message.
+
+      WRITE p_datos-fecha TO l_fecha DD/MM/YY.
+
+*      CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+*        EXPORTING
+*          date_internal            = l_fecha
+*        IMPORTING
+*          date_external            = l_fecha
+*        EXCEPTIONS
+*          date_internal_is_invalid = 1
+*          OTHERS                   = 2.
+
+      CONCATENATE 'Fecha:' l_fecha '<br>' INTO lw_message SEPARATED BY space.
+      APPEND lw_message TO li_message. CLEAR lw_message.
+
+*      WRITE p_datos-hora TO l_hora.
+      WRITE sy-uzeit TO l_hora.
+      CONCATENATE l_hora(2) ':' l_hora+2(2) ':' l_hora+4(2) INTO l_hora_text.
+      WRITE:/ l_hora_text.
+      CONCATENATE 'Hora:' l_hora_text '<br>' INTO lw_message SEPARATED BY space.
+      APPEND lw_message TO li_message. CLEAR lw_message.
+
+      CONCATENATE 'Estación:' p_datos-porta_bobinas '<br>' INTO lw_message SEPARATED BY space.
+      APPEND lw_message TO li_message. CLEAR lw_message.
+
+      CONCATENATE 'Unidad de almacén:' p_datos-cod_etiqueta '<br>' INTO lw_message SEPARATED BY space.
+      APPEND lw_message TO li_message. CLEAR lw_message.
+
+      l_rest = p_datos-metros_restantes.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = l_rest
+        IMPORTING
+          output = l_rest.
+      WRITE l_rest.
+      CONCATENATE 'Metros restantes:' l_rest '<br>' INTO lw_message SEPARATED BY space.
+      APPEND lw_message TO li_message. CLEAR lw_message.
+
+      l_desa = p_datos-metros_desarrollados.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = l_desa
+        IMPORTING
+          output = l_desa.
+      WRITE l_desa.
+      CONCATENATE 'Metros desarrollados:' l_desa '<br>' INTO lw_message SEPARATED BY space.
+      APPEND lw_message TO li_message. CLEAR lw_message.
+
+      CONCATENATE 'Orden BHS:' p_datos-orden_bhs '<br>' INTO lw_message SEPARATED BY space.
+      APPEND lw_message TO li_message. CLEAR lw_message.
+
+      CONCATENATE 'Calidad:' p_datos-calidad '<br>' INTO lw_message SEPARATED BY space.
+      APPEND lw_message TO li_message. CLEAR lw_message.
+
+      IF p_datos-message IS NOT INITIAL.
+        CONCATENATE 'Mensaje:' p_datos-message '<br>' INTO lw_message SEPARATED BY space.
+        APPEND lw_message TO li_message. CLEAR lw_message.
+      ENDIF.
+
+* Crear documento
+      lv_subject = 'Error al procesar un consumo de BHS'.
+      lcl_document =  cl_document_bcs=>create_document( i_type    =  'HTM'
+                                                        i_subject =  lv_subject
+                                                        i_importance = '1'
+                                                        i_text    =  li_message ).
+
+* Enviar documento al email
+      lcl_send_email->set_document( lcl_document ).
+
+* Añadir remitente
+      lv_sender = 'sap@hinojosa.es'.
+      lcl_sender = cl_cam_address_bcs=>create_internet_address( lv_sender  ).
+      lcl_send_email->set_sender( i_sender = lcl_sender ).
+
+
+      DATA(o_logl) = NEW zcl_ap_log( object = 'PROXY_BHS' clave = p_datos-msgguid && '-' && p_datos-pos_fich ).
+
+* Añadir destinatarios al email
+      LOOP AT li_addr ASSIGNING <fs_addr>.
+        lcl_recipient = cl_cam_address_bcs=>create_internet_address( <fs_addr> ).
+        lcl_send_email->add_recipient( i_recipient = lcl_recipient i_express = 'X' ).
+        o_logl->log( p1 = 'Enviamos mail a' p2 = <fs_addr> msgty = 'S' ).
+      ENDLOOP.
+
+      IF lw_ztmm0025-lista NE space. " 58445 - Envío a listas de distribución
+        lcl_recipient = cl_distributionlist_bcs=>getu_persistent( i_dliname = lw_ztmm0025-lista
+                                                                  i_private = space ).
+        lcl_send_email->add_recipient( i_recipient = lcl_recipient i_express = 'X' ).
+
+        o_logl->log( p1 = 'Enviamos a lista distribución a' p2 = lw_ztmm0025-lista msgty = 'S' ).
+      ENDIF.
+
+* set send immediately flag
+      lcl_send_email->set_send_immediately( 'X' ).
+
+* Enviar email
+      lv_sent_to_all = lcl_send_email->send( i_with_error_screen = 'X' ).
+*  COMMIT WORK. " no se puede porque estamos en UPDATE!
+
+      IF lv_sent_to_all EQ 'X'.
+*   Enviado Correctamente
+      ELSE.
+*   Error al enviar
+      ENDIF.
+    ENDIF.
+
+* fin - cvivo - 58201 Enviar mail al no procesar un consumo
+  ENDMETHOD.
+  METHOD f_cambia_unidad.
+    DATA: lv_aux  TYPE bstmg,
+          lv_aux2 TYPE bstmg.
+
+    CLEAR pc_cant.
+
+    MOVE pe_cant TO lv_aux.
+
+    CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+      EXPORTING
+        i_matnr              = pe_matnr
+        i_in_me              = pe_gmein
+        i_out_me             = pe_unit_conv
+        i_menge              = lv_aux
+      IMPORTING
+        e_menge              = lv_aux2
+      EXCEPTIONS
+        error_in_application = 1
+        error                = 2
+        OTHERS               = 3.
+    IF sy-subrc <> 0.
+* Implement suitable error handling here
+    ELSE.
+      MOVE lv_aux2 TO pc_cant.
+    ENDIF.
+  ENDMETHOD.
+  METHOD zii_si_bhs_consum_bob_mat_prim~si_bhs_consum_bob_mat_prima_in.
+*** **** INSERT IMPLEMENTATION HERE **** ***
+    DATA: lv_fecha(10),
+          lv_hora(8),
+          lt_datos               TYPE STANDARD TABLE OF zwm_intf_bhs,
+          ls_datos               TYPE zwm_intf_bhs,
+          ls_lqua                TYPE lqua,
+          lv_aux                 TYPE lein_mgewi,
+          lv_cant                TYPE bstmg,
+          lv_unidad              TYPE meins,
+          lv_id                  TYPE zid_intf_bhs,
+          lv_vengo_inter_consumo TYPE xfeld,
+          lv_cod_maq_portabo     TYPE zwm_param-maquina.
+
+    DATA l_text TYPE char20.
+    DATA l_restantes TYPE zwm_cant_dif.
+    DATA l_restantes_kg TYPE bstmg.
+
+    DATA: lv_tanum        TYPE  ltak-tanum,
+          lv_nltyp        TYPE ltap-nltyp,
+          lv_nlber        TYPE  ltap-nlber,
+          lv_nlpla        TYPE  ltap-nlpla,
+          lv_nppos        TYPE  ltap-nppos,
+          lt_ltap_move_su TYPE TABLE OF ltap_move_su,
+          lt_ltak         TYPE TABLE OF ltak_vb,
+          lt_ltap_vb      TYPE TABLE OF ltap_vb,
+          lt_rspar        TYPE TABLE OF rsparams,
+          ls_rspar        TYPE rsparams,
+          lref_exc        TYPE REF TO cx_root,
+          lv_error        TYPE string,
+          lv_bwlvs        TYPE ltak-bwlvs,
+          lv_bwlvs_exp    TYPE ltak-bwlvs,
+          lv_nltyp_exp    TYPE ltap-nltyp,
+          lv_nlber_exp    TYPE  ltap-nlber,
+          lv_nlpla_exp    TYPE  ltap-nlpla,
+          lv_lenum        TYPE lein-lenum,
+          lrng_tvarvc     TYPE RANGE OF tvarvc-low,
+          lsrng_tvarvc    LIKE LINE OF lrng_tvarvc,
+          lv_cont_inf     TYPE i,
+          ls_log          TYPE zwm_intf_bhs_log.
+
+    FIELD-SYMBOLS: <l_s_my_context>  TYPE c.
+
+    DATA: l_ancho   TYPE i,
+          l_gramaje TYPE i.
+
+    DATA: g_log_handle  TYPE balloghndl,   "Application Log: Log Handle
+          gt_log_handle TYPE bal_t_logh,
+          g_log         TYPE bal_s_log,    "Log header data
+          g_msg         TYPE bal_s_msg.
+
+    DATA: lt_sel TYPE TABLE OF rsparamsl_255.
+
+
+***********INI RGUILLOT GAP WM18 Bernabeu 22-4-19*********************
+    LOOP AT input-mt_bhs_consum_bob_mat_prima_in-items ASSIGNING FIELD-SYMBOL(<ls>).
+      lsrng_tvarvc-sign = 'I'.
+      lsrng_tvarvc-option = 'EQ'.
+      lsrng_tvarvc-low = <ls>-portabobinas.
+
+      APPEND lsrng_tvarvc TO lrng_tvarvc.
+    ENDLOOP.
+
+    IF <ls> IS ASSIGNED.
+      SELECT *
+        FROM ztwm001
+        INTO CORRESPONDING FIELDS OF TABLE gat_hard
+        WHERE cprog  = ga_bhs_bobina AND
+              param2 = ga_param1 AND
+              param3 = <ls>-almacen.
+
+      " cvivo - posibilidad de descartar ficheros ya procesados
+      SELECT SINGLE @abap_true FROM tvarvc
+        WHERE name EQ 'BHS_DESCARTAR_DUPLICADOS'
+          AND low EQ @<ls>-almacen
+        INTO @DATA(duplicados).
+
+
+*  posibilidad de hacer bucle infinito y parar la interfase
+      SELECT SINGLE * INTO @DATA(ls_tvarvc_inf)
+      FROM tvarvc
+      WHERE name = 'Z_DEBUG_INTF_CONSUMO'.
+
+      IF sy-subrc = 0 AND ls_tvarvc_inf-low = 'X'.
+        WHILE lv_cont_inf = 0.
+          CONTINUE.
+        ENDWHILE.
+      ENDIF.
+
+      SELECT SINGLE *
+        FROM ztwm001
+        INTO @DATA(ls_ztwm001_bwlvs)
+        WHERE cprog  = @ga_nemesis_aprov
+          AND param1 = @ga_param1_bwlvs_aprov
+          AND param2 = @ga_param2_nemesis_aprov
+          AND param3 = @<ls>-almacen.
+
+      IF sy-subrc = 0.
+        SELECT SINGLE *
+          FROM ztwm001
+          INTO @DATA(ls_ztwm001_nltyp)
+          WHERE cprog  = @ga_nemesis_aprov
+            AND param1 = @ga_param1_nltyp_aprov
+            AND param2 = @ga_param2_nemesis_aprov
+            AND param3 = @<ls>-almacen.
+
+        IF sy-subrc = 0.
+          SELECT *
+          FROM tvarvc
+          INTO TABLE @DATA(lt_tvarvc)
+          WHERE name = @ga_param1_tvarvc_name
+            AND low IN @lrng_tvarvc.  " cod_maquina
+        ENDIF.
+      ENDIF.
+***********FIN RGUILLOT GAP WM18 Bernabeu 22-4-19*********************
+    ENDIF.
+
+
+    DATA zwm_intf_bhs_l TYPE zwm_intf_bhs_l.
+
+    zwm_intf_bhs_l-msgguid = zcl_ap_proxy=>get_msgguid( ).
+    IF zwm_intf_bhs_l-msgguid IS INITIAL.
+      zwm_intf_bhs_l-msgguid = zcl_ap_string=>get_guid( ).
+    ENDIF.
+    IF NOT zwm_intf_bhs_l-msgguid IS INITIAL.
+      zwm_intf_bhs_l-fecha = sy-datum.
+      zwm_intf_bhs_l-hora = sy-uzeit.
+      zwm_intf_bhs_l-lineas = lines( input-mt_bhs_consum_bob_mat_prima_in-items ).
+      zwm_intf_bhs_l-contenido = /ui2/cl_json=>serialize( data = input-mt_bhs_consum_bob_mat_prima_in-items
+                                        compress = 'X' ).
+      DATA(l_clave_log) = zwm_intf_bhs_l-msgguid.
+    ENDIF.
+    IF l_clave_log IS INITIAL.
+      l_clave_log = condense( <ls>-trabajo_interno_bhs && '|' && <ls>-fecha_hora ).
+    ENDIF.
+
+    DATA(o_log) = NEW zcl_ap_log( object = 'PROXY_BHS' clave = l_clave_log ).
+
+* APC20240422 Determinamos si el tipo de almacén es susceptible de los nuevos cambios
+* de consumo a nivel de orden en lugar hacer un movimiento 291
+* El criterio es que lo que llegue al nº de almacén 200 será un consumo contra orden
+* y el ID será el del primer nº de necesidad que llegue
+    IF zcl_ap_parametros=>get_atributo1( clave = 'BHS' campo = 'CONSUMO_BOB_MAT_PRIM' ) = 'ORDEN'.
+      LOOP AT input-mt_bhs_consum_bob_mat_prima_in-items ASSIGNING <ls> WHERE almacen = '200'.
+        DATA(vl_cinumber) = CONV lvs_benum( <ls>-trabajo_interno_bhs(9) ).
+
+        DATA(vl_cinumber_int) = zhcl_pp_core=>s_conv_cinumber_2_internal( i_mjahr = CONV #( <ls>-fecha_hora(4) )
+                                                                          i_cinumber = vl_cinumber ).
+        "lv_id = |0{ <ls>-fecha_hora+2(2) }{ <ls>-trabajo_interno_bhs }|.
+        lv_id = vl_cinumber_int.
+        DATA(l_consumos_orden) = 'X'.
+
+
+*
+*        o_log->log( p1 = 'Procesaremos necesidad:' p2 = lv_id msgty = 'I' ).
+*        IF sy-tcode = 'SE38'.
+*          WRITE: / 'Procesaremos necesidad:', lv_id.
+*        ENDIF.
+
+** Si existe un registro con ese nº de necesidad previo, no continuamos procesando
+        IF NOT zwm_intf_bhs_l-msgguid IS INITIAL and sy-tcode ne 'ZPROXYS'.
+          SELECT SINGLE reintentos FROM zwm_intf_bhs_l
+           INTO zwm_intf_bhs_l-reintentos
+          WHERE msgguid = zwm_intf_bhs_l-msgguid.
+          IF sy-subrc = 0.
+            ADD 1 TO zwm_intf_bhs_l-reintentos.
+            UPDATE zwm_intf_bhs_l
+               SET reintentos = zwm_intf_bhs_l-reintentos
+              WHERE msgguid = zwm_intf_bhs_l-msgguid.
+
+            o_log->log( p1 = 'Ese nº de necesidad ya se procesó. Salimos' msgty = 'E' ).
+            CONCATENATE 'ZWM_' <ls>-almacen INTO g_log-object.
+            g_log-subobject = 'CONSUMO'.
+            g_log-aldate     = sy-datum.
+            g_log-altime     = sy-uzeit.
+            g_log-aluser     = sy-uname.
+            g_log-alprog     = sy-repid.
+            g_log-altcode    = sy-tcode.
+
+            CALL FUNCTION 'BAL_LOG_CREATE'
+              EXPORTING
+                i_s_log                 = g_log
+              IMPORTING
+                e_log_handle            = g_log_handle
+              EXCEPTIONS
+                log_header_inconsistent = 1
+                OTHERS                  = 2.
+            CLEAR ls_log.
+            g_msg-msgid = 'ZWM_CONSUMO'.
+            g_msg-msgno = 002.
+            g_msg-msgv1 = lv_id.
+            g_msg-msgty = 'E'.
+            g_msg-probclass = 1.
+
+            g_msg-context-tabname = 'ZWM_INTF_BHS_LOG'.
+            ls_log-cod_etiqueta = <ls>-codigo_etiqueta.
+            ASSIGN ls_log TO <l_s_my_context> CASTING.
+            g_msg-context-value = <l_s_my_context>. " id consumo en tabla
+
+            CALL FUNCTION 'BAL_LOG_MSG_ADD'
+              EXPORTING
+                i_log_handle     = g_log_handle
+                i_s_msg          = g_msg
+              EXCEPTIONS
+                log_not_found    = 1
+                msg_inconsistent = 2
+                log_is_full      = 3
+                OTHERS           = 4.
+
+            APPEND g_log_handle TO gt_log_handle.
+
+            CALL FUNCTION 'BAL_DB_SAVE'
+              EXPORTING
+                i_t_log_handle   = gt_log_handle
+              EXCEPTIONS
+                log_not_found    = 1
+                save_not_allowed = 2
+                numbering_error  = 3
+                OTHERS           = 4.
+            RETURN. "Salimos sin hace nada.
+          ENDIF.
+        ENDIF.
+
+        EXIT.
+      ENDLOOP.
+    ENDIF.
+
+    IF l_consumos_orden IS INITIAL.
+*FIN APCA20240422
+      SELECT MAX( id ) FROM zwm_intf_bhs INTO lv_id.
+      IF sy-subrc <> 0.
+        lv_id = '0000000001'.
+      ELSE.
+        lv_id = lv_id + 1.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = lv_id
+          IMPORTING
+            output = lv_id.
+      ENDIF.
+    ENDIF.
+
+* Guardamos el log en todos los casos
+    IF NOT zwm_intf_bhs_l-msgguid IS INITIAL.
+      zwm_intf_bhs_l-id = lv_id.
+      INSERT zwm_intf_bhs_l FROM zwm_intf_bhs_l.
+    ENDIF.
+
+*APC20241023 Guardamos nueva tabla con el contenido recibido del proxy.
+    DATA i_ztwm0001 TYPE TABLE OF ztwm0001.
+    MOVE-CORRESPONDING input-mt_bhs_consum_bob_mat_prima_in-items TO i_ztwm0001.
+    LOOP AT i_ztwm0001 ASSIGNING FIELD-SYMBOL(<ztwm0001>).
+      <ztwm0001>-linea = sy-tabix.
+      <ztwm0001>-msgguid = zwm_intf_bhs_l-msgguid.
+      IF l_consumos_orden = 'X'.
+        <ztwm0001>-bwart = '261'.
+      ELSE.
+        <ztwm0001>-bwart = '291'.
+      ENDIF.
+      <ztwm0001>-erdat = sy-datum.
+      <ztwm0001>-erzet = sy-uzeit.
+
+      IF strlen( <ztwm0001>-portabobinas ) = 1 AND <ztwm0001>-cod_maquina_principal = '105'.
+        __poner_ceros <ztwm0001>-portabobinas(2).
+      ENDIF.
+      INSERT ztwm0001 FROM <ztwm0001>.
+    ENDLOOP.
+
+
+    IF l_consumos_orden = 'X'.
+*      DATA(r_hu_no_auto) = NEW zcl_ap_parametros( clave = 'ZRPWM0001' )->get_rango_tabla_campo( campo = 'HU_NO_AUTO'
+*                                      campo_rango = 'VALOR'
+*                                      error_si_vacio = 'X' ).
+
+*      DATA(r_hu_auto) = NEW zcl_ap_parametros( clave = 'ZRPWM0001' )->get_rango_tabla_campo( campo = 'HU_AUTO'
+*                                      campo_rango = 'VALOR'
+*                                      error_si_vacio = 'X' ).
+
+* Procesamos inmediatamente las HUS parametrizadas como automáticas
+      DATA r_cod_eti TYPE RANGE OF ztwm0001-codigo_etiqueta.
+
+      DATA(r_maq) = NEW zcl_ap_parametros( clave = 'ZRPWM0001' )->get_rango_tabla_campo( campo = 'MAQ_NO_PROCESAR_AUTO'
+                                                                                         campo_rango = 'VALOR'
+                                                                                         sign = 'E' ).
+
+      LOOP AT input-mt_bhs_consum_bob_mat_prima_in-items ASSIGNING <ls> WHERE ( codigo_consumo = '02' OR codigo_consumo = '04' )
+*                                                                          AND cod_maquina_principal NE '105'. "Temporalmente desactivado
+                                                                          AND cod_maquina_principal IN r_maq. "Temporalmente desactivado
+*                                                                          AND codigo_etiqueta IN r_hu_auto.
+        IF NOT line_exists( r_cod_eti[ low = <ls>-codigo_etiqueta ] ).
+          APPEND VALUE #( option = 'EQ' sign = 'I' low = <ls>-codigo_etiqueta ) TO r_cod_eti.
+        ENDIF.
+      ENDLOOP.
+      IF NOT r_cod_eti IS INITIAL.
+        SET PARAMETER ID 'Z_NO_VAR_DEF' FIELD 'X' ##EXISTS.
+        SUBMIT zrpwm0001
+         AND RETURN
+         WITH s_etiq IN r_cod_eti
+         WITH s_proce = ''
+         WITH p_ejec = 'X'
+         WITH p_nolis = 'X'.
+      ENDIF.
+      RETURN. "LOS CONSUMOS CONTRA ORDEN SIIEMPRE ACABAN AQUÍ, EL OTRO CODIGO SE DEJA SÓLO PARA LOS MOVIENTOS ANTIGUOS (SI LOS HUBIERA)
+    ENDIF.
+
+
+****************************** CODIGO SÓLO PARA MOVIMIENTOS 291 *****************************************************************
+
+* Movemos los datos recibidos a la tabla de la interface y realizamos los calculos necesarios
+    LOOP AT input-mt_bhs_consum_bob_mat_prima_in-items ASSIGNING <ls>
+                                  WHERE codigo_consumo = '02'. "Sólo queremos procesar en automático los movimientos de parada de portabobinas
+*                                    AND NOT codigo_etiqueta IN r_hu_no_auto "Excluimos algunas para procesarlas manualmente
+*                                    AND NOT codigo_etiqueta IN r_hu_auto. "Excluimos las que lanzamos en automático
+      DATA(l_tabix) = sy-tabix.
+
+      CLEAR: ls_datos, lv_fecha, lv_hora.
+*FECHA_HORA
+      MOVE lv_id TO ls_datos-id.
+      MOVE <ls>-fecha_hora+0(10) TO lv_fecha.
+      CONCATENATE lv_fecha+0(4) lv_fecha+5(2) lv_fecha+8(2) INTO ls_datos-fecha.
+
+      MOVE <ls>-fecha_hora+11(8) TO lv_hora.
+      CONCATENATE lv_hora+0(2) lv_hora+3(2) lv_hora+6(2) INTO ls_datos-hora.
+
+      ls_datos-pos_fich = l_tabix.
+*numero de almacen
+      MOVE <ls>-almacen TO ls_datos-lgnum.
+*centro
+      MOVE <ls>-centro TO ls_datos-werks.
+
+*CODIGO_CONSUMO
+      MOVE <ls>-codigo_consumo TO ls_datos-cod_consumo.
+*PORTABOBINAS
+      MOVE <ls>-portabobinas TO ls_datos-porta_bobinas.
+*CODIGO_ETIQUETA
+*      MOVE <ls>-codigo_etiqueta TO ls_datos-cod_etiqueta.
+      CALL FUNCTION 'CONVERSION_EXIT_LENUM_INPUT'
+        EXPORTING
+          input           = <ls>-codigo_etiqueta
+        IMPORTING
+          output          = ls_datos-cod_etiqueta
+        EXCEPTIONS
+          check_failed    = 1
+          not_numeric     = 2
+          t344_get_failed = 3
+          wrong_length    = 4
+          OTHERS          = 5.
+
+*METROS_RESTANTES
+      MOVE <ls>-metros_restantes TO ls_datos-metros_restantes.
+*METROS_DESARROLLADOS
+      MOVE <ls>-metros_desarrollados TO ls_datos-metros_desarrollados.
+*TRABAJO_INTERNO_BHS
+      MOVE <ls>-trabajo_interno_bhs TO ls_datos-orden_bhs.
+*CALIDAD
+      MOVE <ls>-calidad TO ls_datos-calidad.
+
+***********INI RGUILLOT GAP WM18 Bernabeu 22-4-19*********************
+*      Guardado de los dos nuevos campos
+*Código máquina principal
+      MOVE <ls>-cod_maquina_principal TO ls_datos-cod_maquina_principal.
+
+*Código operario
+      MOVE <ls>-cod_operario TO ls_datos-cod_operario.
+***********FIN RGUILLOT GAP WM18 Bernabeu 22-4-19*********************
+
+* ini - cvivo - 05.11.2020 62668 Primero verificar si existe un registro pte de procesar
+      SELECT SINGLE @abap_true FROM zwm_intf_bhs
+      WHERE cod_etiqueta EQ @ls_datos-cod_etiqueta
+      AND procesado EQ @space
+      INTO @DATA(result).
+
+      IF sy-subrc EQ 0. " hay algún registro pendiente de procesar para esa etiqueta, intentamos procesar primero
+        REFRESH: lt_sel.
+
+        lt_sel = VALUE #(
+        ( selname = 'P_REPRO'   kind = 'P' sign = 'I' option = 'EQ' low = abap_true  ) " Reprocess parameter
+        ( selname = 'P_PROC'    kind = 'P' sign = 'I' option = 'EQ' low = abap_false  )
+        ( selname = 'P_NOPROC'  kind = 'P' sign = 'I' option = 'EQ' low = abap_true  ) " Only not processed
+        ( selname = 'P_ALL'     kind = 'P' sign = 'I' option = 'EQ' low = abap_false  )
+        ( selname = 'P_LGNUM'   kind = 'P' sign = 'I' option = 'EQ' low = ls_datos-lgnum  ) " Whse number
+        ( selname = 'S_ETIQ'    kind = 'S' sign = 'I' option = 'EQ' low = ls_datos-cod_etiqueta  ) " UA
+        ( selname = 'S_ID'      kind = 'S' sign = 'E' option = 'EQ' low = ls_datos-id ) " Excluímos este ID
+        ( selname = 'P_VARI'    kind = 'P' sign = 'I' option = 'EQ' low = '/ASCENDENTE' ) " variante ascendente para reprocesar en orden
+        ).
+
+        o_log->log( p1 = 'Existen registros pendientes para etiqueta' p2 = ls_datos-cod_etiqueta p3 = 'Se lanza ZRWM_INTF_BHS' msgty = 'W' ).
+        " 1 - must do a submit to tcode ZWM_CONSUMO
+        SUBMIT zrwm_intf_bhs
+        WITH SELECTION-TABLE lt_sel
+        EXPORTING LIST TO MEMORY
+          AND RETURN.
+
+        WAIT UP TO 1 SECONDS. " por si acaso
+      ENDIF.
+* fin - cvivo - 05.11.2020
+
+      " cvivo - descartar duplicados si activado
+      IF duplicados IS NOT INITIAL.
+        SELECT SINGLE @abap_true FROM zwm_intf_bhs
+          WHERE cod_etiqueta EQ @ls_datos-cod_etiqueta
+            AND orden_bhs EQ @ls_datos-orden_bhs
+            AND fecha EQ @ls_datos-fecha
+            AND hora EQ @ls_datos-hora
+          INTO @DATA(exists).
+
+        IF sy-subrc EQ 0.
+          o_log->log( p1 = 'Registro duplicado, no se procesa' msgty = 'E' ).
+          CONTINUE. " lo descartamos
+        ENDIF.
+      ENDIF.
+
+      " cvivo - 65400 - Sólo HPX, obtener necesidad a partir de consumo BHS
+      IF ls_datos-lgnum EQ '200'. " detesto hardcodes, pero en este caso no hay reutilización posible en el futuro
+        " para que el informe de trazabilidad identifique la necesidad y los pedidos debe tener informado: orden bhs correcta (=ltbk-benum),
+        " nlpla correcta (en cod_estacion) y rsnum correcta (la obtenemos desde el tbnum que cogemos con el benum)
+
+
+        " primero vamos a montar el CI number bien desde orden_bhs
+*        DATA: str1 TYPE string,
+*              str2 TYPE string,
+*              str3 TYPE string.
+*
+*        str1 = ls_datos-orden_bhs(4).
+*        str2 = ls_datos-orden_bhs+4(2). REPLACE '0' WITH space INTO str2.
+*        str3 = ls_datos-orden_bhs+6(1).
+*
+*        ls_datos-orden_bhs = |{ str1 } { str2 } { str3 }|.
+*        DATA(l_benum) = CONV lvs_benum( ls_datos-orden_bhs ).
+
+        vl_cinumber     = CONV lvs_benum( ls_datos-orden_bhs(9) ).
+        vl_cinumber_int = zhcl_pp_core=>s_conv_cinumber_2_internal( i_mjahr = ls_datos-fecha(4)
+                                                                    i_cinumber = vl_cinumber ).
+        DATA(l_benum) = vl_cinumber_int.
+
+
+
+
+
+        " ahora vamos a montar la ubicación desde el PORTA_BOBINAS
+        ls_datos-porta_bobinas = |BHS{ ls_datos-porta_bobinas+1 }|.
+
+        "buscamos la NT
+        SELECT SINGLE * FROM ltbk
+          INTO @DATA(ls_ltbk)
+          WHERE lgnum EQ @ls_datos-lgnum
+            AND betyp EQ 'O'
+            AND bwlvs EQ '919'
+            AND benum EQ @l_benum
+            AND nlpla EQ @ls_datos-porta_bobinas
+            AND statu NE 'E'. " tratada finalmente
+
+        IF sy-subrc EQ 0.
+          ls_datos-tbnum = ls_ltbk-tbnum.
+
+          DATA(ls_resb) = zcl_wm_nt_generic=>get_resb_for_nt( is_ltbk = ls_ltbk
+                                                              iv_only_open = abap_false ).
+
+          IF ls_resb IS NOT INITIAL.
+            ls_datos-rsnum = ls_resb-rsnum.
+            ls_datos-rspos = ls_resb-rspos.
+            ls_datos-rsart = ls_resb-rsart.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      APPEND ls_datos TO lt_datos.
+
+      CLEAR: ls_resb, ls_ltbk.
+    ENDLOOP.
+    IF sy-subrc NE 0.
+      RETURN. "No habia ningún movimiento 02, salimos sin grabar nada
+    ENDIF.
+
+    MODIFY zwm_intf_bhs FROM TABLE lt_datos.
+    COMMIT WORK AND WAIT.
+
+* cvivo - 60590 - Log SLG1 en consumos
+    CONCATENATE 'ZWM_' ls_datos-lgnum INTO g_log-object.
+    g_log-subobject = 'CONSUMO'.
+    g_log-aldate     = sy-datum.
+    g_log-altime     = sy-uzeit.
+    g_log-aluser     = sy-uname.
+    g_log-alprog     = sy-repid.
+    g_log-altcode    = sy-tcode.
+
+    CALL FUNCTION 'BAL_LOG_CREATE'
+      EXPORTING
+        i_s_log                 = g_log
+      IMPORTING
+        e_log_handle            = g_log_handle
+      EXCEPTIONS
+        log_header_inconsistent = 1
+        OTHERS                  = 2.
+
+    LOOP AT lt_datos ASSIGNING FIELD-SYMBOL(<lin>).
+*APC Necesitamos en <ls> la fila exacta origen
+      READ TABLE input-mt_bhs_consum_bob_mat_prima_in-items ASSIGNING <ls> INDEX <lin>-pos_fich.
+
+      CLEAR: l_gramaje, l_ancho, ls_lqua.
+
+      " cvivo - 61834 - Para HPX si no tiene metros desarrollados es un fallo de BHS
+      READ TABLE gat_hard WITH KEY param1 = 'STOP SIN DESARROLLA.' TRANSPORTING NO FIELDS.
+      IF sy-subrc EQ 0 AND <lin>-metros_desarrollados IS INITIAL.
+        <lin>-message = 'No se contabiliza por no tener metros desarrollados'.
+        <lin>-procesado = abap_true.
+      ENDIF.
+
+* ini - cvivo - 08.01.2019 Marcar empalmes como procesados
+      IF <lin>-cod_etiqueta CS 'BHSBHS' AND <lin>-metros_restantes LE 0 AND <lin>-metros_desarrollados LE 800.
+        <lin>-message = 'No se contabiliza por ser un empalme en BHS'.
+        <lin>-procesado = abap_true.
+      ENDIF.
+* fin - cvivo - 08.01.2019 Marcar empalmes como procesados
+
+      IF <lin>-cod_etiqueta IS NOT INITIAL.
+        SELECT SINGLE * INTO ls_lqua
+          FROM lqua
+          WHERE lgnum = <lin>-lgnum AND
+                lenum = <lin>-cod_etiqueta AND
+                verme > 0.
+
+        IF NOT ls_lqua-lenum IS INITIAL.
+          <lin>-matnr = ls_lqua-matnr.
+          <lin>-charg = ls_lqua-charg.
+
+          SELECT matnr, meinh INTO TABLE @DATA(lt_marm)
+          FROM marm
+          WHERE matnr = @ls_lqua-matnr.
+
+          READ TABLE lt_marm INTO DATA(ls_marm) WITH KEY meinh = 'M'.
+          IF sy-subrc = 0.
+            <lin>-meinh = ls_marm-meinh.
+          ELSE.
+            CLEAR: ls_marm.
+            READ TABLE lt_marm INTO ls_marm WITH KEY meinh = 'ST'.
+            IF sy-subrc = 0.
+              <lin>-meinh = ls_marm-meinh.
+            ELSE.
+              <lin>-message = 'Error en UMA para el material, no tiene M o UN'.
+            ENDIF.
+          ENDIF.
+
+          IF <lin>-meinh NE ls_lqua-meins.
+            f_cambia_unidad( EXPORTING pe_matnr = ls_lqua-matnr
+                                                  pe_cant = ls_lqua-verme
+                                                  pe_gmein = ls_lqua-meins
+                                                  pe_unit_conv = <lin>-meinh
+                                       IMPORTING  pc_cant = lv_aux ).
+            <lin>-stock_sap = lv_aux . " stock WM en UMA
+          ELSE.
+            <lin>-stock_sap = ls_lqua-verme. " stock WM en UMA
+          ENDIF.
+
+          IF <lin>-meinh IS NOT INITIAL.
+            SELECT SINGLE *
+              INTO @DATA(ls_tolerancia)
+              FROM zwm_tolerancia
+              WHERE werks = @ls_lqua-werks AND
+                    lgort = @ls_lqua-lgort AND
+                    meins = @<lin>-meinh.
+            IF ls_tolerancia-dinamico IS INITIAL.
+              MOVE ls_tolerancia-tolerancia TO <lin>-tolerancia.
+              MOVE <lin>-meinh TO <lin>-meins_tol.
+            ELSE.
+              MOVE <lin>-matnr+10(4) TO l_gramaje.
+              MOVE <lin>-matnr+14(4) TO l_ancho.
+              <lin>-tolerancia = ( ls_tolerancia-minutos * ls_tolerancia-velocidad * l_gramaje * l_ancho ) / 1000000.
+              <lin>-tolerancia = trunc( <lin>-tolerancia ).
+              MOVE 'KG' TO <lin>-meins_tol.
+            ENDIF.
+          ENDIF.
+
+          SELECT SINGLE * FROM mchb
+            WHERE charg EQ @ls_lqua-charg
+              AND lgort EQ @ls_lqua-lgort
+              AND werks EQ @ls_lqua-werks
+              AND clabs > 0
+            INTO @DATA(ls_mchb).
+
+          <lin>-stock_sap_kg = ls_mchb-clabs. " stock en KG
+        ENDIF.
+      ENDIF.
+
+      <lin>-cant_dif = <lin>-stock_sap - <lin>-metros_restantes. " diferencia en UMA
+
+      CLEAR: lv_aux, lv_cant.
+      lv_cant = <lin>-metros_restantes.
+
+*   Convertimos a KG
+      f_cambia_unidad( EXPORTING  pe_matnr = ls_lqua-matnr
+                                  pe_cant =  lv_cant
+                                  pe_gmein = <lin>-meinh
+                                  pe_unit_conv = 'KG'
+                       IMPORTING  pc_cant = lv_aux ).
+
+      l_restantes_kg = trunc( lv_aux ).
+      <lin>-cant_dif_kg = <lin>-stock_sap_kg - l_restantes_kg. " diferencia en UMA
+
+      l_restantes = <lin>-metros_restantes.
+
+*        Se ejecuta lo que había antes de la modificación para Bernabeu
+      IF abs( l_restantes ) LE <lin>-tolerancia AND ls_tolerancia-dinamico IS INITIAL. " consumo total no dinámico
+        <lin>-cant_consumo = <lin>-stock_sap.
+        <lin>-cant_consumo_kg = <lin>-stock_sap_kg.
+      ELSEIF abs( l_restantes_kg ) LE <lin>-tolerancia AND ls_tolerancia-dinamico IS NOT INITIAL.  " consumo total dinámico
+        <lin>-cant_consumo = <lin>-stock_sap.
+        <lin>-cant_consumo_kg = <lin>-stock_sap_kg.
+      ELSE. " consumo parcial
+        <lin>-cant_consumo = <lin>-cant_dif.
+        <lin>-cant_consumo_kg = <lin>-cant_dif_kg.
+      ENDIF.
+
+      IF <lin>-procesado IS INITIAL. " si hay error no hacemos movimiento  " cvivo - 61834
+
+        IF l_consumos_orden = 'X'.
+          IF sy-tcode = 'SE38'.
+            WRITE: / 'Se intenta consumo contra orden de necesidad:', <lin>-orden_bhs, 'por', <lin>-cant_consumo_kg, 'KG'.
+          ENDIF.
+          o_log->log( p1 = 'Se intenta consumo desde PROXY contra orden de necesidad:' p2 = <lin>-orden_bhs p3 = 'por' p4 = <lin>-cant_consumo_kg p5 = 'KG' msgty = 'I' ).
+          <lin>-bwart = '261'. "Identificación del tipo de movimiento que se intenta hacer
+
+          consumo_contra_orden( EXPORTING input = <ls>
+                                          o_log = o_log
+                                CHANGING  intf_bhs   = <lin> ).
+
+          IF NOT zwm_intf_bhs_l IS INITIAL.
+            IF <lin>-mblnr IS INITIAL.
+              zwm_intf_bhs_l-message = <lin>-message.
+            ELSE.
+              zwm_intf_bhs_l-mblnr = <lin>-mblnr.
+            ENDIF.
+            MODIFY zwm_intf_bhs_l FROM zwm_intf_bhs_l.
+
+* APC20241023 Sólo a titulo informativos guardadmos el ID procesado (en un futuro esto no se hará aqui, sino sólo en report ZRPWM0001)
+            READ TABLE i_ztwm0001 ASSIGNING <ztwm0001> WITH KEY linea = <lin>-pos_fich.
+            IF sy-subrc = 0.
+              MOVE-CORRESPONDING <lin> TO <ztwm0001>.
+              MODIFY ztwm0001 FROM <ztwm0001>.
+            ENDIF.
+          ENDIF.
+        ELSE.
+          <lin>-bwart = '291'. "Identificación del tipo de movimiento que se intenta hacer
+          crea_mov_291( EXPORTING pi_lqua = ls_lqua
+                                  pi_orden_bhs = <lin>-orden_bhs
+                                  pi_fecha = <lin>-fecha
+                                  pi_cant = <lin>-cant_consumo_kg
+                                  pi_gmein = 'KG'
+                        IMPORTING pe_mblnr = <lin>-mblnr
+                                  pe_mjahr = <lin>-mjahr
+                                  pe_message = <lin>-message ).
+
+          IF <lin>-mblnr IS NOT INITIAL AND <lin>-mjahr IS NOT INITIAL.
+            crea_ot( EXPORTING pi_lqua = ls_lqua
+                               pi_mblnr = <lin>-mblnr
+                               pi_mjahr = <lin>-mjahr
+                     IMPORTING pe_tbnum = <lin>-tbnum
+                               pe_tanum = <lin>-tanum ).
+
+            <lin>-procesado = abap_true.
+            <lin>-contabilizado = abap_true. "" cvivo - 61834 - Añado control de contabilización para entendimiento de usuarios
+
+************INI RGUILLOT GAP WM18 Bernabeu 11-6-19********************* " cvivo, no creo que sea necesario por ahora
+**        En el caso que falle la segunda OT, tenemos los datos actualizados en la tabla
+*        MODIFY zwm_intf_bhs FROM TABLE lt_datos.
+*        COMMIT WORK AND WAIT.
+************FIN RGUILLOT GAP WM18 Bernabeu 11-6-19*********************
+
+***********INI RGUILLOT GAP WM18 Bernabeu 25-4-19*********************
+            READ TABLE gat_hard WITH KEY param1 = 'IMPRESION'
+                                         cprog  = 'INTF_BHS_BOBINA' TRANSPORTING NO FIELDS.
+
+            IF l_restantes > 0 AND sy-subrc EQ 0.
+*             Se lanza la impresión y se setea el Número de unidad de almacén
+*            con el código de etiqueta
+              SET PARAMETER ID 'LEN' FIELD <lin>-cod_etiqueta.
+
+*          Se exporta a memoria esta variable para no tocar
+*          pantalla selección del programa de impresión ZIMPRESION_UA
+*          En dicho programa, se hace el import
+              lv_vengo_inter_consumo = 'X'.
+
+              EXPORT lv_vengo_inter_consumo = lv_vengo_inter_consumo
+              TO MEMORY ID 'VENGO_CONSUMO' .
+
+              lv_cod_maq_portabo = <lin>-porta_bobinas.
+
+              EXPORT lv_cod_maq_portabo = lv_cod_maq_portabo
+              TO MEMORY ID 'MAQUINA' .
+
+              CLEAR: ls_rspar.
+              REFRESH: lt_rspar.
+
+              ls_rspar-kind = 'P'.
+              ls_rspar-selname = 'P_LGNUM'.
+              ls_rspar-sign = 'I'.
+              ls_rspar-option = 'EQ'.
+              ls_rspar-low = <lin>-lgnum.
+              APPEND ls_rspar TO lt_rspar.
+
+              ls_rspar-kind = 'S'.
+              ls_rspar-selname = 'S_LENUM'.
+              ls_rspar-sign = 'I'.
+              ls_rspar-option = 'EQ'.
+              ls_rspar-low = <lin>-cod_etiqueta.
+              APPEND ls_rspar TO lt_rspar.
+
+              SUBMIT zimpresion_ua WITH SELECTION-TABLE lt_rspar AND RETURN.
+            ENDIF.
+***********FIN RGUILLOT GAP WM18 Bernabeu 25-4-19*********************
+          ENDIF.
+        ENDIF.
+
+***********INI RGUILLOT GAP WM18 Bernabeu 22-4-19*********************
+        " hay pico, reubicar
+        IF l_restantes > 0  AND ls_ztwm001_bwlvs IS NOT INITIAL AND ls_ztwm001_nltyp IS NOT INITIAL
+                            AND lt_tvarvc[] IS NOT INITIAL AND <lin>-mblnr IS NOT INITIAL AND <lin>-mjahr IS NOT INITIAL.
+          TRY .
+              CLEAR: lv_bwlvs_exp, lv_nltyp_exp, lv_nlpla_exp, lv_tanum,
+              lv_nltyp, lv_nlber, lv_nlpla, lv_nppos.
+
+              REFRESH: lt_ltap_move_su, lt_ltak, lt_ltap_vb.
+
+              WRITE ls_ztwm001_bwlvs-valor1 TO lv_bwlvs_exp.
+              CONDENSE lv_bwlvs_exp.
+
+              WRITE ls_ztwm001_nltyp-valor1 TO lv_nltyp_exp.
+              CONDENSE lv_nltyp_exp.
+
+              READ TABLE lt_tvarvc INTO DATA(ls_tvarvc)
+              WITH KEY low = <lin>-porta_bobinas.  " cod_maquina
+
+              WRITE ls_tvarvc-high TO lv_nlpla_exp.
+              CONDENSE lv_nlpla_exp.
+
+              CALL FUNCTION 'L_TO_CREATE_MOVE_SU'
+                EXPORTING
+                  i_lenum               = <lin>-cod_etiqueta
+                  i_bwlvs               = lv_bwlvs_exp
+                  i_nltyp               = lv_nltyp_exp
+                  i_nlpla               = lv_nlpla_exp
+                IMPORTING
+                  e_tanum               = lv_tanum
+                  e_nltyp               = lv_nltyp
+                  e_nlber               = lv_nlber
+                  e_nlpla               = lv_nlpla
+                  e_nppos               = lv_nppos
+                TABLES
+                  t_ltap_move_su        = lt_ltap_move_su
+                  t_ltak                = lt_ltak
+                  t_ltap_vb             = lt_ltap_vb
+                EXCEPTIONS
+                  not_confirmed_to      = 1
+                  foreign_lock          = 2
+                  bwlvs_wrong           = 3
+                  betyp_wrong           = 4
+                  nltyp_wrong           = 5
+                  nlpla_wrong           = 6
+                  nltyp_missing         = 7
+                  nlpla_missing         = 8
+                  squit_forbidden       = 9
+                  lgber_wrong           = 10
+                  xfeld_wrong           = 11
+                  drukz_wrong           = 12
+                  ldest_wrong           = 13
+                  no_stock_on_su        = 14
+                  su_not_found          = 15
+                  update_without_commit = 16
+                  no_authority          = 17
+                  benum_required        = 18
+                  ltap_move_su_wrong    = 19
+                  lenum_wrong           = 20
+                  error_message         = 22
+                  OTHERS                = 21.
+              IF sy-subrc <> 0.
+                <lin>-message = 'Procesado, pero error al crear segunda OT'.
+
+                MODIFY zwm_intf_bhs FROM TABLE lt_datos.
+                COMMIT WORK AND WAIT.
+              ENDIF.
+
+            CATCH cx_root INTO lref_exc.
+              lv_error = lref_exc->get_text( ).
+              WRITE lv_error TO <lin>-message.
+
+              MODIFY zwm_intf_bhs FROM TABLE lt_datos.
+              COMMIT WORK AND WAIT.
+          ENDTRY.
+        ENDIF.
+      ENDIF.
+***********FIN RGUILLOT GAP WM18 Bernabeu 22-4-19*********************
+      CLEAR: ls_tolerancia.
+
+* cvivo - 60590 - Log SLG1 en consumos
+      CLEAR: g_msg, ls_log.
+      IF <lin>-message IS NOT INITIAL.
+        IF <lin>-procesado IS INITIAL. " error
+          g_msg-msgty = 'E'.
+        ELSE. " success
+          g_msg-msgty = 'S'.
+        ENDIF.
+
+        g_msg-msgid = 'ZWM_CONSUMO'.
+        g_msg-msgno = 000.
+        g_msg-msgv1 = <lin>-message(50).
+        g_msg-msgv2 = <lin>-message+50(50).
+        g_msg-msgv3 = <lin>-message+100(50).
+        g_msg-msgv4 = <lin>-message+150(50).
+
+        g_msg-context-tabname = 'ZWM_INTF_BHS_LOG'.
+        MOVE-CORRESPONDING <lin> TO ls_log.
+        ASSIGN ls_log TO <l_s_my_context> CASTING.
+        g_msg-context-value = <l_s_my_context>. " id consumo en tabla
+
+        CALL FUNCTION 'BAL_LOG_MSG_ADD'
+          EXPORTING
+            i_log_handle     = g_log_handle
+            i_s_msg          = g_msg
+          EXCEPTIONS
+            log_not_found    = 1
+            msg_inconsistent = 2
+            log_is_full      = 3
+            OTHERS           = 4.
+
+* cvivo - 60590 - Log SLG1 en consumos
+        APPEND g_log_handle TO gt_log_handle.
+
+        CALL FUNCTION 'BAL_DB_SAVE'
+          EXPORTING
+            i_t_log_handle   = gt_log_handle
+          EXCEPTIONS
+            log_not_found    = 1
+            save_not_allowed = 2
+            numbering_error  = 3
+            OTHERS           = 4.
+
+        REFRESH: gt_log_handle.
+      ENDIF.
+
+      IF <lin>-procesado IS INITIAL. " cvivo - 58201 - Mail tras error de consumo
+        envio_mail_no_procesado( EXPORTING p_datos = <lin> ).
+      ENDIF.
+    ENDLOOP.
+
+    MODIFY zwm_intf_bhs FROM TABLE lt_datos.
+    COMMIT WORK AND WAIT.
+
+    " cvivo - 64459 Contingencia final
+    IF duplicados IS INITIAL. " si voy a procesar duplicados, evito esto para no lanzar mensajes en log
+      LOOP AT input-mt_bhs_consum_bob_mat_prima_in-items INTO DATA(item).
+        CALL FUNCTION 'CONVERSION_EXIT_LENUM_INPUT'
+          EXPORTING
+            input           = item-codigo_etiqueta
+          IMPORTING
+            output          = item-codigo_etiqueta
+          EXCEPTIONS
+            check_failed    = 1
+            not_numeric     = 2
+            t344_get_failed = 3
+            wrong_length    = 4
+            OTHERS          = 5.
+
+        DO 2 TIMES.
+          SELECT SINGLE @abap_true FROM zwm_intf_bhs
+            WHERE cod_etiqueta EQ @item-codigo_etiqueta
+              AND orden_bhs EQ @item-trabajo_interno_bhs
+            INTO @DATA(check).
+
+          IF check IS INITIAL.
+            WAIT UP TO 1 SECONDS.
+          ELSE.
+            EXIT.
+          ENDIF.
+        ENDDO.
+
+        IF check IS INITIAL. " si no hay entrada, grabamo error en log
+          CLEAR ls_log.
+          g_msg-msgid = 'ZWM_CONSUMO'.
+          g_msg-msgno = 001.
+          g_msg-msgv1 = item-codigo_etiqueta.
+          g_msg-msgv2 = item-trabajo_interno_bhs.
+          g_msg-msgv3 = item-fecha_hora.
+          g_msg-msgty = 'E'.
+          g_msg-probclass = 1.
+
+          g_msg-context-tabname = 'ZWM_INTF_BHS_LOG'.
+          ls_log-cod_etiqueta = item-codigo_etiqueta.
+          ASSIGN ls_log TO <l_s_my_context> CASTING.
+          g_msg-context-value = <l_s_my_context>. " id consumo en tabla
+
+          CALL FUNCTION 'BAL_LOG_MSG_ADD'
+            EXPORTING
+              i_log_handle     = g_log_handle
+              i_s_msg          = g_msg
+            EXCEPTIONS
+              log_not_found    = 1
+              msg_inconsistent = 2
+              log_is_full      = 3
+              OTHERS           = 4.
+
+* cvivo - 60590 - Log SLG1 en consumos
+          APPEND g_log_handle TO gt_log_handle.
+
+          CALL FUNCTION 'BAL_DB_SAVE'
+            EXPORTING
+              i_t_log_handle   = gt_log_handle
+            EXCEPTIONS
+              log_not_found    = 1
+              save_not_allowed = 2
+              numbering_error  = 3
+              OTHERS           = 4.
+
+          REFRESH: gt_log_handle.
+
+          MESSAGE a001(zwm_consumo). " que registre DUMP
+        ENDIF.
+
+        CLEAR: check.
+      ENDLOOP.
+    ENDIF.
+
+  ENDMETHOD.

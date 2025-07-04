@@ -1,0 +1,128 @@
+FUNCTION zswm_ui5_aprov_bulto.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(VP_WERKS) TYPE  WERKS_D
+*"     VALUE(VP_LGORT_O) TYPE  LGORT_D
+*"     VALUE(VP_LGORT_D) TYPE  LGORT_D OPTIONAL
+*"     VALUE(VP_LENUM) TYPE  LENUM
+*"  EXPORTING
+*"     REFERENCE(TP_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+
+
+  SELECT SINGLE lein~lenum, lein~lgnum, lqua~werks, lqua~lgort, lqua~matnr, lqua~charg, lqua~verme, lqua~meins,
+                mara~mtart
+    INTO @DATA(wl_lqua)
+    FROM lein INNER JOIN lqua ON lqua~lenum = lein~lenum AND
+                                 lqua~lgnum = lein~lgnum
+              INNER JOIN mara ON mara~matnr = lqua~matnr
+    WHERE lein~lenum = @vp_lenum AND
+          lqua~werks = @vp_werks AND
+          lqua~lgort = @vp_lgort_o.
+  IF sy-subrc <> 0.
+    PERFORM mensaje USING 'E' 'ZSWM_UI5' '071' vp_lenum space space space CHANGING tp_return.
+    RETURN.
+  ENDIF.
+
+  DATA: lt_goodsmvt_item TYPE bapi2017_gm_item_create_t.
+
+  DATA: ls_goodsmvt_header TYPE bapi2017_gm_head_01,
+        ls_goodsmvt_item   TYPE bapi2017_gm_item_create.
+
+  DATA: lv_mblnr TYPE bapi2017_gm_head_ret-mat_doc,
+        lv_mjahr TYPE bapi2017_gm_head_ret-doc_year.
+
+
+  IF vp_lgort_d IS INITIAL.
+    SELECT SINGLE atributo1
+      INTO vp_lgort_d
+      FROM zparametros
+      WHERE clave     = 'UI5_ALM_PT'    AND
+            campo     = 'ALMACEN_APRO'  AND
+            valor     = wl_lqua-lgnum   AND
+            valor2    = wl_lqua-mtart.
+    IF sy-subrc <> 0.
+      PERFORM mensaje USING 'E' 'SY' '002' 'Falta parametrización de almacén apro.' space space space CHANGING tp_return.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+
+  ""PREPARE DATA
+
+  "HEADER
+  ls_goodsmvt_header-pstng_date = sy-datum.
+  ls_goodsmvt_header-doc_date   = sy-datum.
+
+  "ITEM
+  ls_goodsmvt_item-plant       = wl_lqua-werks.
+  ls_goodsmvt_item-stge_loc    = wl_lqua-lgort.
+  ls_goodsmvt_item-move_stloc  = vp_lgort_d.
+  ls_goodsmvt_item-material    = wl_lqua-matnr.
+  ls_goodsmvt_item-batch       = wl_lqua-charg.
+  ls_goodsmvt_item-move_type   = '311'.
+  ls_goodsmvt_item-entry_qnt   = wl_lqua-verme.
+  ls_goodsmvt_item-entry_uom   = wl_lqua-meins.
+  ls_goodsmvt_item-unload_pt   = |{ wl_lqua-lenum ALPHA = OUT }|.
+  APPEND ls_goodsmvt_item TO lt_goodsmvt_item.
+
+  "CREATE MVT
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header  = ls_goodsmvt_header
+      goodsmvt_code    = '04'
+    IMPORTING
+      materialdocument = lv_mblnr
+      matdocumentyear  = lv_mjahr
+    TABLES
+      goodsmvt_item    = lt_goodsmvt_item
+      return           = tp_return.
+
+  IF line_exists( tp_return[ type = 'E' ] ).
+    RETURN.
+  ENDIF.
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+    EXPORTING
+      wait = 'X'.
+
+
+
+  SELECT SINGLE *
+    FROM mseg
+    INTO @DATA(ls_mseg)
+    WHERE mblnr = @lv_mblnr AND
+          mjahr = @lv_mjahr.
+
+  IF sy-subrc = 0.
+    TRY.
+        DATA(rl_wm_core) = NEW zhcl_wm_core( i_werks       = vp_werks
+                                             i_lgort       = vp_lgort_o ).
+        DATA(vl_tanum) = rl_wm_core->create_to_4_mblnr_zeile( i_mblnr       =  ls_mseg-mblnr
+                                                              i_mblpo       =  ls_mseg-zeile
+                                                              i_mjahr       =  ls_mseg-mjahr
+                                                              i_lenum       =  vp_lenum    ).
+      CATCH zcx_exception INTO DATA(rl_exc).
+        CALL FUNCTION 'BAPI_GOODSMVT_CANCEL'
+          EXPORTING
+            materialdocument = lv_mblnr
+            matdocumentyear  = lv_mjahr
+          TABLES
+            return           = tp_return.
+        IF line_exists( tp_return[ type = 'E' ] ).
+          RETURN.
+        ENDIF.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+
+        DATA(wl_key)     = rl_exc->if_t100_message~t100key.
+        PERFORM mensaje USING 'E' wl_key-msgid wl_key-msgno wl_key-attr1 wl_key-attr2 wl_key-attr3 wl_key-attr4 CHANGING tp_return.
+
+    ENDTRY.
+  ENDIF.
+
+
+
+
+ENDFUNCTION.

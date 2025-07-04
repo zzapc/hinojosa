@@ -1,0 +1,156 @@
+FUNCTION zui5_cm_mod_cant_bloqueo_zz.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_ACCION) TYPE  FLAG OPTIONAL
+*"     VALUE(I_MATNR) TYPE  MATNR
+*"     VALUE(I_WERKS) TYPE  WERKS_D
+*"     VALUE(I_LGORT) TYPE  LGORT_D
+*"     VALUE(I_TIPO_BLOQUEO) TYPE  ZSCM_TIPO_BLOQUEO
+*"     VALUE(I_CHARG) TYPE  CHARG_D
+*"     VALUE(I_CANTIDAD) TYPE  MENGE_D
+*"     VALUE(I_CANTIDAD_UOM) TYPE  MEINS
+*"  EXPORTING
+*"     VALUE(O_OK) TYPE  FLAG
+*"     VALUE(O_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+  CONSTANTS: n_veces TYPE i VALUE 5.
+  DATA: lt_return              TYPE bapiret2_t,
+        bloqueo_activo         TYPE flag,
+        lv_cantidad_montaje    TYPE menge_d,
+
+        lv_cantidad_defectuosa TYPE menge_d.
+
+  DO n_veces TIMES.
+    "Bloqueamos el objeto de la tabla MCHB
+    CLEAR: bloqueo_activo.
+    CALL FUNCTION 'ENQUEUE_EZCM_MCHB'
+      EXPORTING
+        matnr          = i_matnr
+        werks          = i_werks
+        lgort          = i_lgort
+        charg          = i_charg
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+    IF sy-subrc = 0.
+      "Recuperamos los valores actuales de ZZ de las tabla MCHB.
+      SELECT SINGLE a~zzcm_montaje, a~zzcm_defectuosa, b~meins
+        FROM mchb AS a
+        INNER JOIN mara AS b ON b~matnr = a~matnr
+        INTO @DATA(ls_cantidades)
+        WHERE  a~matnr = @i_matnr AND a~werks = @i_werks AND a~lgort = @i_lgort AND a~charg = @i_charg.
+      IF sy-subrc = 0.
+        "Comprobamos que la unidad de la cantidad sea la base
+        IF ls_cantidades-meins NE i_cantidad_uom.
+          CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+            EXPORTING
+              i_matnr              = i_matnr
+              i_in_me              = i_cantidad_uom
+              i_out_me             = ls_cantidades-meins
+              i_menge              = i_cantidad
+            IMPORTING
+              e_menge              = i_cantidad
+            EXCEPTIONS
+              error_in_application = 1
+              error                = 2
+              OTHERS               = 3.
+          IF sy-subrc <> 0.
+            APPEND INITIAL LINE TO lt_return ASSIGNING field-symbol(<ls_return>).
+            <ls_return>-id = sy-msgid.
+            <ls_return>-type = sy-msgty.
+            <ls_return>-number = sy-msgno.
+            <ls_return>-message_v1 = sy-msgv1.
+            <ls_return>-message_v2 = sy-msgv2.
+            <ls_return>-message_v3 = sy-msgv3.
+            <ls_return>-message_v3 = sy-msgv4.
+
+            EXIT.
+          ENDIF.
+        ENDIF.
+
+        "Calculamos la cantidad dependiendo de la acción.
+        CASE i_accion.
+          WHEN 'X'. "Añadir
+            lv_cantidad_montaje = ls_cantidades-zzcm_montaje + i_cantidad.
+            lv_cantidad_defectuosa = ls_cantidades-zzcm_defectuosa + i_cantidad.
+          WHEN ''.
+            lv_cantidad_montaje = ls_cantidades-zzcm_montaje - i_cantidad.
+            lv_cantidad_defectuosa = ls_cantidades-zzcm_defectuosa - i_cantidad.
+
+        ENDCASE.
+        "Desbloqueamos el objeto.
+        CALL FUNCTION 'DEQUEUE_EZCM_MCHB'
+          EXPORTING
+*           matnr = i_matnr
+            werks = i_werks
+            lgort = i_lgort
+            charg = i_charg.
+        IF sy-subrc = 0.
+          CASE i_tipo_bloqueo.
+            WHEN 'M'. "Bloqueo Montaje
+              UPDATE mchb SET zzcm_montaje = lv_cantidad_montaje WHERE matnr = i_matnr AND werks = i_werks AND lgort = i_lgort AND charg = i_charg.
+              COMMIT WORK.
+            WHEN 'D'. "Bloqueo defectuoso
+              UPDATE mchb SET zzcm_defectuosa = lv_cantidad_defectuosa WHERE matnr = i_matnr AND werks = i_werks AND lgort = i_lgort AND charg = i_charg..
+              COMMIT WORK.
+          ENDCASE.
+          IF sy-subrc = 0.
+            o_ok = 'X'.
+            APPEND INITIAL LINE TO lt_return ASSIGNING <ls_return>.
+            <ls_return>-id = 'ZUI5_CM'.
+            <ls_return>-type = 'S'.
+            <ls_return>-number = '012'.
+            <ls_return>-message_v1 = |{ i_matnr ALPHA = OUT }|.
+            <ls_return>-message_v2 = i_werks.
+            <ls_return>-message_v3 = i_lgort.
+            <ls_return>-message_v3 = i_charg.
+            EXIT.
+          ELSE.
+            WAIT UP TO 1 SECONDS.
+          ENDIF.
+
+        ENDIF.
+      ELSE.
+        APPEND INITIAL LINE TO lt_return ASSIGNING <ls_return>.
+        <ls_return>-id = 'ZUI5_CM'.
+        <ls_return>-type = 'W'.
+        <ls_return>-number = '014'.
+        <ls_return>-message_v1 = |{ i_matnr ALPHA = OUT }|.
+        <ls_return>-message_v2 = i_werks.
+        <ls_return>-message_v3 = i_lgort.
+        <ls_return>-message_v3 = i_charg.
+        EXIT.
+      ENDIF.
+    ELSE.
+      bloqueo_activo = 'X'.
+    ENDIF.
+  ENDDO.
+  IF sy-subrc NE 0. "Un posible error de actualización del dato
+    IF bloqueo_activo = 'X'.
+      APPEND INITIAL LINE TO lt_return ASSIGNING <ls_return>.
+      <ls_return>-id = sy-msgid.
+      <ls_return>-type = sy-msgty.
+      <ls_return>-number = sy-msgno.
+      <ls_return>-message_v1 = sy-msgv1.
+      <ls_return>-message_v2 = sy-msgv2.
+      <ls_return>-message_v3 = sy-msgv3.
+      <ls_return>-message_v3 = sy-msgv4.
+    ENDIF.
+
+    APPEND INITIAL LINE TO lt_return ASSIGNING <ls_return>.
+    <ls_return>-id = 'ZUI5_CM'.
+    <ls_return>-type = 'W'.
+    <ls_return>-number = '013'.
+    <ls_return>-message_v1 = |{ i_matnr ALPHA = OUT }|.
+    <ls_return>-message_v2 = i_werks.
+    <ls_return>-message_v3 = i_lgort.
+    <ls_return>-message_v3 = i_charg.
+  ENDIF.
+
+  APPEND LINES OF lt_return TO o_return.
+
+
+
+ENDFUNCTION.

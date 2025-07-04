@@ -1,0 +1,189 @@
+FUNCTION zui5_cm_bapi_po_change_dev_pl.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_HEADER) TYPE  ZSUIS_CM_ENTREGAS_TRASLADOS
+*"     VALUE(IT_POSITIONS) TYPE  ZSUITT_CM_POSICIONES_ENT_DEV
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+
+  DATA: purchaseorder LIKE  bapimepoheader-po_number,
+        poitem        TYPE TABLE OF bapimepoitem,
+        lt_return     TYPE bapiret2_t,
+        l_posnr       TYPE i,
+        poitemx       TYPE TABLE OF  bapimepoitemx,
+        poheader      TYPE bapimepoheader,
+        poheaderx     TYPE bapimepoheaderx,
+        ls_parametros TYPE zcmventa.
+
+  CLEAR: et_return.
+
+  CALL FUNCTION 'ZUI5_CM_GET_PARAMETROS_CM'
+    EXPORTING
+      i_werks      = i_header-centro_montaje
+      i_lgort      = i_header-almacen_montaje
+    IMPORTING
+      e_parametros = ls_parametros.
+
+  purchaseorder = i_header-ebeln.
+  poheader-suppl_plnt = i_header-centro_montaje.
+
+  "Recuperamos las posiciones de pedido para eliminar las posiciones que no vengan informadas.
+  SELECT ebeln, ebelp, loekz
+    FROM ekpo
+    INTO TABLE @DATA(lt_ekpo)
+    WHERE ebeln = @i_header-ebeln
+   .
+  IF sy-subrc = 0.
+    DESCRIBE TABLE lt_ekpo LINES l_posnr.
+    l_posnr = l_posnr * 10.
+
+    "Modificamos las posiciones que ya existen
+    LOOP AT lt_ekpo INTO DATA(ls_ekpo) WHERE loekz = space.
+      LOOP AT it_positions INTO DATA(ls_pedido) WHERE ebeln = ls_ekpo-ebeln AND ebelp = ls_ekpo-ebelp.
+        PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '056' ls_pedido-ebeln ls_pedido-ebelp '' ''CHANGING et_return.
+
+        APPEND INITIAL LINE TO poitem ASSIGNING FIELD-SYMBOL(<ls_poitem>).
+        <ls_poitem>-po_item = ls_pedido-ebelp.
+        <ls_poitem>-quantity = ls_pedido-lfimg.
+        <ls_poitem>-po_unit =  ls_pedido-meins.
+
+        APPEND INITIAL LINE TO poitemx ASSIGNING FIELD-SYMBOL(<ls_poitemx>).
+        <ls_poitemx>-po_item = ls_pedido-ebelp.
+        <ls_poitemx>-quantity = 'X'.
+        <ls_poitemx>-po_unit = 'X'.
+
+      ENDLOOP.
+      IF sy-subrc NE 0.
+        APPEND INITIAL LINE TO poitem ASSIGNING <ls_poitem>.
+        <ls_poitem>-po_item = ls_ekpo-ebelp.
+        <ls_poitem>-delete_ind = 'X'.
+
+        APPEND INITIAL LINE TO poitemx ASSIGNING <ls_poitemx>.
+        <ls_poitemx>-po_item = ls_ekpo-ebelp.
+        <ls_poitemx>-delete_ind = 'X'.
+      ENDIF.
+
+    ENDLOOP.
+    LOOP AT it_positions INTO ls_pedido.
+      LOOP AT lt_ekpo INTO ls_ekpo WHERE ebeln = ls_pedido-ebeln AND ebelp = ls_pedido-ebelp.
+      ENDLOOP.
+      "Si no existe añadimos la posición nueva
+      IF sy-subrc NE 0.
+        ADD 10 TO l_posnr.
+        APPEND INITIAL LINE TO poitem ASSIGNING <ls_poitem>.
+        <ls_poitem>-material = ls_pedido-matnr.
+        <ls_poitem>-quantity = ls_pedido-lfimg.
+        <ls_poitem>-po_unit  = ls_pedido-meins.
+        <ls_poitem>-plant    = i_header-centro_montaje.
+        <ls_poitem>-stge_loc = i_header-lgort_dest.
+        <ls_poitem>-suppl_stloc = i_header-almacen_montaje.
+        <ls_poitem>-batch = ls_pedido-charg.
+        <ls_poitem>-po_item  = l_posnr.
+
+        APPEND INITIAL LINE TO poitemx ASSIGNING <ls_poitemx>.
+        <ls_poitemx>-po_item = l_posnr.
+        <ls_poitemx>-material  = 'X'.
+        <ls_poitemx>-quantity  = 'X'.
+        <ls_poitemx>-po_unit  = 'X'.
+        <ls_poitemx>-plant     = 'X'..
+        <ls_poitemx>-stge_loc  = 'X'.
+        <ls_poitemx>-suppl_stloc = 'X'.
+        <ls_poitemx>-batch = 'X'.
+
+      ENDIF.
+    ENDLOOP.
+    CALL FUNCTION 'MEPO_DOC_INITIALIZE'.
+    "Asignamos en memoria LFART para asignarla en la BADI ZCL_IM_ME_PROCESS_PO_CUST IF_EX_ME_PROCESS_PO_CUST~PROCESS_ITEM
+
+    "Obtenemos la Condición de expedición
+    SELECT SINGLE * FROM tvstz
+      INTO @DATA(ls_tvstz)
+      WHERE werks = @i_header-centro_montaje
+      AND vsbed LIKE 'Y%'
+      AND ( vstel = @i_header-almacen_montaje OR vste1 = @i_header-almacen_montaje OR vste2 = @i_header-almacen_montaje OR vste3 = @i_header-almacen_montaje OR
+            vste4 = @i_header-almacen_montaje OR vste5 = @i_header-almacen_montaje OR vste6 = @i_header-almacen_montaje OR vste7 = @i_header-almacen_montaje OR
+            vste8 = @i_header-almacen_montaje OR vste9 = @i_header-almacen_montaje OR vste10 = @i_header-almacen_montaje OR vste11 = @i_header-almacen_montaje ).
+
+    CALL FUNCTION 'ZUI5_CM_SET_LFART'
+      EXPORTING
+        i_lfart = ls_parametros-lfart_dev_planta
+        i_vsbed = ls_tvstz-vsbed
+        i_route = ls_parametros-route.
+
+    CALL FUNCTION 'BAPI_PO_CHANGE'
+      EXPORTING
+        purchaseorder = purchaseorder
+        poheader      = poheader
+        poheaderx     = poheaderx
+      TABLES
+        return        = lt_return
+        poitem        = poitem
+        poitemx       = poitemx
+      EXCEPTIONS
+        error_message = 1
+        OTHERS        = 2.
+
+    APPEND LINES OF lt_return TO et_return.
+
+    READ TABLE et_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc = 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+*      LOOP AT it_positions INTO ls_pedido.
+*        "Actualizamos los campos ZZMATPAL, ZZCANTPAL y ZZCANXPAL
+*        UPDATE ekpo SET zzmatpal = ls_pedido-tipo_pallet
+*                        zzcantpal = ls_pedido-num_pallets
+*                        zzcanxpal = ls_pedido-cajas_pallets
+*                    WHERE ebeln  = ls_pedido-ebeln AND ebelp = ls_pedido-ebelp.
+*        IF sy-subrc = 0.
+*          COMMIT WORK AND WAIT.
+*          PERFORM mensajes_pasos USING 'ZUI5_CM' 'S' '057' ls_pedido-ebeln ls_pedido-ebelp '' ''CHANGING et_return.
+*        ELSE.
+*          PERFORM mensajes_pasos USING 'ZUI5_CM' 'E' '057' ls_pedido-ebeln ls_pedido-ebelp '' ''CHANGING et_return.
+*        ENDIF.
+*      ENDLOOP.
+      SELECT a~ebeln, a~ebelp, a~matnr, a~werks, a~lgort, a~menge, a~zzaugru, b~charg
+            FROM ekpo AS a
+            LEFT JOIN eket AS b ON b~ebeln = a~ebeln AND b~ebelp = a~ebelp AND b~etenr = '0001'
+            INTO TABLE @DATA(lt_ekpo2)
+            WHERE a~ebeln = @purchaseorder
+            AND a~loekz = @space.
+
+      SORT it_positions BY ebeln DESCENDING ebelp DESCENDING.
+
+      LOOP AT lt_ekpo2 INTO DATA(ls_ekpo2).
+        DATA(lv_tabix) = sy-tabix.
+        READ TABLE it_positions INTO DATA(ls_pos) WITH KEY ebeln = ls_ekpo2-ebeln ebelp = ls_ekpo2-ebelp.
+        IF sy-subrc NE 0.
+          READ TABLE it_positions INTO ls_pos WITH KEY ebeln = space ebelp = space matnr = ls_ekpo2-matnr werks = ls_ekpo2-werks
+                                                       lfimg = ls_ekpo2-menge charg = ls_ekpo2-charg.
+          IF sy-subrc NE 0.
+            READ TABLE it_positions INTO ls_pos INDEX lv_tabix.
+          ENDIF.
+        ENDIF.
+        IF sy-subrc = 0.
+          UPDATE ekpo SET zzaugru = ls_pos-zzaugru
+                      WHERE ebeln = purchaseorder AND ebelp = ls_ekpo2-ebelp.
+          IF sy-subrc = 0.
+            COMMIT WORK AND WAIT.
+            PERFORM mensajes_pasos USING 'ZUI5_CM' 'S' '094' ls_ekpo2-ebeln ls_ekpo2-ebelp ls_pos-zzaugru ''CHANGING et_return.
+          ELSE.
+            PERFORM mensajes_pasos USING 'ZUI5_CM' 'E' '095' ls_ekpo2-ebeln ls_ekpo2-ebelp ls_pos-zzaugru ''CHANGING et_return.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+    CALL FUNCTION 'ZUI5_CM_SET_LFART'
+      EXPORTING
+        i_lfart = ''.
+  ENDIF.
+
+
+
+ENDFUNCTION.

@@ -1,0 +1,193 @@
+FUNCTION zsdcom_enviar_propliq_comis.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IS_CABLIQ) TYPE  ZSSDCOM_PRLIQCAB_KEY OPTIONAL
+*"     VALUE(I_LIFNR) TYPE  LIFNR OPTIONAL
+*"     VALUE(IT_SELEC) TYPE  ZTTSDCOM002_SEL OPTIONAL
+*"     VALUE(EMAIL) TYPE  FLAG OPTIONAL
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_T
+*"  CHANGING
+*"     VALUE(C_TDDEST) TYPE  RSPOPNAME
+*"----------------------------------------------------------------------
+
+  DATA: lti_pos   TYPE zttsdcom_prliqpos_print.
+  DATA: it_pos    TYPE zttsdcom_prliqpos_print.
+  DATA: ls_cab    TYPE zssdcom_prliqcab_print,
+        ls_pos    TYPE zssdcom_prliqpos_print,
+        ls_imp    TYPE zssdcom_prliqimp_print,
+        ls_imp2   TYPE zssdcom_prliqimp_print,
+        ls_return TYPE bapiret2.
+  DATA: lv_sform    TYPE na_fname,
+        lv_formtype TYPE na_formtype,
+        lv_waerk    TYPE waerk.
+  DATA:ls_form_data TYPE zsfis_form_data,
+       lt_form_data TYPE zsfitt_form_data.
+  DATA:l_len_in      TYPE i,
+       l_pdf_xstring TYPE xstring,
+       l_tddest      TYPE rspopname.
+  DATA lt_aux TYPE zttsdcom002_sel.
+
+  TYPES: BEGIN OF ty_lifnr,
+           lifnr TYPE lifnr.
+  TYPES: END OF ty_lifnr.
+
+  DATA: lt_comisionistas TYPE TABLE OF ty_lifnr.
+
+**  SELECT DISTINCT lifnr FROM @it_selec AS l INTO TABLE @DATA(lt_comisionistas).
+
+  lt_comisionistas = CORRESPONDING #( it_selec ).
+
+  SORT lt_comisionistas BY lifnr.
+
+  DELETE ADJACENT DUPLICATES FROM lt_comisionistas.
+
+
+  LOOP AT lt_comisionistas INTO DATA(ls_comisionistas).
+    CLEAR lt_aux[].
+    LOOP AT it_selec INTO DATA(ls_selec) WHERE lifnr = ls_comisionistas-lifnr.
+      APPEND ls_selec TO lt_aux.
+    ENDLOOP.
+    DATA(l_lifnr) = ls_comisionistas-lifnr.
+* Sacamos el formulario y el tipo que tiene el comisionista
+    SELECT SINGLE sform formtype
+    INTO (lv_sform, lv_formtype)
+    FROM  ztsdcom002
+    WHERE bukrs = is_cabliq-bukrs
+    AND   lifnr = l_lifnr.
+
+* Si el comisionista no tiene formulario asignado -> ERROR
+    IF lv_sform IS INITIAL OR lv_formtype IS INITIAL.
+      ls_return-id         = 'ZSDCOM'.
+      ls_return-type       = 'E'.
+      ls_return-number     = '019'.
+      ls_return-message_v1 = is_cabliq-bukrs.
+      ls_return-message_v2 = i_lifnr.
+      APPEND ls_return TO et_return.
+      EXIT.
+    ENDIF.
+
+* Sacamos los datos de cabecera de impresión
+    CALL FUNCTION 'ZSDCOM_IMPR_PROPLIQ_CABECERA'
+      EXPORTING
+        is_cabliq = is_cabliq
+        i_lifnr   = l_lifnr
+      IMPORTING
+        es_cab    = ls_cab.
+
+* Sacamos las posiciones a imprimir
+    CALL FUNCTION 'ZSDCOM_IMPR_PROPLIQ_POSICIONES'
+      EXPORTING
+        is_cabliq = is_cabliq
+        it_aux    = lt_aux
+      IMPORTING
+        et_pos    = lti_pos.
+
+    TYPES: BEGIN OF ty_waerk,
+             waerk TYPE waerk.
+    TYPES: END OF ty_waerk.
+    DATA: lt_monedas TYPE TABLE OF ty_waerk.
+
+    TYPES: BEGIN OF ty_gsber,
+             gsber TYPE gsber.
+    TYPES: END OF ty_gsber.
+    DATA: lt_gsber TYPE TABLE OF ty_gsber.
+
+    LOOP AT lti_pos INTO DATA(lsi_pos_a).
+      APPEND lsi_pos_a-waerk TO lt_monedas.
+      APPEND lsi_pos_a-gsber TO lt_gsber.
+    ENDLOOP.
+
+    lt_monedas = CORRESPONDING #( lti_pos ).
+    lt_gsber = CORRESPONDING #( lti_pos ).
+
+    SORT lt_monedas BY waerk.
+    SORT lt_gsber BY gsber.
+
+    DELETE ADJACENT DUPLICATES FROM lt_monedas.
+    DELETE ADJACENT DUPLICATES FROM lt_gsber.
+
+    LOOP AT lt_monedas INTO DATA(ls_monedas).
+
+      LOOP AT lt_gsber INTO DATA(ls_gsber).
+
+* Sacamos el formulario y el tipo que tiene el comisionista
+        SELECT SINGLE sform formtype
+        INTO (lv_sform, lv_formtype)
+        FROM  ztsdcom002
+        WHERE bukrs = is_cabliq-bukrs
+        AND   lifnr = l_lifnr
+        AND   gsber = ls_gsber-gsber.
+
+        CLEAR it_pos[].
+        LOOP AT lti_pos INTO DATA(lsi_pos) WHERE waerk = ls_monedas-waerk AND gsber = ls_gsber-gsber.
+          DATA(l_waerk) = lsi_pos-waerk.
+          APPEND lsi_pos TO it_pos.
+        ENDLOOP.
+        CHECK it_pos[] IS NOT INITIAL.
+* Rellenamos la estructura de importes
+        CALL FUNCTION 'ZSDCOM_IMPR_PROPLIQ_IMPORTES'
+          EXPORTING
+            is_cabliq   = is_cabliq
+            i_lifnr     = l_lifnr
+            it_pos      = it_pos
+          IMPORTING
+            es_importes = ls_imp.
+        l_tddest = c_tddest.
+
+        IF email = 'X'.
+          PERFORM get_attachment USING lv_sform ls_cab ls_imp it_pos
+                                 CHANGING l_len_in l_pdf_xstring l_tddest.
+          CLEAR ls_form_data.
+          ls_form_data-name = 'PropCom_' && ls_cab-laufi && '-' && ls_cab-lifnr && '_' && l_waerk && '_' && ls_gsber-gsber.
+          ls_form_data-len = l_len_in.
+          ls_form_data-bin_file = l_pdf_xstring.
+          ls_form_data-tddest = l_tddest.
+          APPEND ls_form_data TO lt_form_data.
+        ELSE.
+          CALL FUNCTION 'ZSDCOM_IMPR_PROPUESTA_SF'
+            EXPORTING
+              i_sform  = lv_sform
+              is_cab   = ls_cab
+              is_imp   = ls_imp
+              it_pos   = it_pos
+              email    = ' '
+            CHANGING
+              c_tddest = c_tddest.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+  ENDLOOP.
+
+
+  IF email = 'X'.
+* Lanzamos el envio del email con el formulario
+    CASE lv_formtype.
+*   Smartform
+      WHEN '1'.
+        CALL FUNCTION 'ZSDCOM_IMPR_PROPUESTA_MAIL'
+          EXPORTING
+            i_form_data = lt_form_data
+*           i_sform     = lv_sform
+            is_cab      = ls_cab
+*           is_imp      = ls_imp
+*           it_pos      = lti_pos
+          CHANGING
+            c_tddest    = c_tddest.
+        CLEAR c_tddest.
+**   PDF
+*      WHEN '2'.
+*        CALL FUNCTION 'ZSDCOM_IMPR_PROPUESTA_PDF'
+*          EXPORTING
+*            i_sform  = lv_sform
+*            is_cab   = ls_cab
+*            is_imp   = ls_imp
+*            it_pos   = lti_pos
+*          CHANGING
+*            c_tddest = c_tddest.
+*        CLEAR c_tddest.
+    ENDCASE.
+  ENDIF.
+
+ENDFUNCTION.

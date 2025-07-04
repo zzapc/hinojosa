@@ -1,0 +1,293 @@
+**********************************************************************
+* TITULO : Archivado de cola de mensajes
+*
+* DESCRIPCION : Archivado de cola de mensajes
+*
+*
+* AUTOR: Andrés Picazo                                FECHA: 21/08/2014
+* ANALISTA: Alfredo Garcia
+*
+* MODIFICACIONES
+*
+***********************************************************************
+REPORT zwhs_archiving.
+
+*------INCLUDES--------------------------------------------------------*
+
+*------TABLAS/ESTRUCTURAS----------------------------------------------*
+TABLES: zwhs_monitor_sel, zwhs_interlocuto, sscrfields.
+
+CONSTANTS: c_max_rows TYPE i VALUE 1000.
+
+*------TABLAS INTERNAS-------------------------------------------------*
+TYPES: t_listado TYPE zwhs_monitor.
+DATA: i_listado TYPE TABLE OF t_listado,
+      l_listado TYPE t_listado.
+
+FIELD-SYMBOLS <listado> TYPE t_listado.
+
+*----------------------------------------------------------------------*
+* CLASS lcl_alv DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv DEFINITION INHERITING FROM zcl_ap_alv_check.
+  PUBLIC SECTION.
+    METHODS: handle_double_click REDEFINITION.
+    METHODS: handle_user_command REDEFINITION.
+ENDCLASS. "lcl_alv DEFINITION
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report DEFINITION INHERITING FROM zcl_ap_dev.
+  PUBLIC SECTION.
+    METHODS: main.
+
+    METHODS:  listado,
+              seleccionar_datos,
+              grabar_ficheros.
+
+ENDCLASS.                    "REPORT DEFINITION
+
+
+*------VARIABLES-------------------------------------------------------*
+DATA: o_prog TYPE REF TO zcl_report,
+      o_alv TYPE REF TO lcl_alv.
+
+*------PARAMETER/SELECT-OPTIONS EN PANTALLA----------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK 001 WITH FRAME.
+PARAMETERS: p_idcli LIKE zwhs_interlocuto-idcliente DEFAULT 'WHS' OBLIGATORY.
+
+SELECT-OPTIONS: s_idcola FOR zwhs_monitor_sel-idcola,
+                s_idmsg  FOR zwhs_monitor_sel-idmsg,
+                s_e_s    FOR zwhs_monitor_sel-e_s,
+                s_estado FOR zwhs_monitor_sel-estado,
+                s_objkey FOR zwhs_monitor_sel-objkey,
+                s_fechac FOR zwhs_monitor_sel-fecha_creacion NO-DISPLAY.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS: p_dias TYPE zwhs_interlocuto-dias_archivado MODIF ID no,
+            p_farch TYPE d MODIF ID no.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS p_ejec AS CHECKBOX.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS: p_vari LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK 001.
+SELECTION-SCREEN: FUNCTION KEY 2,
+                  FUNCTION KEY 3,
+                  FUNCTION KEY 4.
+
+
+************************************************************************
+*
+* LOGICA DEL PROGRAMA
+*
+************************************************************************
+
+*----------------------------------------------------------------------*
+* CLASS lcl_alv IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv IMPLEMENTATION.
+  METHOD handle_double_click.
+    READ TABLE i_listado INDEX row INTO l_listado.
+    IF sy-subrc = 0.
+      CASE column.
+        WHEN 'FICHERO'.
+          IF NOT l_listado-fichero IS INITIAL.
+            zcl_ap_ficheros=>ver_fichero_texto( l_listado-fichero ).
+          ENDIF.
+        WHEN OTHERS.
+          zwhs=>muestra_msg( idcola = l_listado-idcola editar = '' ).
+      ENDCASE.
+    ENDIF.
+  ENDMETHOD. "handle_double_click
+  METHOD handle_user_command.
+    DATA: l_row TYPE i.
+
+    CASE e_salv_function.
+      WHEN 'EXCEL'.
+        exportar_excel( ).
+      WHEN 'CREAR'.
+        get_seleccion( ).
+        o_prog->grabar_ficheros( ).
+        refresh( ).
+
+      WHEN OTHERS.
+    ENDCASE.
+  ENDMETHOD. "handle_USER_COMMAND
+ENDCLASS. "lcl_alv IMPLEMENTATION
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report IMPLEMENTATION.
+  METHOD main.
+
+    seleccionar_datos( ).
+
+    IF p_ejec = 'X'.
+      grabar_ficheros( ).
+
+      DESCRIBE TABLE i_listado LINES sy-tfill.
+      IF sy-tfill = c_max_rows.
+        MESSAGE 'Continuamos con registros pendientes' TYPE 'I'.
+        COMMIT WORK AND WAIT.
+        main( ).
+      ENDIF.
+    ELSE.
+      listado( ).
+    ENDIF.
+
+  ENDMETHOD.                    "REPORT
+
+  METHOD seleccionar_datos.
+
+    sgpi_texto( 'Leyendo datos' ).
+
+    i_listado = zwhs=>select_cola( idcliente   = p_idcli
+                                   r_idcola    = s_idcola[]
+                                   r_idmsg     = s_idmsg[]
+                                   r_e_s       = s_e_s[]
+                                   r_estado    = s_estado[]
+                                   r_objkey    = s_objkey[]
+                                   r_fechac    = s_fechac[]
+                                   max_entries = c_max_rows ).
+
+    LOOP AT i_listado ASSIGNING <listado>.
+      <listado>-check = p_ejec.
+    ENDLOOP.
+
+  ENDMETHOD.                    "seleccionar_datos
+
+
+  METHOD listado.
+
+    sgpi_texto( 'Generando informe' ).
+
+    o_alv->set_layout( p_vari ).
+
+    o_alv->show( ).
+
+
+  ENDMETHOD.                    "
+
+  METHOD grabar_ficheros.
+    DATA: l_cont(7),
+          l_cola TYPE zwhs_cola,
+          l_cola_bak TYPE zwhs_cola_bak,
+          i_log TYPE TABLE OF zwhs_log,
+          i_log_bak TYPE TABLE OF zwhs_log_bak,
+          l_log TYPE zwhs_log,
+          l_log_bak TYPE zwhs_log_bak.
+
+    l_cont = 0.
+    LOOP AT i_listado ASSIGNING <listado> WHERE check = 'X'.
+      SELECT SINGLE * FROM zwhs_cola
+        INTO l_cola
+       WHERE idcola = <listado>-idcola.
+      IF sy-subrc = 0.
+        MOVE-CORRESPONDING l_cola TO l_cola_bak.
+        CLEAR: l_cola_bak-contenido_ficher, l_cola_bak-contenido_zip.
+        INSERT zwhs_cola_bak FROM l_cola_bak.
+        IF sy-subrc = 0.
+          DELETE FROM zwhs_cola
+           WHERE idcola = <listado>-idcola.
+          ADD 1 TO l_cont.
+
+          SELECT * FROM zwhs_log
+            INTO TABLE i_log
+       WHERE idcola = <listado>-idcola.
+          IF sy-subrc = 0.
+            LOOP AT i_log INTO l_log.
+              MOVE-CORRESPONDING l_log TO l_log_bak.
+              INSERT zwhs_log_bak FROM l_log_bak.
+              DELETE FROM zwhs_log
+               WHERE idcola = l_log-idcola
+                 AND fecha = l_log-fecha
+                 AND hora = l_log-hora
+                  AND usuario = l_log-usuario
+                  AND cont = l_log-cont.
+            ENDLOOP.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+    ENDLOOP.
+    MESSAGE s398(00) WITH 'Se han movido' l_cont 'registros'.
+
+  ENDMETHOD.                    "grabar_ficheros
+
+ENDCLASS.                    "REPORT IMPLEMENTATION
+
+*----------------------------------------------------------------------*
+* INITIALIZATION
+*----------------------------------------------------------------------*
+INITIALIZATION.
+
+  CREATE OBJECT o_prog
+    EXPORTING
+      status        = 'INICIO'
+      get_nombre_pc = 'X'.
+
+  o_prog->initialization( EXPORTING nombre_pc = o_prog->nombre_pc CHANGING sscrfields = sscrfields ).
+
+  CREATE OBJECT o_alv
+    EXPORTING
+      status = 'STANDARD'
+      lights = 'LIGHTS'.
+  p_vari = o_alv->get_default_layout( ).
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_vari.
+
+  p_vari = o_alv->get_f4_layout( ).
+
+************************************************************************
+* AT SELECTION-SCREEN.
+************************************************************************
+AT SELECTION-SCREEN.
+
+  SELECT SINGLE * FROM zwhs_interlocuto
+   WHERE idcliente = p_idcli.
+  IF sy-subrc NE 0.
+    MESSAGE 'Interlocutor no válido' TYPE 'E'.
+  ELSEIF zwhs_interlocuto-dias_archivado IS INITIAL.
+    MESSAGE 'No se ha definido días de archivado para el interlocutor' TYPE 'E'.
+  ENDIF.
+
+  o_prog->at_selection(  ).
+
+
+AT SELECTION-SCREEN OUTPUT.
+
+  SELECT SINGLE * FROM zwhs_interlocuto
+   WHERE idcliente = p_idcli.
+  IF sy-subrc = 0.
+    p_dias = zwhs_interlocuto-dias_archivado.
+    p_farch = sy-datum - zwhs_interlocuto-dias_archivado.
+
+    CLEAR s_fechac.
+    s_fechac-option = 'LT'.
+    s_fechac-sign   = 'I'.
+    s_fechac-low    = p_farch.
+    APPEND s_fechac.
+  ENDIF.
+
+  zcl_ap_dynpro=>screen_input( group1 = 'NO' variable = '' ).
+
+*----------------------------------------------------------------------
+* START-OF-SELECTION.
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  IF zcl_ap_utils=>bloquear_programa( ) = 'X'.
+    MESSAGE 'Saliendo debido a que el programa ya se está ejecutando.' TYPE 'I'.
+    STOP.
+  ENDIF.
+
+  o_prog->main( ).

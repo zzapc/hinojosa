@@ -1,0 +1,498 @@
+FUNCTION zsdcom_contab_propliq_comis.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IS_COMIS) TYPE  ZTSDCOM002
+*"     VALUE(I_BUDAT) TYPE  BUDAT
+*"     VALUE(I_XBLNR) TYPE  XBLNR
+*"     VALUE(IT_POS) TYPE  ZTTSDCOM_PRLIQPOS
+*"     VALUE(I_BLDAT) TYPE  BLDAT OPTIONAL
+*"     VALUE(I_DIFER) TYPE  NETWR_AP OPTIONAL
+*"     REFERENCE(I_WAERS) TYPE  WAERS
+*"  EXPORTING
+*"     VALUE(E_BUKRS) TYPE  BUKRS
+*"     VALUE(E_BELNR) TYPE  BELNR_D
+*"     VALUE(E_GJAHR) TYPE  GJAHR
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+
+  DATA: i_reprf LIKE lfb1-reprf,
+        i_shkzg LIKE bseg-shkzg,
+        i_xumsw LIKE bseg-xumsw,
+        i_bstat LIKE bkpf-bstat.
+
+  DATA: lti_acc_gl  TYPE TABLE OF bapiacgl09,
+        lti_acc_py  TYPE TABLE OF bapiacap09,
+        lti_acc_tax TYPE TABLE OF bapiactx09,
+        lti_acc_wt  TYPE TABLE OF bapiacwt09,
+        lti_curr    TYPE TABLE OF bapiaccr09,
+        lti_return  TYPE TABLE OF bapiret2,
+        lti_ext     TYPE TABLE OF bapiparex,
+        lti_mwdat   TYPE TABLE OF rtax1u15.
+
+  DATA: ls_pos     TYPE ztsdcom_prliqpos,
+        ls_contab  TYPE ztsdcom005,
+        ls_header  TYPE bapiache09,
+        ls_acc_gl  TYPE bapiacgl09,
+        ls_acc_py  TYPE bapiacap09,
+        ls_acc_tax TYPE bapiactx09,
+        ls_acc_wt  TYPE bapiacwt09,
+        ls_curr    TYPE bapiaccr09,
+        ls_return  TYPE bapiret2,
+        ls_ext     TYPE bapiparex,
+        ls_mwdat   TYPE rtax1u15.
+
+  DATA: lv_key       TYPE awkey,
+        lv_pos       TYPE posnr_acc,
+        lv_total     TYPE wrbtr,
+        lv_zterm     TYPE dzterm,
+        lv_witht     TYPE witht,
+        lv_wt_withcd TYPE wt_withcd,
+        lv_fwste     TYPE fwste,
+        lv_fwast     TYPE fwste,
+        lv_name1     TYPE name1_gp.
+  DATA l_return TYPE bapiret2.
+  DATA lv_gjahr   TYPE bseg-gjahr.
+
+* Inicializamos
+  CLEAR: e_bukrs, e_belnr, e_gjahr.
+  REFRESH et_return.
+
+  SELECT SINGLE * INTO ls_contab
+      FROM  ztsdcom005
+      WHERE bukrs = is_comis-bukrs
+      AND   grcta = is_comis-grcta
+      "AND kschl EQ space "EMP: 11.09.18
+      AND   tipoa = '02'            "liquidación
+      AND   tipol = is_comis-tipol
+      AND   waers = i_waers.
+  IF sy-subrc <> 0.
+    SELECT SINGLE * INTO ls_contab
+    FROM  ztsdcom005
+    WHERE bukrs = is_comis-bukrs
+    AND   grcta = is_comis-grcta
+    AND   tipoa = '02'            "liquidación
+    AND   tipol = is_comis-tipol
+    AND   waers = space.
+    IF sy-subrc <> 0.
+      CLEAR ls_return.
+      ls_return-id          = 'ZSDCOM'.
+      ls_return-type        = 'E'.
+      ls_return-number      = '027'.
+      ls_return-message_v1  = is_comis-grcta.
+      APPEND ls_return TO et_return.
+      EXIT.
+    ENDIF.
+  ENDIF.
+*  ENDIF.
+
+* Nombre del proveedor (comisionista)
+  SELECT SINGLE name1 INTO lv_name1
+      FROM  lfa1
+      WHERE lifnr = is_comis-lifnr.
+
+* Sacamos la condición de pago del proveedor
+  SELECT SINGLE zterm INTO lv_zterm
+      FROM  lfb1
+      WHERE lifnr = is_comis-lifnr
+      AND   bukrs = is_comis-bukrs.
+
+* Sacamos el indicador de retención del comisionista
+  SELECT SINGLE witht wt_withcd
+      INTO (lv_witht, lv_wt_withcd)
+      FROM  lfbw
+      WHERE lifnr     = is_comis-lifnr
+      AND   bukrs     = is_comis-bukrs
+      AND   wt_subjct = 'X'.
+
+
+* Rellenamos los datos de cabecera
+* ---------------------------------------------------------------------
+  ls_header-username    = sy-uname.
+  ls_header-comp_code   = is_comis-bukrs.
+  IF i_bldat IS NOT INITIAL.
+    ls_header-doc_date    = i_bldat.
+  ELSE.
+    ls_header-doc_date    = i_budat.
+  ENDIF.
+  ls_header-pstng_date  = i_budat.
+
+
+  CALL FUNCTION 'FI_PERIOD_DETERMINE'
+    EXPORTING
+      i_budat        = i_budat
+      i_bukrs        = is_comis-bukrs
+    IMPORTING
+      e_gjahr        = lv_gjahr
+    EXCEPTIONS
+      fiscal_year    = 1
+      period         = 2
+      period_version = 3
+      posting_period = 4
+      special_period = 5
+      version        = 6
+      posting_date   = 7
+      OTHERS         = 8.
+
+  ls_header-fisc_year   = lv_gjahr.
+  ls_header-doc_type    = ls_contab-blart.
+  ls_header-ref_doc_no  = i_xblnr.
+
+* Rellenamos las posiciones de las facturas
+* ---------------------------------------------------------------------
+  LOOP AT it_pos INTO ls_pos.
+*   Actualizamos el número de posición
+    lv_pos = lv_pos + '0000000001'.
+*   Añadimos la posición a la BAPI
+    CLEAR ls_acc_gl.
+    ls_acc_gl-itemno_acc = lv_pos.
+    ls_acc_gl-gl_account = ls_contab-saknr_deb.
+    ls_acc_gl-alloc_nmbr = is_comis-lifnr.
+    ls_acc_gl-tax_code   = is_comis-mwskz.
+    ls_acc_gl-item_text  = lv_name1.
+    ls_acc_gl-ref_key_3  = ls_pos-vbeln.
+    ls_acc_gl-ref_key_2  = is_comis-lifnr.
+    ls_acc_gl-bus_area = is_comis-gsber.
+    APPEND ls_acc_gl TO lti_acc_gl.
+
+*   Añadimos la clave contable a la EXTENSION2
+*   Si la comisión es negativa, no pongo la clave contable (la determina solo)
+    IF ls_pos-zimp_liq > 0.
+      CLEAR ls_ext.
+      ls_ext-structure  = 'ZSDCOM'.
+      ls_ext-valuepart1 = 'BSCHL'.
+      ls_ext-valuepart2 = lv_pos.
+      ls_ext-valuepart3 = ls_contab-bschl_deb.
+      APPEND ls_ext TO lti_ext.
+    ENDIF.
+
+*   Añadimos la línea del importe
+    CLEAR ls_curr.
+    ls_curr-itemno_acc = lv_pos.
+    ls_curr-curr_type  = '00'.
+    ls_curr-currency   = i_waers.
+    IF i_waers = 'EUR'.
+      ls_curr-amt_doccur = ls_pos-zimp_liq_eur.
+    ELSE.
+      ls_curr-amt_doccur = ls_pos-zimp_liq.
+    ENDIF.
+    APPEND ls_curr TO lti_curr.
+
+*   Sacamos un sumatorio con el total del importe
+    IF i_waers = 'EUR'.
+      lv_total = lv_total + ls_pos-zimp_liq_eur.
+    ELSE.
+      lv_total = lv_total + ls_pos-zimp_liq.
+    ENDIF.
+
+  ENDLOOP.
+
+* Añadimos las diferencias
+  IF i_difer IS NOT INITIAL.
+    lv_pos = lv_pos + '0000000001'.
+*   Añadimos la posición a la BAPI
+    CLEAR ls_acc_gl.
+    ls_acc_gl-itemno_acc = lv_pos.
+    IF i_difer > 0.
+      ls_acc_gl-gl_account = ls_contab-dif_saknr_deb.
+    ELSE.
+      ls_acc_gl-gl_account = ls_contab-dif_saknr_hab.
+    ENDIF.
+    ls_acc_gl-alloc_nmbr = is_comis-lifnr.
+    ls_acc_gl-tax_code   = is_comis-mwskz.
+    ls_acc_gl-item_text  = 'AJUSTES DIFERENCIAS'.
+    ls_acc_gl-ref_key_3  = ls_pos-vbeln.
+    ls_acc_gl-bus_area = is_comis-gsber.
+    APPEND ls_acc_gl TO lti_acc_gl.
+    lv_total = lv_total + i_difer.
+
+*   Añadimos la clave contable a la EXTENSION2
+*   Si la comisión es negativa, no pongo la clave contable (la determina solo)
+    IF i_difer > 0.
+      CLEAR ls_ext.
+      ls_ext-structure  = 'ZSDCOM'.
+      ls_ext-valuepart1 = 'BSCHL'.
+      ls_ext-valuepart2 = lv_pos.
+      ls_ext-valuepart3 = ls_contab-dif_bschl_deb.
+      APPEND ls_ext TO lti_ext.
+    ELSE.
+      CLEAR ls_ext.
+      ls_ext-structure  = 'ZSDCOM'.
+      ls_ext-valuepart1 = 'BSCHL'.
+      ls_ext-valuepart2 = lv_pos.
+      ls_ext-valuepart3 = ls_contab-dif_bschl_hab.
+      APPEND ls_ext TO lti_ext.
+    ENDIF.
+
+*   Añadimos la línea del importe
+    CLEAR ls_curr.
+    ls_curr-itemno_acc = lv_pos.
+    ls_curr-curr_type  = '00'.
+    ls_curr-currency   = i_waers.
+    ls_curr-amt_doccur = i_difer.
+    APPEND ls_curr TO lti_curr.
+
+  ENDIF.
+
+* ----------------------------------------------------------------------------------
+* Dependiendo del tipo de liquidación del comisionista, rellenamos unas tablas u otras
+* Liquidación de factura -> Contabilizamos contra el comisionista
+* ----------------------------------------------------------------------------------
+  IF is_comis-tipol = '01'.
+*   Actualizamos el número de posición
+    lv_pos = lv_pos + '0000000001'.
+
+*   Añadimos la línea del IVA
+    IF is_comis-mwskz IS NOT INITIAL.
+*     Sacamos los datos del impuesto
+      CALL FUNCTION 'CALCULATE_TAX_FROM_NET_AMOUNT'
+        EXPORTING
+          i_bukrs           = is_comis-bukrs
+          i_mwskz           = is_comis-mwskz
+          i_waers           = i_waers
+          i_wrbtr           = lv_total
+        IMPORTING
+          e_fwste           = lv_fwste
+          e_fwast           = lv_fwast
+        TABLES
+          t_mwdat           = lti_mwdat
+        EXCEPTIONS
+          bukrs_not_found   = 1
+          country_not_found = 2
+          mwskz_not_defined = 3
+          mwskz_not_valid   = 4
+          ktosl_not_found   = 5
+          kalsm_not_found   = 6
+          parameter_error   = 7
+          knumh_not_found   = 8
+          kschl_not_found   = 9
+          unknown_error     = 10
+          account_not_found = 11
+          txjcd_not_valid   = 12
+          OTHERS            = 13.
+
+*     Añadimos la línea del IVA a la tabla de la BAPI
+      IF sy-subrc = 0.
+        DATA i TYPE i.
+        DESCRIBE TABLE lti_mwdat LINES i.
+        IF i = 1.
+          lv_pos = lv_pos + '0000000001'.
+          READ TABLE lti_mwdat INTO ls_mwdat INDEX 1.
+          CLEAR ls_acc_tax.
+          ls_acc_tax-itemno_acc = lv_pos.
+          ls_acc_tax-gl_account = ls_mwdat-hkont.
+          ls_acc_tax-tax_code   = is_comis-mwskz.
+          APPEND ls_acc_tax TO lti_acc_tax.
+
+*         Añadimos la línea con el importe del IVA
+          CLEAR ls_curr.
+          ls_curr-itemno_acc = lv_pos.
+          ls_curr-curr_type  = '00'.
+          ls_curr-currency   = i_waers.
+          ls_curr-amt_base   = lv_total.
+          IF lv_fwste IS INITIAL.
+            ls_curr-amt_doccur = ls_mwdat-wmwst.
+            ls_curr-tax_amt    = ls_mwdat-wmwst.
+          ELSE.
+            ls_curr-amt_doccur = lv_fwste.
+            ls_curr-tax_amt    = lv_fwste.
+          ENDIF.
+          APPEND ls_curr TO lti_curr.
+
+        ELSE.
+          LOOP AT lti_mwdat INTO ls_mwdat.
+            IF sy-tabix <> 1.
+              lv_pos = lv_pos + '0000000001'.
+            ENDIF.
+
+            CLEAR ls_acc_tax.
+            ls_acc_tax-itemno_acc = lv_pos.
+            ls_acc_tax-gl_account = ls_mwdat-hkont.
+            ls_acc_tax-acct_key = ls_mwdat-ktosl. "CVP 02.12.2020
+*            IF ls_mwdat-hkont = '4770000000' .
+*              ls_acc_tax-acct_key = 'ESA'.
+*            ELSEIF ls_mwdat-hkont = '4720000000'.
+*              ls_acc_tax-acct_key = 'ESE'.
+*            ENDIF.
+            ls_acc_tax-tax_code   = is_comis-mwskz.
+            APPEND ls_acc_tax TO lti_acc_tax.
+
+*           Añadimos la línea con el importe del IVA
+            CLEAR ls_curr.
+            ls_curr-itemno_acc = lv_pos.
+            ls_curr-curr_type  = '00'.
+            ls_curr-currency   = i_waers.
+            ls_curr-amt_base   = lv_total.
+            IF lv_fwste IS INITIAL.
+              ls_curr-amt_doccur = ls_mwdat-wmwst.
+              ls_curr-tax_amt    = ls_mwdat-wmwst.
+            ELSE.
+              ls_curr-amt_doccur = lv_fwste.
+              ls_curr-tax_amt    = lv_fwste.
+            ENDIF.
+            APPEND ls_curr TO lti_curr.
+          ENDLOOP.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+
+*   Actualizamos el número de posición
+    lv_pos = lv_pos + '0000000001'.
+*   Añadimos la posición del comisionista
+    CLEAR ls_acc_py.
+    ls_acc_py-itemno_acc = lv_pos.
+    ls_acc_py-vendor_no  = is_comis-lifnr.
+    ls_acc_py-bus_area = is_comis-gsber.
+    ls_acc_py-comp_code  = is_comis-bukrs.
+    ls_acc_py-item_text  = lv_name1.
+    ls_acc_py-tax_code   = is_comis-mwskz.
+    ls_acc_py-tax_date   = i_budat.
+    ls_acc_py-pmnttrms   = lv_zterm.
+    APPEND ls_acc_py TO lti_acc_py.
+
+*   Añadimos la clave contable a la EXTENSION2
+    IF lv_total > 0.
+      CLEAR ls_ext.
+      ls_ext-structure  = 'ZSDCOM'.
+      ls_ext-valuepart1 = 'BSCHL'.
+      ls_ext-valuepart2 = lv_pos.
+      ls_ext-valuepart3 = ls_contab-bschl_hab.
+      APPEND ls_ext TO lti_ext.
+    ENDIF.
+
+*   Añadimos la línea del importe del comisionista
+    CLEAR ls_curr.
+    ls_curr-itemno_acc = lv_pos.
+    ls_curr-curr_type  = '00'.
+    ls_curr-currency   = i_waers.
+    ls_curr-amt_doccur = -1 * ( lv_total + lv_fwste ).
+    APPEND ls_curr TO lti_curr.
+
+*   Si tiene retención añadimos la línea de la retención (con referencia a la del comisionista)
+    IF lv_witht IS NOT INITIAL.
+*     Añadimos la posición de la retención
+      CLEAR ls_acc_wt.
+      ls_acc_wt-itemno_acc  = lv_pos.
+      ls_acc_wt-wt_type     = lv_witht.
+      ls_acc_wt-wt_code     = lv_wt_withcd.
+      "ASC 19.07.2021 Las retenciones negativas hay que pasarlas en positivo.
+      IF lv_total < 0.
+        lv_total = lv_total * -1.
+      ENDIF.
+      ls_acc_wt-bas_amt_tc  = lv_total.
+      APPEND ls_acc_wt TO lti_acc_wt.
+    ENDIF.
+
+
+* Otro tipo de apunte -> Contra otra cuenta de mayor
+* ----------------------------------------------------------------------------------
+  ELSEIF is_comis-tipol = '02'.
+*   Actualizamos el número de posición
+    lv_pos = lv_pos + '0000000001'.
+
+*   Añadimos la posición a la BAPI
+    CLEAR ls_acc_gl.
+    ls_acc_gl-itemno_acc = lv_pos.
+    ls_acc_gl-gl_account = ls_contab-saknr_hab.
+    ls_acc_gl-alloc_nmbr = is_comis-lifnr.
+    ls_acc_gl-bus_area = is_comis-gsber.
+    ls_acc_gl-item_text  = lv_name1.
+    ls_acc_gl-tax_code   = is_comis-mwskz.
+    APPEND ls_acc_gl TO lti_acc_gl.
+
+*   Añadimos la clave contable a la EXTENSION2
+    IF lv_total > 0.
+      CLEAR ls_ext.
+      ls_ext-structure  = 'ZSDCOM'.
+      ls_ext-valuepart1 = 'BSCHL'.
+      ls_ext-valuepart2 = lv_pos.
+      ls_ext-valuepart3 = ls_contab-bschl_hab.
+      APPEND ls_ext TO lti_ext.
+    ENDIF.
+
+*   Añadimos la línea del importe
+    CLEAR ls_curr.
+    ls_curr-itemno_acc = lv_pos.
+    ls_curr-curr_type  = '00'.
+    ls_curr-currency   = i_waers.
+    ls_curr-amt_doccur = -1 * lv_total.
+    APPEND ls_curr TO lti_curr.
+  ENDIF.
+
+  i_shkzg = 'H'.
+  i_xumsw = 'X'.
+
+  CALL FUNCTION 'ZSFI_DUPLICATE_INVOICE_CHECK'
+    EXPORTING
+      i_bukrs      = is_comis-bukrs
+      i_lifnr      = is_comis-lifnr
+      i_waers      = i_waers
+      i_bldat      = i_bldat
+      i_xblnr      = i_xblnr
+      i_wrbtr      = 1
+      i_koart      = 'K'
+      i_reprf      = i_reprf
+      i_shkzg      = i_shkzg
+      i_xumsw      = i_xumsw
+      i_bstat      = i_bstat
+      i_blart      = ls_contab-blart
+    IMPORTING
+      return       = lti_return[]
+    EXCEPTIONS
+      missing_data = 1
+      OTHERS       = 2.
+  IF sy-subrc <> 0.
+    l_return-type = 'E'.
+    l_return-number = '398'.
+    l_return-id = '00'.
+    l_return-message_v1 = 'Errores al chequear duplicados'.
+    APPEND l_return TO lti_return.
+* Implement suitable error handling here
+  ELSE.
+
+    READ TABLE lti_return INTO ls_return WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+
+* Llamamos a la BAPI de contabilizar
+* ---------------------------------------------------------------------
+      CALL FUNCTION 'BAPI_ACC_DOCUMENT_POST'
+        EXPORTING
+          documentheader = ls_header
+        IMPORTING
+          obj_key        = lv_key
+        TABLES
+          accountgl      = lti_acc_gl
+          accountpayable = lti_acc_py
+          accounttax     = lti_acc_tax
+          currencyamount = lti_curr
+          return         = lti_return
+          extension2     = lti_ext
+          accountwt      = lti_acc_wt.
+
+
+* Control de errores
+* ---------------------------------------------------------------------
+      READ TABLE lti_return INTO ls_return WITH KEY type = 'E'.
+      IF sy-subrc <> 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+* Pasamos los mensajes a la tabla de salida
+  et_return[] = lti_return[].
+
+
+* Devolvemos el número de apunte contable
+* ---------------------------------------------------------------------
+  IF lv_key IS NOT INITIAL.
+    e_belnr = lv_key(10).
+    e_bukrs = lv_key+10(4).
+    e_gjahr = lv_key+14(4).
+  ENDIF.
+
+ENDFUNCTION.

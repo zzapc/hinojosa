@@ -1,0 +1,123 @@
+FUNCTION z_omp_sot_out.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(OBJKEY) TYPE  ZWHS_CLAVE
+*"     REFERENCE(MENSAJE) TYPE  ZWHS_MENSAJE
+*"     REFERENCE(SIMULAR) TYPE  OAF_AGENT_SIMULATION_RUN DEFAULT ''
+*"     REFERENCE(VAR1) TYPE  ANY DEFAULT ''
+*"     REFERENCE(VAR2) TYPE  ANY DEFAULT ''
+*"     REFERENCE(MODO_CT) TYPE  BDCMODE DEFAULT 'N'
+*"  EXPORTING
+*"     REFERENCE(CONTENIDO) TYPE  ZCONTENIDO_FICHERO
+*"     REFERENCE(MESSAGE) TYPE  BAPI_MSG
+*"  CHANGING
+*"     REFERENCE(COLA) TYPE  ZWHS_COLA
+*"----------------------------------------------------------------------
+  DATA: ltap         TYPE ltap,
+        i_return_log TYPE TABLE OF bapiret2,
+        i_sel_mat    TYPE TABLE OF lqua,
+        l_sel_mat    TYPE lqua.
+
+break_simular.
+
+  IF objkey IS INITIAL.
+    message = 'Indique nºalm$nºOT$pos'.
+    RETURN.
+  ENDIF.
+
+  SPLIT objkey AT '-' INTO cola-lgnum cola-tanum.
+
+  SELECT lgnum, matnr, charg, nltyp AS lgtyp, nlpla AS lgpla, nlenr AS exidv, nistm AS cantidad, meins,
+         werks, lgort, pquit FROM ltap
+    INTO TABLE @DATA(i_ot)
+   WHERE lgnum = @cola-lgnum
+     AND tanum = @cola-tanum.
+  IF sy-subrc NE 0.
+    message = condense( |No se encuentra nº OT { cola-lgnum } { cola-tanum ALPHA = OUT }| ).
+    RETURN.
+  ELSE.
+    DELETE i_ot WHERE pquit IS INITIAL.
+    IF i_ot IS INITIAL.
+      message = 'OT no confirmada'.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+  LOOP AT i_ot ASSIGNING FIELD-SYMBOL(<ot>).
+    SELECT SINGLE mtart FROM mara
+      INTO cola-auart
+     WHERE matnr = cola-matnr.
+
+    SELECT SINGLE valor1 FROM ztwm001
+      INTO @DATA(lv_tpmat)
+      WHERE cprog = 'ZRWM_RTLABELO' AND
+            param1 = 'PAP_MTART' AND
+            param2 = '01' AND
+            param3 = @cola-auart.
+*    IF sy-subrc ne 0.
+*      message = |No hay equivalencia tipo para tipo material { cola-auart }|.
+*      RETURN.
+*    ELSE.
+    IF sy-subrc = 0.
+      SELECT SINGLE param3 FROM ztwm001
+        INTO @DATA(l_param3)
+        WHERE cprog	= 'ZRWM_RTLABELO'
+         AND param1 = 'SUPPLIER_NAME'
+         AND param3 = @<ot>-werks.
+      IF sy-subrc = 0.
+        MOVE-CORRESPONDING <ot> TO cola.
+        cola-otros = lv_tpmat.
+
+        CLEAR l_sel_mat.
+        MOVE-CORRESPONDING <ot> TO l_sel_mat.
+        l_sel_mat-lenum = <ot>-exidv.
+        l_sel_mat-zeugn = lv_tpmat.
+        COLLECT l_sel_mat INTO i_sel_mat.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  IF i_sel_mat IS INITIAL.
+    message = 'No hay posiciones en la OT susceptibles de enviar por el interfaz'.
+    RETURN.
+  ENDIF.
+
+  EXPORT i_sel_mat FROM i_sel_mat TO MEMORY ID 'ZINTF_OMP_SEL'.
+
+  SUBMIT zrwm_intf_omp_new
+    AND RETURN
+*   WITH p_matnr = cola-matnr
+   WITH p_werks = cola-werks
+*   WITH p_lgnum = cola-lgnum
+*   WITH p_charg = cola-charg
+*   WITH p_lenum = cola-exidv
+*   WITH p_tpmat = lv_tpmat
+   WITH p_send  = 'X'
+   WITH p_auto  = 'X'.
+
+  IMPORT i_return_log TO i_return_log msgguid TO cola-msgguid FROM MEMORY ID 'ZINTF_OMP'.
+
+  IF i_return_log IS INITIAL.
+    message = |No se ha recuperado nada de log|.
+  ELSE.
+    LOOP AT i_return_log ASSIGNING FIELD-SYMBOL(<log>).
+      zwhs=>inserta_log( idcola = cola-idcola tipo = <log>-type mensaje = <log>-message ).
+      IF <log>-type = 'E'.
+        message = <log>-message.
+      ENDIF.
+    ENDLOOP.
+    IF message IS INITIAL.
+      IF cola-msgguid IS INITIAL.
+        zwhs=>inserta_log( idcola = cola-idcola tipo = 'W' mensaje = 'No se ha detectado mensaje proxy' ).
+      ELSE.
+        zwhs=>inserta_log( idcola = cola-idcola tipo = 'S' mensaje = |Se ha generado mensaje proxy { cola-msgguid }| ).
+      ENDIF.
+
+      cola-estado = 'X'.
+    ENDIF.
+  ENDIF.
+
+
+
+ENDFUNCTION.

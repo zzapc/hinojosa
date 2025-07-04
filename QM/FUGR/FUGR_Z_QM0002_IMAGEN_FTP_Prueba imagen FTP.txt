@@ -1,0 +1,174 @@
+FUNCTION Z_QM0002_IMAGEN_FTP.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(VP_WERKS) TYPE  WERKS_D
+*"     REFERENCE(VP_MATNR) TYPE  MATNR
+*"  EXPORTING
+*"     REFERENCE(VP_IMAGEN) TYPE  XSTRING
+*"----------------------------------------------------------------------
+  CLEAR vp_imagen.
+
+
+
+  SELECT *
+    INTO TABLE @DATA(tl_zparametros)
+    FROM zparametros
+    WHERE clave = 'HINIMAG'
+    ORDER BY atributo1 DESCENDING, campo ASCENDING.
+
+
+  READ TABLE tl_zparametros ASSIGNING FIELD-SYMBOL(<fs_zparametros>) WITH KEY campo = vp_werks.
+  CHECK sy-subrc = 0.
+
+  DATA(vl_tipo)     = <fs_zparametros>-atributo1.
+  DATA(vl_destino)  = <fs_zparametros>-atributo2.
+  DATA(vl_ruta)     = <fs_zparametros>-atributo3.
+  DATA(vl_user)     = <fs_zparametros>-atributo4.
+  DATA(vl_pwd)      = <fs_zparametros>-atributo5.
+
+
+
+  TYPES: BEGIN OF st_result,
+           line(100) TYPE c,
+         END OF st_result.
+
+
+  CONSTANTS: cl_key_ftp_scramble TYPE i VALUE 26101957,
+             cl_compress         TYPE c VALUE 'N'.
+
+  DATA: tl_result   TYPE TABLE OF st_result,
+        vl_handle   TYPE i,
+        vl_command  TYPE text100,
+        tl_ficheros TYPE TABLE OF text40,
+        tl_blob     TYPE TABLE OF blob.
+
+
+  tl_ficheros = VALUE #( ( |{ vp_matnr }.jpg|  )
+                         ( |S{ vp_matnr }.jpg|  )
+                         ( |R{ vp_matnr }.jpg|  ) ).
+
+
+  DATA(vl_len) = strlen( vl_pwd ).
+
+  CALL FUNCTION 'HTTP_SCRAMBLE'
+    EXPORTING
+      source      = vl_pwd
+      sourcelen   = vl_len
+      key         = cl_key_ftp_scramble
+    IMPORTING
+      destination = vl_pwd.
+
+
+  CALL FUNCTION 'FTP_CONNECT'
+    EXPORTING
+      user            = vl_user
+      password        = vl_pwd
+      host            = vl_destino
+      rfc_destination = 'SAPFTPA'
+    IMPORTING
+      handle          = vl_handle
+    EXCEPTIONS
+      not_connected   = 1
+      OTHERS          = 2.
+  IF sy-subrc <> 0.
+*    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*      WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    RETURN.
+  ENDIF.
+
+
+  CLEAR tl_result.
+  vl_command = |cd { vl_ruta }|.
+  CALL FUNCTION 'FTP_COMMAND'
+    EXPORTING
+      handle        = vl_handle
+      command       = vl_command
+      compress      = cl_compress
+    TABLES
+      data          = tl_result
+    EXCEPTIONS
+      command_error = 1
+      tcpip_error   = 2.
+  IF sy-subrc <> 0.
+*      zcl_seis_odata_utils=>lanzar_excepcion( ).
+    CALL FUNCTION 'FTP_DISCONNECT'
+      EXPORTING
+        handle = vl_handle.
+    RETURN.
+  ENDIF.
+
+
+
+  LOOP AT tl_ficheros ASSIGNING FIELD-SYMBOL(<fs_ficheros>).
+    CLEAR tl_result.
+    vl_command = |get { <fs_ficheros> }|.
+    CALL FUNCTION 'FTP_COMMAND'
+      EXPORTING
+        handle        = vl_handle
+        command       = vl_command
+        compress      = cl_compress
+      TABLES
+        data          = tl_result
+      EXCEPTIONS
+        command_error = 1
+        tcpip_error   = 2.
+    IF sy-subrc <> 0.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR tl_blob.
+    CALL FUNCTION 'FTP_CLIENT_TO_R3'
+      EXPORTING
+        fname           = <fs_ficheros>
+        rfc_destination = 'SAPFTPA'
+      IMPORTING
+        blob_length     = vl_len
+      TABLES
+        blob            = tl_blob
+      EXCEPTIONS
+        command_error   = 1
+        data_error      = 2
+        OTHERS          = 3.
+    IF sy-subrc <> 0.
+*    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*      WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      CONTINUE.
+    ENDIF.
+
+    LOOP AT tl_blob ASSIGNING FIELD-SYMBOL(<fs_blob>).
+      CONCATENATE vp_imagen <fs_blob>-content INTO vp_imagen IN BYTE MODE.
+    ENDLOOP.
+
+
+    "Borramos fichero local
+    IF vp_imagen IS NOT INITIAL.
+      CLEAR tl_result.
+      vl_command = |!rm { <fs_ficheros> }|.
+
+      CALL FUNCTION 'FTP_COMMAND'
+        EXPORTING
+          handle        = vl_handle
+          command       = vl_command
+        TABLES
+          data          = tl_result
+        EXCEPTIONS
+          tcpip_error   = 1
+          command_error = 2
+          data_error    = 3.
+*        IF sy-subrc <> 0.
+*          zcl_seis_odata_utils=>lanzar_excepcion( ).
+*        ENDIF.
+
+
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+  CALL FUNCTION 'FTP_DISCONNECT'
+    EXPORTING
+      handle = vl_handle.
+
+
+
+ENDFUNCTION.

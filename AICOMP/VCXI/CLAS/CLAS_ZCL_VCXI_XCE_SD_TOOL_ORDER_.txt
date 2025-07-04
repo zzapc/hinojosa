@@ -1,0 +1,282 @@
+
+class ZCL_VCXI_XCE_SD_TOOL_ORDER definition
+  public
+  create public .
+
+public section.
+
+  class-methods ADD_PRT
+    importing
+      !IT_PRT type ZVCXI_XCE_PP_TT_PRT
+      !IR_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC
+      !IF_VGBEL type VGBEL optional
+      !IF_VGPOS type VGPOS optional
+    raising
+      /VCXI/CX_CKX .
+  class-methods CREATE
+    importing
+      !IF_MATNR type MATNR
+      !IF_WERKS type WERKS_D optional
+      !IF_AUART type AUART
+      !IF_TESTRUN type ABAP_BOOL default ABAP_FALSE
+      !IF_COMMIT type ABAP_BOOL default ABAP_TRUE
+      !IF_VGBEL type VGBEL optional
+      !IF_VGPOS type VGPOS optional
+    exporting
+      !ER_MSG type ref to /VCXI/CL_CKXM_MESSAGE
+    returning
+      value(RF_VBELN) type VBELN
+    raising
+      /VCXI/CX_CKX .
+  class-methods PREPARE
+    importing
+      !IF_AUART type AUART
+      !IF_VKORG type VKORG
+      !IF_VTWEG type VTWEG
+      !IF_SPART type SPART
+      !IF_VDATU type EDATU_VBAK
+      !IF_KUNAG type KUNAG
+      !IF_KUNWE type KUNWE
+    returning
+      value(RR_BOB_SDOC) type ref to ZCL_VCXI_XCI_BOB_SDOC .
+protected section.
+private section.
+endclass. "ZCL_VCXI_XCE_SD_TOOL_ORDER definition
+class ZCL_VCXI_XCE_SD_TOOL_ORDER implementation.
+  method ADD_PRT.
+
+    check IT_PRT is not initial.
+
+***------------------------------------------------------------------------------------------------
+*** Search for Plant View
+    select MATNR, WERKS
+           into table @data(LT_MARC)
+           from MARC
+           for all entries in @IT_PRT
+          where MATNR eq @IT_PRT-MATNR
+           and  WERKS eq @IT_PRT-WERKS
+           and  LVORM eq @SPACE.
+    check SY-SUBRC eq 0 and
+          LT_MARC  is not initial.
+
+*** Search for General View
+    select MATNR, MEINS
+           into table @data(LT_MARA)
+           from MARA
+           for all entries in @LT_MARC
+          where MATNR eq @LT_MARC-MATNR
+           and  LVORM eq @SPACE.
+    check SY-SUBRC eq 0 and
+          LT_MARA  is not initial.
+
+*** Search for Sales View
+    select MATNR, VRKME
+           into table @data(LT_MVKE)
+           from MVKE
+           for all entries in @LT_MARA
+          where MATNR eq @LT_MARA-MATNR
+           and  VKORG eq @IR_BOB_SDOC->S_VBAK-VKORG
+           and  VTWEG eq @IR_BOB_SDOC->S_VBAK-VTWEG
+           and  LVORM eq @SPACE.
+    check SY-SUBRC eq 0 and
+          LT_MVKE  is not initial.
+
+*** Search for Purchase Requisition (ignore if related to Sales Document)
+    if IF_VGBEL is initial.
+      select BANFN, MATNR, WERKS
+             into table @data(LT_EBAN)
+             from EBAN
+             for all entries in @LT_MARC
+            where MATNR eq @LT_MARC-MATNR
+             and  WERKS eq @LT_MARC-WERKS
+             and  LOEKZ eq @SPACE.
+    else.
+***   Get Sales Document Category of reference
+      select single VBTYP
+             from VBAK
+             into @data(LF_VGTYP)
+            where VBELN eq @IF_VGBEL.
+      if SY-SUBRC ne 0.
+        clear LF_VGTYP.   "Issue will be handled by BAPI
+      endif.
+    endif.
+
+***------------------------------------------------------------------------------------------------
+*** Add Items
+    loop at IT_PRT into data(LS_PRT).
+***   Filter
+      check LINE_EXISTS( LT_MARC[ MATNR = LS_PRT-MATNR
+                                  WERKS = LS_PRT-WERKS ] ) and
+            LINE_EXISTS( LT_MVKE[ MATNR = LS_PRT-MATNR ] ) and
+            not LINE_EXISTS( LT_EBAN[ MATNR = LS_PRT-MATNR
+                                      WERKS = LS_PRT-WERKS ] ).
+
+***   Add Item
+      append value #( POSNR  = IR_BOB_SDOC->GET_POSNR_NEXT( )
+                      MATNR  = LS_PRT-MATNR
+                      WERKS  = LS_PRT-WERKS
+                      SPART  = IR_BOB_SDOC->S_VBAK-SPART
+                      KWMENG = 1
+                      VRKME  = LT_MVKE[ MATNR = LS_PRT-MATNR ]-VRKME
+                      MEINS  = LT_MARA[ MATNR = LS_PRT-MATNR ]-MEINS
+                      UMVKZ  = 1
+                      UMVKN  = 1
+                      STDAT  = SY-DATUM
+                      VGTYP  = LF_VGTYP
+                      VGBEL  = IF_VGBEL
+                      VGPOS  = IF_VGPOS
+                    ) to IR_BOB_SDOC->T_VBAP assigning field-symbol(<S_VBAP>).
+
+***   Schedule Lines Data
+      append value #( POSNR = <S_VBAP>-POSNR
+                      ETENR = '0001'
+                      WMENG = <S_VBAP>-KWMENG
+                      VRKME = <S_VBAP>-VRKME
+                      MEINS = <S_VBAP>-MEINS
+                    ) to IR_BOB_SDOC->T_VBEP.
+
+***   Determine Ship-to of Plant and use for Tool Item
+      select single KUNNR
+             into @data(LF_KUNWE)
+             from T001W
+            where WERKS = @LS_PRT-WERKS.
+      if SY-SUBRC ne 0 or
+         LF_KUNWE is initial.
+***     No Customer Number maintained for Plant &1
+        /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGID = 'ZVCXI_PXSS'
+                                              IF_MSGTY = 'W'
+                                              IF_MSGNO = '081'
+                                              IF_MSGV1 = LS_PRT-WERKS ).
+      else.
+***     Define Partner on Item Level
+        append value #( POSNR = <S_VBAP>-POSNR
+                        PARVW = 'WE'
+                        KUNNR = LF_KUNWE
+                      ) to IR_BOB_SDOC->T_VBPA.
+      endif.
+    endloop.
+
+  endmethod.
+  method CREATE.
+
+    data: LF_WERKS type WERKS_D,
+          LF_VKORG type VKORG,
+          LF_VTWEG type VTWEG,
+          LF_KUNAG type KUNAG,
+          LF_KUNWE type KUNWE.
+    data: LI_VBELN type range of VBELN.
+
+***------------------------------------------------------------------------------------------------
+*** Determine Plant
+    if IF_WERKS is supplied.
+      LF_WERKS = IF_WERKS.
+    else.
+      select single WERKS
+             into @LF_WERKS
+             from MARC
+            where MATNR eq @IF_MATNR
+             and  CUOBJ ne @SPACE.
+    endif.
+
+*** Determine Ship-to of Plant and use for Tool Order
+    select single KUNNR
+           into LF_KUNWE
+           from T001W
+          where WERKS = LF_WERKS.
+    if SY-SUBRC ne 0 or
+       LF_KUNWE is initial.
+***   No Customer Number maintained for Plant &1
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGID = 'ZVCXI_PXSS'
+                                            IF_MSGTY = 'W'
+                                            IF_MSGNO = '081'
+                                            IF_MSGV1 = LF_WERKS ).
+    endif.
+
+***------------------------------------------------------------------------------------------------
+*** Get PRTs
+    data(LT_PRT) = ZCL_VCXI_XCE_PP_SERVICE=>GET_PRT( IF_MATNR = IF_MATNR
+                                                     IF_WERKS = LF_WERKS ).
+ENHANCEMENT-POINT FILTER_PRT SPOTS ZVCXI_XCE_SD_ES_TOOL_ORDER .
+    check LT_PRT is not initial.
+
+*** Filter by Reference Document
+    if IF_VGBEL is supplied.
+      LI_VBELN = value #( ( SIGN = 'I' OPTION = 'EQ' LOW = IF_VGBEL ) ).
+    endif.
+
+*** Get Sold-to / Ship-to (prioritized)
+    select VBAK~VBELN, VBAK~VKORG, VBAK~VTWEG, VBAK~SPART, VBAK~VDATU,
+           VBPA~POSNR, VBPA~PARVW, VBPA~KUNNR
+           into table @data(LT_SDOC)
+           from VBAP
+           inner join VBAK
+            on VBAK~VBELN eq VBAP~VBELN
+           inner join VBPA
+            on VBPA~VBELN eq VBAP~VBELN
+           and VBPA~POSNR eq '00000'
+          where VBAP~VBELN  in @LI_VBELN
+           and  VBAP~MATNR  eq @IF_MATNR
+           and  VBAP~WERKS  eq @LF_WERKS
+           and ( VBPA~PARVW eq 'AG' or
+                 VBPA~PARVW eq 'WE' )
+           order by VBAP~ERDAT ascending,
+                    VBPA~PARVW,
+                    VBPA~POSNR descending.
+    if SY-SUBRC ne 0.
+      exit.
+    else.
+      LF_KUNAG = value #( LT_SDOC[ PARVW = 'AG' ]-KUNNR optional ).
+      LF_VKORG = LT_SDOC[ 1 ]-VKORG.
+      LF_VTWEG = LT_SDOC[ 1 ]-VTWEG.
+    endif.
+
+***------------------------------------------------------------------------------------------------
+*** Create a new Sale Document Business Object Instance
+    data(LR_BOB_SDOC) = ZCL_VCXI_XCE_SD_TOOL_ORDER=>PREPARE( IF_AUART = IF_AUART
+                                                             IF_VKORG = LF_VKORG
+                                                             IF_VTWEG = LF_VTWEG
+                                                             IF_SPART = LT_SDOC[ 1 ]-SPART
+                                                             IF_VDATU = LT_SDOC[ 1 ]-VDATU
+                                                             IF_KUNAG = LF_KUNAG
+                                                             IF_KUNWE = LF_KUNWE ).
+
+*** Add sales relevant PRTs
+    ZCL_VCXI_XCE_SD_TOOL_ORDER=>ADD_PRT( IT_PRT      = LT_PRT
+                                         IR_BOB_SDOC = LR_BOB_SDOC
+                                         IF_VGBEL    = IF_VGBEL
+                                         IF_VGPOS    = IF_VGPOS ).
+    check LR_BOB_SDOC->T_VBAP is not initial.
+
+
+***------------------------------------------------------------------------------------------------
+*** Create Sales Document
+    ER_MSG = LR_BOB_SDOC->SAVE( IF_TESTRUN = IF_TESTRUN
+                                IF_COMMIT  = IF_COMMIT ).
+    RF_VBELN = LR_BOB_SDOC->S_VBAK-VBELN.
+
+  endmethod.
+  method PREPARE.
+
+*** Create a new Sale Document Business Object Instance
+    RR_BOB_SDOC = new ZCL_VCXI_XCI_BOB_SDOC( ).
+
+*** Define the view relevant
+    RR_BOB_SDOC->S_ORDER_VIEW = value #( HEADER     = ABAP_TRUE
+                                         ITEM       = ABAP_TRUE
+                                         SDSCHEDULE = ABAP_TRUE
+                                         BUSINESS   = ABAP_TRUE
+                                         PARTNER    = ABAP_TRUE
+                                         SDCOND     = ABAP_TRUE
+                                         CONFIGURE  = ABAP_TRUE ).
+
+*** Define Header
+    RR_BOB_SDOC->S_VBAK = value #( AUART = IF_AUART
+                                   VKORG = IF_VKORG
+                                   VTWEG = IF_VTWEG
+                                   SPART = IF_SPART
+                                   VDATU = IF_VDATU ).
+*** Define Partner
+    RR_BOB_SDOC->T_VBPA = value #( ( PARVW = 'AG'  KUNNR = IF_KUNAG )
+                                   ( PARVW = 'WE'  KUNNR = IF_KUNWE ) ).
+
+  endmethod.

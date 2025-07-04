@@ -1,0 +1,128 @@
+
+class ZCL_VCXI_PXE_CAD_OUTB_MAT definition
+  public
+  inheriting from ZCL_VCXI_PXE_CAD_OUTB
+  create public .
+
+public section.
+
+  methods CONSTRUCTOR
+    importing
+      !IF_MATNR type MATNR
+      !IF_WERKS type WERKS_D
+      !IF_UNAME type UNAME default SY-UNAME
+    raising
+      /VCXI/CX_CKX .
+
+  methods SEND
+    redefinition .
+protected section.
+
+  data F_MATNR type MATNR .
+  data F_WERKS type WERKS_D .
+
+  methods IS_RELEVANT
+    importing
+      !IR_BOB_MAT type ref to ZCL_VCXI_XCI_BOB_MAT
+    returning
+      value(RF_RELEVANT) type ABAP_BOOL
+    raising
+      /VCXI/CX_CKX .
+  methods SEND_MAT
+    importing
+      !IR_BOB_MAT type ref to ZCL_VCXI_XCI_BOB_MAT
+    raising
+      /VCXI/CX_CKX .
+private section.
+endclass. "ZCL_VCXI_PXE_CAD_OUTB_MAT definition
+class ZCL_VCXI_PXE_CAD_OUTB_MAT implementation.
+  method CONSTRUCTOR.
+
+    SUPER->CONSTRUCTOR( IF_NREXT = conv #( IF_MATNR )
+                        IF_UNAME = IF_UNAME ).
+    ME->F_MATNR = IF_MATNR.
+    ME->F_WERKS = IF_WERKS.
+
+  endmethod.
+  method IS_RELEVANT.
+  endmethod.
+  method SEND.
+
+    try.
+***------------------------------------------------------------------------------------------------
+***     Create Business Object
+        data(LR_BOB_MAT) = new ZCL_VCXI_XCI_BOB_MAT( ).
+
+***     Load existing Material
+        LR_BOB_MAT->INIT_FROM_DB( IF_MATNR = ME->F_MATNR
+                                  IF_WERKS = ME->F_WERKS ).
+
+***     Check Material is relevant for outbound processing
+        check ME->IS_RELEVANT( IR_BOB_MAT = LR_BOB_MAT ).
+
+***------------------------------------------------------------------------------------------------
+***     Lock Material
+        LR_BOB_MAT->ENQUEUE( ).
+
+***     Send Material
+        ME->SEND_MAT( IR_BOB_MAT = LR_BOB_MAT ).
+
+***     Release Lock of Material
+        LR_BOB_MAT->DEQUEUE( ).
+
+      catch /VCXI/CX_CKX into data(LR_CX_CKX).
+        ME->R_BAL->ADD_BAL_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+        raise exception LR_CX_CKX.
+    endtry.
+
+  endmethod.
+  method SEND_MAT.
+
+***------------------------------------------------------------------------------------------------
+*** Run Configuration of Material (in Change Mode)
+    IR_BOB_MAT->RUN_CONFIG( IF_LOCKED = ABAP_TRUE ).
+
+*** Get SmartVC API Instance
+    data(LR_SVC) = IR_BOB_MAT->GET_SVC( ).
+
+***------------------------------------------------------------------------------------------------
+*** Get CAD Interface - Project
+    data(LR_EA_CADIF_PRJ) = ME->GET_CADIF_PRJ( IR_SVC = LR_SVC ).
+    check LR_EA_CADIF_PRJ is bound.
+
+*** Call HTTP Client with CAD Inferface Information XML
+    data(LF_SUBRC) = ME->CALL_HTTP( IF_OWNER   = |Material { IR_BOB_MAT->GET_MATNR_AS_MSGV( ) }|
+                                    IF_BODY    = LR_EA_CADIF_PRJ->GET_XML( )
+                                    IF_RFCDEST = LR_EA_CADIF_PRJ->GET_RFCDEST( ) ).
+    check LF_SUBRC eq 0.
+
+*** Set next Status
+    LR_EA_CADIF_PRJ->GET_CADPS( importing ET_CADPS_NEXT = data(LT_CADPS_NEXT) ).
+    if LT_CADPS_NEXT is not initial.
+      LR_EA_CADIF_PRJ->SET_CADPS( IF_CADPS = LT_CADPS_NEXT[ 1 ] ).
+    endif.
+
+***------------------------------------------------------------------------------------------------
+*** Run Configuration afterwards to ensure Routing Supervisor gets executed
+    LR_SVC->UPDATE_DC( ).
+
+*** Run Configuration to update LO-VC consistency etc.
+    IR_BOB_MAT->RUN_CONFIG( IF_LOCKED = ABAP_TRUE ).
+
+
+***------------------------------------------------------------------------------------------------
+*** Get SmartVC API Instance
+    LR_SVC = IR_BOB_MAT->GET_SVC( ).
+
+*** Create Integration Data for SmartVC based on CAD Interface - Project
+    ME->BUILD_IDAT( IR_SVC = LR_SVC ).
+
+*** Change Material Configuration
+    IR_BOB_MAT->CHANGE_CONFIG( ).
+
+*** Material Configuration successfully updated.
+    ME->R_BAL->ADD_BAL_BY_BAPIRET2( IS_BAPIRET2 = value #( TYPE   = 'S'
+                                                           ID     = 'ZVCXI_PXM_CAD'
+                                                           NUMBER = '031' ) ).
+
+  endmethod.

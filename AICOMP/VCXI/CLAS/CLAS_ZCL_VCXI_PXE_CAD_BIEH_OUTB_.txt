@@ -1,0 +1,180 @@
+
+class ZCL_VCXI_PXE_CAD_BIEH_OUTB definition
+  public
+  create public .
+
+public section.
+
+  interfaces BI_EVENT_HANDLER_STATIC .
+
+  class-methods CALL_HTTP
+    importing
+      !IF_POSNR type POSNR
+      !IF_BODY type XSTRING
+      !IF_CONTENT_TYPE type STRING default IF_REST_MEDIA_TYPE=>GC_APPL_XML
+      !IF_RFCDEST type RFCDEST
+      !IF_BALLOGHNDL type BALLOGHNDL optional
+    exporting
+      !EF_CODE type SYSUBRC
+      !EF_MSG type STRING
+    returning
+      value(RF_SUBRC) type SYSUBRC
+    raising
+      /VCXI/CX_CKX .
+  class-methods GET_CADIF_PRJ
+    importing
+      !IR_SVC type ref to /VCXI/CL_VKSRA_SVC
+    exporting
+      !ER_SVCEL type ref to /VCXI/CL_VKSRA_SVC_ELEMENT
+    returning
+      value(RR_EA_CADIF_PRJ) type ref to ZCL_VCXI_PXSS_EA_CADIF_PRJ
+    raising
+      /VCXI/CX_CKX .
+protected section.
+
+  types:
+    YT_POSNR type table of POSNR with key table_line .
+
+  constants C_BALPROBCL_IMP type BALPROBCL value '2' ##NO_TEXT.
+  constants C_BALPROBCL_INFO type BALPROBCL value '4' ##NO_TEXT.
+  data F_BAL_HANDLE type BALLOGHNDL .
+  data R_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC .
+private section.
+endclass. "ZCL_VCXI_PXE_CAD_BIEH_OUTB definition
+class ZCL_VCXI_PXE_CAD_BIEH_OUTB implementation.
+  method BI_EVENT_HANDLER_STATIC~ON_EVENT.
+
+    data: LS_ACTOR type SWHACTOR.
+
+
+    try.
+***     Get Creator of Event
+        EVENT_CONTAINER->GET( exporting NAME = '_EVT_CREATOR'
+                              importing VALUE = LS_ACTOR ).
+
+***     Ignore Events created by WorkFlow itself
+        check LS_ACTOR-OBJID ne SY-UNAME.
+
+***------------------------------------------------------------------------------------------------
+***     Sales Document Outbound Processing
+        data(LR_OUTB_SDOC) = new ZCL_VCXI_PXE_CAD_OUTB_SDOC( IF_VBELN = conv #( SENDER-INSTID )
+                                                             IF_UNAME = LS_ACTOR-OBJID ).
+
+***     Send to CAD
+        LR_OUTB_SDOC->SEND( ).
+
+***------------------------------------------------------------------------------------------------
+***     Restart for specific Sales Document
+        wait up to 2 seconds.   "Ensure Dequeue fully processed...
+        ZCL_VCXI_PXM_CAD_SERVICE=>RESTART_BY_VBELN( IF_VBELN = conv #( SENDER-INSTID ) ).
+
+
+***------------------------------------------------------------------------------------------------
+***   Error Handling
+      catch /VCXI/CX_CKX into data(LR_CX_CKX).
+        if LR_CX_CKX->F_TEMP ne ABAP_TRUE.
+          raise exception type CX_BO_ERROR
+            exporting
+              PREVIOUS = LR_CX_CKX.
+        else.
+          raise exception type CX_BO_TEMPORARY
+            exporting
+              PREVIOUS = LR_CX_CKX.
+        endif.
+
+      catch CX_SWF_CNT_CONTAINER into data(LR_CX_SWF_CNT_CONTAINER).
+        raise exception type CX_BO_ERROR
+          exporting
+            PREVIOUS = LR_CX_SWF_CNT_CONTAINER.
+    endtry.
+
+  endmethod.
+  method CALL_HTTP.
+
+    data: LR_HTTP_CLIENT type ref to IF_HTTP_CLIENT.
+
+
+*** Application Log
+    data(LR_BAL) = new /VCXI/CL_CKX_BAL( IF_LOGHNDL = IF_BALLOGHNDL ).
+
+***------------------------------------------------------------------------------------------------
+*** Creating the HTTP Client based on HTTP RFC Connection (SM59)
+    CL_HTTP_CLIENT=>CREATE_BY_DESTINATION( exporting  DESTINATION = IF_RFCDEST
+                                           importing  CLIENT      = LR_HTTP_CLIENT
+                                           exceptions others      = 9 ).
+    if SY-SUBRC <> 0.
+      /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+    endif.
+
+*** Set HTTP Version and Method
+    LR_HTTP_CLIENT->REQUEST->SET_VERSION( IF_HTTP_REQUEST=>CO_PROTOCOL_VERSION_1_0 ).
+    LR_HTTP_CLIENT->REQUEST->SET_METHOD( IF_HTTP_REQUEST=>CO_REQUEST_METHOD_POST ).
+
+***------------------------------------------------------------------------------------------------
+*** Set Payload or Body (JSON or XML)
+    LR_HTTP_CLIENT->REQUEST->SET_CONTENT_TYPE( CONTENT_TYPE = IF_CONTENT_TYPE ).
+    LR_HTTP_CLIENT->REQUEST->SET_DATA( DATA = IF_BODY ).
+
+*** Add Application Log by BAPI Return Structure
+    if IF_BALLOGHNDL is not initial.
+      LR_BAL->ADD_BAL_BY_BAPIRET2( IS_BAPIRET2   = value #( TYPE       = 'I'
+                                                            ID         = '/VCXI/CKX'
+                                                            NUMBER     = '000'
+                                                            MESSAGE_V1 = 'Item' && IF_POSNR
+                                                            MESSAGE_V2 = 'Start HTTP Call' )
+                                   IF_BALPROBCL  = C_BALPROBCL_INFO ).
+    endif.
+
+*** Send
+    LR_HTTP_CLIENT->SEND( exceptions others = 9 ).
+    if SY-SUBRC ne 0.
+      LR_HTTP_CLIENT->GET_LAST_ERROR( importing CODE    = EF_CODE
+                                                MESSAGE = EF_MSG ).
+      exit.
+    endif.
+
+***------------------------------------------------------------------------------------------------
+*** Get Response
+    LR_HTTP_CLIENT->RECEIVE( exceptions others = 9 ).
+
+    if SY-SUBRC ne 0.
+      LR_HTTP_CLIENT->GET_LAST_ERROR( importing CODE    = EF_CODE
+                                                MESSAGE = EF_MSG ).
+    else.
+      EF_CODE = LR_HTTP_CLIENT->RESPONSE->GET_HEADER_FIELD( '~status_code' ).
+      EF_MSG  = LR_HTTP_CLIENT->RESPONSE->GET_HEADER_FIELD( '~status_reason' ).
+    endif.
+
+*** Process Return Code
+    if EF_CODE eq '200'.
+      RF_SUBRC = 0.
+    else.
+      RF_SUBRC = 4.
+    endif.
+
+*** Add Application Log by BAPI Return Structure
+    if IF_BALLOGHNDL is not initial.
+      LR_BAL->ADD_BAL_BY_BAPIRET2( IS_BAPIRET2   = value #( TYPE       = 'I'
+                                                            ID         = '/VCXI/CKX'
+                                                            NUMBER     = '000'
+                                                            MESSAGE_V1 = 'Item' && IF_POSNR
+                                                            MESSAGE_V2 = 'HTTP Call with'
+                                                            MESSAGE_V3 = EF_CODE
+                                                            MESSAGE_V4 = EF_MSG )
+                                   IF_BALPROBCL  = switch #( RF_SUBRC when '4' then C_BALPROBCL_IMP
+                                                                               else C_BALPROBCL_INFO ) ).
+    endif.
+
+  endmethod.
+  method GET_CADIF_PRJ.
+
+    data: LT_SVCEL type /VCXI/CKX_TT_OBJECT.
+
+
+    LT_SVCEL = IR_SVC->GET_SVC_ELEMENTS( IF_ID = 'CADIF_PRJ' ).
+    check LT_SVCEL is not initial.
+
+    ER_SVCEL = cast /VCXI/CL_VKSRA_SVC_ELEMENT( LT_SVCEL[ 1 ] ).
+    RR_EA_CADIF_PRJ ?= ER_SVCEL->GET_CLSEA( ).
+
+  endmethod.

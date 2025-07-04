@@ -1,0 +1,155 @@
+FUNCTION zspp_envio_orders_background.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IT_AUFNR) TYPE  ZSPP_TT_UPDATE_ORDENES
+*"----------------------------------------------------------------------
+
+*  DATA: lv_number     TYPE bapi_order_key-order_number,
+*        wa_orderdata  TYPE bapi_pp_order_change,
+*        wa_orderdatax TYPE bapi_pp_order_changex,
+*        wa_return     TYPE bapiret2.
+*  DO.ENDDO.
+  SELECT aufnr INTO TABLE @DATA(lt_aufnr) FROM zsppt_reenvioof.
+
+  LOOP AT lt_aufnr ASSIGNING FIELD-SYMBOL(<fs>).
+    APPEND INITIAL LINE TO it_aufnr ASSIGNING FIELD-SYMBOL(<fs2>).
+    <fs2>-aufnr = <fs>-aufnr.
+  ENDLOOP.
+
+  SORT lt_aufnr BY aufnr ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM lt_aufnr COMPARING aufnr.
+
+  LOOP AT it_aufnr ASSIGNING FIELD-SYMBOL(<aufn>).
+
+    "Chequeamos que la OF está ABIE para enviar la OF
+    SELECT SINGLE stat
+      INTO @DATA(lv_stat)
+      FROM jest AS t1 INNER JOIN aufk AS t2
+      ON t1~objnr EQ t2~objnr
+      WHERE aufnr EQ @<aufn>-aufnr
+      AND inact = @space
+      AND stat EQ 'I0001'."ABIE
+    IF sy-subrc <> 0.
+      "Si la orden no está ABIE, no la enviamos, a partir de otro status, manda OMP
+      SELECT SINGLE aufnr INTO @DATA(lv_aufnr) FROM zsppt_reenvioof WHERE aufnr EQ @<aufn>-aufnr.
+      "Si viene de un fallo de envío, tratamos de enviarla de nuevo, sino continuamos
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+
+*    CLEAR: wa_orderdata, wa_orderdatax.
+*
+*    IF <aufn>-fecha_fin IS NOT INITIAL.
+*      wa_orderdata-basic_end_date = <aufn>-fecha_fin.
+*      wa_orderdatax-basic_end_date = abap_true.
+*    ENDIF.
+*
+*    IF <aufn>-menge IS NOT INITIAL.
+*      wa_orderdata-quantity = <aufn>-menge.
+*      wa_orderdatax-quantity = abap_true.
+*    ENDIF.
+*
+*    lv_number = <aufn>-aufnr.
+*
+*    IF wa_orderdata IS NOT INITIAL.
+*      SET UPDATE TASK LOCAL.
+*
+*      CALL FUNCTION 'BAPI_PRODORD_CHANGE'
+*        EXPORTING
+*          number     = lv_number
+*          orderdata  = wa_orderdata
+*          orderdatax = wa_orderdatax
+*        IMPORTING
+*          return     = wa_return
+**         order_type =
+**         order_status     =
+**         master_data_read =
+*        .
+*
+*      IF NOT ( wa_return-type EQ 'X' OR wa_return-type EQ 'A' OR wa_return-type EQ 'E' ).
+*        COMMIT WORK AND WAIT.
+*      ELSE.
+*        ROLLBACK WORK.
+*      ENDIF.
+*
+*      WAIT UP TO 5 SECONDS.
+*
+*      zssd_utils=>re_schedule_orden_fab(
+*   EXPORTING
+*     i_aufnr = lv_number
+*   IMPORTING
+*     o_error = DATA(lv_error)
+* ).
+*
+*
+*    ENDIF.
+
+    "ADD JVM - 12/06/2024 Si es orden de grafo, no puede lanzarse con grabación ya que da dump
+    SELECT SINGLE prodnet, gamng FROM caufv WHERE aufnr EQ @<aufn>-aufnr INTO @DATA(lv_aufcheck).
+*    IF sy-subrc = 0 AND lv_aufcheck-prodnet EQ abap_true.
+      DATA: wa_data  TYPE bapi_pp_order_change,
+            wa_datax TYPE bapi_pp_order_changex,
+            wa_ret   TYPE bapiret2.
+
+      CLEAR: wa_data, wa_datax, wa_ret.
+
+      wa_data-quantity = lv_aufcheck-gamng.
+      wa_datax-quantity = abap_true.
+
+      CALL FUNCTION 'BAPI_PRODORD_CHANGE'
+        EXPORTING
+          number     = <aufn>-aufnr
+          orderdata  = wa_data
+          orderdatax = wa_datax
+        IMPORTING
+          return     = wa_ret
+*         order_type =
+*         order_status     =
+*         master_data_read =
+        .
+
+      COMMIT WORK AND WAIT.
+      IF NOT wa_ret-type CA 'AEX'.
+        DELETE FROM zsppt_reenvioof WHERE aufnr EQ <aufn>-aufnr.
+      ELSE.
+        DATA wa_aufnr TYPE zsppt_reenvioof.
+        wa_aufnr-aufnr = <aufn>-aufnr.
+        MODIFY zsppt_reenvioof FROM wa_aufnr.
+      ENDIF.
+
+*    ELSE.
+*      CLEAR: bdc_tab, bdc_tab[].
+*      CLEAR: messtab[], messtab.
+*
+*      PERFORM bdc_dynpro      USING 'SAPLCOKO1' '0110'.
+*      PERFORM bdc_field       USING 'BDC_OKCODE' '/00'.
+*      PERFORM bdc_field       USING 'CAUFVD-AUFNR' <aufn>-aufnr.
+*      PERFORM bdc_dynpro      USING 'SAPLCOKO1' '0115'.
+*      PERFORM bdc_field       USING 'BDC_OKCODE' '=BU'.
+*
+*      CALL TRANSACTION 'CO02' USING  bdc_tab
+*                              MODE   'N'
+*                              UPDATE 'S'
+*                              MESSAGES INTO messtab.
+*
+*      LOOP AT messtab TRANSPORTING NO FIELDS WHERE msgtyp = 'A' OR msgtyp EQ 'E' OR msgtyp EQ 'X'.
+*        EXIT.
+*      ENDLOOP.
+*      IF sy-subrc <> 0.
+*        DELETE FROM zsppt_reenvioof WHERE aufnr EQ <aufn>-aufnr.
+*      ELSE.
+**        DATA wa_aufnr TYPE zsppt_reenvioof.
+*        wa_aufnr-aufnr = <aufn>-aufnr.
+*        MODIFY zsppt_reenvioof FROM wa_aufnr.
+*      ENDIF.
+*    ENDIF.
+    "FJVM - FIN ADD 12/06/2024 Si es orden de grafo, no puede lanzarse con grabación ya que da dump
+
+  ENDLOOP.
+
+
+
+ENDFUNCTION.

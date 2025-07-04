@@ -1,0 +1,441 @@
+FUNCTION zssd_plastico_fact.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(VBELN) TYPE  VBELN_VF
+*"     REFERENCE(YCIP) TYPE  FLAG DEFAULT 'X'
+*"     REFERENCE(YZIP) TYPE  FLAG DEFAULT 'X'
+*"  EXPORTING
+*"     REFERENCE(DATOS) TYPE  ZSSDTT_PLASTICO_DATOS
+*"----------------------------------------------------------------------
+
+  DATA: lw_datos     TYPE zssds_plastico_datos,
+        lw_header    TYPE thead,
+        lw_header_1  TYPE thead,
+        lw_header_2  TYPE thead,
+        lt_lines     TYPE TABLE OF tline,
+        lt_lines_1   TYPE TABLE OF tline,
+        lt_lines_2   TYPE TABLE OF tline,
+        lw_lines     TYPE tline,
+        lw_konp      TYPE /sei/ie5_ed_tarifa,
+        l_precio_txt TYPE c LENGTH 30,
+        l_kilos_txt  TYPE c LENGTH 30,
+        l_kilos_c    TYPE c LENGTH 30,
+        l_imp_c      TYPE c LENGTH 30,
+        l_ntgew_txt  TYPE c LENGTH 30,
+        l_imp_txt    TYPE c LENGTH 30,
+        l_gewei_txt  TYPE c LENGTH 3,
+        l_porcentaje TYPE p DECIMALS 2,
+        l_port_c(20) TYPE c,
+        lv_check     TYPE flag,
+        ts1          TYPE timestampl,
+        ts2          TYPE timestampl,
+        lv_posnr_aux TYPE posnr,
+*        lv_letra     TYPE c LENGTH 3,
+        l_tx_exe     TYPE zssds_plastico_datos-tx_exe.
+
+  DATA: is_producto_input TYPE  /sei/ie5_s_producto_in,
+        et_producto       TYPE  /sei/ie5_tt_producto,
+        wa_producto       TYPE /sei/ie5_s_producto.
+
+  RANGES: lr_kschl FOR konv-kschl.
+
+  IF ycip IS INITIAL AND yzip IS INITIAL.
+    RETURN.
+  ENDIF.
+
+
+
+  GET TIME STAMP FIELD ts2.
+  "Ponemos una espera activa hasta que se rellene la tabla
+  lv_check = abap_false.
+  WHILE lv_check = abap_false.
+
+    SELECT SINGLE vbeln
+      INTO @DATA(l_vbeln)
+      FROM vbrk
+      WHERE vbeln = @vbeln.
+
+    IF sy-subrc EQ 0.
+      lv_check = abap_true.
+      EXIT.
+    ENDIF.
+
+    GET TIME STAMP FIELD ts1.
+
+    DATA(seconds) = cl_abap_tstmp=>subtract(
+      EXPORTING
+        tstmp1 = ts1
+        tstmp2 = ts2 ).
+
+    IF seconds > 5.
+      lv_check = abap_true.
+      EXIT.
+    ENDIF.
+  ENDWHILE.
+
+
+  IF ycip IS NOT INITIAL.
+    lr_kschl = 'IEQYCIP'.
+    APPEND lr_kschl.
+  ENDIF.
+  IF yzip IS NOT INITIAL.
+    lr_kschl = 'IEQYZIP'.
+    APPEND lr_kschl.
+  ENDIF.
+
+  SELECT vbrk~vbeln, vbrp~posnr, vbrp~uecha, vbrk~fkdat, vbrp~ntgew, vbrp~gewei,
+         prcd~knumv, prcd~kposn, prcd~kschl, prcd~kawrt,
+         prcd~kwert, prcd~kbetr, prcd~kpein, prcd~kmein
+    INTO TABLE @DATA(lt_prcd)
+    FROM vbrk
+     INNER JOIN vbrp ON vbrk~vbeln = vbrp~vbeln
+     INNER JOIN konv AS prcd ON vbrk~knumv = prcd~knumv AND vbrp~posnr = prcd~kposn
+    WHERE vbrk~vbeln = @vbeln
+      AND prcd~kschl IN @lr_kschl.
+
+  "Si estamos utilizando la KONV, miramos si el grupo de función V61A tiene marcado el "Cálculo de coma fija"
+  "Si lo tiene desmarcado, dividimos entre 10
+  DATA: lv_kawrt_aux TYPE konv-kawrt.
+  SELECT SINGLE fixpt
+    FROM trdir
+    WHERE name = 'SAPLV61A'
+    INTO @DATA(lv_coma_fija).
+
+  LOOP AT lt_prcd INTO DATA(lw_prcd).
+    "Posición
+    READ TABLE datos ASSIGNING FIELD-SYMBOL(<fs_datos>) WITH KEY vbeln = lw_prcd-vbeln posnr = lw_prcd-posnr.
+    IF sy-subrc <> 0.
+      CLEAR lw_datos.
+      lw_datos-vbeln = lw_prcd-vbeln.
+      lw_datos-posnr = lw_prcd-posnr.
+      lw_datos-uecha = lw_prcd-uecha.
+      lw_datos-ntgew = lw_prcd-ntgew.
+      lw_datos-gewei = lw_prcd-gewei.
+      APPEND lw_datos TO datos.
+      READ TABLE datos ASSIGNING <fs_datos> WITH KEY vbeln = lw_prcd-vbeln posnr = lw_prcd-posnr.
+    ENDIF.
+
+    IF lw_prcd-kschl = 'YZIP' AND yzip = 'X'.
+      ADD lw_prcd-kwert TO <fs_datos>-yzip_imp.
+      IF lv_coma_fija IS INITIAL.
+        CLEAR: lv_kawrt_aux.
+        lv_kawrt_aux = lw_prcd-kawrt / 10.
+        ADD lv_kawrt_aux TO <fs_datos>-yzip_kg.
+      ELSE.
+        ADD lw_prcd-kawrt TO <fs_datos>-yzip_kg.
+      ENDIF.
+    ENDIF.
+
+    IF lw_prcd-kschl = 'YCIP' AND ycip = 'X'.
+      ADD lw_prcd-kwert TO <fs_datos>-ycip_imp.
+      IF lv_coma_fija IS INITIAL.
+        CLEAR: lv_kawrt_aux.
+        lv_kawrt_aux = lw_prcd-kawrt / 10.
+        ADD lv_kawrt_aux TO <fs_datos>-ycip_kg.
+      ELSE.
+        ADD lw_prcd-kawrt TO <fs_datos>-ycip_kg.
+      ENDIF.
+    ENDIF.
+
+    <fs_datos>-total_imp =  <fs_datos>-yzip_imp + <fs_datos>-ycip_imp.
+    <fs_datos>-total_kg  =  <fs_datos>-yzip_kg  + <fs_datos>-ycip_kg.
+
+    "Posición superior
+    IF lw_prcd-uecha IS NOT INITIAL AND lw_prcd-uecha <> lw_prcd-posnr.
+      READ TABLE datos ASSIGNING <fs_datos> WITH KEY vbeln = lw_prcd-vbeln posnr = lw_prcd-uecha.
+      IF sy-subrc <> 0.
+        CLEAR lw_datos.
+        lw_datos-vbeln = lw_prcd-vbeln.
+        lw_datos-posnr = lw_prcd-uecha.
+        lw_datos-uecha = lw_prcd-uecha.
+        lw_datos-gewei = lw_prcd-gewei.
+        APPEND lw_datos TO datos.
+        READ TABLE datos ASSIGNING <fs_datos> WITH KEY vbeln = lw_prcd-vbeln posnr = lw_prcd-uecha.
+      ENDIF.
+
+      IF lw_prcd-kschl = 'YZIP' AND yzip = 'X'.
+        ADD lw_prcd-kwert TO <fs_datos>-yzip_imp.
+        IF lv_coma_fija IS INITIAL.
+          CLEAR: lv_kawrt_aux.
+          lv_kawrt_aux = lw_prcd-kawrt / 10.
+          ADD lv_kawrt_aux TO <fs_datos>-yzip_kg.
+        ELSE.
+          ADD lw_prcd-kawrt TO <fs_datos>-yzip_kg.
+        ENDIF.
+      ENDIF.
+
+      IF lw_prcd-kschl = 'YCIP' AND ycip = 'X'.
+        ADD lw_prcd-kwert TO <fs_datos>-ycip_imp.
+        IF lv_coma_fija IS INITIAL.
+          CLEAR: lv_kawrt_aux.
+          lv_kawrt_aux = lw_prcd-kawrt / 10.
+          ADD lv_kawrt_aux TO <fs_datos>-ycip_kg.
+        ELSE.
+          ADD lw_prcd-kawrt TO <fs_datos>-ycip_kg.
+        ENDIF.
+      ENDIF.
+
+      <fs_datos>-total_imp =  <fs_datos>-yzip_imp + <fs_datos>-ycip_imp.
+      <fs_datos>-total_kg  =  <fs_datos>-yzip_kg  + <fs_datos>-ycip_kg.
+      <fs_datos>-ntgew = <fs_datos>-ntgew + lw_prcd-ntgew.
+    ENDIF.
+  ENDLOOP.
+
+**********************************************************************
+* EXENCIONEs
+**********************************************************************
+  DATA: lt_out TYPE /sei/ie5_tt_fra_vta.
+  CLEAR lt_out[].
+
+  CALL FUNCTION '/SEI/IE5_FACTURA_VTAS_V2'
+    EXPORTING
+      i_vbeln = vbeln
+    IMPORTING
+      t_out   = lt_out.
+
+  SELECT *
+    INTO TABLE @DATA(lt_denom)
+    FROM /sei/ie5_tc001.
+
+*  LOOP AT lt_out INTO DATA(lw_out).
+*    READ TABLE datos ASSIGNING <fs_datos> WITH KEY vbeln = lw_out-vbeln posnr = lw_out-posnr.
+*    IF sy-subrc = 0.
+*      READ TABLE lt_denom ASSIGNING FIELD-SYMBOL(<fs_denom>) WITH KEY id_regimen_fiscal = lw_out-id_regimen_fiscal.
+*      IF sy-subrc EQ 0.
+*        CLEAR lv_letra.
+*        CONCATENATE '(' <fs_denom>-tipo_regimen_anexo_vii ')' INTO lv_letra.
+*        CONCATENATE lv_texto_regimen lv_letra <fs_denom>-denom_regimen INTO <fs_datos>-tx_exe SEPARATED BY space.
+*        CONDENSE <fs_datos>-tx_exe.
+*      ELSE.
+*        READ TABLE lt_denom ASSIGNING <fs_denom> WITH KEY id_regimen_fiscal = '01'.
+*        IF sy-subrc EQ 0.
+*          CLEAR lv_letra.
+*          CONCATENATE '(' <fs_denom>-tipo_regimen_anexo_vii ')' INTO lv_letra.
+*          CONCATENATE lv_texto_regimen lv_letra <fs_denom>-denom_regimen INTO <fs_datos>-tx_exe SEPARATED BY space.
+*          CONDENSE <fs_datos>-tx_exe.
+*        ENDIF.
+*      ENDIF.
+*    ENDIF.
+*  ENDLOOP.
+
+
+
+**********************************************************************
+* GRABAR TEXTO
+**********************************************************************
+
+  READ TABLE lt_prcd INTO lw_prcd INDEX 1.
+  CALL FUNCTION '/SEI/IE5_LEER_TARIFA'
+    EXPORTING
+      i_date = lw_prcd-fkdat
+    IMPORTING
+      o_konp = lw_konp.
+  IF lw_konp-kbetr IS INITIAL.
+    lw_konp-kbetr = '0.45'.
+  ENDIF.
+
+  WRITE lw_konp-kbetr TO l_precio_txt.
+  CONDENSE l_precio_txt.
+
+  SELECT t0~vbeln, t0~posnr, t0~matnr, t0~fkimg, t0~vrkme,
+         t0~fbuda, t0~werks, t1~kunag
+    FROM vbrp AS t0
+    INNER JOIN vbrk AS t1
+    ON t1~vbeln = t0~vbeln
+    INTO TABLE @DATA(tl_vbrp)
+    WHERE t0~vbeln EQ @vbeln.
+
+
+  LOOP AT datos ASSIGNING <fs_datos>.
+    <fs_datos>-tarifa = lw_konp-kbetr.
+    <fs_datos>-moneda = lw_konp-konwa.
+
+    CLEAR: l_imp_txt, l_kilos_txt.
+    WRITE <fs_datos>-total_imp TO l_imp_txt.
+    WRITE <fs_datos>-total_kg  TO l_kilos_txt.
+    WRITE <fs_datos>-ntgew  TO l_ntgew_txt.
+    WRITE <fs_datos>-ycip_kg  TO l_kilos_c.
+    WRITE <fs_datos>-ycip_imp  TO l_imp_c.
+    WRITE <fs_datos>-gewei TO l_gewei_txt. TRANSLATE l_gewei_txt TO LOWER CASE.
+    CONDENSE: l_imp_txt, l_kilos_txt, l_ntgew_txt, l_kilos_c, l_imp_c, l_gewei_txt.
+
+    "Calcular porcentaje
+    READ TABLE tl_vbrp INTO DATA(wa_vbrp)
+      WITH KEY vbeln = <fs_datos>-vbeln posnr = <fs_datos>-posnr.
+
+    IF sy-subrc = 0.
+      CLEAR is_producto_input.
+      is_producto_input-material        = wa_vbrp-matnr.
+      is_producto_input-ambito          = 'IEPNR'.
+      is_producto_input-partner         = wa_vbrp-kunag.
+      is_producto_input-tipo_partner    = 'KU'.
+      is_producto_input-cantidad        = wa_vbrp-fkimg.
+      is_producto_input-unidad          = wa_vbrp-vrkme.
+      is_producto_input-werks           = wa_vbrp-werks.
+      is_producto_input-leer_solo_comp  = ' '.
+      is_producto_input-fecha           = wa_vbrp-fbuda.
+
+      CALL FUNCTION '/SEI/IE5_ESTRUCTURA_PROD'
+        EXPORTING
+          is_producto_input = is_producto_input
+        IMPORTING
+          et_producto       = et_producto.
+
+      READ TABLE et_producto INTO wa_producto INDEX 1.
+
+      IF sy-subrc = 0.
+        IF wa_producto-total_plastico_no_reciclado <> wa_producto-total_plastico
+          AND wa_producto-total_plastico > 0.
+          l_porcentaje = ( ( wa_producto-total_plastico_no_reciclado / wa_producto-total_plastico ) - 1 ) * 100.
+          l_porcentaje = l_porcentaje * -1.
+        ELSE.
+          l_porcentaje = '0.00'.
+        ENDIF.
+        WRITE l_porcentaje TO l_port_c.
+        CONDENSE l_port_c.
+      ENDIF.
+    ENDIF.
+
+    CLEAR: lw_header, lw_header_1, lw_header_2, lt_lines[].
+    lw_header-tdobject = 'VBBP'.
+    CONCATENATE <fs_datos>-vbeln <fs_datos>-posnr INTO lw_header-tdname.
+    lw_header-tdid = 'Z003'.
+    lw_header-tdspras = 'S'.
+
+*    IF <fs_datos>-total_imp = 0 AND <fs_datos>-total_kg = 0.
+*      CONTINUE.
+*    ENDIF.
+
+    LOOP AT lt_out INTO DATA(lw_out) WHERE vbeln = <fs_datos>-vbeln AND posnr = <fs_datos>-posnr.
+    ENDLOOP.
+    IF sy-subrc <> 0 AND <fs_datos>-total_imp = 0 AND <fs_datos>-total_kg = 0.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR lv_posnr_aux.
+    LOOP AT lt_out INTO lw_out WHERE vbeln = <fs_datos>-vbeln AND posnr = <fs_datos>-posnr.
+
+      IF lv_posnr_aux = <fs_datos>-posnr.
+        CONTINUE.
+      ENDIF.
+
+      CLEAR l_tx_exe.
+      READ TABLE lt_denom ASSIGNING FIELD-SYMBOL(<fs_denom>) WITH KEY id_regimen_fiscal = lw_out-id_regimen_fiscal.
+      IF sy-subrc EQ 0.
+        l_tx_exe = <fs_denom>-denom_regimen.
+        CONDENSE <fs_datos>-tx_exe.
+      ELSE.
+        READ TABLE lt_denom ASSIGNING <fs_denom> WITH KEY id_regimen_fiscal = '01'.
+        IF sy-subrc EQ 0.
+          l_tx_exe = <fs_denom>-denom_regimen.
+          CONDENSE <fs_datos>-tx_exe.
+        ENDIF.
+      ENDIF.
+
+      CLEAR lw_lines.
+      lw_lines-tdformat = '/'.
+      lw_lines-tdline = l_tx_exe.
+      APPEND lw_lines TO lt_lines.
+
+      CONCATENATE <fs_datos>-tx_exe l_tx_exe INTO <fs_datos>-tx_exe SEPARATED BY space.
+      l_tx_exe = <fs_datos>-tx_exe.
+
+      lv_posnr_aux = <fs_datos>-posnr.
+    ENDLOOP.
+
+
+
+*    IF <fs_datos>-total_imp <> 0 OR <fs_datos>-total_kg <> 0.
+
+    CLEAR: lw_lines, lt_lines[], lt_lines_1[], lt_lines_2[].
+    CONDENSE l_tx_exe.
+    lw_lines-tdformat = '/'.
+    lw_lines-tdline = l_tx_exe.
+
+    IF lw_out-id_regimen_fiscal = '01'.    "Porcentaje reciclado
+      CONCATENATE lw_lines-tdline ',' INTO lw_lines-tdline.
+      CONCATENATE lw_lines-tdline l_port_c INTO lw_lines-tdline SEPARATED BY space.
+      CONCATENATE lw_lines-tdline '% de plastico reciclado'(001) INTO lw_lines-tdline.
+    ELSE.
+      "Exento, relleno los campos para el formulario
+      IF <fs_datos>-yzip_kg IS INITIAL.
+        <fs_datos>-yzip_kg = <fs_datos>-ntgew.
+      ENDIF.
+    ENDIF.
+
+    CONCATENATE lw_lines-tdline '.' INTO lw_lines-tdline.
+    CONCATENATE lw_lines-tdline 'Total producto'(002) l_ntgew_txt INTO lw_lines-tdline SEPARATED BY space.
+    CONCATENATE lw_lines-tdline l_gewei_txt '.' INTO lw_lines-tdline.
+    APPEND lw_lines TO lt_lines.
+    APPEND lw_lines TO lt_lines_1.
+
+    IF lw_out-id_regimen_fiscal = '01'.    "Porcentaje reciclado
+      CLEAR lw_lines.
+      lw_lines-tdformat = '/'.
+      CONCATENATE 'Adicionalmente informamos que incluye'(003) l_kilos_c INTO lw_lines-tdline SEPARATED BY space.
+      CONCATENATE lw_lines-tdline 'kg·' l_precio_txt '=' l_imp_c '€' INTO lw_lines-tdline.
+      APPEND lw_lines TO lt_lines.
+      APPEND lw_lines TO lt_lines_2.
+      CLEAR lw_lines.
+      lw_lines-tdline = 'de film-fleje plástico (no reciclado) que ya fueron gravados.'(004).
+      APPEND lw_lines TO lt_lines.
+      APPEND lw_lines TO lt_lines_2.
+    ENDIF.
+*    ENDIF.
+
+    "Texto posicion factura
+    CALL FUNCTION 'SAVE_TEXT'
+      EXPORTING
+        header          = lw_header
+        savemode_direct = 'X'
+      TABLES
+        lines           = lt_lines
+      EXCEPTIONS
+        id              = 1
+        language        = 2
+        name            = 3
+        object          = 4
+        OTHERS          = 5.
+
+    "Texto 1 posicion formulario
+    lw_header_1 = lw_header.
+    CONCATENATE lw_header_1-tdname '_1' INTO lw_header_1-tdname.
+    lw_header_1-tdid = 'ST'.
+    lw_header_1-tdobject = 'TEXT'.
+
+    CALL FUNCTION 'SAVE_TEXT'
+      EXPORTING
+        header          = lw_header_1
+        savemode_direct = 'X'
+      TABLES
+        lines           = lt_lines_1
+      EXCEPTIONS
+        id              = 1
+        language        = 2
+        name            = 3
+        object          = 4
+        OTHERS          = 5.
+
+    "Texto 2 posicion formulario
+    lw_header_2 = lw_header.
+    CONCATENATE lw_header_2-tdname '_2' INTO lw_header_2-tdname.
+    lw_header_2-tdid = 'ST'.
+    lw_header_2-tdobject = 'TEXT'.
+
+    CALL FUNCTION 'SAVE_TEXT'
+      EXPORTING
+        header          = lw_header_2
+        savemode_direct = 'X'
+      TABLES
+        lines           = lt_lines_2
+      EXCEPTIONS
+        id              = 1
+        language        = 2
+        name            = 3
+        object          = 4
+        OTHERS          = 5.
+
+  ENDLOOP.
+
+ENDFUNCTION.

@@ -1,0 +1,155 @@
+
+class ZCL_VCXI_PXSS_CUST_XPROC definition
+  public
+  inheriting from ZCL_VCXI_XCS_CUST_MATNR
+  abstract
+  create public .
+
+public section.
+
+  data F_KZKUP type KZKUPMAT read-only .
+  data F_CUOBJ type CUOBJ read-only .
+  data F_WRK02 type WERKS_D read-only .
+  data S_CMPRK type /VCXI/VKC_S_CMPRK read-only .
+  data F_PRODH type PRODH_D read-only .
+
+  methods GET_MCOPR
+    returning
+      value(RF_MCOPR) type ZVCXI_P0SS_MCOPR
+    raising
+      /VCXI/CX_CKX .
+  methods CONSTRUCTOR
+    importing
+      !IF_MATNR type MATNR
+      !IF_WERKS type WERKS_D
+      !IF_DATE type DATS
+    raising
+      /VCXI/CX_CKX .
+protected section.
+private section.
+endclass. "ZCL_VCXI_PXSS_CUST_XPROC definition
+class ZCL_VCXI_PXSS_CUST_XPROC implementation.
+  method CONSTRUCTOR.
+
+    data: LS_MARA type MARA,
+          LS_MARC type MARC.
+
+    try.
+        SUPER->CONSTRUCTOR( exporting IF_MATNR = IF_MATNR
+                                      IF_WERKS = IF_WERKS
+                                      IF_DATE  = IF_DATE ).
+
+***--------------------------------------------------------------------------------------
+***     Get Material Data
+        select single PRDHA
+               into ME->F_PRODH
+               from MARA
+              where MATNR = ME->F_MATNR.
+        if SY-SUBRC ne 0.
+          /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+        endif.
+
+***--------------------------------------------------------------------------------------
+***     Get Material Plant Data
+        call function 'MARC_SINGLE_READ'
+          exporting
+            MATNR     = ME->F_MATNR
+            WERKS     = ME->F_WERKS
+          importing
+            WMARC     = LS_MARC
+          exceptions
+            NOT_FOUND = 4
+            others    = 5.
+        if SY-SUBRC <> 0.
+          /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+        endif.
+
+***     Consider Special Procurement Type
+        if LS_MARC-BESKZ eq 'F' and
+           LS_MARC-SOBSL is not initial.
+          select single WRK02
+                 into ME->F_WRK02
+                 from T460A
+                where WERKS eq LS_MARC-WERKS
+                 and  SOBSL eq LS_MARC-SOBSL.
+          if ME->F_WRK02 is initial.
+            move ME->F_WERKS to ME->F_WRK02.
+          endif.
+          if SY-SUBRC ne 0.
+            /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+          endif.
+        else.
+          move ME->F_WERKS to ME->F_WRK02.
+        endif.
+
+***--------------------------------------------------------------------------------------
+***     Get Configuration Info
+        call function 'MARC_SINGLE_READ'
+          exporting
+            MATNR  = ME->F_MATNR
+            WERKS  = ME->F_WRK02
+          importing
+            WMARC  = LS_MARC
+          exceptions
+            others = 0.
+
+        if LS_MARC-CUOBJ is not initial.
+          move LS_MARC-CUOBJ to ME->F_CUOBJ.
+          move LS_MARC-STDPD to ME->S_CMPRK-CMATN.
+        endif.
+
+***     Co-product Indicator
+        ME->F_KZKUP = LS_MARC-KZKUP.
+
+      cleanup.
+        ME->DO_FREE( ).
+    endtry.
+
+  endmethod.
+  method GET_MCOPR.
+
+    data: LF_MATNR type MATNR.
+    data: LT_MATNR type table of MATNR,
+          LT_MAKZ  type table of MAKZ.
+
+
+***--------------------------------------------------------------------------------------
+*** Search for Leading Co-Product
+    select MATNR into table LT_MATNR
+                 from MAKZ
+                where WERKS eq ME->F_WERKS
+                 and  KUPPL eq ME->F_MATNR.
+    check SY-SUBRC eq 0.
+    sort LT_MATNR.
+    delete adjacent duplicates from LT_MATNR.
+
+*** Check if Cost-Split is valid
+    loop at LT_MATNR into LF_MATNR.
+      clear LT_MAKZ.
+      call function 'MATERIAL_COSTS_SPLIT_READ'
+        exporting
+          MATNR                 = LF_MATNR
+          WERKS                 = ME->F_WERKS
+          DATUM                 = ME->F_DATE
+        tables
+          TMAKZ                 = LT_MAKZ
+        exceptions
+          COSTS_SPLIT_NOT_FOUND = 1
+          others                = 2.
+      if SY-SUBRC ne 0.
+        delete LT_MATNR.
+        exit.
+      endif.
+
+      read table LT_MAKZ with key KUPPL = ME->F_MATNR
+                         transporting no fields.
+      if SY-SUBRC ne 0.
+        delete LT_MATNR.
+        exit.
+      endif.
+    endloop.
+
+***--------------------------------------------------------------------------------------
+    RF_MCOPR = value #( LT_MATNR[ 1 ] optional ).
+
+  endmethod.

@@ -1,0 +1,102 @@
+FUNCTION zswm_mod_ubicacion_consumo.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(T320) TYPE  T320 OPTIONAL
+*"     REFERENCE(T321) TYPE  T321 OPTIONAL
+*"     REFERENCE(DM07M) TYPE  DM07M OPTIONAL
+*"     REFERENCE(YMSEGWA) TYPE  MSEG OPTIONAL
+*"     REFERENCE(FLG_LF_LGPLA_DA) OPTIONAL
+*"     REFERENCE(FLG_HU_PLATZ_DA) OPTIONAL
+*"     REFERENCE(MSEG) TYPE  MSEG OPTIONAL
+*"  EXPORTING
+*"     REFERENCE(LGTYP) TYPE  MSEG-LGTYP
+*"     REFERENCE(LGPLA) TYPE  MSEG-LGPLA
+*"     REFERENCE(SGTXT) TYPE  MSEG-SGTXT
+*"  CHANGING
+*"     REFERENCE(BERKZ) TYPE  MSEG-BERKZ
+*"----------------------------------------------------------------------
+  lgtyp = mseg-lgtyp.
+  lgpla = mseg-lgpla.
+  sgtxt = mseg-sgtxt.
+* add jtm 15.03.2022 el tipo de almacén 100 lleva gestión de UAS, cosa que a SAP no le gusta mucho
+* al ser un tipo de almacén interno (interfase WM+IM). Lo que hacemos aqui es quitar las ubicaciones
+* de la MSEG y dejar el dato en la MSEG-sGTXT. De esta forma el sistema calcula donde ubicar según
+* custo de movimiento WM y posteriormente habrá que hacer una tarea de almacén auto-confirmada
+* del 100 al 914 que corresponda
+
+  CALL FUNCTION 'ZSWM_BREAK_USER_EXIT'.
+  CHECK flg_lf_lgpla_da NE abap_true   "nicht bei WA zur Lieferung
+    AND flg_hu_platz_da NE abap_true.       "nicht wenn Platz aus HU
+
+
+  DATA: rr_lgnum TYPE shp_lgnum_range_t.
+  CALL FUNCTION 'ZSWM_SET_GET_VALUES'
+    EXPORTING
+      shortname = 'ZSWM_PLANCHA_HER_UAS_EE'
+*     TT_SHORTNAME             =
+*     NO_AUTHORITY_CHECK       = 'X'
+*     LANGU     = SYST-LANGU
+*     TT_FIELDNAME             =
+    IMPORTING
+      rr_lgnum  = rr_lgnum.
+  DATA(lgnum) = mseg-lgnum.
+  IF lgnum IS INITIAL.
+    SELECT SINGLE lgnum INTO lgnum FROM t320 WHERE werks EQ mseg-werks
+                                               AND lgort EQ mseg-lgort.
+    IF sy-subrc NE 0.
+      CLEAR lgnum.
+    ENDIF.
+  ENDIF.
+  CHECK rr_lgnum[] IS NOT INITIAL
+    AND lgnum     IN rr_lgnum
+    AND mseg-bwart EQ '261'
+    AND ( mseg-lgtyp EQ '100'". fcardona 04.11.2022 - Consumo de bobinas.
+        OR mseg-lgtyp EQ '010'
+        OR mseg-lgtyp EQ '020' ).
+
+  "INI ARA 31.01.25 - Ajuste berkz error consumos
+  "En 2000 los consumos se hacen contra reserva (En el 2001 no). al ser contra reserva el sistema intenta proponer
+  "la ubicación de consumo de la reserva 100 LA QUE SEA y este valor no deja cambiarlo ya que el berkz = '4'.
+  IF ( mseg-werks = '2000' AND mseg-berkz = '4' AND mseg-rsnum IS NOT INITIAL ). "Cuando HPX y BERKZ = 4 (pta disp. manual)
+    berkz = '1'. "Fijar BERKZ = 1 (Pieza de Picking)
+  ENDIF.
+  "FIN ARA 31.01.25 - Ajuste berkz error consumos
+
+  IF ( mseg-sgtxt IS NOT INITIAL ).
+    SPLIT mseg-sgtxt AT '/' INTO TABLE DATA(lt_sgtxt_text).
+
+    IF ( lines( lt_sgtxt_text ) = 3 ).
+      IF ( lt_sgtxt_text[ 1 ] = 'CDE' AND lt_sgtxt_text[ 2 ] = '100' AND lt_sgtxt_text[ 3 ] IS NOT INITIAL ).
+
+        DATA: lv_lgtyp TYPE lgtyp,
+              lv_lgpla TYPE lgpla.
+
+        lv_lgtyp = lt_sgtxt_text[ 2 ].
+        lv_lgpla = lt_sgtxt_text[ 3 ].
+
+        SELECT COUNT(*) UP TO 1 ROWS
+          FROM lagp
+         WHERE lgnum = mseg-lgnum
+           AND lgtyp = lv_lgtyp
+           AND lgpla = lv_lgpla.
+
+*APC2050203 Corregimos este IF, que es para borrar ubicación si no es correcta.
+*        IF ( sy-subrc = 0 ).
+        IF sy-subrc ne 0 .
+          CLEAR: lgtyp, lgpla.
+          EXIT.
+        ENDIF.
+
+      ENDIF.
+
+    ENDIF.
+
+  ENDIF.
+
+  CONCATENATE 'CDE'  lgtyp lgpla INTO sgtxt SEPARATED BY '/'.
+  CLEAR: lgtyp, lgpla.
+
+
+
+ENDFUNCTION.

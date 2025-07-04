@@ -1,0 +1,166 @@
+*&---------------------------------------------------------------------*
+*& Report ZSEI_MIG_00052
+*&---------------------------------------------------------------------*
+*& Utilidad transporte masivo órdenes
+*&---------------------------------------------------------------------*
+REPORT zsei_mig_00052 NO STANDARD PAGE HEADING.
+TABLES: tmsbuffer.
+
+* Órdenes de transporte
+TYPES: tyt_tmsbuffer TYPE STANDARD TABLE OF tmsbuffer.
+DATA: t_tmsbuffer    TYPE                   tyt_tmsbuffer.
+* Resultado proceso
+DATA: w_subrc TYPE sy-subrc.
+
+
+*&---------------------------------------------------------------------*
+*& Pantalla de selección
+*&---------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME.
+  SELECT-OPTIONS: s_trkorr FOR tmsbuffer-trkorr MODIF ID tk NO INTERVALS.
+SELECTION-SCREEN END OF BLOCK b2.
+
+*&---------------------------------------------------------------------*
+*& START-OF-SELECTION
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+  IF s_trkorr[] IS INITIAL.
+*   ERROR: Introduzca al menos una orden de transporte
+    MESSAGE 'Introduzca al menos una orden de transporte' TYPE 'S' DISPLAY LIKE 'E'.
+  ELSE.
+*   Chequeamos las órdenes
+    PERFORM check_request CHANGING t_tmsbuffer
+                                   w_subrc.
+    IF w_subrc EQ 0.
+*     Seleccionamos las órdenes y las transportamos
+      PERFORM import_request USING t_tmsbuffer.
+    ENDIF.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN OUTPUT
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN OUTPUT.
+  PERFORM modify_parameters.
+
+*&---------------------------------------------------------------------*
+*& Subrutinas
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*& MODIFY_PARAMETERS
+*&---------------------------------------------------------------------*
+FORM modify_parameters.
+  LOOP AT SCREEN.
+    IF screen-group1 = 'TK'.
+      screen-required = '2'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form check_request
+*&---------------------------------------------------------------------*
+FORM check_request CHANGING pc_t_tmsbuffer  TYPE tyt_tmsbuffer
+                            pc_w_subrc      TYPE sy-subrc.
+* Órdenes de transporte
+  DATA: xl_tmsbuffer TYPE         tmsbuffer.
+  DATA: xl_trkorr    LIKE LINE OF s_trkorr.
+
+  pc_w_subrc = 0.
+* Recuperamos las órdenes
+  SELECT *
+    INTO TABLE pc_t_tmsbuffer
+    FROM tmsbuffer
+    WHERE
+      trkorr IN s_trkorr AND
+      sysnam EQ sy-sysid.
+  IF sy-subrc NE 0.
+    pc_w_subrc = 4.
+    MESSAGE 'No se ha seleccionado ninguna orden de transporte' TYPE 'S' DISPLAY LIKE 'E'.
+    EXIT.
+  ENDIF.
+
+  LOOP AT s_trkorr INTO xl_trkorr.
+    READ TABLE pc_t_tmsbuffer INTO xl_tmsbuffer WITH KEY trkorr = xl_trkorr-low.
+    IF sy-subrc NE 0.
+      IF pc_w_subrc EQ 0.
+        WRITE: AT 5(100) 'Las siguientes órdenes no están disponibles para transportar al sistema:'.
+      ENDIF.
+      WRITE:/, AT 5(10) xl_trkorr-low.
+      pc_w_subrc = 4.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form import_request
+*&---------------------------------------------------------------------*
+FORM import_request USING pi_t_tmsbuffer  TYPE tyt_tmsbuffer.
+* Órdenes de transporte
+  DATA: xl_tmsbuffer TYPE tmsbuffer.
+* Filtros
+  DATA: xl_filter    TYPE tmsqafilter.
+  DATA: wl_counter   TYPE tmsqafilter-counter.
+
+  READ TABLE pi_t_tmsbuffer INTO xl_tmsbuffer INDEX 1.
+  CHECK sy-subrc EQ 0.
+
+  CALL FUNCTION 'TMS_UI_IMPORT_TR_REQUEST'
+    EXPORTING
+      iv_system             = xl_tmsbuffer-sysnam
+      iv_request            = 'SOME'
+      iv_some_active        = 'X'
+      iv_check_strategy     = 'X'
+      it_requests           = pi_t_tmsbuffer[]
+    EXCEPTIONS
+      cancelled_by_user     = 1
+      import_request_denied = 2
+      import_request_failed = 3
+      OTHERS                = 4.
+  IF sy-subrc NE 0.
+    MESSAGE 'No ha sido posible transportar las órdenes' TYPE 'S' DISPLAY LIKE 'E'.
+    EXIT.
+  ENDIF.
+
+
+* 1. Eliminamos los filtros actuales del usuario
+  DELETE FROM tmsqafilter WHERE uname = sy-uname
+                           AND  type  = 'IQ'
+                           AND sysnam = xl_tmsbuffer-sysnam.
+
+* 2. Añadimos el filtro de las órdenes tratadas
+  CLEAR: wl_counter.
+  LOOP AT pi_t_tmsbuffer INTO xl_tmsbuffer.
+    ADD 1 TO wl_counter.
+    CLEAR xl_filter.
+    xl_filter-uname   = sy-uname.
+    xl_filter-type    = 'IQ'.
+    xl_filter-sysnam  = xl_tmsbuffer-sysnam.
+    xl_filter-counter = wl_counter.
+    xl_filter-field  = 'TRKORR'.
+    xl_filter-icon   = '@4G@'.
+    xl_filter-icoinf = 'Filtrar'.
+    xl_filter-name   = 'Orden'.
+    xl_filter-value  = xl_tmsbuffer-trkorr.
+    xl_filter-sign   = 'I'.
+    xl_filter-optn   = 'EQ'.
+
+    INSERT INTO tmsqafilter VALUES xl_filter.
+  ENDLOOP.
+
+* Abrimos la STMS
+  CALL FUNCTION 'TMS_UIQ_IMPORT_QUEUE_DISPLAY'
+    EXPORTING
+      iv_system                   = xl_tmsbuffer-sysnam
+      iv_domain                   = xl_tmsbuffer-domnam
+      iv_max_exp                  = '010'
+      iv_monitor                  = 'X'
+    EXCEPTIONS
+      import_queue_display_failed = 1
+      OTHERS                      = 2.
+  IF sy-subrc <> 0.
+*   Implement suitable error handling here
+  ENDIF.
+ENDFORM.

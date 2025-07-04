@@ -1,0 +1,1566 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZMMR0056_SUB
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  COMPROBAR_OBLIGATORIOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_GV_CHECK  text
+*----------------------------------------------------------------------*
+FORM comprobar_obligatorios  CHANGING cv_check.
+
+  CLEAR cv_check.
+
+  " Visualizar radio button
+  IF p_rb1 EQ abap_true.
+    " Clase de pedido
+    IF p_bsart IS INITIAL.
+      cv_check = abap_true.
+      MESSAGE text-e03 TYPE 'S' DISPLAY LIKE 'E'. " El campo Clase de pedido es obligatorio
+      RETURN.
+    ENDIF.
+    " Fecha de pedido
+    IF p_datum IS INITIAL.
+      cv_check = abap_true.
+      MESSAGE text-e04 TYPE 'S' DISPLAY LIKE 'E'. " El campo Fecha de precio es obligatorio
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+  " Actualizar precios
+  IF p_rb2 EQ abap_true.
+    IF p_file IS INITIAL.
+      cv_check = abap_true.
+      MESSAGE text-e05 TYPE 'S' DISPLAY LIKE 'E'. " El campo ruta del fichero es obligatorio
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  F_FILE_MATCHCODE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_file_matchcode .
+
+  CALL FUNCTION 'F4_FILENAME'
+    EXPORTING
+      program_name  = sy-repid
+      dynpro_number = sy-dynnr
+      field_name    = 'PATH'
+    IMPORTING
+      file_name     = p_file.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  GET_DATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_data .
+
+  DATA: ls_addr1_complete TYPE szadr_addr1_complete,
+        lv_smtp_addr      TYPE string,
+        lv_strlen         TYPE i,
+        lv_lines          TYPE i.
+
+  DATA: lt_emails TYPE TABLE OF string.
+
+  REFRESH gt_a016.
+
+  SELECT a016~evrtn , a016~evrtp, a016~datbi, a016~datab, a016~knumh,
+          konp~kbetr, konp~konwa, konp~kpein, konp~kmein, "konp~knumh,
+          ekko~ebeln, ekko~lifnr,
+          ekpo~txz01, ekpo~matnr, ekpo~werks, "ekpo~ebeln,  ekpo~ebelp,
+          lfa1~land1, lfa1~name1, lfa1~adrnr "lfa1~lifnr,
+         FROM a016 AS a016
+         INNER JOIN konp
+         ON a016~knumh = konp~knumh
+         INNER JOIN ekko AS ekko
+         ON ekko~ebeln = a016~evrtn
+         INNER JOIN ekpo AS ekpo
+         ON ekpo~ebeln = a016~evrtn
+         AND ekpo~ebelp = a016~evrtp
+         INNER JOIN lfa1 AS lfa1
+         ON lfa1~lifnr = ekko~lifnr
+         INTO TABLE @DATA(lt_data)
+         WHERE a016~evrtn IN @so_ebeln
+         AND a016~evrtp IN @so_ebelp
+         AND a016~datbi GE @p_datum
+         AND a016~datab LE @p_datum
+         AND ekko~bsart EQ @p_bsart
+         AND ekko~lifnr IN @so_lifnr
+         " Descartar contrato con fecha fin de validez sea inferior a la fecha actual
+         AND ekko~kdate GE @sy-datum
+         "-------------------------------
+         " Modif descartar registros con indicador de borrado ekpo~loekz <> 'X' o bloqueo 'L' o 'S'
+         AND ekpo~loekz NE @abap_true
+         AND ekpo~loekz NE 'L'
+         AND ekpo~loekz NE 'S'
+         "--------------------------------
+         AND ekpo~werks IN @so_reswk.
+
+  IF sy-subrc EQ 0.
+    CLEAR gs_outtab.
+    REFRESH gt_outtab.
+    SORT lt_data BY name1.
+    LOOP AT lt_data INTO DATA(ls_data).
+      gs_outtab-ebeln = ls_data-evrtn. " Nº Contrato
+      gs_outtab-ebelp = ls_data-evrtp. " Posición
+      gs_outtab-matnr = ls_data-matnr. " Material
+      gs_outtab-txz01 = ls_data-txz01. " Descripción
+      gs_outtab-werks = ls_data-werks. " Centro
+      gs_outtab-datab = ls_data-datab. " Fecha inicio
+      gs_outtab-datbi = ls_data-datbi. " Fecha fin
+      gs_outtab-kbetr = ls_data-kbetr. " Precio
+      gs_outtab-konwa = ls_data-konwa. " Un
+      gs_outtab-kpein = ls_data-kpein. " Por
+      gs_outtab-kmein = ls_data-kmein. " Unidad de medida
+      gs_outtab-lifnr = ls_data-lifnr. " Número de cuenta del proveedor
+      gs_outtab-land1 = ls_data-land1. " Idioma
+      gs_outtab-name1 = ls_data-name1. " Nombre del proveedor
+      gs_outtab-adrnr = ls_data-adrnr. " Dirección
+      PERFORM obtener_email USING gs_outtab CHANGING ls_addr1_complete.
+      LOOP AT ls_addr1_complete-adsmtp_tab INTO DATA(ls_adsmtp_tab).
+        IF ls_adsmtp_tab-adsmtp-smtp_addr IS NOT INITIAL.
+          APPEND ls_adsmtp_tab-adsmtp-smtp_addr TO lt_emails.
+        ENDIF.
+      ENDLOOP.
+      " Borramos los emails duplicados si los hubiera
+      DELETE ADJACENT DUPLICATES FROM lt_emails.
+      CLEAR: lv_smtp_addr.
+      " Concatenamos los emails con comas
+      LOOP AT lt_emails INTO DATA(ls_emails).
+        CONCATENATE ls_emails lv_smtp_addr INTO lv_smtp_addr SEPARATED BY ','.
+      ENDLOOP.
+      REFRESH lt_emails.
+      IF lv_smtp_addr IS NOT INITIAL.
+        lv_strlen = strlen( lv_smtp_addr ) - 1. " Quitar la última coma
+        gs_outtab-smtp_addr = lv_smtp_addr(lv_strlen).
+      ENDIF.
+      APPEND gs_outtab TO gt_outtab.
+      CLEAR gs_outtab.
+    ENDLOOP.
+  ENDIF.
+
+  SORT gt_outtab BY name1 ebeln ebelp.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  GET_FILE_DATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_file_data .
+
+  DATA: lt_excel TYPE TABLE OF alsmex_tabline.
+
+  DATA: l_datbi TYPE string,
+        l_datab TYPE string,
+        l_kbetr TYPE string,
+        l_kpein TYPE string,
+        l_ebeln TYPE ebeln.
+
+  DATA: ls_addr1_complete TYPE szadr_addr1_complete,
+        lv_smtp_addr      TYPE string,
+        lv_strlen         TYPE i.
+
+  DATA: lt_emails TYPE TABLE OF string.
+
+  REFRESH: gt_outtab_excel, lt_excel, gt_outtab.
+  CLEAR gs_outtab_excel.
+
+  CALL FUNCTION 'ALSM_EXCEL_TO_INTERNAL_TABLE'
+    EXPORTING
+      filename                = p_file
+      i_begin_col             = '1'
+      i_begin_row             = '2'
+      i_end_col               = '12'
+      i_end_row               = '6000'
+    TABLES
+      intern                  = lt_excel
+    EXCEPTIONS
+      inconsistent_parameters = 1
+      upload_ole              = 2
+      OTHERS                  = 3.
+
+  LOOP AT lt_excel INTO DATA(ls_excel).
+
+    CASE ls_excel-col.
+      WHEN '0001'.
+        gs_outtab_excel-name1 = ls_excel-value. " Nombre de proveedor
+      WHEN '0002'.
+        CLEAR l_ebeln.
+        l_ebeln = ls_excel-value. " Número de contrato
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = l_ebeln
+          IMPORTING
+            output = l_ebeln.
+        gs_outtab_excel-ebeln = l_ebeln. " Número de contrato
+        CLEAR l_ebeln.
+      WHEN '0003'.
+        gs_outtab_excel-ebelp = ls_excel-value. " Posición
+      WHEN '0004'.
+        gs_outtab_excel-matnr = ls_excel-value. " Material
+      WHEN '0005'.
+        gs_outtab_excel-txz01 = ls_excel-value. " Descripción
+      WHEN '0006'.
+        gs_outtab_excel-werks = ls_excel-value. " Centro
+      WHEN '0007'.
+        l_kbetr = ls_excel-value.
+        PERFORM convertir_cantidad CHANGING l_kbetr.
+        gs_outtab_excel-kbetr = l_kbetr. " Precio
+        CLEAR: l_kbetr.
+      WHEN '0008'.
+        gs_outtab_excel-konwa = ls_excel-value. " Moneda
+      WHEN '0009'.
+        l_kpein = ls_excel-value.
+        PERFORM convertir_cantidad CHANGING l_kpein.
+        gs_outtab_excel-kpein = l_kpein. " Cantidad
+        CLEAR: l_kpein.
+      WHEN '0010'.
+        gs_outtab_excel-kmein = ls_excel-value. " Unit of measure
+      WHEN '0011'.
+        CONCATENATE ls_excel-value+6(4) ls_excel-value+3(2) ls_excel-value(2) INTO l_datab.
+        gs_outtab_excel-datab = l_datab. " Válido desde
+        CLEAR: l_datab.
+      WHEN '0012'.
+        CONCATENATE ls_excel-value+6(4) ls_excel-value+3(2) ls_excel-value(2) INTO l_datbi.
+        gs_outtab_excel-datbi = l_datbi. " Valido hasta
+        CLEAR: l_datbi.
+    ENDCASE.
+
+    AT END OF row.
+
+      PERFORM obtener_emails_excel CHANGING gs_outtab_excel.
+      PERFORM obtener_email USING gs_outtab_excel CHANGING ls_addr1_complete.
+      CLEAR: lv_smtp_addr.
+
+      LOOP AT ls_addr1_complete-adsmtp_tab INTO DATA(ls_adsmtp_tab).
+        IF ls_adsmtp_tab-adsmtp-smtp_addr IS NOT INITIAL.
+          APPEND ls_adsmtp_tab-adsmtp-smtp_addr TO lt_emails.
+        ENDIF.
+      ENDLOOP.
+      " Borramos los emails duplicados si los hubiera
+      DELETE ADJACENT DUPLICATES FROM lt_emails.
+      CLEAR: lv_smtp_addr.
+      " Concatenamos los emails con comas
+      LOOP AT lt_emails INTO DATA(ls_emails).
+        CONCATENATE ls_emails lv_smtp_addr INTO lv_smtp_addr SEPARATED BY ','.
+      ENDLOOP.
+      REFRESH lt_emails.
+      IF lv_smtp_addr IS NOT INITIAL.
+        lv_strlen = strlen( lv_smtp_addr ) - 1. " Quitar la última coma
+        gs_outtab_excel-smtp_addr = lv_smtp_addr(lv_strlen).
+      ENDIF.
+      APPEND gs_outtab_excel TO gt_outtab.
+      CLEAR gs_outtab.
+    ENDAT.
+
+  ENDLOOP.
+
+  SORT gt_outtab BY ebeln ebelp.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  SHOW_ALV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM show_alv .
+
+  DATA: lr_selections TYPE REF TO cl_salv_selections,
+        lt_rows       TYPE salv_t_row,
+        ls_cell       TYPE salv_s_cell,
+        lr_layout     TYPE REF TO cl_salv_layout,
+        lr_key        TYPE salv_s_layout_key.
+
+  DATA: "lr_columns TYPE REF TO cl_salv_columns,
+    lt_column TYPE salv_t_column,
+    " lr_column  TYPE REF TO cl_salv_column_table,
+    lr_events TYPE REF TO cl_salv_events_table,
+    pfstatus  TYPE sypfkey.
+
+  " Variables para el layout
+  DATA:set_lay   TYPE slis_vari,
+       l_exit    TYPE c,
+       l_variant TYPE disvariant.
+
+  DATA r_handler_salv_table TYPE REF TO lcl_handle_events.
+  DATA: lr_functions TYPE REF TO cl_salv_functions_list.
+  DATA: lr_header TYPE REF TO cl_salv_form_header_info.
+
+
+  TRY.
+      CALL METHOD cl_salv_table=>factory
+        IMPORTING
+          r_salv_table = gr_table
+        CHANGING
+          t_table      = gt_outtab.
+    CATCH cx_salv_msg .
+      EXIT.
+  ENDTRY.
+
+
+  lr_columns = gr_table->get_columns( ).
+  lr_columns->set_optimize( abap_true ).
+
+  IF p_check EQ abap_true.
+    " Esconder el campo Email para la conversión del spool en PDF
+    lr_column ?=  lr_columns->get_column( 'SMTP_ADDR' ).
+    lr_column->set_visible( value = if_salv_c_bool_sap=>false ).
+    CLEAR: p_check.
+  ENDIF.
+
+  " Esconder el campo ADRNR
+  lr_column ?=  lr_columns->get_column( 'ADRNR' ).
+  lr_column->set_visible( value = if_salv_c_bool_sap=>false ).
+
+  " Esconder el campo LIFNR
+  lr_column ?=  lr_columns->get_column( 'LIFNR' ).
+  lr_column->set_visible( value = if_salv_c_bool_sap=>false ).
+
+  " Esconder el campo LAND1
+  lr_column ?=  lr_columns->get_column( 'LAND1' ).
+  lr_column->set_visible( value = if_salv_c_bool_sap=>false ).
+
+
+  " Esconder el campo Mensaje
+  lr_column ?=  lr_columns->get_column( 'STATUS' ).
+  lr_column->set_visible( value = if_salv_c_bool_sap=>false ).
+
+  " Asignamos nombres nuevos a las columnas
+  PERFORM cambiar_nombres_columnas.
+
+  lr_functions = gr_table->get_functions( ).
+  lr_functions->set_all( abap_true ).
+
+* Cabecera para el ALV
+  CREATE OBJECT lr_header
+    EXPORTING
+      text = text-004. " TARIFA DE PRECIOS
+  gr_table->set_top_of_list( lr_header ).
+
+*... §3.1 activate ALV generic Functions
+*... §3.2 include own functions by setting own status
+  IF p_rb1 EQ abap_true.
+    gr_table->set_screen_status(
+      pfstatus      = 'D0101'
+      report        = sy-repid
+      set_functions = gr_table->c_functions_all ).
+  ELSEIF p_rb2 EQ abap_true.
+    gr_table->set_screen_status(
+      pfstatus      = 'D0102'
+      report        = sy-repid
+      set_functions = gr_table->c_functions_all ).
+  ENDIF.
+
+* Register to the events of cl_salv_table
+  lr_events = gr_table->get_event( ).
+
+  CREATE OBJECT gr_events.
+
+*   Creamos la instancia de la clase de eventos y registramos el evento on_user_command
+  CREATE OBJECT r_handler_salv_table.
+  SET HANDLER r_handler_salv_table->on_user_command FOR gr_table->get_event( ).
+  SET HANDLER r_handler_salv_table->on_double_click FOR gr_table->get_event( ).
+
+
+  lr_selections = gr_table->get_selections( ).
+  lr_selections->set_selection_mode( if_salv_c_selection_mode=>row_column ).
+  gr_display = gr_table->get_display_settings( ).
+  gr_display->set_striped_pattern( abap_true ). " To set striped Pattern
+
+  "Obtenemos la instancia de la clase CL_SALV_LAYOUT
+  CALL METHOD gr_table->get_layout
+    RECEIVING
+      value = lr_layout.
+
+  "Carga el nombre del programa en estructura WA_KEY
+  lr_key-report = sy-repid.
+
+  "Seteamos variates con la estructura
+  CALL METHOD lr_layout->set_key
+    EXPORTING
+      value = lr_key.
+
+  "Permitir grabacion de Variante
+  CALL METHOD lr_layout->set_save_restriction
+    EXPORTING
+      value = if_salv_c_layout=>restrict_none.
+
+
+  l_variant = sy-repid.
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant    = l_variant
+      i_save        = 'A'
+    IMPORTING
+      e_exit        = l_exit
+      es_variant    = l_variant
+    EXCEPTIONS
+      not_found     = 1
+      program_error = 2
+      OTHERS        = 3.
+
+  IF sy-subrc EQ 0.
+    p_varnt = l_variant-variant.
+    set_lay = l_variant-variant.
+  ENDIF.
+
+  lr_layout->set_initial_layout( value = set_lay ).
+
+  gr_table->display( ).
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ENVIAR_TARIFAS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM enviar_tarifas .
+
+  DATA: lr_selections TYPE REF TO cl_salv_selections.
+
+  DATA: lt_rows TYPE salv_t_row,
+        ls_cell TYPE salv_s_cell,
+        l_lines TYPE i.
+
+  DATA: ls_addr1_complete TYPE szadr_addr1_complete,
+        lt_outtab_aux     TYPE TABLE OF ty_email,
+        ls_outtab_aux     TYPE ty_email,
+        l_tabix           TYPE sy-tabix.
+
+  DATA: lt_rspar      TYPE TABLE OF rsparams,
+        ls_rspar      LIKE LINE OF lt_rspar,
+        lt_listobject TYPE TABLE OF abaplist,
+        ls_tsp01      TYPE tsp01.
+
+  DATA: objbin  LIKE solisti1   OCCURS 10 WITH HEADER LINE.
+
+  REFRESH lt_rows.
+
+  lr_selections = gr_table->get_selections( ).
+  lt_rows = lr_selections->get_selected_rows( ).
+
+  CLEAR l_lines.
+  DESCRIBE TABLE lt_rows LINES l_lines.
+  IF l_lines GT 0.
+    CLEAR: ls_rspar, l_tabix.
+    REFRESH lt_rspar.
+
+    LOOP AT lt_rows INTO DATA(ls_rows).
+      READ TABLE gt_outtab ASSIGNING FIELD-SYMBOL(<fs_outtab>) INDEX ls_rows.
+      IF sy-subrc EQ 0.
+        ls_outtab_aux = CORRESPONDING #( <fs_outtab> ).
+        ls_outtab_aux-p_datum = p_datum.
+        APPEND ls_outtab_aux TO lt_outtab_aux.
+      ENDIF.
+    ENDLOOP.
+    " Enviamos los correos de las lineas seleccionadas
+    IF lt_outtab_aux IS NOT INITIAL.
+      CLEAR: ls_outtab_aux, l_tabix.
+      SORT lt_outtab_aux BY ebeln.
+      LOOP AT lt_outtab_aux INTO ls_outtab_aux.
+        l_tabix = sy-tabix.
+        AT NEW adrnr.
+          READ TABLE lt_outtab_aux INTO DATA(ls_aux) INDEX l_tabix.
+          gv_smtp_addr = ls_aux-smtp_addr.
+        ENDAT.
+        " Número de proveedor
+        ls_rspar-selname = 'SO_LIFNR'.
+        ls_rspar-kind = 'S'.
+        ls_rspar-sign = 'I'.
+        ls_rspar-option = 'EQ'.
+        ls_rspar-low = ls_outtab_aux-lifnr.
+        APPEND ls_rspar TO lt_rspar.
+
+        " Número de pedido
+        ls_rspar-selname = 'SO_EBELN'.
+        ls_rspar-kind = 'S'.
+        ls_rspar-sign = 'I'.
+        ls_rspar-option = 'EQ'.
+        ls_rspar-low = ls_outtab_aux-ebeln.
+        APPEND ls_rspar TO lt_rspar.
+
+        " Posición de pedido
+        ls_rspar-selname = 'SO_EBELP'.
+        ls_rspar-kind = 'S'.
+        ls_rspar-sign = 'I'.
+        ls_rspar-option = 'EQ'.
+        ls_rspar-low = ls_outtab_aux-ebelp.
+        APPEND ls_rspar TO lt_rspar.
+
+        " Fecha de precio
+        ls_rspar-selname = 'P_DATUM'.
+        ls_rspar-kind = 'S'.
+        ls_rspar-sign = 'I'.
+        ls_rspar-option = 'EQ'.
+        ls_rspar-low = p_datum.
+        APPEND ls_rspar TO lt_rspar.
+
+        " Radio button - "Visualizar"
+        ls_rspar-selname = 'P_RB1'.
+        ls_rspar-kind = 'S'.
+        ls_rspar-sign = 'I'.
+        ls_rspar-option = 'EQ'.
+        ls_rspar-low = abap_true.
+        APPEND ls_rspar TO lt_rspar.
+
+        " Boton para ocultar el email en el spool
+        ls_rspar-selname = 'P_CHECK'.
+        ls_rspar-kind = 'S'.
+        ls_rspar-sign = 'I'.
+        ls_rspar-option = 'EQ'.
+        ls_rspar-low = abap_true.
+        APPEND ls_rspar TO lt_rspar.
+
+        CLEAR ls_rspar.
+
+        gs_outtab_envio-ebeln = ls_outtab_aux-ebeln.
+        gs_outtab_envio-ebelp = ls_outtab_aux-ebelp.
+        gs_outtab_envio-datab = ls_outtab_aux-datab.
+        gs_outtab_envio-datbi = ls_outtab_aux-datbi.
+        APPEND gs_outtab_envio TO gt_outtab_envio.
+
+        AT END OF adrnr.
+
+          " Generamos el SPOOL
+          SUBMIT zmmr0056 TO SAP-SPOOL
+          WITH SELECTION-TABLE lt_rspar
+          WITHOUT SPOOL DYNPRO
+           AND RETURN.
+
+          " Obtenemos el SPOOL
+          PERFORM obtener_spool CHANGING ls_tsp01.
+          REFRESH lt_rspar.
+          CLEAR: gv_smtp_addr.
+        ENDAT.
+
+      ENDLOOP.
+    ELSE.
+      MESSAGE text-e07 TYPE 'S' DISPLAY LIKE 'E'. " Las lineas seleccionadas no tiene ningún correo asignado
+      RETURN.
+    ENDIF.
+
+  ELSE.
+    MESSAGE text-e01 TYPE 'S' DISPLAY LIKE 'E'. " Necesita seleccionar al menos una linea
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ACTUALIZAR_PRECIOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM actualizar_precios .
+
+  LOOP AT gt_outtab ASSIGNING FIELD-SYMBOL(<fs_outtab_excel>)." INTO DATA(ls_outtab_excel).
+    PERFORM actualizar_contratos USING <fs_outtab_excel>." ls_outtab_excel.
+  ENDLOOP.
+
+  PERFORM mostrar_campos.
+
+  gr_table->refresh( refresh_mode = if_salv_c_refresh=>full ).
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_SPOOL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_TSP01  text
+*----------------------------------------------------------------------*
+FORM obtener_spool  CHANGING cs_tsp01 TYPE tsp01.
+
+  WAIT UP TO 1 SECONDS.
+
+  CLEAR cs_tsp01.
+
+  SELECT * FROM tsp01 INTO TABLE @DATA(lt_rqident)
+    WHERE rqowner EQ @sy-uname
+    AND rqclient EQ @sy-mandt.
+
+  SORT lt_rqident DESCENDING BY rqident.
+
+  READ TABLE lt_rqident INTO DATA(ls_rqident) INDEX 1.
+  IF sy-subrc EQ 0.
+    cs_tsp01 = CORRESPONDING #( ls_rqident ).
+  ENDIF.
+
+  PERFORM convertir_pdf USING cs_tsp01.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CONVERTIR_PDF
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_CS_TSP01  text
+*----------------------------------------------------------------------*
+FORM convertir_pdf  USING cs_tsp01 TYPE tsp01.
+
+  DATA: lt_pdf TYPE TABLE OF tline.
+  REFRESH gt_pdf_output.
+  CALL FUNCTION 'CONVERT_ABAPSPOOLJOB_2_PDF'
+    EXPORTING
+      src_spoolid              = cs_tsp01-rqident
+      no_dialog                = gc_no_dialog
+      dst_device               = gc_device
+    IMPORTING
+      pdf_bytecount            = gv_bytecount
+    TABLES
+      pdf                      = gt_pdf_output
+    EXCEPTIONS
+      err_no_abap_spooljob     = 1
+      err_no_spooljob          = 2
+      err_no_permission        = 3
+      err_conv_not_possible    = 4
+      err_bad_destdevice       = 5
+      user_cancelled           = 6
+      err_spoolerror           = 7
+      err_temseerror           = 8
+      err_btcjob_open_failed   = 9
+      err_btcjob_submit_failed = 10
+      err_btcjob_close_failed  = 11
+      OTHERS                   = 12.
+  IF sy-subrc EQ 0.
+
+    PERFORM enviar_email.
+
+  ENDIF.
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ENVIAR_EMAIL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM enviar_email .
+
+  DATA: ls_ssfctrlop TYPE ssfctrlop,
+        ls_ssfcompop TYPE ssfcompop.
+
+  DATA: l_subject TYPE so_obj_des,
+        l_flname  TYPE so_obj_des.
+
+  DATA: lt_bodymail TYPE bcsy_text.
+
+  DATA: lo_send_reqst TYPE REF TO cl_bcs,
+        lo_document   TYPE REF TO cl_document_bcs,
+        lo_sender     TYPE REF TO if_sender_bcs,
+        lo_recipient  TYPE REF TO if_recipient_bcs.
+  DATA: lv_content    TYPE xstring,
+        lt_binary_tab TYPE STANDARD TABLE OF solix, " Mensaje de Correo.
+        l_length      TYPE i.
+
+  DATA: lt_email TYPE TABLE OF string,
+        lv_email TYPE ad_smtpadr,
+        lt_lines TYPE TABLE OF tline,
+        lv_langu TYPE sy-langu.
+
+  DATA: lt_textos_mail    TYPE TABLE OF zap_textos_mail,
+        ls_textos_mail    TYPE zap_textos_mail,
+        l_msg             TYPE bapi_msg,
+        lv_nombre_fichero TYPE string.
+
+  DATA: ls_check_delivery TYPE ty_check_delivery,
+        lv_message_error  TYPE string,
+        lv_message        TYPE string.
+
+  FIELD-SYMBOLS <fs_x> TYPE x.
+
+*convertimos a BINARIO
+  CLEAR: lv_content,
+         l_length.
+
+  LOOP AT gt_pdf_output.
+    ASSIGN gt_pdf_output TO <fs_x> CASTING.
+    CONCATENATE lv_content <fs_x> INTO lv_content IN BYTE MODE.
+  ENDLOOP.
+
+
+  TRY .
+
+      " Obtenemos el texto del cuerpo del email, en el idioma correspondiente(ES, FR).
+      PERFORM get_language_text CHANGING lv_langu.
+      " Borramos los emails duplicados
+      SPLIT gv_smtp_addr AT ',' INTO TABLE lt_email.
+      DELETE ADJACENT DUPLICATES FROM lt_email.
+      " Modificación para enviar todos los emails 16/07/2024
+      IF lt_email[] IS NOT INITIAL.
+        LOOP AT lt_email INTO DATA(ls_email).
+          CLEAR: lv_email.
+          lv_email = ls_email.
+
+          "-----------------------------------------------------------------------------------------"
+          " Se ha modificado la clase CL_BCS por la clase zcl_ap_envio_mail para los envios por mail
+          "-----------------------------------------------------------------------------------------"
+
+          CASE lv_langu.
+            WHEN 'S'.
+              CLEAR: lv_nombre_fichero.
+              CONCATENATE 'Tarifas_precios_' sy-datum '_' sy-uzeit INTO lv_nombre_fichero.
+            WHEN 'F'.
+              CLEAR: lv_nombre_fichero.
+              CONCATENATE 'Taux_prix_' sy-datum '_' sy-uzeit INTO lv_nombre_fichero.
+            WHEN OTHERS.
+          ENDCASE.
+
+          zcl_ap_envio_mail=>mail( EXPORTING
+                              grupo = 'PAPELERA'
+                              codigo = 'PRECIO_CM'
+                              spras = lv_langu
+                              direccion = lv_email
+                              pdf = lv_content
+                              nombre_fichero = lv_nombre_fichero
+          IMPORTING
+             message = l_msg ).
+
+          CLEAR: ls_check_delivery.
+          ls_check_delivery-snddat = sy-datum.
+          ls_check_delivery-sndtim = sy-uzeit.
+          WAIT UP TO 1 SECONDS.
+          " Checkeamos el status del email
+          SELECT SINGLE * FROM soes
+                  INTO @DATA(ls_soes)
+                  WHERE snddat EQ @ls_check_delivery-snddat
+                  AND sndtim EQ @ls_check_delivery-sndtim.
+          "-------------------------------------------------------------"
+          IF sy-subrc EQ 0 .
+            " Mail enviado
+            IF ls_soes-status EQ '73'.
+              LOOP AT gt_outtab_envio INTO DATA(ls_outtab_envio_si).
+                READ TABLE gt_outtab ASSIGNING FIELD-SYMBOL(<fs_outtab_s>) WITH KEY ebeln = ls_outtab_envio_si-ebeln
+                                                                                    ebelp = ls_outtab_envio_si-ebelp
+                                                                                    datab = ls_outtab_envio_si-datab
+                                                                                    datbi = ls_outtab_envio_si-datbi.
+                IF sy-subrc EQ 0.
+                  MESSAGE e073(xs) WITH lv_email INTO lv_message.
+                  CONCATENATE <fs_outtab_s>-status lv_message INTO <fs_outtab_s>-status SEPARATED BY space.
+                  EXIT.
+                ENDIF.
+              ENDLOOP.
+              " Error en el envio del mail
+            ELSEIF ls_soes-status BETWEEN '601' AND '699' OR ls_soes-status BETWEEN '801' AND '899'.
+              CLEAR: lv_message_error.
+              LOOP AT gt_outtab_envio INTO DATA(ls_outtab_envio_no).
+                READ TABLE gt_outtab ASSIGNING <fs_outtab_s> WITH KEY ebeln = ls_outtab_envio_no-ebeln
+                                                                      ebelp = ls_outtab_envio_no-ebelp
+                                                                      datab = ls_outtab_envio_no-datab
+                                                                      datbi = ls_outtab_envio_no-datbi.
+                IF sy-subrc EQ 0.
+                  CALL FUNCTION 'FORMAT_MESSAGE'
+                    EXPORTING
+                      id        = 'XS'
+                      no        = ls_soes-status
+                      v1        = lv_email
+                    IMPORTING
+                      msg       = lv_message_error
+                    EXCEPTIONS
+                      not_found = 1
+                      OTHERS    = 2.
+                  IF sy-subrc EQ 0.
+                    CONCATENATE <fs_outtab_s>-status lv_message_error INTO <fs_outtab_s>-status SEPARATED BY space.
+                    EXIT.
+                  ENDIF.
+                ENDIF.
+              ENDLOOP.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+        " Actualizamos el ALV
+      ELSE.
+        LOOP AT gt_outtab_envio INTO DATA(ls_outtab_no_email).
+          READ TABLE gt_outtab ASSIGNING <fs_outtab_s> WITH KEY ebeln = ls_outtab_no_email-ebeln
+                                                                ebelp = ls_outtab_no_email-ebelp
+                                                                datab = ls_outtab_no_email-datab
+                                                                datbi = ls_outtab_no_email-datbi.
+          IF sy-subrc EQ 0.
+            <fs_outtab_s>-status = text-s04.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+      gr_table->refresh( refresh_mode = if_salv_c_refresh=>full ).
+      PERFORM mostrar_campos.
+      REFRESH: gt_outtab_envio.
+  ENDTRY.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_ADRNR_EXCEL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_GT_OUTTAB  text
+*      -->P_GT_OUTTAB_EXCEL  text
+*----------------------------------------------------------------------*
+FORM obtener_adrnr_excel  TABLES ct_outtab TYPE ty_t_outtab
+                                 ct_outtab_excel TYPE ty_t_outtab.
+
+  REFRESH: gt_outtab.
+  gt_outtab[] = CORRESPONDING #( gt_outtab_excel ).
+  SELECT ebeln, lifnr FROM ekko
+                      INTO TABLE @DATA(lt_ekko)
+                      FOR ALL ENTRIES IN @gt_outtab
+                      WHERE ebeln = @gt_outtab-ebeln.
+
+  SELECT lifnr, land1, adrnr FROM lfa1
+                      INTO TABLE @DATA(lt_lfa1)
+                      FOR ALL ENTRIES IN @lt_ekko
+                      WHERE lifnr = @lt_ekko-lifnr.
+
+  LOOP AT gt_outtab ASSIGNING FIELD-SYMBOL(<fs_outtab>).
+
+    READ TABLE lt_ekko INTO DATA(ls_ekko) WITH KEY ebeln = <fs_outtab>-ebeln.
+    IF sy-subrc EQ 0.
+      READ TABLE lt_lfa1 INTO DATA(ls_lfa1) WITH KEY lifnr = ls_ekko-lifnr.
+      IF sy-subrc EQ 0.
+        <fs_outtab>-lifnr = ls_lfa1-lifnr.
+        <fs_outtab>-land1 = ls_lfa1-land1.
+        <fs_outtab>-adrnr = ls_lfa1-adrnr.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+  " Le damos un valor al sy-datum para poder hacer el submit al programa
+  CLEAR: p_datum.
+  p_datum = sy-datum.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CAMBIAR_NOMBRES_COLUMNAS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM cambiar_nombres_columnas .
+
+  DATA: lr_columns TYPE REF TO cl_salv_columns,
+        lt_column  TYPE salv_t_column,
+        lr_column  TYPE REF TO cl_salv_column_table.
+
+  DATA not_found TYPE REF TO cx_salv_not_found.
+
+  TRY.
+      " Nombre de proveedor
+      lr_columns ?= gr_table->get_columns( ).
+      lr_column ?= lr_columns->get_column( 'NAME1' ).
+      lr_column->set_short_text( 'Proveedor' ).
+      lr_column->set_medium_text( 'Nombre proveedor' ).
+      lr_column->set_long_text( 'Nombre proveedor' ).
+
+      " Número de contrato
+      lr_columns ?= gr_table->get_columns( ).
+      lr_column ?= lr_columns->get_column( 'EBELN' ).
+      lr_column->set_short_text( 'Contrato' ).
+      lr_column->set_medium_text( 'Número de contrato' ).
+      lr_column->set_long_text( 'Número de contrato' ).
+
+      " Descripción
+      lr_columns ?= gr_table->get_columns( ).
+      lr_column ?= lr_columns->get_column( 'TXZ01' ).
+      lr_column->set_short_text( 'Descript' ).
+      lr_column->set_medium_text( 'Descripción' ).
+      lr_column->set_long_text( 'Descripción' ).
+
+      " Precio
+      lr_columns ?= gr_table->get_columns( ).
+      lr_column ?= lr_columns->get_column( 'KBETR' ).
+      lr_column->set_short_text( 'Precio' ).
+      lr_column->set_medium_text( 'Precio' ).
+      lr_column->set_long_text( 'Precio' ).
+
+      " Un
+      lr_columns ?= gr_table->get_columns( ).
+      lr_column ?= lr_columns->get_column( 'KONWA' ).
+      lr_column->set_short_text( 'Un' ).
+      lr_column->set_medium_text( 'Un' ).
+      lr_column->set_long_text( 'Un' ).
+
+      " Por
+      lr_columns ?= gr_table->get_columns( ).
+      lr_column ?= lr_columns->get_column( 'KPEIN' ).
+      lr_column->set_short_text( 'Por' ).
+      lr_column->set_medium_text( 'Por' ).
+      lr_column->set_long_text( 'Por' ).
+
+      " UM
+      lr_columns ?= gr_table->get_columns( ).
+      lr_column ?= lr_columns->get_column( 'KMEIN' ).
+      lr_column->set_short_text( 'UM' ).
+      lr_column->set_medium_text( 'UM' ).
+      lr_column->set_long_text( 'UM' ).
+
+      " Válido de
+      lr_columns ?= gr_table->get_columns( ).
+      lr_column ?= lr_columns->get_column( 'DATAB' ).
+      lr_column->set_short_text( 'V. De' ).
+      lr_column->set_medium_text( 'Válido de' ).
+      lr_column->set_long_text( 'Válido de' ).
+
+      " Válido hasta
+      lr_columns ?= gr_table->get_columns( ).
+      lr_column ?= lr_columns->get_column( 'DATBI' ).
+      lr_column->set_short_text( 'V. Hasta' ).
+      lr_column->set_medium_text( 'Válido hasta' ).
+      lr_column->set_long_text( 'Válido hasta' ).
+
+      " status - Mensaje
+      lr_columns ?= gr_table->get_columns( ).
+      lr_column ?= lr_columns->get_column( 'STATUS' ).
+      lr_column->set_short_text( 'Mensaje' ).
+      lr_column->set_medium_text( 'Mensaje' ).
+      lr_column->set_long_text( 'Mensaje' ).
+
+    CATCH cx_salv_not_found INTO not_found.
+      " error handling
+  ENDTRY.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ACTUALIZAR_CONTRATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM actualizar_contratos USING us_outtab_excel TYPE zts_mm_zmmr0056." ty_outtab_excel.
+
+  " BAPI_CONTRACT_GETDETAILS
+  DATA: ls_header        TYPE bapimeoutheader,
+        lt_item          TYPE TABLE OF bapimeoutitem,
+        lt_cond_validity TYPE TABLE OF bapimeoutvalidity,
+        ls_cond_validity TYPE bapimeoutvalidity,
+        lt_condition     TYPE TABLE OF bapimeoutcondition,
+        ls_condition     TYPE bapimeoutcondition,
+        lt_return        TYPE TABLE OF bapiret2.
+
+  " BAPI_CONTRACT_CHANGE
+  DATA: lt_item_cc                TYPE TABLE OF bapimeoutitem,
+        ls_item_cc                TYPE bapimeoutitem,
+        lt_itemx                  TYPE TABLE OF bapimeoutitemx,
+        ls_itemx                  TYPE bapimeoutitemx,
+        lt_item_cond_validity     TYPE TABLE OF bapimeoutvalidity,
+        ls_item_cond_validity     TYPE bapimeoutvalidity,
+        ls_item_cond_validity_aux TYPE bapimeoutvalidity,
+        lt_item_cond_validityx    TYPE TABLE OF bapimeoutvalidityx,
+        ls_item_cond_validityx    TYPE bapimeoutvalidityx,
+        lt_item_condition         TYPE TABLE OF bapimeoutcondition,
+        ls_item_condition         TYPE bapimeoutcondition,
+        lt_item_conditionx        TYPE TABLE OF bapimeoutconditionx,
+        ls_item_conditionx        TYPE bapimeoutconditionx.
+
+
+  CLEAR: ls_header, ls_cond_validity, ls_condition, ls_item_cc, ls_itemx,ls_item_cond_validity,
+         ls_item_cond_validityx, ls_item_condition,ls_item_conditionx, ls_item_cond_validity_aux.
+  REFRESH: lt_item,lt_return, lt_item_conditionx, lt_item_condition, lt_cond_validity,lt_condition,
+           lt_item_cond_validity, lt_item_cc, lt_itemx, lt_item_cond_validity, lt_item_cond_validity,
+           lt_item_condition, lt_item_conditionx.
+
+
+  " Comprobamos si hay que insertar un nuevo registro
+  PERFORM comprobar_registro_existente USING us_outtab_excel
+                                       CHANGING gv_check_registro.
+  IF gv_check_registro EQ abap_true.
+    PERFORM insertar_nuevo_registro USING us_outtab_excel.
+  ENDIF.
+
+  CALL FUNCTION 'BAPI_CONTRACT_GETDETAIL'
+    EXPORTING
+      purchasingdocument = us_outtab_excel-ebeln
+      item_data          = 'X'
+      condition_data     = 'X'
+    IMPORTING
+      header             = ls_header
+    TABLES
+      item               = lt_item
+      item_cond_validity = lt_cond_validity
+      item_condition     = lt_condition
+      return             = lt_return.
+
+  "-------------------------------"
+  "--- set validity to period ----"
+  "-------------------------------"
+  ls_item_cond_validity-item_no = us_outtab_excel-ebelp.
+  ls_item_cond_validity-valid_from = us_outtab_excel-datab.
+  ls_item_cond_validity-valid_to = us_outtab_excel-datbi.
+
+*lt_condition : cond_count
+  LOOP AT lt_cond_validity INTO ls_cond_validity WHERE item_no = us_outtab_excel-ebelp.
+    IF us_outtab_excel-datab BETWEEN ls_cond_validity-valid_from AND ls_cond_validity-valid_to.
+      " Estructura para actualizar el precio
+      ls_item_cond_validity_aux = CORRESPONDING #( ls_cond_validity ).
+      ls_item_cond_validityx-item_no = us_outtab_excel-ebelp.
+      ls_item_cond_validityx-serial_id = ls_cond_validity-serial_id.
+      ls_item_cond_validity-serial_id = ls_cond_validity-serial_id.
+      ls_item_cond_validityx-valid_from = 'X'.
+      ls_item_cond_validityx-valid_to = 'X'.
+*      ls_item_cond_validityx-item_nox = 'X'.
+      APPEND ls_item_cond_validityx TO lt_item_cond_validityx.
+      APPEND ls_item_cond_validity TO lt_item_cond_validity.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+  "-------------------------------"
+  "------- set new price ---------"
+  "-------------------------------"
+  READ TABLE lt_condition INTO DATA(ls_condition_aux) WITH KEY serial_id = ls_cond_validity-serial_id .
+  IF sy-subrc EQ 0.
+    " Tabla de Condiciones
+    ls_item_condition-item_no = us_outtab_excel-ebelp.
+    ls_item_condition-serial_id = ls_condition_aux-serial_id.
+    ls_item_condition-cond_count = ls_condition_aux-cond_count.
+    ls_item_condition-cond_type = ls_condition_aux-cond_type.
+    ls_item_condition-calctypcon =  ls_condition_aux-calctypcon.
+    ls_item_condition-cond_value = us_outtab_excel-kbetr.
+    ls_item_condition-currency = ls_condition_aux-currency.
+    ls_item_condition-currency_iso = ls_condition_aux-currency_iso.
+    ls_item_condition-numerator = ls_condition_aux-numerator.
+    ls_item_condition-denominator = ls_condition_aux-denominator.
+    ls_item_condition-base_uom = ls_condition_aux-base_uom.
+    ls_item_condition-base_uom_iso = ls_condition_aux-base_uom_iso.
+    ls_item_condition-cond_p_unt = us_outtab_excel-kpein ." ls_condition_aux-cond_p_unt.
+    ls_item_condition-cond_unit = ls_condition_aux-cond_unit.
+    ls_item_condition-change_id = 'U'.
+    APPEND ls_item_condition TO lt_item_condition.
+    " Tabla de Condiciones X
+    ls_item_conditionx-item_no = us_outtab_excel-ebelp.
+    ls_item_conditionx-serial_id = ls_condition_aux-serial_id.
+    ls_item_conditionx-cond_count = abap_true.
+    ls_item_conditionx-cond_type = abap_true.
+    ls_item_conditionx-calctypcon = abap_true.
+    ls_item_conditionx-cond_value = abap_true.
+    ls_item_conditionx-currency = abap_true.
+    ls_item_conditionx-currency_iso = abap_true.
+    ls_item_conditionx-numerator = abap_true.
+    ls_item_conditionx-denominator = abap_true.
+    ls_item_conditionx-base_uom = abap_true.
+    ls_item_conditionx-base_uom_iso = abap_true.
+    ls_item_conditionx-cond_p_unt = abap_true.
+    ls_item_conditionx-cond_unit = abap_true. " ls_condition-cond_unit.
+    APPEND ls_item_conditionx TO lt_item_conditionx.
+  ENDIF.
+
+
+  READ TABLE lt_item INTO DATA(ls_item_aux) WITH KEY item_no = us_outtab_excel-ebelp.
+  IF sy-subrc EQ 0.
+    " Tabla de Item
+    ls_item_cc-item_no = us_outtab_excel-ebelp.
+    ls_item_cc-material = ls_item_aux-material.
+    ls_item_cc-target_qty = ls_item_aux-target_qty.
+    ls_item_cc-net_price = us_outtab_excel-kbetr.
+    ls_item_cc-price_unit =  ls_item_aux-price_unit.
+    ls_item_cc-orderpr_un = ls_item_aux-orderpr_un.
+    ls_item_cc-conv_num1 = ls_item_aux-conv_num1.
+    ls_item_cc-conv_den1 = ls_item_aux-conv_den1.
+*    ls_item_cc-pricedate = '1'.
+    ls_item_cc-price_date = us_outtab_excel-datbi.
+    ls_item_cc-calctype = 'B'.
+    APPEND ls_item_cc TO lt_item_cc.
+    " Tabla de Itemx
+    ls_itemx-item_no = us_outtab_excel-ebelp.
+    ls_itemx-item_nox = abap_true.
+    ls_itemx-material = abap_true.
+    ls_itemx-target_qty = abap_true.
+    ls_itemx-net_price = abap_true.
+    ls_itemx-price_unit = abap_true.
+    ls_itemx-orderpr_un = abap_true.
+    ls_itemx-conv_num1 = abap_true.
+    ls_itemx-conv_den1 = abap_true.
+*    ls_itemx-pricedate = abap_true.
+    ls_itemx-price_date = abap_true.
+    ls_itemx-calctype = abap_true.
+    APPEND ls_itemx TO lt_itemx.
+  ENDIF.
+
+  REFRESH: lt_return.
+  CALL FUNCTION 'BAPI_CONTRACT_CHANGE'
+    EXPORTING
+      purchasingdocument  = us_outtab_excel-ebeln
+    TABLES
+      item                = lt_item_cc
+      itemx               = lt_itemx
+      item_cond_validity  = lt_item_cond_validity
+      item_cond_validityx = lt_item_cond_validityx
+      item_condition      = lt_item_condition
+      item_conditionx     = lt_item_conditionx
+      return              = lt_return.
+  IF sy-subrc EQ 0.
+    READ TABLE lt_return INTO DATA(ls_data) WITH KEY type = 'S'.
+    IF sy-subrc EQ 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+      us_outtab_excel-status = ls_data-message.
+      PERFORM update_pricedate USING us_outtab_excel.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      READ TABLE lt_return INTO DATA(ls_data_error) WITH KEY type = 'E'.
+      IF sy-subrc EQ 0.
+        us_outtab_excel-status = ls_data_error-message.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  CONVERTIR_CANTIDAD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_L_KBETR  text
+*----------------------------------------------------------------------*
+FORM convertir_cantidad  CHANGING cv_amount TYPE string.
+
+  REPLACE '.' WITH ' ' INTO cv_amount.
+  CONDENSE cv_amount NO-GAPS.
+  " 2 la coma la convertimos en punto
+  REPLACE ',' WITH '.' INTO cv_amount.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_PRICEDATE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM update_pricedate USING us_outtab_excel TYPE zts_mm_zmmr0056. " ty_outtab_excel.
+
+  " BAPI_CONTRACT_GETDETAILS
+  DATA: ls_header        TYPE bapimeoutheader,
+        lt_cond_validity TYPE TABLE OF bapimeoutvalidity,
+        ls_cond_validity TYPE bapimeoutvalidity,
+        lt_condition     TYPE TABLE OF bapimeoutcondition,
+        ls_condition     TYPE bapimeoutcondition,
+        lt_return        TYPE TABLE OF bapiret2.
+
+  DATA: l_prdat TYPE ekpo-prdat.
+
+  " Obtenemos la información del número de pedido actualizada para poder actualizar el periodo vigente en la ekpo
+  CALL FUNCTION 'BAPI_CONTRACT_GETDETAIL'
+    EXPORTING
+      purchasingdocument = us_outtab_excel-ebeln
+      condition_data     = 'X'
+    IMPORTING
+      header             = ls_header
+    TABLES
+      item_cond_validity = lt_cond_validity
+      item_condition     = lt_condition
+      return             = lt_return.
+
+  LOOP AT lt_cond_validity INTO ls_cond_validity WHERE item_no = us_outtab_excel-ebelp.
+    IF sy-datum BETWEEN ls_cond_validity-valid_from AND ls_cond_validity-valid_to.
+      l_prdat = ls_cond_validity-valid_to.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+  IF l_prdat IS NOT INITIAL.
+
+    UPDATE ekpo
+      SET prdat = l_prdat
+      WHERE ebeln EQ us_outtab_excel-ebeln
+      AND   ebelp EQ us_outtab_excel-ebelp.
+
+  ENDIF.
+
+  CLEAR: l_prdat, ls_cond_validity.
+  REFRESH: lt_cond_validity, lt_condition, lt_return.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  COMPROBAR_REGISTRO_EXISTENTE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_GV_CHECK_REGISTRO  text
+*----------------------------------------------------------------------*
+FORM comprobar_registro_existente USING us_outtab_excel TYPE zts_mm_zmmr0056 " ty_outtab_excel
+                                  CHANGING cv_check_registro TYPE abap_bool.
+
+  CLEAR: cv_check_registro.
+
+  SELECT * FROM a016 INTO TABLE @DATA(lt_a016)
+      WHERE evrtn = @us_outtab_excel-ebeln
+      AND evrtp = @us_outtab_excel-ebelp.
+  IF sy-subrc EQ 0.
+    SORT lt_a016 BY evrtn evrtp datbi DESCENDING.
+    READ TABLE lt_a016 INTO DATA(ls_a016) INDEX 1.
+    IF us_outtab_excel-datab GT ls_a016-datab AND us_outtab_excel-datab GT ls_a016-datbi.
+      cv_check_registro = abap_true.
+      EXIT.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  INSERTAR_NUEVO_REGISTRO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM insertar_nuevo_registro USING us_outtab_excel TYPE zts_mm_zmmr0056. " ty_outtab_excel.
+
+  DATA: lt_bapicondct  TYPE TABLE OF bapicondct,
+        ls_bapicondct  TYPE bapicondct,
+        lt_bapicondhd  TYPE TABLE OF bapicondhd,
+        ls_bapicondhd  TYPE bapicondhd,
+        lt_bapicondit  TYPE TABLE OF bapicondit,
+        ls_bapicondit  TYPE bapicondit,
+        lt_bapicondqs  TYPE TABLE OF bapicondqs,
+        ls_bapicondqs  TYPE bapicondqs,
+        lt_bapicondvs  TYPE TABLE OF bapicondvs,
+        ls_bapicondvs  TYPE bapicondvs,
+        lt_return      TYPE TABLE OF bapiret2,
+        lt_bapiknumhs  TYPE TABLE OF bapiknumhs,
+        ls_bapiknumhs  TYPE bapiknumhs,
+        lt_mem_initial TYPE TABLE OF cnd_mem_initial,
+        ls_mem_initial TYPE cnd_mem_initial.
+
+  IF us_outtab_excel IS NOT INITIAL.
+
+    " Obtenemos el knumh de los registros del excel
+    SELECT evrtn, evrtp, datbi, datab, knumh FROM a016 INTO TABLE @DATA(lt_a016)
+      WHERE evrtn = @us_outtab_excel-ebeln
+      AND evrtp   = @us_outtab_excel-ebelp.
+
+    IF sy-subrc EQ 0 AND lt_a016 IS NOT INITIAL.
+
+      SORT lt_a016 BY evrtn evrtp datbi DESCENDING.
+
+      " Obtenemos los registros de la tabla konh
+      SELECT * FROM konp INTO TABLE @DATA(lt_konp)
+        FOR ALL ENTRIES IN @lt_a016
+        WHERE knumh = @lt_a016-knumh.
+
+      " Obtenemos los registros de la tabla konh
+      SELECT * FROM konh INTO TABLE @DATA(lt_konh)
+        FOR ALL ENTRIES IN @lt_a016
+        WHERE knumh = @lt_a016-knumh.
+
+      SELECT * FROM konm INTO TABLE @DATA(lt_konm)
+        FOR ALL ENTRIES IN @lt_a016
+        WHERE knumh = @lt_a016-knumh.
+
+      SORT lt_a016 BY evrtn evrtp datbi DESCENDING.
+
+
+      CLEAR: ls_bapicondct, ls_bapicondhd, ls_bapicondit.
+      REFRESH: lt_bapicondct, lt_bapicondhd, lt_bapicondit .
+
+      READ TABLE lt_a016 INTO DATA(ls_a016) WITH KEY evrtn = us_outtab_excel-ebeln
+                                                    evrtp = us_outtab_excel-ebelp.
+      IF sy-subrc EQ 0.
+
+        READ TABLE lt_konh INTO DATA(ls_konh) WITH KEY knumh = ls_a016-knumh.
+        IF sy-subrc EQ 0.
+          "--- BAPICONDCT ---"
+          ls_bapicondct-operation = gc_operacion_modificacion. "'004'.
+          ls_bapicondct-cond_usage = ls_konh-kvewe.
+          ls_bapicondct-table_no = ls_konh-kotabnr.
+          ls_bapicondct-applicatio = ls_konh-kappl.
+          ls_bapicondct-cond_type = ls_konh-kschl.
+          ls_bapicondct-varkey = ls_konh-vakey.
+          ls_bapicondct-valid_from = us_outtab_excel-datab.
+          ls_bapicondct-valid_to  = us_outtab_excel-datbi.
+          ls_bapicondct-cond_no = gc_knumh_new.
+          ls_bapicondct-vadat = ls_konh-vadat.
+          APPEND ls_bapicondct TO lt_bapicondct.
+          "--- BAPICONDHD ---"
+          ls_bapicondhd-operation   = gc_operacion_modificacion. "'004'.
+          ls_bapicondhd-cond_no     = gc_knumh_new.
+          ls_bapicondhd-created_by  = sy-uname.
+          ls_bapicondhd-creat_date  = sy-datum.
+          ls_bapicondhd-cond_usage  = ls_konh-kvewe.
+          ls_bapicondhd-table_no    = ls_konh-kotabnr.
+          ls_bapicondhd-applicatio  = ls_konh-kappl.
+          ls_bapicondhd-cond_type   = ls_konh-kschl.
+          ls_bapicondhd-varkey      = ls_konh-vakey.
+          ls_bapicondhd-vardate     = ls_konh-vadat.
+          ls_bapicondhd-valid_from  = us_outtab_excel-datab.
+          ls_bapicondhd-valid_to    = us_outtab_excel-datbi.
+          APPEND ls_bapicondhd TO lt_bapicondhd.
+        ENDIF.
+        READ TABLE lt_konp INTO DATA(ls_konp) WITH KEY knumh = ls_a016-knumh.
+        IF sy-subrc EQ 0.
+          "------------------"
+          "--- BAPICONDIT ---"
+          "------------------"
+          ls_bapicondit-operation   = gc_operacion_modificacion. "'004'.
+          ls_bapicondit-cond_no     = gc_knumh_new.
+          ls_bapicondit-cond_count  = ls_konp-kopos.
+          ls_bapicondit-applicatio  = ls_konp-kappl.
+          ls_bapicondit-cond_type   = ls_konp-kschl.
+          ls_bapicondit-text_no     = ls_konp-knumt.
+          ls_bapicondit-scaletype   = ls_konp-stfkz.
+          ls_bapicondit-scale_qty   = ls_konp-kstbm.
+          ls_bapicondit-unitmeasur  = ls_konp-konms.
+          ls_bapicondit-scale_val   = ls_konp-kstbw.
+          ls_bapicondit-currenckey  = ls_konp-konws.
+          ls_bapicondit-calctypcon  = ls_konp-krech.
+          ls_bapicondit-cond_value  = us_outtab_excel-kbetr. " You can update the changed price value here.
+          ls_bapicondit-condcurr    = ls_konp-konwa.
+          ls_bapicondit-cond_p_unt  = ls_konp-kpein.
+          ls_bapicondit-cond_unit   = ls_konp-kmein.
+          ls_bapicondit-pricelevel  = ls_konp-prsch.
+          ls_bapicondit-numconvert  = ls_konp-kumza.
+          ls_bapicondit-denominato  = ls_konp-kumne.
+          ls_bapicondit-base_uom    = ls_konp-meins.
+          ls_bapicondit-lowerlimit  = ls_konp-mxwrt.
+          ls_bapicondit-upperlimit  = ls_konp-gkwrt.
+          ls_bapicondit-plcondval   = ls_konp-pkwrt.
+          ls_bapicondit-cum_value   = ls_konp-fkwrt.
+          ls_bapicondit-cumm_accr   = ls_konp-rswrt.
+          ls_bapicondit-currency    = ls_konp-konwa.
+          ls_bapicondit-condcurren  = ls_konp-kwaeh.
+          ls_bapicondit-plan_basis  = ls_konp-ukbas.
+          ls_bapicondit-rate_unit   = ls_konp-kmein.
+          ls_bapicondit-exclusion   = ls_konp-kznep.
+          ls_bapicondit-customer    = ls_konp-kunnr.
+          ls_bapicondit-vendor_no   = ls_konp-lifnr.
+          ls_bapicondit-tax_code    = ls_konp-mwsk1.
+          ls_bapicondit-conditidx   = ls_konp-zaehk_ind.
+          ls_bapicondit-matlsettl   = ls_konp-bomat.
+          ls_bapicondit-accruals    = ls_konp-kbrue.
+          ls_bapicondit-reb_retroa  = ls_konp-kspae.
+          ls_bapicondit-statofagre  = ls_konp-bosta.
+          ls_bapicondit-promot_no   = ls_konp-knuma_pi.
+          ls_bapicondit-sales_deal  = ls_konp-knuma_ag.
+          ls_bapicondit-salesquote  = ls_konp-knuma_sq.
+          ls_bapicondit-add_val_dy  = ls_konp-valtg.
+          ls_bapicondit-fix_val_dy  = ls_konp-valdt.
+          ls_bapicondit-pmnttrms    = ls_konp-zterm.
+          ls_bapicondit-numborders  = ls_konp-anzauf.
+          ls_bapicondit-minconbava  = ls_konp-mikbas.
+          ls_bapicondit-maxconbava  = ls_konp-mxkbas.
+          ls_bapicondit-maxconval   = ls_konp-komxwrt.
+          ls_bapicondit-incr_scale  = ls_konp-klf_stg.
+          ls_bapicondit-pricscale   = ls_konp-klf_kal.
+          ls_bapicondit-relprcg     = ls_konp-vkkal.
+          ls_bapicondit-promotion   = ls_konp-aktnr.
+          ls_bapicondit-rebagreemt  = ls_konp-knuma_bo.
+          ls_bapicondit-withtaxcod  = ls_konp-mwsk2.
+          ls_bapicondit-contract    = ls_konp-vertt.
+          ls_bapicondit-contractno  = ls_konp-vertn.
+          ls_bapicondit-flow_type   = ls_konp-vbewa.
+          ls_bapicondit-indimatmai  = ls_konp-mdflg.
+          ls_bapicondit-status      = ls_konp-kfrst.
+          ls_bapicondit-umsabst     = ls_konp-uasta.
+          APPEND ls_bapicondit TO lt_bapicondit.
+        ENDIF.
+
+        CALL FUNCTION 'BAPI_PRICES_CONDITIONS'
+          TABLES
+            ti_bapicondct  = lt_bapicondct
+            ti_bapicondhd  = lt_bapicondhd
+            ti_bapicondit  = lt_bapicondit
+            ti_bapicondqs  = lt_bapicondqs
+            ti_bapicondvs  = lt_bapicondvs
+            to_bapiret2    = lt_return
+            to_bapiknumhs  = lt_bapiknumhs
+            to_mem_initial = lt_mem_initial
+          EXCEPTIONS
+            update_error   = 1
+            OTHERS         = 2.
+        IF sy-subrc EQ 0.
+          READ TABLE lt_return INTO DATA(ls_return) WITH KEY type = 'S'.
+          IF sy-subrc EQ 0.
+            CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+              EXPORTING
+                wait = 'X'.
+          ELSE.
+            CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    REFRESH: lt_bapicondct, lt_bapicondhd, lt_bapicondit, lt_bapicondqs, lt_bapicondvs, lt_return, lt_bapiknumhs, lt_mem_initial.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_EMAIL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_<FS_OUTTAB>  text
+*      <--P_LS_ADDR1_COMPLETE  text
+*----------------------------------------------------------------------*
+FORM obtener_email  USING    us_outtab TYPE zts_mm_zmmr0056
+                    CHANGING cs_addr1_complete TYPE szadr_addr1_complete.
+
+  DATA: ls_addr1_complete TYPE szadr_addr1_complete.
+
+  CLEAR: cs_addr1_complete.
+
+  CALL FUNCTION 'ADDR_GET_COMPLETE'
+    EXPORTING
+      addrnumber              = us_outtab-adrnr
+      iv_current_comm_data    = 'X'
+    IMPORTING
+      addr1_complete          = ls_addr1_complete
+    EXCEPTIONS
+      parameter_error         = 1
+      address_not_exist       = 2
+      internal_error          = 3
+      wrong_access_to_archive = 4
+      address_blocked         = 5
+      OTHERS                  = 6.
+  IF sy-subrc EQ 0 AND ls_addr1_complete IS NOT INITIAL.
+    cs_addr1_complete = ls_addr1_complete.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_EMAILS_EXCEL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_GS_OUTTAB_EXCEL  text
+*----------------------------------------------------------------------*
+FORM obtener_emails_excel  CHANGING cs_outtab_excel TYPE zts_mm_zmmr0056.
+
+  SELECT SINGLE ebeln, lifnr FROM ekko
+                      INTO @DATA(ls_ekko)
+                      WHERE ebeln = @cs_outtab_excel-ebeln.
+  IF sy-subrc EQ 0.
+    SELECT SINGLE  lifnr, adrnr FROM lfa1
+                        INTO @DATA(ls_lfa1)
+                        WHERE lifnr = @ls_ekko-lifnr.
+    IF sy-subrc EQ 0.
+      cs_outtab_excel-lifnr = ls_lfa1-lifnr.
+      cs_outtab_excel-adrnr = ls_lfa1-adrnr.
+    ENDIF.
+  ENDIF.
+
+  " Le damos un valor al sy-datum para poder hacer el submit al programa
+  CLEAR: p_datum.
+  p_datum = sy-datum.
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_LANGUAGE_TEXT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LT_LINES  text
+*----------------------------------------------------------------------*
+FORM get_language_text CHANGING cv_langu TYPE sy-langu.
+
+  DATA: lt_langu        TYPE TABLE OF string,
+        ls_langu        TYPE sy-langu,
+        lv_id           TYPE thead-tdid,
+        lv_language     TYPE thead-tdspras,
+        lv_language_aux TYPE lfa1-land1,
+        lv_name         TYPE thead-tdname,
+        lv_object       TYPE thead-tdobject,
+        lv_tabix        TYPE sy-tabix.
+
+
+  LOOP AT gt_outtab_envio INTO DATA(ls_outtab_envio).
+    READ TABLE gt_outtab ASSIGNING FIELD-SYMBOL(<fs_outtab_s>) WITH KEY ebeln = ls_outtab_envio-ebeln
+                                                                      ebelp = ls_outtab_envio-ebelp
+                                                                      datab = ls_outtab_envio-datab
+                                                                      datbi = ls_outtab_envio-datbi.
+    IF sy-subrc EQ 0.
+      lv_language_aux = <fs_outtab_s>-land1.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+  IF lv_language_aux IS NOT INITIAL.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ISOLA_INPUT'
+      EXPORTING
+        input            = lv_language_aux
+      IMPORTING
+        output           = ls_langu
+      EXCEPTIONS
+        unknown_language = 1
+        OTHERS           = 2.
+    IF sy-subrc EQ 0.
+      cv_langu = ls_langu.
+    ENDIF.
+  ENDIF.
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  MOSTRAR_CAMPOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM mostrar_campos .
+
+  lr_columns = gr_table->get_columns( ).
+  lr_columns->set_optimize( abap_true ).
+
+  " Mostrar el campo Mensaje
+  lr_column ?=  lr_columns->get_column( 'STATUS' ).
+  lr_column->set_visible( value = if_salv_c_bool_sap=>true ).
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  SHOW_CELL_INFO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_ROW  text
+*      -->P_COLUMN  text
+*----------------------------------------------------------------------*
+FORM show_cell_info  USING i_row    TYPE i
+                           i_column TYPE lvc_fname.
+
+  READ TABLE gt_outtab ASSIGNING FIELD-SYMBOL(<fs_outtab>) INDEX i_row.
+  IF sy-subrc EQ 0.
+    CASE i_column.
+      WHEN 'STATUS'.
+        IF <fs_outtab>-status IS NOT INITIAL.
+          MESSAGE <fs_outtab>-status TYPE 'I'.
+        ENDIF.
+    ENDCASE.
+  ENDIF.
+
+ENDFORM.

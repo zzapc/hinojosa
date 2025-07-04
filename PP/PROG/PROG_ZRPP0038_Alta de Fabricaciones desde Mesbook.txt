@@ -1,0 +1,519 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRPP0038
+*&
+*&---------------------------------------------------------------------*
+*& Alta de fabricación desde Mesbook
+*&---------------------------------------------------------------------*
+REPORT zrpp0038.
+
+INCLUDE zrpp0038_top.
+INCLUDE zrpp0038_f01.
+
+DATA: lt_fab TYPE STANDARD TABLE OF ztpi0007,
+      ls_fab TYPE ztpi0007.
+
+DATA:  it_carac TYPE STANDARD TABLE OF t_carac,
+       wa_carac TYPE t_carac.
+
+DATA: wa_order_objects TYPE          bapi_pi_order_objects,
+      t_return         TYPE          bapiret2,
+      t_header         TYPE TABLE OF bapi_order_header1,
+      wa_header        TYPE          bapi_order_header1,
+      t_position       TYPE TABLE OF bapi_order_item,
+      t_sequence       TYPE TABLE OF bapi_order_sequence,
+      t_phase          TYPE TABLE OF bapi_order_phase,
+      wa_phase         TYPE          bapi_order_phase,
+      t_trigger_point  TYPE TABLE OF bapi_order_trigger_point,
+      t_component      TYPE TABLE OF bapi_order_component,
+      t_component_aux  TYPE TABLE OF bapi_order_component,
+      wa_component     TYPE          bapi_order_component,
+      t_prod_rel_tool  TYPE TABLE OF bapi_order_prod_rel_tools,
+      lt_return_total  TYPE TABLE OF bapiret2.
+
+DATA: lv_mtart       TYPE mtart,
+      lv_charg       TYPE charg_d,
+      lv_orden       TYPE aufnr,
+      lv_lineas      TYPE i,
+      lv_rsnum       TYPE rsnum,
+      lv_clabs       TYPE labst,
+      lv_clabs_aux   TYPE labst,
+      lv_zzaptoalim  TYPE zaptoalim,
+      lv_zzcoex      TYPE zzcoex,
+      lv_zzkunnr4    TYPE zzkunnr4,
+      lv_zzebeln4    TYPE zzebeln4,
+      lv_zzebelp4    TYPE zzebelp4,
+      lv_name1       TYPE name1,
+      lv_zzmatventa  TYPE zzmatventa,
+      lv_index       TYPE i,
+      lv_atnam       TYPE atnam,
+      lv_data_cad    LIKE p0001-begda,
+      lv_data        TYPE sy-datum,
+      lv_time        TYPE char6,
+      lv_matnr       LIKE  mcha-matnr,
+      lv_charg_func  LIKE  mcha-charg,
+      lv_id_tmp      TYPE co_msid2,
+      lv_op_sig      TYPE char4,
+      lv_objnr       TYPE j_objnr,
+      lv_aufpl       TYPE co_aufpl,
+      lv_stat	       TYPE j_status,
+      lv_zzttocorona TYPE zzttocorona,
+      lv_xchpf       TYPE xchpf.
+
+DATA: lt_char_of_batch TYPE TABLE OF  clbatch,
+      ls_char_of_batch TYPE clbatch.
+
+DATA: lv_fecha_fab TYPE char19.
+
+START-OF-SELECTION.
+
+  REFRESH lt_fab.
+  SELECT * INTO TABLE lt_fab
+    FROM ztpi0007
+    WHERE procesado = ''.
+
+  CLEAR ls_fab.
+  LOOP AT lt_fab INTO ls_fab.
+    lv_id_tmp = 1.
+    REFRESH lt_return_total.
+
+**    Si no tiene lote es un error.
+    IF ls_fab-lotefabricacion IS NOT INITIAL.
+
+**  Preparamos datos
+      CLEAR lv_orden.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = ls_fab-numeroorden
+        IMPORTING
+          output = lv_orden.
+
+      CLEAR lv_matnr.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = ls_fab-codigo
+        IMPORTING
+          output = lv_matnr.
+
+**  Comprobar si el material tiene loteswip.
+      CLEAR: lv_mtart,lv_xchpf.
+      SELECT SINGLE mtart xchpf INTO (lv_mtart, lv_xchpf)
+        FROM mara
+        WHERE matnr EQ lv_matnr.
+
+**  Primero debemos de volver a calcular el peso
+      CLEAR: lv_clabs.
+      SELECT SINGLE clabs INTO lv_clabs
+        FROM mchb
+        WHERE charg = ls_fab-lotefabricacion AND matnr EQ lv_matnr AND werks EQ '4000'.
+
+**  Lanzamos la BAPI_PROCORD_GET_DETAIL para obtener los de la OF.
+      CLEAR: t_header, t_position, t_sequence, t_phase,
+           t_trigger_point, t_component, t_prod_rel_tool.
+      REFRESH: t_header, t_position, t_sequence, t_phase,
+               t_trigger_point, t_component, t_prod_rel_tool.
+
+**  Indicamos las estructuras a obtener.
+      wa_order_objects-header = 'X'.
+      wa_order_objects-positions = 'X'.
+      wa_order_objects-sequences = ''.
+      wa_order_objects-phases = 'X'.
+      wa_order_objects-components = 'X'.
+      wa_order_objects-prod_rel_tools = ''.
+      wa_order_objects-trigger_points = ''.
+      wa_order_objects-secondary_resources = ''.
+
+      CALL FUNCTION 'BAPI_PROCORD_GET_DETAIL'
+        EXPORTING
+          number        = lv_orden
+          order_objects = wa_order_objects
+        IMPORTING
+          return        = t_return
+        TABLES
+          header        = t_header
+          position      = t_position
+          sequence      = t_sequence
+          phase         = t_phase
+          trigger_point = t_trigger_point
+          component     = t_component
+          prod_rel_tool = t_prod_rel_tool.
+
+**  Comprobar si existe el lote.
+      CLEAR lv_charg.
+      SELECT SINGLE charg INTO lv_charg
+        FROM mcha
+        WHERE matnr EQ lv_matnr AND charg EQ ls_fab-lotefabricacion AND werks EQ '4000'.
+
+**  Separamos el timestamp de mesbook. "Formato 2017-10-27T13:12:00
+      CLEAR lv_fecha_fab.
+      lv_fecha_fab = ls_fab-timestampfabricacion.
+**  Separamos la fecha y la hora del timestamp que proporciona mesbook.
+      CLEAR: lv_data,lv_time.
+      REPLACE ALL OCCURRENCES OF '-' IN lv_fecha_fab WITH ''.
+      REPLACE ALL OCCURRENCES OF ':' IN lv_fecha_fab WITH ''.
+      CONDENSE lv_fecha_fab.
+      SPLIT lv_fecha_fab AT 'T' INTO lv_data lv_time.
+
+      IF lv_charg IS INITIAL AND lv_xchpf EQ 'X'. " si el lote no existe en SAP y el material esta sujeto a lote.
+**  Si no existe lanzamos el mensaje de proceso ZC_BT_CR  – Creación de lote
+        PERFORM p_lanzar_mensaje_zc_bt_cr USING ls_fab
+                                              lv_data
+                                              lv_id_tmp
+                                              lv_orden
+                                              lv_matnr
+                                              lv_time
+                                     CHANGING lt_return_total.
+
+      ENDIF.
+
+      IF lv_mtart EQ 'ZWIP'. " Si es ZWIP lanzamos el mensaje de proceso ZC_PRODW
+**  Limpiamos las tablas del mensaje de proceso.
+        PERFORM p_lanzar_mensaje_zc_prodw USING ls_fab
+                                              lv_data
+                                              lv_id_tmp
+                                              lv_orden
+                                              lv_matnr
+                                              lv_time
+                                     CHANGING lt_return_total.
+
+
+      ELSE. " Si no es un ZWIP comprobamos si es material de cabecera o coproducto y lanzamos el mensaje de proceso ZC_PROD.
+**  Recuperar el coproducto.
+        CLEAR lv_lineas.
+        DESCRIBE TABLE t_position LINES lv_lineas.
+
+        CLEAR wa_component.
+        READ TABLE t_component INTO wa_component WITH KEY material = lv_matnr.
+        CLEAR lv_rsnum.
+        IF lv_lineas > 1.
+
+          SELECT SINGLE rsnum INTO lv_rsnum
+            FROM resb
+            WHERE rsnum = wa_component-reservation_number AND
+                  bwart = '101' AND
+                  kzkup = 'X' AND
+                  matnr EQ lv_matnr.
+        ENDIF.
+
+        CLEAR wa_header.
+        READ TABLE t_header INTO wa_header INDEX 1.
+
+        IF wa_header-material EQ lv_matnr OR lv_rsnum IS NOT INITIAL. " material de cabecera o coproducto
+          PERFORM p_lanzar_mensaje_zc_prod USING ls_fab
+                                              lv_data
+                                              lv_id_tmp
+                                              lv_orden
+                                              lv_matnr
+                                              lv_time
+                                     CHANGING lt_return_total.
+        ELSE. "Subproducto, por lo que lanzamos un mensaje de proceso ZC_SUBP
+          PERFORM p_lanzar_mensaje_zc_subp USING ls_fab
+                                              lv_data
+                                              lv_id_tmp
+                                              lv_orden
+                                              lv_matnr
+                                              lv_time
+                                     CHANGING lt_return_total.
+        ENDIF.
+      ENDIF.
+
+**  Si no es alguno de estos tipos no clasifica.
+      IF lv_mtart EQ 'ZWIP' OR lv_mtart EQ 'ZPMP' OR lv_mtart EQ 'ZPLP'.
+
+**  ZC_BT_CL  – Clasificación de lote
+**  Buscamos la caracteristica del material
+        CLEAR lv_charg_func.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = ls_fab-lotefabricacion
+          IMPORTING
+            output = lv_charg_func.
+
+        REFRESH lt_char_of_batch.
+        CALL FUNCTION 'VB_BATCH_GET_DETAIL'
+          EXPORTING
+            matnr              = lv_matnr
+            charg              = lv_charg
+            werks              = '4000'
+            get_classification = 'X'
+          TABLES
+            char_of_batch      = lt_char_of_batch
+          EXCEPTIONS
+            no_material        = 1
+            no_batch           = 2
+            no_plant           = 3
+            material_not_found = 4
+            plant_not_found    = 5
+            no_authority       = 6
+            batch_not_exist    = 7
+            lock_on_batch      = 8
+            OTHERS             = 9.
+
+        CLEAR ls_char_of_batch.
+
+        CLEAR lv_atnam.
+        SELECT SINGLE atnam INTO lv_atnam
+          FROM ztpp0016
+          WHERE clave EQ 'Z_UN_MED_ESP_LOTE'.
+
+        READ TABLE lt_char_of_batch INTO ls_char_of_batch WITH KEY atnam = lv_atnam.
+        IF sy-subrc = 0.
+          REPLACE 'kg' WITH '' INTO ls_char_of_batch-atwtb.
+          REPLACE ',' WITH '.' INTO ls_char_of_batch-atwtb.
+          MOVE ls_char_of_batch-atwtb TO lv_clabs_aux.
+          lv_clabs = ( ( lv_clabs * lv_clabs_aux ) + ls_fab-kgproducidos ) / ( lv_clabs + ls_fab-cantidadfabricacionprod ).
+        ELSE.
+          lv_clabs = ls_fab-kgproducidos  / ( lv_clabs + ls_fab-cantidadfabricacionprod ).
+        ENDIF.
+
+**  Lanzamos mensaje de clasificacion para la caracteristica Z_UN_MED_ESP_LOTE.
+        PERFORM p_lanzar_mensaje_zc_bt_cl USING ls_fab
+                                                lv_data
+                                                lv_id_tmp
+                                                lv_orden
+                                                lv_matnr
+                                                lv_time
+                                                lv_clabs
+                                                lv_atnam
+                                       CHANGING lt_return_total.
+        REFRESH it_carac.
+**  Rellenamos las caracteristicas que tenemos que enviar para cada tipo de material (WIP,ZPLP' OR 'ZPMP)
+        CLEAR : lv_zzkunnr4,lv_zzebeln4,lv_zzebelp4,lv_zzmatventa,lv_zzcoex.
+        SELECT SINGLE   zzkunnr4
+                        zzebeln4
+                        zzebelp4
+                        zzmatventa
+                        zzcoex
+                        zzttocorona
+          INTO (lv_zzkunnr4,lv_zzebeln4,lv_zzebelp4,lv_zzmatventa,lv_zzcoex,lv_zzttocorona)
+          FROM aufk
+          WHERE aufnr = lv_orden.
+
+        CLEAR lv_name1.
+        SELECT SINGLE name1 INTO lv_name1
+          FROM kna1
+          WHERE kunnr EQ lv_zzkunnr4.
+
+        CLEAR lv_zzaptoalim.
+        SELECT SINGLE zzaptoalim INTO lv_zzaptoalim
+          FROM mara
+          WHERE matnr = lv_matnr.
+
+        CLEAR lv_data_cad.
+        IF lv_zzttocorona EQ 'X'.
+          CALL FUNCTION 'RP_CALC_DATE_IN_INTERVAL'
+            EXPORTING
+              date      = sy-datum
+              days      = '00'
+              months    = '06'
+              signum    = '+'
+              years     = '00'
+            IMPORTING
+              calc_date = lv_data_cad.
+        ENDIF.
+
+        CASE lv_mtart.
+          WHEN 'ZWIP'.
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_APTO_ALIM'.
+            IF lv_zzaptoalim EQ 'S'.
+              wa_carac-atwrt = 'S'.
+            ELSE.
+              wa_carac-atwrt = 'N'.
+            ENDIF.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_CADUC_CORONA'.
+            wa_carac-atwrt = lv_data_cad.
+            IF lv_zzttocorona EQ 'X'.
+              APPEND wa_carac TO it_carac.
+            ENDIF.
+
+            CLEAR wa_carac.
+            wa_carac = 'Z_COEX'.
+            IF lv_zzcoex IS INITIAL.
+              wa_carac-atwrt = 'N'.
+            ELSE.
+              wa_carac-atwrt = 'S'.
+            ENDIF.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_CLIENTE'.
+            wa_carac-atwrt = lv_zzkunnr4.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_NOMBRE_CLIENTE'.
+            wa_carac-atwrt = lv_name1.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_PEDIDO'.
+            wa_carac-atwrt =  lv_zzebeln4.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_POSICION'.
+            wa_carac-atwrt = lv_zzebelp4.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_ORDEN'.
+            wa_carac-atwrt = lv_orden.
+            APPEND wa_carac TO it_carac.
+
+            DELETE t_phase WHERE superior_operation = ''.
+            DELETE t_phase INDEX 1.
+            DELETE t_phase  WHERE operation_number = ls_fab-operacion.
+
+            CLEAR wa_phase.
+            CLEAR lv_op_sig.
+            LOOP AT t_phase INTO wa_phase.
+**   Recuperamos los datos para despues calcular el coste catidad/hora
+              CLEAR lv_aufpl.
+              SELECT SINGLE aufpl INTO lv_aufpl
+                FROM afko
+                WHERE aufnr EQ lv_orden.
+
+              IF lv_aufpl IS NOT INITIAL.
+                CLEAR: lv_objnr.
+                SELECT SINGLE  objnr INTO  lv_objnr
+                  FROM afvv INNER JOIN afvc ON afvv~aufpl EQ afvc~aufpl
+                  AND afvv~aplzl EQ afvc~aplzl
+                  WHERE afvv~aufpl EQ lv_aufpl AND afvc~vornr EQ wa_phase-operation_number.
+              ENDIF.
+
+**  Descartamos las operaciones con el flag de peticion de borrado.
+              IF lv_objnr IS NOT INITIAL.
+                CLEAR lv_stat.
+                SELECT SINGLE stat INTO lv_stat
+                  FROM jest
+                  WHERE objnr EQ lv_objnr AND stat EQ 'I0013' AND inact <> 'X'.
+
+                IF lv_stat IS NOT INITIAL AND lv_op_sig IS INITIAL.
+                  CONTINUE.
+                ELSE.
+                  lv_op_sig = wa_phase-operation_number.
+                ENDIF.
+              ENDIF.
+
+            ENDLOOP.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_OPERACION'.
+            wa_carac-atwrt =  lv_op_sig.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_MATERIALVENTA'.
+            wa_carac-atwrt =  lv_zzmatventa.
+            APPEND wa_carac TO it_carac.
+
+          WHEN 'ZPLP' OR 'ZPMP'.
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_APTO_ALIM'.
+            IF lv_zzaptoalim EQ 'S'.
+              wa_carac-atwrt = 'S'.
+            ELSE.
+              wa_carac-atwrt = 'N'.
+            ENDIF.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_CADUC_CORONA'.
+            wa_carac-atwrt = lv_data_cad.
+            IF lv_zzttocorona EQ 'X'.
+              APPEND wa_carac TO it_carac.
+            ENDIF.
+
+            CLEAR wa_carac.
+            wa_carac = 'Z_COEX'.
+            IF lv_zzcoex IS INITIAL.
+              wa_carac-atwrt = 'N'.
+            ELSE.
+              wa_carac-atwrt = 'S'.
+            ENDIF.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_CLIENTE'.
+            wa_carac-atwrt = lv_zzkunnr4.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_NOMBRE_CLIENTE'.
+            wa_carac-atwrt = lv_name1.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_PEDIDO'.
+            wa_carac-atwrt =  lv_zzebeln4.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_POSICION'.
+            wa_carac-atwrt = lv_zzebelp4.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_ORDEN'.
+            wa_carac-atwrt = lv_orden.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_OPERACION'.
+            wa_carac-atwrt =  ls_fab-operacion.
+            APPEND wa_carac TO it_carac.
+
+            CLEAR wa_carac.
+            wa_carac-atnam = 'Z_MATERIALVENTA'.
+            wa_carac-atwrt =  lv_zzmatventa.
+            APPEND wa_carac TO it_carac.
+          WHEN OTHERS.
+        ENDCASE.
+
+        IF it_carac[] IS NOT INITIAL.
+          CLEAR wa_carac.
+          LOOP AT it_carac INTO wa_carac.
+
+**  Para que no coja las posiciones.
+            IF wa_carac-atwrt IS INITIAL OR wa_carac-atwrt EQ '000000'.
+              CONTINUE.
+            ENDIF.
+**  Lanzamos mensaje de clasificacion de lote para el resto de caracteristicas segun el tipo de material.
+            PERFORM p_lanzar_mensaje_zc_bt_cl_1 USING ls_fab
+                                                lv_data
+                                                lv_id_tmp
+                                                lv_orden
+                                                lv_matnr
+                                                lv_time
+                                                wa_carac
+                                       CHANGING lt_return_total.
+          ENDLOOP.
+        ENDIF.
+
+      ENDIF.
+
+      READ TABLE lt_return_total
+          WITH KEY type = 'E' TRANSPORTING NO FIELDS.
+
+      IF sy-subrc <> 0.
+        ls_fab-procesado = 'X'.
+        MODIFY ztpi0007 FROM ls_fab.
+
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+*      SUBMIT rcocb004 WITH plant = '4000' AND RETURN.
+      ENDIF.
+
+
+    ELSE." si viene sin lote marcamos el registro con una E para luego poder filtrar.
+      ls_fab-procesado = 'E'.
+      MODIFY ztpi0007 FROM ls_fab.
+    ENDIF.
+
+  ENDLOOP.
+**  Hacemos el commit para la modificacion de la tabla.
+*  COMMIT WORK AND WAIT.

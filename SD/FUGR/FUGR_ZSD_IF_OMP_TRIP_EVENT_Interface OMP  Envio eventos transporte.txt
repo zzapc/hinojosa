@@ -1,0 +1,435 @@
+FUNCTION zsd_if_omp_trip_event.
+*"----------------------------------------------------------------------
+*"*"Módulo funciones actualiz.
+*"
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(VP_TKNUM) TYPE  TKNUM
+*"     VALUE(WP_VTTK) TYPE  VTTKVB OPTIONAL
+*"----------------------------------------------------------------------
+  CONSTANTS: c_edi_extern TYPE edi_rcvpor VALUE 'OMP',
+             c_rcvprn     TYPE edi_rcvprn VALUE 'OMP',
+             c_ls_d       TYPE edi_rcvprt VALUE 'LS',
+             c_ls_r       TYPE edi_sndprt VALUE 'LS',
+             c_zmsg       TYPE edi_mestyp VALUE 'ZIF_OMP_TRIP_EVENT',
+             c_idoctp     TYPE edi_idoctp VALUE 'ZIF_OMP_TRIP_EVENT'.
+
+  DATA: vl_idoc_header       TYPE edidc,
+        tl_idoc_comm_control TYPE TABLE OF edidc,
+        ls_idoc_comm_control TYPE edidc,
+        tl_edidd             TYPE edidd_tt,
+        wl_edidd             TYPE edidd,
+        vl_segnum            TYPE edidd-segnum,
+        vl_psgnum            TYPE edidd-psgnum.
+
+  DATA: wl_ztripevent           TYPE ztripevent,
+        wl_ztripeventdata       TYPE ztripeventdata,
+        wl_ztripdetailevent     TYPE ztripdetailevent,
+        wl_ztripdetaileventdata TYPE ztripdetaileventdata,
+        vl_tripid               LIKE wl_ztripdetaileventdata-tripid,
+        vl_sequencenr           LIKE wl_ztripdetaileventdata-sequencenr.
+
+  DATA: rl_mtart TYPE RANGE OF mara-mtart,
+        wl_mtart LIKE LINE OF rl_mtart.
+
+  DATA: vl_fecha TYPE sy-datum,
+        vl_hora  TYPE sy-uzeit.
+
+  " Para que de tiempo a generar el transporte
+***  WAIT UP TO 10 SECONDS.
+  "
+  " Estaría bien seleccionar por
+  " SHTYP
+  " TPLST
+  "
+
+  "
+  " Recuperamos datos.
+  "
+  IF wp_vttk IS INITIAL.
+    SELECT SINGLE *
+      FROM vttk
+      INTO CORRESPONDING FIELDS OF wp_vttk
+      WHERE tknum = vp_tknum.
+    CHECK sy-subrc = 0.
+  ENDIF.
+
+  " O carga iniciada o Carga finalizada.
+***  CHECK wp_vttk-stlbg IS NOT INITIAL OR wp_vttk-stlad IS NOT INITIAL.
+
+  SELECT SINGLE tripid
+    INTO vl_tripid
+    FROM zssd_if_omp_tp
+    WHERE tknum = vp_tknum AND
+          borrado = ''.
+  CHECK sy-subrc = 0. " Sólo si está en OMP y no está borrada por OMP
+
+  "
+  " Obtenemos los requerimientos que incluye el transporte.
+  "
+  DATA: rl_num_req TYPE RANGE OF zssd_if_omp_tr-num_req,
+        wl_num_req LIKE LINE OF rl_num_req.
+
+  SELECT *
+    FROM zssd_if_omp_tp_r
+    INTO TABLE @DATA(tl_omp_tp_r)
+    WHERE tripid = @vl_tripid.
+
+  CLEAR: rl_num_req, wl_num_req.
+  LOOP AT tl_omp_tp_r ASSIGNING FIELD-SYMBOL(<fs_omp_tp_r>).
+    wl_num_req-sign = 'I'.
+    wl_num_req-option = 'EQ'.
+    wl_num_req-low = <fs_omp_tp_r>-num_req.
+    APPEND wl_num_req TO rl_num_req.
+  ENDLOOP.
+
+  "
+  " Inicio generación IDOC
+  "
+
+  vl_segnum = 1.
+  vl_sequencenr = 1.
+  CLEAR tl_edidd.
+  "
+  " Generación datos.
+  "
+  CLEAR wl_ztripevent.
+  wl_ztripevent-operation = 'Replace'.
+
+  CLEAR: wl_edidd.
+  wl_edidd-sdata = wl_ztripevent.
+  wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_ztripevent )->get_relative_name( ).
+  wl_edidd-segnum = vl_segnum.
+  vl_psgnum = vl_segnum.
+  ADD 1 TO vl_segnum.
+  APPEND wl_edidd TO tl_edidd.
+  CLEAR wl_ztripevent.
+
+  CLEAR wl_ztripeventdata.
+
+  wl_ztripeventdata-tripid = vl_tripid.
+  IF wp_vttk-stdis IS NOT INITIAL.
+    wl_ztripeventdata-event = 'confirmed'.
+    vl_fecha = wp_vttk-dtdis.
+    vl_hora = wp_vttk-uzdis.
+  ENDIF.
+  IF wp_vttk-stlbg IS NOT INITIAL.
+    wl_ztripeventdata-event = 'loading'.
+
+    vl_fecha = wp_vttk-dalbg.
+    vl_hora = wp_vttk-ualbg.
+  ENDIF.
+***  IF  wp_vttk-stlad IS NOT INITIAL.
+***    wl_ztripeventdata-event = 'loaded'.
+***    vl_fecha = wp_vttk-dareg.
+***    vl_hora = wp_vttk-uareg.
+***  ENDIF.
+  IF  wp_vttk-stabf IS NOT INITIAL.
+    wl_ztripeventdata-event = 'loaded'.
+    vl_fecha = wp_vttk-dtabf.
+    vl_hora = wp_vttk-uzabf.
+  ENDIF.
+  IF  wp_vttk-sttbg IS NOT INITIAL. " Inicio transporte.
+    wl_ztripeventdata-event = 'departed'.
+    vl_fecha = wp_vttk-datbg.
+    vl_hora = wp_vttk-uatbg.
+  ENDIF.
+  IF  wp_vttk-stten IS NOT INITIAL. " Fin transporte.
+    wl_ztripeventdata-event = 'finished'.
+    vl_fecha = wp_vttk-daten.
+    vl_hora = wp_vttk-uaten.
+  ENDIF.
+  CHECK wl_ztripeventdata-event IS NOT INITIAL.
+  IF  wp_vttk-stabf IS NOT INITIAL.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = wp_vttk-tdlnr
+      IMPORTING
+        output = wl_ztripeventdata-erpcarrierid.
+  ENDIF.
+
+  DATA wl_if_omp_te TYPE zssd_if_omp_te.
+  SELECT SINGLE *
+    FROM zssd_if_omp_te
+    INTO wl_if_omp_te
+    WHERE tknum = vp_tknum AND
+          event = wl_ztripeventdata-event AND
+          fecha = vl_fecha AND
+          hora = vl_hora.
+  CHECK sy-subrc <> 0. " Sólo si este evento no se ha enviado con esta hora y fecha.
+
+  CLEAR wl_if_omp_te.
+  wl_if_omp_te-tknum = vp_tknum.
+  wl_if_omp_te-event = wl_ztripeventdata-event.
+  wl_if_omp_te-fecha = vl_fecha.
+  wl_if_omp_te-hora = vl_hora.
+  wl_if_omp_te-usucre = sy-uname.
+  wl_if_omp_te-erdat = sy-datum.
+  wl_if_omp_te-erzet = sy-uzeit.
+
+
+
+  CALL FUNCTION 'ZSD_IF_OMP_COMP_DATETIME'
+    EXPORTING
+      vp_fecha    = vl_fecha
+      vp_hora     = vl_hora
+    IMPORTING
+      vp_datetime = wl_ztripeventdata-eventdate.
+
+  wl_ztripeventdata-eventdateseqnr = 0.
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+    EXPORTING
+      input  = vp_tknum
+    IMPORTING
+      output = wl_ztripeventdata-erptripid.
+  wl_ztripeventdata-vehicleid = ''.
+
+*wl_ZTRIPEVENTdata-CARRIERID
+*wl_ZTRIPEVENTdata-CARRIERTRIPID
+*wl_ZTRIPEVENTdata-COMMENTS
+*wl_ZTRIPEVENTdata-ERPCARRIERID
+*wl_ZTRIPEVENTdata-ERPTRANSPORTTEMPLATEID
+*wl_ZTRIPEVENTdata-FIXEDCOST
+*wl_ZTRIPEVENTdata-PAIDDISTANCE
+*wl_ZTRIPEVENTdata-PAIDFLOORLENGTH
+*wl_ZTRIPEVENTdata-TOTALCOST
+*wl_ZTRIPEVENTdata-TOTALDISTANCE
+*wl_ZTRIPEVENTdata-TRANSPORTLOCATIONID
+*wl_ZTRIPEVENTdata-TRANSPORTTEMPLATEID
+*wl_ZTRIPEVENTdata-TRIPEVENTID
+*wl_ZTRIPEVENTdata-VARCOST
+*wl_ZTRIPEVENTdata-VEHICLEID
+*wl_ZTRIPEVENTdata-EXTERNALTRIP
+
+  CLEAR: wl_edidd.
+  wl_edidd-sdata = wl_ztripeventdata.
+  wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_ztripeventdata )->get_relative_name( ).
+  wl_edidd-segnum = vl_segnum.
+  wl_edidd-psgnum = vl_psgnum.
+  ADD 1 TO vl_segnum.
+  APPEND wl_edidd TO tl_edidd.
+  CLEAR wl_ztripeventdata.
+
+  "
+  " Generación datos. Detalle HU.
+  "
+  IF wp_vttk-stabf IS NOT INITIAL AND wp_vttk-sttbg IS INITIAL AND wp_vttk-stten IS INITIAL.
+    SELECT *
+      FROM vttp
+      INTO TABLE @DATA(tl_vttp)
+      WHERE tknum = @vp_tknum.
+    "  AND ltap~tapos = vbfa~posnn
+    LOOP AT tl_vttp ASSIGNING FIELD-SYMBOL(<fs_vttp>).
+      SELECT *
+        FROM lips
+        INNER JOIN vbfa ON ( vbfa~vbelv = lips~vbeln AND vbfa~posnv = lips~posnr )
+        INNER JOIN likp ON ( likp~vbeln = lips~vbeln )
+        INTO TABLE @DATA(tl_lips)
+        WHERE lips~vbeln = @<fs_vttp>-vbeln AND
+              vbfa~vbtyp_n = 'Q'.
+
+      LOOP AT tl_lips ASSIGNING FIELD-SYMBOL(<fs_lips>).
+
+        DATA: wl_config_omp  TYPE zssd_if_omp_cfg,
+              rl_range_mtart TYPE efg_tab_ranges.
+        CALL FUNCTION 'ZSD_IF_OMP_TRANS_GET_CONFG'
+          EXPORTING
+            vp_lgnum       = <fs_lips>-lips-lgnum
+          IMPORTING
+            wp_config      = wl_config_omp
+            tp_range_mtart = rl_range_mtart
+          EXCEPTIONS
+            no_config      = 1
+            OTHERS         = 2.
+        IF sy-subrc <> 0. CONTINUE. ENDIF. " No es del almacén WM correcto.
+
+        SELECT SINGLE *
+          FROM mara
+          INTO @DATA(wl_mara)
+          WHERE matnr = @<fs_lips>-lips-matnr AND
+                mtart IN @rl_range_mtart.
+        IF sy-subrc <> 0. CONTINUE. ENDIF. " No es el tipo de material correcto.
+
+
+        SELECT SINGLE *
+          FROM ltap
+          INTO @DATA(wl_ltap)
+          WHERE lgnum = @<fs_lips>-lips-lgnum AND
+                tanum = @<fs_lips>-vbfa-vbeln AND
+                tapos = @<fs_lips>-vbfa-posnn.
+
+        CLEAR wl_ztripdetailevent.
+        wl_ztripdetailevent-operation = 'Replace'.
+
+        CLEAR: wl_edidd.
+        wl_edidd-sdata = wl_ztripdetailevent.
+        wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_ztripdetailevent )->get_relative_name( ).
+        wl_edidd-segnum = vl_segnum.
+        vl_psgnum = vl_segnum.
+        ADD 1 TO vl_segnum.
+        APPEND wl_edidd TO tl_edidd.
+        CLEAR wl_ztripdetailevent.
+
+        CLEAR wl_ztripdetaileventdata.
+        wl_ztripdetaileventdata-tripid = vl_tripid.
+
+        CALL FUNCTION 'CONVERSION_EXIT_LENUM_OUTPUT'
+          EXPORTING
+            input           = wl_ltap-vlenr
+          IMPORTING
+            output          = wl_ztripdetaileventdata-erphandlingunitid
+          EXCEPTIONS
+            t344_get_failed = 1
+            OTHERS          = 2.
+        IF sy-subrc <> 0.
+          CLEAR wl_ztripdetaileventdata-erphandlingunitid.
+        ENDIF.
+
+        wl_ztripdetaileventdata-loadlocationid = wl_config_omp-transportlocationid.
+*        vl_fecha = wl_ltap-qdatu.
+*        vl_hora = wl_ltap-qzeit.
+        vl_fecha = wp_vttk-dtabf.
+        vl_hora = wp_vttk-uzabf.
+        CALL FUNCTION 'ZSD_IF_OMP_COMP_DATETIME'
+          EXPORTING
+            vp_fecha    = vl_fecha
+            vp_hora     = vl_hora
+          IMPORTING
+            vp_datetime = wl_ztripdetaileventdata-loaddate.
+
+        wl_ztripdetaileventdata-sequencenr = vl_sequencenr.
+        ADD 1 TO vl_sequencenr.
+
+        SELECT *
+          FROM zssd_if_omp_tr
+          INTO TABLE @DATA(tl_omp_tr)
+          WHERE vbeln = @<fs_lips>-lips-vgbel AND
+                posnr = @<fs_lips>-lips-vgpos AND
+                num_req IN @rl_num_req.
+
+        IF sy-subrc = 0.
+          " Pedido de venta.
+          DATA(vl_numero_req) = lines( tl_omp_tr ).
+          IF vl_numero_req = 1.
+            READ TABLE tl_omp_tr ASSIGNING FIELD-SYMBOL(<fs_omp_tr>) INDEX 1.
+            IF sy-subrc = 0.
+              wl_ztripdetaileventdata-transportrequirementid = <fs_omp_tr>-num_req.
+            ENDIF.
+          ELSE.
+            " Hay más de un reparto para la posición. Buscamos en VBEP por fecha.
+            SELECT SINGLE *
+              FROM vbep
+              INTO @DATA(wl_vbep)
+              WHERE vbeln = @<fs_lips>-lips-vgbel AND
+                    posnr = @<fs_lips>-lips-vgpos AND
+                    edatu >= @<fs_lips>-likp-lfdat.
+            IF sy-subrc = 0.
+              SELECT SINGLE *
+                FROM zssd_if_omp_tr
+                INTO @DATA(wl_omp_tr)
+                WHERE vbeln = @wl_vbep-vbeln AND
+                      posnr = @wl_vbep-posnr AND
+                      etenr = @wl_vbep-etenr.
+            ENDIF.
+            IF sy-subrc = 0.
+              wl_ztripdetaileventdata-transportrequirementid = wl_omp_tr-num_req.
+            ENDIF.
+          ENDIF.
+        ELSE.
+          " Pedido traslado
+          SELECT SINGLE *
+          FROM zssd_if_omp_tr
+          INTO wl_omp_tr
+          WHERE ebeln = <fs_lips>-lips-vgbel AND
+                ebelp = <fs_lips>-lips-vgpos.
+          IF sy-subrc = 0.
+            wl_ztripdetaileventdata-transportrequirementid = wl_omp_tr-num_req.
+          ENDIF.
+        ENDIF.
+
+*wl_ZTRIPDETAILEVENTdata-COMMENTS
+*wl_ZTRIPDETAILEVENTdata-DELIVERYDATE
+*wl_ZTRIPDETAILEVENTdata-DELIVERYLOCATIONID
+*wl_ZTRIPDETAILEVENTdata-TRIPDETAILEVENTID
+*wl_ZTRIPDETAILEVENTdata-TRIPELEMENTID
+
+
+        CLEAR: wl_edidd.
+        wl_edidd-sdata = wl_ztripdetaileventdata.
+        wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_ztripdetaileventdata )->get_relative_name( ).
+        wl_edidd-segnum = vl_segnum.
+        wl_edidd-psgnum = vl_psgnum.
+        ADD 1 TO vl_segnum.
+        APPEND wl_edidd TO tl_edidd.
+        CLEAR wl_ztripdetaileventdata.
+      ENDLOOP.
+
+    ENDLOOP.
+  ENDIF.
+
+  "
+  " Generamos IDOC
+  "
+  CLEAR vl_idoc_header.
+  vl_idoc_header-mandt  = sy-mandt.
+  vl_idoc_header-direct = '1'.
+  vl_idoc_header-rcvpor = c_edi_extern.
+  vl_idoc_header-rcvprt = c_ls_d.
+  vl_idoc_header-rcvprn = c_rcvprn.
+  vl_idoc_header-sndprt = c_ls_r.
+  vl_idoc_header-sndprn = sy-uname.
+  vl_idoc_header-mestyp = c_zmsg.
+  vl_idoc_header-idoctp = c_idoctp.
+
+  SORT tl_edidd BY segnum ASCENDING.
+
+
+  CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE' "IN UPDATE TASK
+    EXPORTING
+      master_idoc_control            = vl_idoc_header
+    TABLES
+      communication_idoc_control     = tl_idoc_comm_control
+      master_idoc_data               = tl_edidd
+    EXCEPTIONS
+      error_in_idoc_control          = 1
+      error_writing_idoc_status      = 2
+      error_in_idoc_data             = 3
+      sending_logical_system_unknown = 4
+      OTHERS                         = 5.
+  IF sy-subrc <> 0.
+*      "KO
+*      ls_return-type        = sy-msgty.
+*      ls_return-number      = sy-msgno.
+*      ls_return-id          = sy-msgid.
+*      ls_return-message_v1  = sy-msgv1.
+*      ls_return-message_v2  = sy-msgv2.
+*      ls_return-message_v3  = sy-msgv3.
+*      ls_return-message_v4  = sy-msgv4.
+*      APPEND ls_return TO lt_return.
+*    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSE.
+    READ TABLE tl_idoc_comm_control INTO DATA(ls_control_record_out) INDEX 1.
+    CHECK sy-subrc = 0.
+
+    wl_if_omp_te-docnum = ls_control_record_out-docnum.
+    MODIFY zssd_if_omp_te FROM wl_if_omp_te.
+
+*      "OK
+*      READ TABLE lt_idoc_comm_control INTO DATA(ls_control_record_out) INDEX 1.
+*      CHECK sy-subrc = 0.
+*      DATA(docnum) = ls_control_record_out-docnum.
+*      ls_return-type        = 'S'.
+*      ls_return-number      = '398'.
+*      ls_return-id          = '00'.
+*      ls_return-message_v1  = docnum.
+*      APPEND ls_return TO lt_return.
+*    MESSAGE 'Proceso terminado correctamente' TYPE 'I'.
+  ENDIF.
+
+* Hacemos un COMMIT para el Idoc
+*  CALL FUNCTION 'DEQUEUE_ALL'.
+*  COMMIT WORK AND WAIT.
+***  CALL FUNCTION 'DB_COMMIT'.
+***  CALL FUNCTION 'DEQUEUE_ALL'.
+
+ENDFUNCTION.

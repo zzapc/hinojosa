@@ -1,0 +1,229 @@
+*&---------------------------------------------------------------------*
+*& Report YRF_RQPTR_SIM_PSTUDY
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+report YRF_RQPTR_SIM_PSTUDY_HPG.
+
+tables: VBAK.
+
+data: LF_VBELN type VBELN.
+data: LS_VBAPKEY type YRF_RQPT_S_VBAPKEY,
+      LS_MSG     type /VCXI/CKXM_S_MSG.
+data: LT_SIM_HEAD type YRF_RQPTR_TT_BOB_HEAD,
+      LT_VBAPKEY  type YRF_RQPT_TT_VBAPKEY.
+data: LR_BOB_PSTUDY type ref to YCL_RF_RQPTS_BOB_PSTUDY,
+      LR_PR_MAIN    type ref to YCL_RF_RQPTR_PR_MAIN,
+      LR_BOB_ITEM   type ref to YCL_RF_RQPTR_BOB_ITEM,
+      LR_ALV_DATA   type ref to DATA,
+      LR_SIM_HEAD   type ref to YCL_RF_RQPTR_BOB_HEAD.
+field-symbols: <T_ALV_DATA> type standard table,
+               <S_ALV_DATA> type ANY,
+               <S_ROW>      type LVC_S_ROW.
+
+selection-screen begin of block S01 with frame title text-001.
+  parameters: PA_PRSTD type YRF_RQPT_PRSTD obligatory.
+  parameters: PA_UI type FLAG.
+selection-screen end of block S01.
+
+
+start-of-selection.
+
+***--------------------------------------------------------------------------------------
+*** Check if Price Study already saved (for newly created ones)
+  do 60 times.
+    create object LR_BOB_PSTUDY.
+    try.
+***     Try to initialize from memory
+        LR_BOB_PSTUDY->INIT_FROM_DB_MEM( PA_PRSTD ).
+
+***     Price Study exists -> Continue with background processing
+        free LR_BOB_PSTUDY.
+        exit.
+
+      catch /VCXI/CX_CKX.
+***     Not found -> wait and try again
+        wait up to 1 seconds.
+    endtry.
+  enddo.
+
+  message id '/VCXI/CKX' type 'I' number '000' with 'Start processing of Price Study:' PA_PRSTD.
+  try.
+***--------------------------------------------------------------------------------------
+***   Create Main Program based on Price Study (via Parameter/Select-Option)
+      LR_PR_MAIN = new #( IF_REPID = SY-REPID ).
+      LR_PR_MAIN->R_PTS_BOB_PSTUDY->GET_DATA( importing ER_DATA = LR_ALV_DATA ).
+
+***   Get relevant items
+      check LR_ALV_DATA is bound.
+      assign LR_ALV_DATA->* to <T_ALV_DATA>.
+*{   INSERT         HEDK930923                                        2
+*INICIO----------------------------- MODIFICACION HINOJOSA ------------------------------------------------------------------
+  loop at <T_ALV_DATA> assigning <S_ALV_DATA>.
+    ASSIGN COMPONENT 'VBELN' OF STRUCTURE <S_ALV_DATA> TO FIELD-SYMBOL(<VBELN>).
+    IF SY-SUBRC = 0.
+      IF <VBELN>(3) = 'SIM'.
+        DATA(L_HAY_SIM) = 'X'.
+        EXIT.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+  IF L_HAY_SIM IS INITIAL.
+    DATA: lv_size  TYPE abap_msize,
+          lv_size2 TYPE abap_msize.
+
+data(l_max_ofertas) = lines( <T_ALV_DATA> ).
+    message |Ofertas { l_max_ofertas }| type 'S'.
+    FIELD-SYMBOLS <T_SIM_DATA> type standard table.
+    data(l_noferta) = 0.
+    loop at <T_ALV_DATA> assigning <S_ALV_DATA>.
+      ASSIGN COMPONENT 'VBELN' OF STRUCTURE <S_ALV_DATA> TO <VBELN>.
+      IF SY-SUBRC = 0.
+        IF <VBELN>(3) = 'SIM'.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+
+        DATA L_VBELN TYPE VBELN_VA.
+        l_vbeln = <vbeln>.
+        add 1 to l_noferta.
+        MESSAGE |Procesando oferta { l_noferta } { l_vbeln ALPHA = out }| type 'S'.
+COMMIT WORK AND WAIT.
+
+      cl_abap_memory_utilities=>get_total_used_size( IMPORTING size = lv_size ).
+
+      DATA(LR_SIM_DATA) = YCL_RF_RQPTR_SIM=>ADD_SIM_ITEM( exporting IR_PR_MAIN  = LR_PR_MAIN
+                                                                    IS_DATA     = <S_ALV_DATA>
+                                                          importing ER_BOB_ITEM = LR_BOB_ITEM ).
+
+
+      assign LR_SIM_DATA->* to <T_SIM_DATA>.
+      ASSIGN COMPONENT 'VBELN' OF STRUCTURE <S_ALV_DATA> TO <VBELN>.
+      IF <VBELN>(3) = 'SIM'.
+        append lines of <T_SIM_DATA> to <T_ALV_DATA>.
+      endif.
+
+      commit work AND WAIT.
+      cl_abap_memory_utilities=>do_garbage_collection( ).
+
+      cl_abap_memory_utilities=>get_total_used_size( IMPORTING size = lv_size2 ).
+      lv_size = lv_size / 1048576.
+      lv_size2 = lv_size2 / 1048576.
+      MESSAGE |Total memoria antes { lv_size } Mb después { lv_size2 }| TYPE 'S'.
+zcl_ap_log=>set_log( proceso = 'SIM' CLAVE = PA_PRSTD && '_' && L_VBELN P1 = |Total memoria antes { lv_size } Kb después { lv_size2 }| MSGTY = 'S' ).
+COMMIT WORK AND WAIT.
+    endloop.
+  ENDIF.
+
+*FIN-------------------------------MODIFICACION HINOJOSA------------------------------------------------------------------
+*}   INSERT
+
+      loop at <T_ALV_DATA> assigning <S_ALV_DATA>.
+***     Get Item
+        LR_PR_MAIN->GET_ITEM_INSTANCE( exporting IS_DATA         = <S_ALV_DATA>
+                                       importing ER_PTR_BOB_ITEM = LR_BOB_ITEM ).
+
+***     Get entries for later Refresh of Main/ALV
+        append LR_BOB_ITEM->GET_VBAPKEY( ) to LT_VBAPKEY.
+
+        if LR_BOB_ITEM->GET_TODO( ) eq ABAP_TRUE.
+***       Get relevant Simulation Headers
+          collect LR_BOB_ITEM->GET_BOB_HEAD( ) into LT_SIM_HEAD.
+        endif.
+      endloop.
+
+      if LT_SIM_HEAD is initial.
+        message id '/VCXI/CKX' type 'I' number '000' with 'No matching items found - end.'.
+        exit.
+      else.
+        loop at LT_SIM_HEAD into LR_SIM_HEAD.
+          message id '/VCXI/CKX' type 'I' number '000' with 'Processing:' LR_SIM_HEAD->GET_VBAK( )-VBELN.
+        endloop.
+      endif.
+*{   INSERT         HEDK930923                                        3
+    MESSAGE |Inicio simulación| type 'S'.
+    COMMIT WORK AND WAIT.
+    cl_abap_memory_utilities=>get_total_used_size( IMPORTING size = lv_size ).
+      zcl_ap_log=>set_log( proceso = 'SIM' CLAVE = PA_PRSTD && '_INICIO' P1 = |SIMULACION Total memoria antes { lv_size } Kb después { lv_size2 }| MSGTY = 'S' ).
+      COMMIT WORK AND WAIT.
+
+*}   INSERT
+
+***--------------------------------------------------------------------------------------
+***   Process requested Simulations (syncrhonously)
+      YCL_RF_RQPTR_SIM=>RUN_SYNC( IT_BOB_HEAD = LT_SIM_HEAD
+                                  IR_PR_MAIN  = LR_PR_MAIN ).
+      message id '/VCXI/CKX' type 'S' number '000' with 'Processing completed'.
+*{   INSERT         HEDK930923                                        4
+    MESSAGE |Fin simulación| type 'S'.
+    COMMIT WORK AND WAIT.
+    cl_abap_memory_utilities=>do_garbage_collection( ).
+
+    cl_abap_memory_utilities=>get_total_used_size( IMPORTING size = lv_size2 ).
+lv_size = lv_size / 1048576.
+    lv_size2 = lv_size2 / 1048576.
+      MESSAGE |SIMULACION Total memoria antes { lv_size } Mb después { lv_size2 }| TYPE 'S'.
+      zcl_ap_log=>set_log( proceso = 'SIM' CLAVE = PA_PRSTD && '_FIN' P1 = |SIMULACION Total memoria antes { lv_size } Kb después { lv_size2 }| MSGTY = 'S' ).
+      COMMIT WORK AND WAIT.
+*}   INSERT
+
+      if LR_PR_MAIN->R_MSG->T_MSG is not initial.
+        message id '/VCXI/CKX' type 'I' number '000' with 'Messages'.
+        loop at LR_PR_MAIN->R_MSG->T_MSG into LS_MSG.
+          message id LS_MSG-MSGID type 'I' number LS_MSG-MSGNO display like LS_MSG-MSGTY
+                                                               with LS_MSG-MSGV1 LS_MSG-MSGV2 LS_MSG-MSGV3 LS_MSG-MSGV4.
+        endloop.
+      endif.
+
+***--------------------------------------------------------------------------------------
+***   Update Price Study Data
+      message id '/VCXI/CKX' type 'I' number '000' with 'Updating Price Study...'.
+
+***   Request redetermination of ALV Values
+      LR_PR_MAIN->F_DET_ALV = ABAP_TRUE.
+
+***   Create dynamic ALV internal table
+      LR_ALV_DATA = LR_PR_MAIN->CREATE_DYNTAB( IT_FCAT = LR_PR_MAIN->T_FCAT ).
+      assign LR_ALV_DATA->* to <T_ALV_DATA>.
+
+***   Get latest List of Positions
+      LT_VBAPKEY = LR_PR_MAIN->GET_VBAPKEYS( ).
+
+***   Process Exits to register for Update
+      loop at LT_VBAPKEY into LS_VBAPKEY.
+        append initial line to <T_ALV_DATA> assigning <S_ALV_DATA>.
+        LR_PR_MAIN->GET_FIELD_VALUE( exporting IS_VBAPKEY = LS_VBAPKEY
+                                     importing ES_ALV     = <S_ALV_DATA> ).
+      endloop.
+
+      LR_PR_MAIN->SET_ALV_TAB( LR_ALV_DATA ).
+
+***   Update Existing Study
+      LR_PR_MAIN->R_PTS_BOB_PSTUDY->UPDATE( IR_PTR_PR_MAIN = LR_PR_MAIN  ).
+
+***   Unlock Study
+      if LR_PR_MAIN->R_PTS_BOB_PSTUDY is bound.
+        LR_PR_MAIN->R_PTS_BOB_PSTUDY->UNLOCK( ).
+      endif.
+
+      if PA_UI eq ABAP_TRUE.
+***     Start UI
+        new YCL_RF_RQPTR_UI_MAIN( IR_PTR_PR_MAIN = LR_PR_MAIN )->START_UI( ).
+      endif.
+
+      message id '/VCXI/CKX' type 'S' number '000' with 'Processing finished.'.
+*{   INSERT         HEDK930780                                        1
+*INICIO----------------------------- MODIFICACION HINOJOSA ------------------------------------------------------------------
+* APC20240625 Envio por mail notificacion fin job
+      data(l_email) = zcl_ap_usuario=>get_email( ).
+      if l_email is initial or sy-sysid ne zcl_c=>entorno_produccion.
+        l_email = sy-uname.
+      endif.
+      zcl_ap_envio_mail=>mail( direccion = l_email
+                               subject = |Ha finalizado la simulación de precios { PA_PRSTD alpha = out }| ).
+*FIN-------------------------------MODIFICACION HINOJOSA------------------------------------------------------------------
+*}   INSERT
+
+    catch /VCXI/CX_CKX into data(LR_CX_CKX).
+      LR_CX_CKX->SHOW_MESSAGE( ).
+  endtry.

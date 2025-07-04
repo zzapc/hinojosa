@@ -1,0 +1,322 @@
+FUNCTION zsui5_sd_get_catalogos.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_KUNNR) TYPE  KUNNR OPTIONAL
+*"     VALUE(I_EJERCICIO) TYPE  MJAHR OPTIONAL
+*"     VALUE(I_BACKOFFICE) TYPE  LIFNR OPTIONAL
+*"     VALUE(I_REGIO) TYPE  REGIO OPTIONAL
+*"     VALUE(I_CP) TYPE  PSTLZ OPTIONAL
+*"     VALUE(I_HISTORICO) TYPE  FLAG OPTIONAL
+*"     VALUE(IR_VKORG) TYPE  RSELOPTION OPTIONAL
+*"  EXPORTING
+*"     VALUE(E_RETURN) TYPE  BAPIRET2_T
+*"     VALUE(E_CATALOGOS) TYPE  ZSUI5TT_SD_CATALOGOS
+*"----------------------------------------------------------------------
+  DATA: ls_return   TYPE bapiret2,
+        lv_datum    TYPE sy-datum,
+        ls_catalogo TYPE zsui5s_sd_catalogos,
+        it_lines    TYPE TABLE OF tline,
+        lv_name     TYPE thead-tdname,
+        r_kunnr     TYPE RANGE OF kunnr,
+        r_regio     TYPE RANGE OF regio,
+        r_cp        TYPE RANGE OF pstlz,
+        r_vkorg     TYPE sd_vkorg_ranges.
+
+  DATA: r_back_ofiice TYPE RANGE OF lifnr.
+  IF i_backoffice IS NOT INITIAL.
+    r_back_ofiice = VALUE #( ( sign = 'I' option = 'EQ' low = i_backoffice ) ) .
+  ENDIF.
+
+
+  IF i_ejercicio IS NOT INITIAL.
+    lv_datum = i_ejercicio && '12' && '31'.
+  ELSE.
+    lv_datum = sy-datum(4) && '12' && '31'.
+  ENDIF.
+
+  IF i_kunnr IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_kunnr ASSIGNING FIELD-SYMBOL(<ls_kunnr>).
+    <ls_kunnr>-option = 'EQ'.
+    <ls_kunnr>-sign = 'I'.
+    <ls_kunnr>-low = i_kunnr.
+  ENDIF.
+
+  IF i_cp IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_cp ASSIGNING FIELD-SYMBOL(<ls_cp>).
+    <ls_cp>-option = 'EQ'.
+    <ls_cp>-sign = 'I'.
+    <ls_cp>-low = i_cp.
+  ENDIF.
+
+  IF i_regio IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_regio ASSIGNING FIELD-SYMBOL(<ls_regio>).
+    <ls_regio>-option = 'EQ'.
+    <ls_regio>-sign = 'I'.
+    <ls_regio>-low = i_regio.
+  ENDIF.
+
+  SELECT a~kunnr, ka~name1 AS kunnrname, b~matnr, b~maktx,  k~kdmat, k~postx, a~vkorg, a~vtweg, a~spart, c~werks, y~board, m~mtpos
+    FROM knvp AS vp
+    INNER JOIN kna1 AS ka ON ka~kunnr = vp~kunnr
+*    INNER JOIN kna1 AS k2 ON ka~kunnr = vp~kunn2
+    INNER JOIN kotg933 AS a ON a~kunnr = vp~kunnr
+    INNER JOIN mara AS ma ON ma~matnr = a~matnr
+    INNER JOIN makt AS b ON b~matnr = ma~matnr AND b~spras = @sy-langu
+    INNER JOIN marc AS c ON c~matnr = b~matnr
+    LEFT JOIN yhp_idx_td110 AS y ON y~cuobj = c~cuobj AND y~mboar = 'S'
+    LEFT JOIN knmt AS k ON k~matnr = a~matnr AND k~kunnr = a~kunnr AND k~vkorg = a~vkorg AND k~vtweg = a~vtweg
+    LEFT JOIN mvke AS m ON m~matnr = a~matnr AND m~vkorg = a~vkorg AND m~vtweg = a~vtweg AND mtpos NE 'ZUTI'
+    INTO TABLE @DATA(lt_data)
+    WHERE vp~lifnr in @r_back_ofiice AND vp~parvw = 'A1'
+    AND ka~regio IN @r_regio
+    AND ka~pstlz IN @r_cp
+    AND a~kunnr IN @r_kunnr
+    AND a~kappl = 'V'
+    AND a~kschl = 'ZA01'
+    AND a~vkorg IN @ir_vkorg                                 " '2001'
+    AND a~vtweg = '10'
+    AND a~spart = '10'
+    AND a~matnr NE @space
+    AND a~datbi >= @lv_datum
+    AND a~datab <= @lv_datum
+    AND ma~mtart NOT IN ( 'ZUTI', 'ZCLI', 'ZTRO' )..
+  IF sy-subrc NE 0.
+    CLEAR ls_return.
+    ls_return-id = 'ZSSD_UI5'.
+    ls_return-type = 'E'.
+    ls_return-number = '001'.
+    ls_return-message_v1 = |{ i_backoffice ALPHA = OUT }|.
+    APPEND ls_return TO e_return.
+  ELSE.
+    "Obtenemos la ruta para el WebGUI de la Tx XD02
+    DATA: lv_hostname TYPE string,
+          lv_port     TYPE string.
+    CALL FUNCTION 'TH_GET_VIRT_HOST_DATA'
+      EXPORTING
+        protocol       = 0
+        virt_idx       = 0
+*       LOCAL          = 1
+      IMPORTING
+        hostname       = lv_hostname
+        port           = lv_port
+      EXCEPTIONS
+        not_found      = 1
+        internal_error = 2
+        OTHERS         = 3.
+    IF sy-subrc = 0.
+      "Obtenemos el PRecio x 1000
+      SELECT a~matnr, a~knumh, a~kunnr, b~kbetr, c~name1
+        FROM knvp AS k
+*        INNER JOIN a927 AS a ON a~kunwe = k~kunn2
+        INNER JOIN a929 AS a ON a~kunnr = k~kunnr
+        INNER JOIN konp AS b ON b~knumh = a~knumh
+        INNER JOIN kna1 AS c ON c~kunnr = a~kunnr
+        INTO TABLE @DATA(lt_konp)
+        FOR ALL ENTRIES IN @lt_data
+        WHERE a~kschl = 'ZPRC'
+        AND a~vkorg = @lt_data-vkorg
+        AND a~vtweg = @lt_data-vtweg
+        AND a~matnr = @lt_data-matnr
+        AND a~datbi >= @lv_datum
+        AND a~datab <= @lv_datum
+        AND k~parvw = 'WE'
+        AND k~kunnr = @lt_data-kunnr.
+
+      "Buscamos la ruta relacionada con el material/centro
+      SELECT a~werks, b~coper, a~matnr, b~arbpl, a~cuobj
+      INTO TABLE @DATA(lt_ruta)
+      FROM marc AS a
+      INNER JOIN yhp_idx_td310 AS b ON b~cuobj = a~cuobj AND b~cself = '1'
+        FOR ALL ENTRIES IN @lt_data
+      WHERE a~werks = @lt_data-werks AND
+            a~matnr = @lt_data-matnr.
+      IF sy-subrc = 0.
+        SORT lt_ruta BY werks coper.
+        "Recuperamos los semielaborados del material
+        SELECT y~cuobj, b~coper, a~matnr, b~arbpl
+          INTO TABLE @DATA(lt_ruta_semi)
+          FROM yhp_idx_td110 AS y
+            INNER JOIN marc AS a ON a~matnr = y~p_matnr
+            INNER JOIN yhp_idx_td310 AS b ON b~cuobj = a~cuobj AND b~cself = '1'
+            FOR ALL ENTRIES IN @lt_ruta
+            WHERE y~cuobj = @lt_ruta-cuobj.
+        IF sy-subrc = 0.
+          SORT lt_ruta_semi BY cuobj coper.
+        ENDIF.
+      ENDIF.
+
+      "Obtenemos bloqueos
+      SELECT a~matnr, a~mstae, t1~mtstb AS text_mstae, a~mstav, t2~mtstb AS text_mstav, b~vkorg, b~vmsta,  t3~mtstb AS text_vmsta
+        FROM mara AS a
+        LEFT JOIN mvke AS b ON b~matnr = a~matnr
+        LEFT JOIN t141t AS t1 ON t1~mmsta = a~mstae AND t1~spras = @sy-langu
+        LEFT JOIN t141t AS t2 ON t2~mmsta = a~mstav AND t2~spras = @sy-langu
+        LEFT JOIN t141t AS t3 ON t3~mmsta = b~vmsta AND t3~spras = @sy-langu
+        INTO TABLE @DATA(lt_bloqueo)
+        FOR ALL ENTRIES IN @lt_data
+        WHERE a~matnr = @lt_data-matnr
+        AND ( a~mstae NE @space OR a~mstav  NE @space OR b~vmsta NE @space ).
+
+      "Recuperamos las medidas de las cajas
+      SELECT a~werks, a~matnr, a~cuobj, prole AS length, prole_uom AS length_uom, prowi AS width, prowi_uom AS width_uom, prohe AS height, prohe_uom AS height_uom
+          INTO TABLE @DATA(lt_medida)
+          FROM marc AS a
+          INNER JOIN yhp_idx_td100 AS b ON b~cuobj = a~cuobj "AND b~shuty = 'BASE_BOX'
+            FOR ALL ENTRIES IN @lt_data
+          WHERE a~werks = @lt_data-werks AND
+                a~matnr = @lt_data-matnr.
+
+      "Obtenemos los escalados
+      SELECT a~kunnr, a~matnr,  b~kbetr, b~kstbm
+        FROM a929 AS a
+        INNER JOIN konm AS b ON b~knumh = a~knumh
+        INTO TABLE @DATA(lt_escalados)
+        FOR ALL ENTRIES IN @lt_data
+          WHERE a~kunnr = @lt_data-kunnr AND
+                a~matnr = @lt_data-matnr
+          AND a~kschl = 'ZPRC'
+*            and vkorg = "FAlta determinar rol o parámetro
+          AND vtweg = '10'.
+
+      "Obtenemos Url Bocetos
+      SELECT SINGLE url
+        FROM zssd_url_sf
+        INTO @DATA(lv_url_boceto)
+        WHERE vkorg IN @r_vkorg.                            " '2000'.
+
+      LOOP AT lt_data ASSIGNING FIELD-SYMBOL(<ls_data>).
+        CLEAR ls_catalogo.
+        MOVE-CORRESPONDING <ls_data> TO ls_catalogo.
+
+        "Concatenamos la Ruta
+        LOOP AT lt_ruta INTO DATA(ls_data) WHERE werks = ls_catalogo-werks AND matnr = ls_catalogo-matnr.
+          IF ( ls_data-coper = 1 ).
+            "Añadimos la ruta de los semielaborados si existe.
+            LOOP AT lt_ruta_semi INTO DATA(ls_ruta_semi) WHERE cuobj = ls_data-cuobj.
+              IF ( ls_ruta_semi-coper = 1 ).
+                ls_catalogo-ruta = ls_ruta_semi-arbpl.
+              ELSE.
+                CONCATENATE ls_catalogo-ruta '-' ls_ruta_semi-arbpl INTO ls_catalogo-ruta.
+              ENDIF.
+            ENDLOOP.
+            IF sy-subrc NE 0.
+              ls_catalogo-ruta = ls_data-arbpl.
+            ELSE.
+              CONCATENATE ls_catalogo-ruta '-' ls_data-arbpl INTO ls_catalogo-ruta.
+            ENDIF.
+          ELSE.
+            CONCATENATE ls_catalogo-ruta '-' ls_data-arbpl INTO ls_catalogo-ruta.
+          ENDIF.
+        ENDLOOP.
+
+        "Obtenemos si está bloqueado
+        READ TABLE lt_bloqueo TRANSPORTING NO FIELDS WITH KEY matnr = ls_catalogo-matnr.
+        IF sy-subrc = 0.
+          ls_catalogo-bloqueado = abap_true.
+        ENDIF.
+
+        "Recuperamos las medidas
+        READ TABLE lt_medida INTO DATA(ls_medida)  WITH KEY matnr = ls_catalogo-matnr.
+        IF sy-subrc = 0.
+          ls_catalogo-width = ls_medida-width.
+          ls_catalogo-width_uom = ls_medida-width_uom.
+          ls_catalogo-height = ls_medida-height.
+          ls_catalogo-height_uom = ls_medida-height_uom.
+          ls_catalogo-length = ls_medida-length.
+          ls_catalogo-length_uom = ls_medida-length_uom.
+        ENDIF.
+
+        "Obtenemos los escalados
+        READ TABLE lt_escalados INTO DATA(ls_escalado) WITH KEY matnr = ls_catalogo-matnr kunnr = ls_catalogo-kunnr.
+        IF sy-subrc = 0.
+          ls_catalogo-kbetr = ls_escalado-kbetr.
+          ls_catalogo-kstbm = ls_escalado-kstbm.
+        ENDIF.
+*        lv_name = <ls_data>-vkorg && <ls_data>-vtweg  && <ls_data>-kunnr && <ls_data>-matnr.
+*        CLEAR: it_lines[].
+*        CALL FUNCTION 'READ_TEXT'
+*          EXPORTING
+*            id                      = 'Z001'
+*            language                = sy-langu
+*            name                    = lv_name
+*            object                  = 'KNMT'
+*          TABLES
+*            lines                   = it_lines
+*          EXCEPTIONS
+*            id                      = 1
+*            language                = 2
+*            name                    = 3
+*            not_found               = 4
+*            object                  = 5
+*            reference_check         = 6
+*            wrong_access_to_archive = 7
+*            OTHERS                  = 8.
+*
+*        IF sy-subrc = 0.
+*          LOOP AT it_lines INTO DATA(is_lines).
+*            IF is_lines-tdformat = '*'.
+*              IF sy-tabix > 1.
+*                CONCATENATE ls_catalogo-info_paletizado cl_abap_char_utilities=>newline INTO ls_catalogo-info_paletizado.
+*              ENDIF.
+*              CONCATENATE ls_catalogo-info_paletizado is_lines-tdline INTO ls_catalogo-info_paletizado.
+*            ELSE.
+*              CONCATENATE ls_catalogo-info_paletizado is_lines-tdline INTO ls_catalogo-info_paletizado SEPARATED BY space.
+*            ENDIF.
+*          ENDLOOP.
+*
+*        ENDIF.
+*
+*        CLEAR: it_lines[].
+*        CALL FUNCTION 'READ_TEXT'
+*          EXPORTING
+*            id                      = 'Z002'
+*            language                = sy-langu
+*            name                    = lv_name
+*            object                  = 'KNMT'
+*          TABLES
+*            lines                   = it_lines
+*          EXCEPTIONS
+*            id                      = 1
+*            language                = 2
+*            name                    = 3
+*            not_found               = 4
+*            object                  = 5
+*            reference_check         = 6
+*            wrong_access_to_archive = 7
+*            OTHERS                  = 8.
+*
+*        IF sy-subrc = 0.
+*          LOOP AT it_lines INTO is_lines.
+*            IF is_lines-tdformat = '*'.
+*              IF sy-tabix > 1.
+*                CONCATENATE ls_catalogo-fsc cl_abap_char_utilities=>newline INTO ls_catalogo-fsc.
+*              ENDIF.
+*              CONCATENATE ls_catalogo-fsc is_lines-tdline INTO ls_catalogo-fsc.
+*            ELSE.
+*              CONCATENATE ls_catalogo-fsc is_lines-tdline INTO ls_catalogo-fsc SEPARATED BY space.
+*            ENDIF.
+*          ENDLOOP.
+*
+*        ENDIF.
+        ls_catalogo-url_matnr = 'http://'&& lv_hostname && ':' && lv_port && '/sap/bc/gui/sap/its/webgui?~transaction=*MM03%20RMMG1-MATNR=' && ls_catalogo-matnr .
+        ls_catalogo-url_kunnr = 'http://'&& lv_hostname && ':' && lv_port && '/sap/bc/gui/sap/its/webgui?~transaction=*XD03%20RF02D-KUNNR=' && ls_catalogo-kunnr .
+        ls_catalogo-url_boceto = lv_url_boceto && ls_catalogo-matnr && '.pdf'.
+        ls_catalogo-ejercicio = i_ejercicio.
+
+        LOOP AT lt_konp INTO DATA(ls_konp) WHERE matnr = ls_catalogo-matnr.
+          ls_catalogo-kunwe = ls_konp-kunnr.
+          ls_catalogo-name1 = ls_konp-name1.
+          ls_catalogo-precio_1000 = ls_konp-kbetr.
+          APPEND ls_catalogo TO e_catalogos.
+
+        ENDLOOP.
+        IF sy-subrc NE 0.
+          APPEND ls_catalogo TO e_catalogos.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+
+ENDFUNCTION.

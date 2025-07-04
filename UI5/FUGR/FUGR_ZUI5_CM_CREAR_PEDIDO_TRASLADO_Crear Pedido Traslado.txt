@@ -1,0 +1,140 @@
+FUNCTION zui5_cm_crear_pedido_traslado.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_HEADER) TYPE  ZSUIS_CM_ENTREGAS_TRASLADOS
+*"     VALUE(I_POSITIONS) TYPE  ZSUITT_CM_POSICIONES_ENT_TRASLA
+*"  EXPORTING
+*"     VALUE(E_RETURN) TYPE  BAPIRET2_T
+*"     VALUE(E_PEDIDO) TYPE  ZSUIS_CM_ENTREGAS_TRASLADOS
+*"----------------------------------------------------------------------
+  DATA:delivery      TYPE bapishpdelivnumbtab,
+       lt_return     TYPE bapiret2_t,
+       ls_transporte TYPE zsuis_cm_get_transportes,
+       purchaseorder TYPE  bapiekkoc-po_number.
+
+  PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '060' '' '' '' '' CHANGING e_return.
+
+  "Borrar Estatus Transporte
+  PERFORM borrar_status_trans USING i_header-tknum CHANGING lt_return.
+  APPEND LINES OF lt_return TO e_return.
+
+  READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+  IF sy-subrc NE 0.
+    "Crea pedido PO
+    PERFORM crear_pedido_po USING i_header i_positions CHANGING  lt_return purchaseorder.
+    APPEND LINES OF lt_return TO e_return.
+
+    READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+      PERFORM crear_entrega_po USING purchaseorder '00000' CHANGING lt_return delivery.
+      APPEND LINES OF lt_return TO e_return.
+
+      READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc NE 0.
+        "Contabilizamos entrga po
+        LOOP AT delivery INTO DATA(ls_delivery).
+          PERFORM embalar_entrega_po USING i_positions ls_delivery-deliv_numb CHANGING lt_return.
+          APPEND LINES OF lt_return TO e_return.
+        ENDLOOP.
+
+        READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+        IF sy-subrc NE 0 AND i_header-tknum IS NOT INITIAL.
+          LOOP AT delivery INTO ls_delivery.
+            PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '025' ls_delivery-deliv_numb i_header-tknum '' ''CHANGING e_return.
+            CALL FUNCTION 'ZUI5_CM_ASIGNAR_ENT_TRANSPORTE'
+              EXPORTING
+                i_transporte = i_header-tknum
+                i_entrega    = ls_delivery-deliv_numb
+              IMPORTING
+                o_return     = lt_return.
+            APPEND LINES OF lt_return TO e_return.
+          ENDLOOP.
+
+          READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+          IF sy-subrc NE 0.
+            PERFORM change_status_trans USING i_header-tknum  CHANGING lt_return.
+            APPEND LINES OF lt_return TO e_return.
+*
+          ELSE.
+            "Recuperamos estados de la Entrega Entrante GBSTK = 'A' o GBSTK = 'C'
+            SELECT a~ebeln, a~ebelp, b~vbeln, c~gbstk
+              FROM  ekbe AS a
+              INNER JOIN vbfa AS b ON b~vbelv = a~belnr AND b~vbtyp_n = '7' " AND b~posnv = a~ebelp
+              INNER JOIN vbuk AS c ON c~vbeln = b~vbeln
+              INTO TABLE @DATA(lt_entrega_entrante)
+              WHERE a~ebeln = @purchaseorder
+              AND a~bewtp = 'L'.
+            IF sy-subrc = 0.
+              "Borrar entrega entrante generada (bapi_inb_delivery_change)
+              LOOP AT lt_entrega_entrante INTO DATA(ls_entrega_entrante).
+                PERFORM borrar_entrega_entrante USING ls_entrega_entrante-vbeln CHANGING lt_return.
+
+                APPEND LINES OF lt_return TO e_return.
+              ENDLOOP.
+              READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+              IF sy-subrc NE 0.
+              ENDIF.
+            ENDIF.
+
+            "Desasignar Entrega del Transporte
+            LOOP AT delivery INTO ls_delivery.
+              PERFORM borrar_asig_ent_trans USING ls_delivery-deliv_numb i_header-tknum CHANGING lt_return.
+              APPEND LINES OF lt_return TO e_return.
+            ENDLOOP.
+
+            READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+            IF sy-subrc NE 0.
+              "Anular Salida de Mercancias
+              LOOP AT delivery INTO ls_delivery.
+                PERFORM anular_salida_mercancias USING ls_delivery-deliv_numb
+                                                    'J'
+                                                     CHANGING lt_return.
+                APPEND LINES OF lt_return TO e_return.
+              ENDLOOP.
+
+              READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+              IF sy-subrc NE 0.
+                "Borra Entrega
+                LOOP AT delivery INTO ls_delivery.
+                  PERFORM borrar_entrega USING ls_delivery-deliv_numb
+                                            CHANGING lt_return.
+                  APPEND LINES OF lt_return TO e_return.
+                ENDLOOP.
+
+                READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+                IF sy-subrc NE 0.
+                  "Borrar pedido de compras. (BAPI_PO_CHANGE) -> EKPO-LOEKZ=L
+                  PERFORM borrar_pedido_po USING purchaseorder '00000' CHANGING lt_return.
+                  APPEND LINES OF lt_return TO e_return.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+
+        ELSE.
+          "Borra Entrega
+          LOOP AT delivery INTO ls_delivery.
+            PERFORM borrar_entrega USING ls_delivery-deliv_numb
+                                      CHANGING lt_return.
+            APPEND LINES OF lt_return TO e_return.
+          ENDLOOP.
+
+          READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+          IF sy-subrc NE 0.
+            "Borrar pedido de compras. (BAPI_PO_CHANGE) -> EKPO-LOEKZ=L
+            PERFORM borrar_pedido_po USING purchaseorder '00000'  CHANGING lt_return.
+            APPEND LINES OF lt_return TO e_return.
+          ENDIF.
+        ENDIF.
+      ELSE.
+        "5.Borrar pedido de compras. (BAPI_PO_CHANGE) -> EKPO-LOEKZ=L
+        PERFORM borrar_pedido_po USING purchaseorder '00000' CHANGING lt_return.
+        APPEND LINES OF lt_return TO e_return.
+      ENDIF.
+
+    ENDIF.
+  ENDIF.
+
+  PERFORM guardar_log_traslado USING purchaseorder  e_return.
+ENDFUNCTION.

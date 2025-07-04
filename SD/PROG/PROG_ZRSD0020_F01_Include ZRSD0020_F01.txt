@@ -1,0 +1,520 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRSD0020_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM obtener_datos .
+  TYPES: BEGIN OF tipo_factura,
+           vbeln TYPE vbrk-vbeln,
+           fkart TYPE vbrk-fkart,
+           bukrs TYPE vbrk-bukrs,
+           vkorg TYPE vbrk-vkorg,
+           vtweg TYPE vbrk-vtweg,
+           spart TYPE vbrk-spart,
+           fkdat TYPE vbrk-fkdat,
+           waerk TYPE vbrk-waerk,
+           kunag TYPE vbrk-kunag,
+           vbtyp TYPE vbrk-vbtyp,
+           knumv TYPE vbrk-knumv.
+  TYPES: END OF tipo_factura.
+  TYPES: tty_factura TYPE TABLE OF tipo_factura.
+
+  DATA: lt_datos     TYPE tty_factura,
+        wa_datos     TYPE LINE OF tty_factura,
+        wa_alv       TYPE zed0020,
+        lv_busad     TYPE knb1-kunnr,
+        t_vbrp       TYPE STANDARD TABLE OF vbrp,
+        wa_vbrp      TYPE vbrp,
+        lv_kbetr     TYPE kbetr,
+        lv_kbetr_c   TYPE c LENGTH 15,
+        wa_alv_total TYPE zed0020_total.
+
+  CLEAR: lt_datos, gt_alv.
+  REFRESH: lt_datos, gt_alv.
+
+  SELECT vbeln fkart bukrs vkorg vtweg spart fkdat waerk kunag vbtyp knumv
+    FROM vbrk
+    INTO TABLE lt_datos
+    WHERE bukrs = p_bukrs AND
+          vkorg IN so_vkorg AND
+          vtweg IN so_vtweg AND
+          spart IN so_spart AND
+          fkdat IN so_fkdat AND
+          rfbsk = 'C' AND
+          fksto = ''  AND
+          ( vbtyp <> 'S' AND vbtyp <> 'N' ).
+
+  LOOP AT lt_datos INTO wa_datos.
+
+    CLEAR: wa_alv.
+
+    wa_alv-bukrs = wa_datos-bukrs.
+    wa_alv-vkorg = wa_datos-vkorg.
+    wa_alv-vtweg = wa_datos-vtweg.
+    wa_alv-spart = wa_datos-spart.
+    wa_alv-vbeln = wa_datos-vbeln.
+
+
+*     Nombre cliente
+    SELECT SINGLE name1 FROM kna1
+      INTO wa_alv-name1
+      WHERE kunnr = wa_datos-kunag.
+
+*     Tipo de documento
+    CASE wa_datos-vbtyp.
+      WHEN 'M'.
+        wa_alv-tipo_doc =  'Factura'.
+      WHEN 'O'.
+        wa_alv-tipo_doc =  'Abono'.
+      WHEN 'P'.
+        wa_alv-tipo_doc =  'Nota de Cargo'.
+      WHEN '5'.
+        wa_alv-tipo_doc =  'Fact.interna (factura)'.
+      WHEN '6'.
+        wa_alv-tipo_doc =  'Fact.interna (abono)'.
+    ENDCASE.
+
+*     nombre del comisionista
+    CLEAR: lv_busad.
+    SELECT SINGLE busab FROM knb1
+      INTO lv_busad
+      WHERE bukrs = wa_datos-bukrs AND
+            kunnr   = wa_datos-kunag.
+    IF sy-subrc = 0.
+      SELECT SINGLE sname FROM t001s
+        INTO wa_alv-sname
+        WHERE bukrs = wa_datos-bukrs AND
+              busab = lv_busad.
+    ENDIF.
+
+
+    wa_alv-fkdat = wa_datos-fkdat.
+    wa_alv-waerk = wa_datos-waerk.
+
+
+    CLEAR: t_vbrp. REFRESH t_vbrp.
+    SELECT * FROM vbrp
+      INTO TABLE t_vbrp
+      WHERE vbeln = wa_datos-vbeln.
+
+    LOOP AT t_vbrp INTO wa_vbrp.
+      wa_alv-posnr = wa_vbrp-posnr.
+
+      IF wa_datos-vbtyp <> 'O'.
+        wa_alv-netwr = wa_vbrp-netwr.
+      ELSE.
+        wa_alv-netwr_abono = wa_vbrp-netwr.
+      ENDIF.
+
+      IF wa_vbrp-vgtyp = 'J'.
+        wa_alv-vgbel = wa_vbrp-vgbel.
+        wa_alv-vgpos = wa_vbrp-vgpos.
+      ENDIF.
+
+      CLEAR: lv_kbetr, lv_kbetr_c.
+
+      SELECT SINGLE kbetr krech kwert FROM konv
+        INTO ( lv_kbetr,  wa_alv-krech, wa_alv-kwert )
+        WHERE knumv = wa_datos-knumv AND
+              kposn = wa_vbrp-posnr AND
+              kschl =  'ZCOM' AND
+              kinak = ''.
+
+      CHECK sy-subrc = 0.
+
+
+      IF wa_datos-vbtyp <> 'O' AND wa_datos-vbtyp <> '6'.
+        lv_kbetr = ( -1 ) * lv_kbetr .
+        wa_alv-kwert = ( -1 ) * wa_alv-kwert.
+      ENDIF.
+
+
+      lv_kbetr = lv_kbetr / 10.
+      lv_kbetr_c = lv_kbetr.
+      CONDENSE lv_kbetr_c.
+
+
+      IF  wa_alv-krech = 'A'.
+        CONCATENATE lv_kbetr_c '%' INTO wa_alv-kbetr.
+      ELSE.
+        wa_alv-kbetr = lv_kbetr_c.
+      ENDIF.
+
+      APPEND wa_alv TO gt_alv.
+
+      MOVE-CORRESPONDING wa_alv TO wa_alv_total.
+      COLLECT wa_alv_total INTO gt_alv_total.
+    ENDLOOP.
+  ENDLOOP.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ALV_MOSTRAR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alv_mostrar .
+  DATA: ls_lvc_s_layo TYPE lvc_s_layo,
+        ls_variant    TYPE disvariant.
+
+* Variante
+  PERFORM alv_prepare_variant CHANGING ls_variant.
+
+* Preparamos el catálogo de campos
+  PERFORM alv_prepare_fielcat.
+
+* Preparamos el layout
+  PERFORM alv_prepare_layout CHANGING ls_lvc_s_layo.
+
+** Preparamos eventos
+*  PERFORM alv_prepare_events.
+
+* Mostramos el ALV
+  CALL METHOD gcl_grid->set_table_for_first_display
+    EXPORTING
+      i_buffer_active    = ' '
+      i_bypassing_buffer = 'X'
+      is_layout          = ls_lvc_s_layo
+      i_structure_name   = 'ZED0020_TOTAL'
+      is_variant         = ls_variant
+      i_save             = 'A'
+    CHANGING
+      it_outtab          = gt_alv_total[]
+      it_fieldcatalog    = gt_fieldcat.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  alv_prepare_variant
+*&---------------------------------------------------------------------*
+FORM alv_prepare_variant CHANGING ps_variant TYPE disvariant .
+
+
+*  IF NOT p_varian IS INITIAL.
+  ps_variant-report      = sy-repid.
+  ps_variant-handle      = space.
+  ps_variant-log_group   = space.
+  ps_variant-username    = space.
+*  ps_variant-variant     = p_varian.
+  ps_variant-text        = space.
+  ps_variant-dependvars  = space.
+*  ENDIF.
+
+
+ENDFORM.                    "alv_prepare_variant
+*&---------------------------------------------------------------------*
+*&      Form  alv_prepare_fielcat
+*&---------------------------------------------------------------------*
+FORM alv_prepare_fielcat.
+
+  DATA: ls_fcat TYPE lvc_s_fcat.
+  DATA: lv_tabix TYPE sytabix.
+
+
+  REFRESH: gt_fieldcat_ant, gt_fieldcat.
+
+* Pasar tabla interna al formato del fieldcat
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_program_name         = sy-repid
+      i_structure_name       = 'ZED0020_TOTAL'
+      i_inclname             = sy-repid
+      i_bypassing_buffer     = 'X'
+    CHANGING
+      ct_fieldcat            = gt_fieldcat_ant
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+* Pasar el anterior fieldcat al formato del nuevo
+  CALL FUNCTION 'LVC_TRANSFER_FROM_SLIS'
+    EXPORTING
+      it_fieldcat_alv = gt_fieldcat_ant
+    IMPORTING
+      et_fieldcat_lvc = gt_fieldcat
+    TABLES
+      it_data         = gt_alv_total
+    EXCEPTIONS
+      it_data_missing = 1
+      OTHERS          = 2.
+
+** Recorremos el catálogo de campos modificandolo
+
+  LOOP AT gt_fieldcat INTO ls_fcat.
+    lv_tabix = sy-tabix.
+    CASE ls_fcat-fieldname.
+      WHEN 'VBELN'.
+        ls_fcat-hotspot = 'X'.
+
+      WHEN 'VGBEL'.
+        ls_fcat-hotspot = 'X'.
+        ls_fcat-seltext   = text-t09.
+        ls_fcat-scrtext_l = text-t09.
+        ls_fcat-scrtext_m = text-t09.
+        ls_fcat-scrtext_s = text-t09.
+        ls_fcat-reptext   = text-t09.
+
+      WHEN 'NAME1'.
+        ls_fcat-seltext   = text-t01.
+        ls_fcat-scrtext_l = text-t01.
+        ls_fcat-scrtext_m = text-t01.
+        ls_fcat-scrtext_s = text-t01.
+        ls_fcat-reptext   = text-t01.
+
+      WHEN 'TIPO_DOC'.
+        ls_fcat-seltext   = text-t02.
+        ls_fcat-scrtext_l = text-t02.
+        ls_fcat-scrtext_m = text-t02.
+        ls_fcat-scrtext_s = text-t02.
+        ls_fcat-reptext   = text-t02.
+
+      WHEN 'VGBEL'.
+        ls_fcat-seltext   = text-t03.
+        ls_fcat-scrtext_l = text-t03.
+        ls_fcat-scrtext_m = text-t03.
+        ls_fcat-scrtext_s = text-t03.
+        ls_fcat-reptext   = text-t03.
+
+      WHEN 'NETWR'.
+        ls_fcat-seltext   = text-t04.
+        ls_fcat-scrtext_l = text-t04.
+        ls_fcat-scrtext_m = text-t04.
+        ls_fcat-scrtext_s = text-t04.
+        ls_fcat-reptext   = text-t04.
+
+      WHEN 'NETWR_ABONO'.
+        ls_fcat-seltext   = text-t05.
+        ls_fcat-scrtext_l = text-t05.
+        ls_fcat-scrtext_m = text-t05.
+        ls_fcat-scrtext_s = text-t05.
+        ls_fcat-reptext   = text-t05.
+
+      WHEN 'KBETR'.
+        ls_fcat-seltext   = text-t06.
+        ls_fcat-scrtext_l = text-t06.
+        ls_fcat-scrtext_m = text-t06.
+        ls_fcat-scrtext_s = text-t06.
+        ls_fcat-reptext   = text-t06.
+
+      WHEN 'KWERT'.
+        ls_fcat-seltext   = text-t07.
+        ls_fcat-scrtext_l = text-t07.
+        ls_fcat-scrtext_m = text-t07.
+        ls_fcat-scrtext_s = text-t07.
+        ls_fcat-reptext   = text-t07.
+
+
+      WHEN 'KWERT_ABONO'.
+        ls_fcat-seltext   = text-t08.
+        ls_fcat-scrtext_l = text-t08.
+        ls_fcat-scrtext_m = text-t08.
+        ls_fcat-scrtext_s = text-t08.
+        ls_fcat-reptext   = text-t08.
+
+*      WHEN 'ZZSEGCAL'.
+*        ls_fcat-seltext   = text-t10.
+*        ls_fcat-scrtext_l = text-t10.
+*        ls_fcat-scrtext_m = text-t10.
+*        ls_fcat-scrtext_s = text-t10.
+*        ls_fcat-reptext   = text-t10.
+*        ls_fcat-no_out    = 'X'.
+*
+*      WHEN 'TEXTO_ZZSEGCAL'.
+*        ls_fcat-seltext   = text-t10.
+*        ls_fcat-scrtext_l = text-t10.
+*        ls_fcat-scrtext_m = text-t10.
+*        ls_fcat-scrtext_s = text-t10.
+*        ls_fcat-reptext   = text-t10.
+*
+*      WHEN 'VTEXT_VKORG'.
+*        ls_fcat-seltext   = text-t11.
+*        ls_fcat-scrtext_l = text-t11.
+*        ls_fcat-scrtext_m = text-t11.
+*        ls_fcat-scrtext_s = text-t11.
+*        ls_fcat-reptext   = text-t11.
+*
+*      WHEN 'VTEXT_VSTEL'.
+*        ls_fcat-seltext   = text-t12.
+*        ls_fcat-scrtext_l = text-t12.
+*        ls_fcat-scrtext_m = text-t12.
+*        ls_fcat-scrtext_s = text-t12.
+*        ls_fcat-reptext   = text-t12.
+*
+*      WHEN 'DIAS_DIFERENCIA'.
+*        ls_fcat-seltext   = text-t13.
+*        ls_fcat-scrtext_l = text-t13.
+*        ls_fcat-scrtext_m = text-t13.
+*        ls_fcat-scrtext_s = text-t13.
+*        ls_fcat-reptext   = text-t13.
+*
+*      WHEN 'FECHA_FABRICACION'.
+*        ls_fcat-seltext   = text-t14.
+*        ls_fcat-scrtext_l = text-t14.
+*        ls_fcat-scrtext_m = text-t14.
+*        ls_fcat-scrtext_s = text-t14.
+*        ls_fcat-reptext   = text-t14.
+*
+*
+*      WHEN 'DOC_SALIDA'.
+*        ls_fcat-seltext   = text-t15.
+*        ls_fcat-scrtext_l = text-t15.
+*        ls_fcat-scrtext_m = text-t15.
+*        ls_fcat-scrtext_s = text-t15.
+*        ls_fcat-reptext   = text-t15.
+*
+*      WHEN 'POS_DOC_SM'.
+*        ls_fcat-seltext   = text-t16.
+*        ls_fcat-scrtext_l = text-t16.
+*        ls_fcat-scrtext_m = text-t16.
+*        ls_fcat-scrtext_s = text-t16.
+*        ls_fcat-reptext   = text-t16.
+*
+*      WHEN 'FACTURADO'.
+*        ls_fcat-seltext   = text-t17.
+*        ls_fcat-scrtext_l = text-t17.
+*        ls_fcat-scrtext_m = text-t17.
+*        ls_fcat-scrtext_s = text-t17.
+*        ls_fcat-reptext   = text-t17.
+*
+*      WHEN 'PEDIDO_FABRICACION'.
+*        ls_fcat-seltext   = text-t18.
+*        ls_fcat-scrtext_l = text-t18.
+*        ls_fcat-scrtext_m = text-t18.
+*        ls_fcat-scrtext_s = text-t18.
+*        ls_fcat-reptext   = text-t18.
+*
+*      WHEN 'POS_FABRIC'.
+*        ls_fcat-seltext   = text-t19.
+*        ls_fcat-scrtext_l = text-t19.
+*        ls_fcat-scrtext_m = text-t19.
+*        ls_fcat-scrtext_s = text-t19.
+*        ls_fcat-reptext   = text-t19.
+*
+*      WHEN 'NTGEW'.
+*        ls_fcat-seltext   = text-t20.
+*        ls_fcat-scrtext_l = text-t20.
+*        ls_fcat-scrtext_m = text-t20.
+*        ls_fcat-scrtext_s = text-t20.
+*        ls_fcat-reptext   = text-t20.
+*
+*      WHEN 'ALBARAN_VALORADO'.
+*        ls_fcat-seltext   = text-t21.
+*        ls_fcat-scrtext_l = text-t21.
+*        ls_fcat-scrtext_m = text-t21.
+*        ls_fcat-scrtext_s = text-t21.
+*        ls_fcat-reptext   = text-t21.
+*
+*      WHEN 'TEXT_KVGR3'.
+*        ls_fcat-seltext   = text-t22.
+*        ls_fcat-scrtext_l = text-t22.
+*        ls_fcat-scrtext_m = text-t22.
+*        ls_fcat-scrtext_s = text-t22.
+*        ls_fcat-reptext   = text-t22.
+*
+*      WHEN 'TEXT_KVGR4'.
+*        ls_fcat-seltext   = text-t23.
+*        ls_fcat-scrtext_l = text-t23.
+*        ls_fcat-scrtext_m = text-t23.
+*        ls_fcat-scrtext_s = text-t23.
+*        ls_fcat-reptext   = text-t23.
+*
+*
+    ENDCASE.
+    MODIFY gt_fieldcat FROM ls_fcat INDEX lv_tabix.
+
+  ENDLOOP.
+
+
+ENDFORM.                    "alv_prepare_fielcat
+*&---------------------------------------------------------------------*
+*&      Form  ALV_PREPARE_LAYOUT
+*&---------------------------------------------------------------------*
+FORM alv_prepare_layout CHANGING ls_lvc_s_layo TYPE lvc_s_layo.
+
+* Para que muestre el ancho de las columnas optimizado
+  ls_lvc_s_layo-cwidth_opt = 'X'.
+  ls_lvc_s_layo-sel_mode   = 'A'.
+
+ENDFORM.                    " ALV_PREPARE_LAYOUT
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_VARIANTE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_P_VARIAN  text
+*----------------------------------------------------------------------*
+FORM obtener_variante  CHANGING c_variant TYPE disvariant-variant.
+
+  DATA: ls_variant TYPE disvariant,
+        l_exit     TYPE char1.
+
+  ls_variant-report = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant = ls_variant
+      i_save     = 'A'
+*     it_default_fieldcat =
+    IMPORTING
+      e_exit     = l_exit
+      es_variant = ls_variant
+    EXCEPTIONS
+      not_found  = 2.
+
+  IF sy-subrc = 2.
+    MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSE.
+    IF l_exit EQ space.
+      c_variant = ls_variant-variant.
+    ENDIF.
+  ENDIF.
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  F_EVENT_UCOMM
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_E_ROW_ID  text
+*      -->P_E_COLUMN_ID  text
+*      -->P_ES_ROW_NO  text
+*----------------------------------------------------------------------*
+FORM f_event_ucomm  USING p_row_id p_column_id p_row_no STRUCTURE lvc_s_roid.
+
+
+  DATA: wa_datos  TYPE zed0020_total.
+
+
+*    leemos la tabla con datos y pasamos a la estructura la linea
+*    seleccionada
+  READ TABLE gt_alv_total INDEX p_row_no-row_id INTO wa_datos.
+  CASE p_column_id.
+    WHEN 'VBELN'.
+      IF NOT wa_datos-vbeln IS INITIAL.
+        SET PARAMETER ID 'VF' FIELD wa_datos-vbeln.
+        CALL TRANSACTION 'VF03' AND SKIP FIRST SCREEN.
+      ENDIF.
+
+    WHEN 'VGBEL'.
+      IF NOT wa_datos-vgbel IS INITIAL.
+        FREE MEMORY ID 'VL'.
+        SET PARAMETER ID 'VL' FIELD wa_datos-vgbel.
+        CALL TRANSACTION 'VL03N' AND SKIP FIRST SCREEN.
+      ENDIF.
+
+
+  ENDCASE.
+
+
+ENDFORM.

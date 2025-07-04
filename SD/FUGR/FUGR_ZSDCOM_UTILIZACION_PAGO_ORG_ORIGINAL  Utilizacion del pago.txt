@@ -1,0 +1,102 @@
+FUNCTION zsdcom_utilizacion_pago_org .
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  TABLES
+*"      ET_BSEG STRUCTURE  BSEG OPTIONAL
+*"----------------------------------------------------------------------
+
+  DATA: ls_bseg     TYPE bseg,
+        ls_bseg_aux TYPE bseg.
+  DATA: lv_bvorg    TYPE bvorg.
+
+  data: lv_gjahr type gjahr,
+        lv_monat type monat.
+
+* Recorremos todos los documentos que nos llegan que tengan documento de compensación
+  LOOP AT et_bseg INTO ls_bseg WHERE augbl IS NOT INITIAL.
+*   Inicializamos datos globales
+    REFRESH postab.
+
+
+  call function 'FI_PERIOD_DETERMINE'
+    exporting
+      i_budat        = ls_bseg-augdt
+      i_bukrs        = ls_bseg-BUKRS
+    importing
+      e_gjahr        = lv_gjahr
+      e_monat        = lv_monat
+*     E_POPER        =
+    exceptions
+      fiscal_year    = 1
+      period         = 2
+      period_version = 3
+      posting_period = 4
+      special_period = 5
+      version        = 6
+      posting_date   = 7
+      others         = 8.
+  if sy-subrc <> 0.
+* Implement suitable error handling here
+  endif.
+
+*   Solo miro utilización del pago de documentos que compensan posiciones de D / K
+    SELECT SINGLE bukrs INTO ls_bseg-bukrs
+      FROM  bseg
+      WHERE belnr = ls_bseg-augbl
+      AND   augbl = ls_bseg-augbl
+      AND   bukrs = ls_bseg-bukrs
+      AND   gjahr = lv_gjahr "ls_bseg-augdt(4)
+      AND   koart <> 'S'.
+    CHECK sy-subrc = 0.
+
+*   Chequeamos el documento de compensación: ver si es un pago
+    CALL FUNCTION 'FI_CLEARED_ACCOUNTS_READ'
+      EXPORTING
+        i_bukrs              = ls_bseg-bukrs
+        i_belnr              = ls_bseg-augbl
+        i_gjahr              = lv_gjahr "ls_bseg-augdt(4)
+        i_cross_company      = 'X'
+      EXCEPTIONS
+        document_not_found   = 1
+        no_clearing_document = 2
+        missing_data         = 3
+        data_not_consistent  = 4
+        OTHERS               = 5.
+    CHECK sy-subrc = 0.
+
+*   Sacamos la utilización del pago
+    CALL FUNCTION 'GET_CLEARED_ITEMS'
+      EXPORTING
+        i_bvorg = lv_bvorg
+        i_bukrs = ls_bseg-bukrs
+        i_belnr = ls_bseg-augbl
+        i_gjahr = lv_gjahr " ls_bseg-augdt(4)
+      TABLES
+        t_items = postab.
+
+*   Recorremos los documentos encontrados con la utilización del pago
+    LOOP AT postab.
+*     Comprobamos si ya tenemos el documento en la tabla
+      READ TABLE et_bseg INTO ls_bseg_aux WITH KEY bukrs = postab-bukrs
+                                                   belnr = postab-belnr
+                                                   gjahr = postab-gjahr
+                                                   buzei = postab-buzei.
+
+*     El documento no está en la tabla y NO es él mismo -> LO AÑADIMOS
+      IF sy-subrc <> 0 AND postab-belnr <> postab-augbl.
+        MOVE-CORRESPONDING postab TO ls_bseg_aux.
+        ls_bseg_aux-wrbtr = postab-wrshb.
+        ls_bseg_aux-dmbtr = postab-dmshb.
+        APPEND ls_bseg_aux TO et_bseg.
+
+*     El documento no está en la tabla, es el mismo, pero es documento llevado al descuento
+      ELSEIF sy-subrc <> 0 AND postab-belnr = postab-augbl AND ls_bseg-disbn IS NOT INITIAL.
+        MOVE-CORRESPONDING postab TO ls_bseg_aux.
+        ls_bseg_aux-wrbtr = postab-wrshb.
+        ls_bseg_aux-dmbtr = postab-dmshb.
+        APPEND ls_bseg_aux TO et_bseg.
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+
+ENDFUNCTION.

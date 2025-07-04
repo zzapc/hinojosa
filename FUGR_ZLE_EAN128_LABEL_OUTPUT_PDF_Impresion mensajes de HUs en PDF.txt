@@ -1,0 +1,202 @@
+FUNCTION zle_ean128_label_output_pdf.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IS_OUTPUT_RECORD) TYPE  NAST
+*"     VALUE(IS_LABEL_DATA) TYPE  VWAHN
+*"     VALUE(IF_LAYOUT_MODULE) TYPE  NA_LABEL OPTIONAL
+*"     VALUE(IF_LAYOUT_SET) TYPE  NA_FNAME OPTIONAL
+*"     VALUE(IF_SCREEN_OUTPUT) TYPE  C DEFAULT SPACE
+*"     VALUE(IF_PROGNAME) TYPE  SYREPID
+*"  CHANGING
+*"     REFERENCE(CS_EAN128_DATA) TYPE  EAN128
+*"     REFERENCE(CS_BARCODE_FLAT) TYPE  BARCODE_FLAT
+*"  EXCEPTIONS
+*"      PRINT_ERROR
+*"      NO_PREVIEW
+*"----------------------------------------------------------------------
+  DATA: ls_outputparams TYPE sfpoutputparams,
+        ls_docparams    TYPE sfpdocparams.
+
+  DATA: lv_formname TYPE tdsfname,
+        lv_funcion  TYPE funcname.
+
+
+  DATA: lv_venum TYPE venum,
+        lt_vepo  TYPE STANDARD TABLE OF vepo,
+        ls_vepo  TYPE vepo,
+        lv_mtart TYPE mtart,
+        l_object TYPE ausp-objek,
+        lv_class TYPE klah-class.
+
+
+
+
+
+  DATA: lt_class           TYPE TABLE OF sclass,
+        lt_objectdata      TYPE TABLE OF clobjdat,
+        ls_objectdata      TYPE clobjdat,
+        lt_caracteristicas TYPE ZTT_HU_PALLETS_KITS. "TABLE OF ty_caract.
+
+
+* Cargamos los parámetros de impresión
+* ----------------------------------------------------------------------
+  CLEAR ls_outputparams.
+  ls_outputparams-dest     = is_output_record-ldest.
+  ls_outputparams-reqimm   = is_output_record-dimme.
+  ls_outputparams-reqdel   = is_output_record-delet.
+  ls_outputparams-copies   = is_output_record-anzal.
+  IF NOT if_screen_output IS INITIAL.
+    ls_outputparams-nodialog = 'X'.
+    ls_outputparams-preview  = 'X'.
+  ELSE.
+    ls_outputparams-nodialog = 'X'.
+    ls_outputparams-preview  = ''.
+  ENDIF.
+
+  CLEAR ls_docparams.
+  ls_docparams-langu      = is_output_record-spras.
+  ls_docparams-country    = is_label_data-kulan.
+  ls_docparams-replangu1  = sy-langu.
+
+
+* Abrimos el formulario
+* ----------------------------------------------------------------------
+  CALL FUNCTION 'FP_JOB_OPEN'
+    CHANGING
+      ie_outputparams = ls_outputparams
+    EXCEPTIONS
+      cancel          = 1
+      usage_error     = 2
+      system_error    = 3
+      internal_error  = 4
+      OTHERS          = 5.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE 'I' NUMBER sy-msgno
+        WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 RAISING print_error.
+    EXIT.
+  ENDIF.
+
+
+* Llamamos al formulario
+* ----------------------------------------------------------------------
+* Primero recuperamos el nombre del formulario
+  lv_formname = if_layout_set.
+  TRY.
+      CALL FUNCTION 'FP_FUNCTION_MODULE_NAME'
+        EXPORTING
+          i_name     = lv_formname
+        IMPORTING
+          e_funcname = lv_funcion.
+    CATCH cx_fp_api_repository
+          cx_fp_api_usage
+          cx_fp_api_internal.
+      EXIT.
+  ENDTRY.
+
+* INI CGV - 24.04.18 - SAT 7000018907 - Ticket 46645
+* En el caso de que los lotes asignados a la HU a imprimir tuvieran un valor divergente
+* de clasificación para el cliente, se deberá de mostrar un aviso indicando esta casuística.
+* Y especificando las diferentes HU y sus clientes.
+
+  CLEAR: lv_venum, lt_vepo.
+  REFRESH: lt_vepo.
+
+  SELECT SINGLE venum
+    INTO  lv_venum
+    FROM  vekp
+    WHERE exidv = cs_ean128_data-exidv.
+
+  SELECT * FROM vepo
+    INTO TABLE lt_vepo
+    WHERE venum = lv_venum.
+
+  LOOP AT lt_vepo INTO ls_vepo.
+    CLEAR: lv_mtart.
+    SELECT SINGLE mtart FROM mara
+      INTO lv_mtart
+      WHERE matnr = ls_vepo-matnr.
+
+    CASE lv_mtart.
+      WHEN 'ZPLP'.
+        lv_class = 'Z_ZPLP'.
+      WHEN 'ZPMP'.
+        lv_class = 'Z_ZPMP'.
+    ENDCASE.
+
+    " Obtenemos las características de todos los lotes origen
+    CLEAR: lt_class, lt_objectdata.
+    REFRESH: lt_class, lt_objectdata.
+
+    l_object = |{ ls_vepo-matnr }{ ls_vepo-charg }|.
+
+    CALL FUNCTION 'CLAF_CLASSIFICATION_OF_OBJECTS'
+      EXPORTING
+        class              = lv_class
+        classtext          = 'X'
+        classtype          = '023'
+        clint              = 0
+        features           = 'X'
+        language           = sy-langu
+        object             = l_object
+        objecttable        = 'MCH1'
+*       KEY_DATE           = SY-DATUM
+        initial_charact    = 'X'
+        change_service_clf = 'X'
+        inherited_char     = 'X'
+      TABLES
+        t_class            = lt_class
+        t_objectdata       = lt_objectdata
+      EXCEPTIONS
+        no_classification  = 1
+        no_classtypes      = 2
+        invalid_class_type = 3
+        OTHERS             = 4.
+
+    IF lt_objectdata[] IS NOT INITIAL.
+      " Montamos la tabla de control de las caracteristicas de los lotes origen
+      PERFORM tabla_caracteristicas TABLES lt_caracteristicas
+                                           lt_objectdata.
+    ENDIF.
+  ENDLOOP.
+
+  " Haremos las comprobaciones para quedarnos con la tabla de caracteristicas con la que actualizaremos el lote
+  PERFORM comprobar_caracteristicas TABLES lt_caracteristicas.
+
+* FIN CGV - 24.04.18 - SAT 7000018907 - Ticket 46645
+
+* Llamamos al módulo de funciones del formulario
+  CALL FUNCTION lv_funcion
+    EXPORTING
+      /1bcdwb/docparams  = ls_docparams
+      is_label           = is_label_data
+      is_ean128          = cs_ean128_data
+      is_nast            = is_output_record
+      is_caracteristicas = lt_caracteristicas
+    EXCEPTIONS
+      usage_error        = 1
+      system_error       = 2
+      internal_error     = 3
+      OTHERS             = 4.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE 'I' NUMBER sy-msgno
+        WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 RAISING print_error.
+  ENDIF.
+
+
+* Cerramos el formulario
+* ----------------------------------------------------------------------
+  CALL FUNCTION 'FP_JOB_CLOSE'
+    EXCEPTIONS
+      usage_error    = 1
+      system_error   = 2
+      internal_error = 3
+      OTHERS         = 4.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE 'I' NUMBER sy-msgno
+        WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 RAISING print_error.
+    EXIT.
+  ENDIF.
+
+
+ENDFUNCTION.

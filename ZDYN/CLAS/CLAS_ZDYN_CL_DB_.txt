@@ -1,0 +1,269 @@
+
+class ZDYN_CL_DB definition
+  public
+  create public .
+
+public section.
+
+  class-data MO type ref to ZDYN_CL_DB .
+  constants CON_REGISTER_VALIDITY type INT1 value 36. "#EC NOTEXT
+
+  class-methods CLASS_CONSTRUCTOR .
+  methods CLEANUP_REGISTER
+    importing
+      !II_OLDER_THAN_MONTHS type INT1 default CON_REGISTER_VALIDITY
+    exceptions
+      TIMEOUT
+      ERROR_OCCURRED .
+  methods GET_WHERE_CLAUSE
+    importing
+      !IT_DYN_SEL type RSDS_TRANGE
+    exporting
+      !ET_WHERE type RSDS_WHERE_TAB .
+  methods SELECT_TABLES_IN_DYN_SEL
+    importing
+      !IT_TABNAMES type TTTABNAME
+    changing
+      !CT_DYN_SEL type RSDS_TRANGE .
+  class-methods SET_MO .
+  methods IS_DOCUMENT_VALID
+    importing
+      !IC_DOC_TYPE type ANY
+      !IC_NUMBER type ANY
+      !ID_CREATE_DATE type DATUM
+      !ID_CREATE_TIME type SY-UZEIT
+      !II_OLDER_THAN_MONTHS type INT1 default CON_REGISTER_VALIDITY
+    returning
+      value(EB_RESULT) type ABAP_BOOL .
+  methods REGISTER_DOCUMENT
+    importing
+      !IC_DOC_TYPE type ANY
+      !IC_NUMBER type ANY
+    exceptions
+      TIMEOUT
+      ERROR_OCCURRED .
+protected section.
+
+  methods IS_DOCUMENT_REGISTERED
+    importing
+      !IC_DOC_TYPE type ANY
+      !IC_NUMBER type ANY
+    returning
+      value(EB_RESULT) type ABAP_BOOL .
+  methods LOCK_DOCUMENTS
+    exceptions
+      TIMEOUT
+      ERROR_OCCURRED .
+  methods UNLOCK_DOCUMENTS .
+  methods WRITE_DOCUMENT
+    importing
+      !IC_NUMBER type ANY
+      !IC_DOC_TYPE type ANY
+    exceptions
+      ERROR_OCCURRED .
+private section.
+endclass. "ZDYN_CL_DB definition
+class ZDYN_CL_DB implementation.
+METHOD class_constructor.
+
+  set_mo( ).
+
+ENDMETHOD.
+METHOD cleanup_register.
+
+  DATA: ld_border_date TYPE zdyn_ws_tdoc-creation_date.
+
+  zdyn_cl_msg=>add_to_call_stack( ).
+
+* wait until access is allowed
+  lock_documents( EXCEPTIONS timeout = 1
+                             OTHERS  = 2 ).
+  IF sy-subrc = 1.
+    RAISE timeout.
+  ELSEIF sy-subrc <> 0.
+    RAISE error_occurred.
+  ENDIF.
+
+* calculate with overlap (20 days currently)
+  ld_border_date = sy-datum - ii_older_than_months * 30 - ii_older_than_months * 2.
+
+  DELETE FROM zdyn_ws_tdoc WHERE creation_date < ld_border_date.
+
+  IF sy-subrc = 0.
+    COMMIT WORK.
+  ELSEIF sy-subrc > 4.
+    unlock_documents( ).
+    RAISE error_occurred.
+  ENDIF.
+
+  unlock_documents( ).
+
+ENDMETHOD.
+METHOD get_where_clause.
+
+* Convert the dynamic range to an SQL WHERE clause and add prefixes with tables names
+* to the field names to allow queries with the JOIN statement.
+
+  DATA: lt_twhere  TYPE rsds_twhere,
+        lst_twhere LIKE LINE OF lt_twhere,
+        lc_where   LIKE LINE OF et_where,
+        lt_dyn_sel LIKE it_dyn_sel.
+  FIELD-SYMBOLS: <st_tab_range> LIKE LINE OF lt_dyn_sel,
+                 <st_range>     LIKE LINE OF <st_tab_range>-frange_t.
+
+  CHECK it_dyn_sel IS NOT INITIAL.
+
+  lt_dyn_sel = it_dyn_sel.
+
+  LOOP AT lt_dyn_sel ASSIGNING <st_tab_range>.
+    LOOP AT <st_tab_range>-frange_t ASSIGNING <st_range>.
+      CONCATENATE <st_tab_range>-tablename '~' <st_range>-fieldname INTO <st_range>-fieldname.
+    ENDLOOP.
+  ENDLOOP.
+
+  CALL FUNCTION 'FREE_SELECTIONS_RANGE_2_WHERE'
+    EXPORTING
+      field_ranges  = lt_dyn_sel
+    IMPORTING
+      where_clauses = lt_twhere.
+
+  LOOP AT lt_twhere INTO lst_twhere.
+    IF et_where IS NOT INITIAL.
+      APPEND 'AND' TO et_where.
+    ENDIF.
+    APPEND LINES OF lst_twhere-where_tab TO et_where.
+  ENDLOOP.
+
+ENDMETHOD.
+METHOD is_document_registered.
+
+  DATA: lc_doc_no   TYPE zdyn_ws_tdoc-id,
+        lc_doc_type TYPE zdyn_ws_tdoc-doc_type,
+        lst_doc     TYPE zdyn_ws_tdoc.
+
+  zdyn_cl_msg=>add_to_call_stack( ).
+
+  lc_doc_type = ic_doc_type.
+  lc_doc_no   = ic_number.
+
+  SELECT SINGLE * FROM zdyn_ws_tdoc INTO lst_doc
+    WHERE doc_type  = lc_doc_type
+      AND id        = lc_doc_no.
+  IF sy-subrc = 0.
+    eb_result = abap_true.
+  ENDIF.
+
+ENDMETHOD.
+METHOD is_document_valid.
+
+  DATA: ld_border_date    TYPE zdyn_ws_tdoc-creation_date,
+        ld_doc_time       LIKE id_create_time,
+        lc_doc_timestamp  TYPE timestamp,
+        lc_curr_timestamp TYPE timestamp.
+
+  CHECK zdyn_cl_db=>mo->is_document_registered( ic_doc_type = ic_doc_type
+                                                ic_number   = ic_number ) = abap_false.
+
+  ld_border_date = sy-datum - ii_older_than_months * 30.
+
+  CHECK id_create_date > ld_border_date.
+
+* do not take documents less than 10 min old to ensure their completeness
+  CONVERT DATE id_create_date TIME id_create_time INTO TIME STAMP lc_doc_timestamp TIME ZONE sy-zonlo.
+  lc_doc_timestamp = cl_abap_tstmp=>add( tstmp = lc_doc_timestamp
+                                         secs  = 600 ).
+  GET TIME STAMP FIELD lc_curr_timestamp.
+
+  CHECK lc_curr_timestamp > lc_doc_timestamp.
+
+  eb_result = abap_true.
+
+ENDMETHOD.
+METHOD lock_documents.
+
+  DO 200 TIMES.
+    CALL FUNCTION 'ENQUEUE_EZDYN_WS_TDOC'
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+    IF sy-subrc = 0.
+      EXIT.
+    ELSEIF sy-subrc = 1.
+      WAIT UP TO 1 SECONDS.
+    ELSEIF sy-subrc > 1.
+      RAISE error_occurred.
+    ENDIF.
+  ENDDO.
+
+  IF sy-subrc <> 0.
+    RAISE timeout.
+  ENDIF.
+
+ENDMETHOD.
+METHOD register_document.
+
+  DATA: lc_doc_no  TYPE zdyn_ws_tdoc-id.
+
+  zdyn_cl_msg=>add_to_call_stack( ).
+
+* wait until access is allowed
+  lock_documents( EXCEPTIONS timeout = 1
+                             OTHERS  = 2 ).
+  IF sy-subrc = 1.
+    RAISE timeout.
+  ELSEIF sy-subrc <> 0.
+    RAISE error_occurred.
+  ENDIF.
+
+  lc_doc_no = ic_number.
+
+  write_document( EXPORTING  ic_doc_type = ic_doc_type
+                             ic_number   = lc_doc_no
+                  EXCEPTIONS OTHERS      = 1 ).
+  IF sy-subrc = 0.
+    COMMIT WORK.
+  ELSE.
+    unlock_documents( ).
+    RAISE error_occurred.
+  ENDIF.
+
+  unlock_documents( ).
+
+ENDMETHOD.
+METHOD select_tables_in_dyn_sel.
+
+  DATA: lc_tabname  LIKE LINE OF it_tabnames,
+        lt_sel_tabs LIKE RANGE OF lc_tabname,
+        lst_sel_tab LIKE LINE OF lt_sel_tabs.
+
+  lst_sel_tab-sign    = 'I'.
+  lst_sel_tab-option  = 'EQ'.
+  LOOP AT it_tabnames INTO lst_sel_tab-low.
+    APPEND lst_sel_tab TO lt_sel_tabs.
+  ENDLOOP.
+
+  DELETE ct_dyn_sel WHERE tablename NOT IN lt_sel_tabs.
+
+ENDMETHOD.
+METHOD set_mo.
+
+  CREATE OBJECT mo.
+
+ENDMETHOD.
+METHOD unlock_documents.
+
+  CALL FUNCTION 'DEQUEUE_EZDYN_WS_TDOC'.
+
+ENDMETHOD.
+METHOD write_document.
+
+  DATA: lst_doc  TYPE zdyn_ws_tdoc.
+
+  lst_doc-doc_type      = ic_doc_type.
+  lst_doc-id            = ic_number.
+  lst_doc-creation_date = sy-datum.
+  lst_doc-creation_time = sy-timlo.
+  INSERT zdyn_ws_tdoc FROM lst_doc.
+
+ENDMETHOD.

@@ -1,0 +1,181 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRMM0019_FO1
+*&---------------------------------------------------------------------*
+FORM get_data.
+  SELECT mara~matnr mara~mtart mara~matkl
+         mbew~verpr mbew~lbkum mbew~salk3
+    FROM mara AS mara
+    INNER JOIN mbew AS mbew
+    ON mara~matnr = mbew~matnr
+    INTO TABLE gt_datos
+    WHERE mara~mtart IN s_mtart
+     AND  mara~matkl IN s_maktl
+     AND  mbew~bwkey IN s_werks.
+ENDFORM.
+
+FORM carga_tabla_datos.
+  DATA: ls_ztmm0026     TYPE ztmm0026,
+        ls_zcah         LIKE LINE OF gt_datos_zcah,
+        lt_ztmm0026     TYPE TABLE OF ztmm0026,
+*        ls_ztmm0026     TYPE ztmm0026,
+        lv_destino(255) TYPE c,
+        lv_sist_des     TYPE sy-dcsys,
+        lv_sist_qas     TYPE sy-dcsys,
+        lv_sist_prd     TYPE sy-dcsys.
+
+* Recorre cada material, los MTART = ZPAP los inserta directamente,
+* pero los ZCAH hay que agruparlos en otra tabla interna para
+* poder calcular el precio medio variable unitario ya que
+* pueden haber materiales que tengan los primeros 13 dígitos iguales.
+  SORT gt_datos BY mtart DESCENDING.
+  LOOP AT gt_datos INTO gs_datos.
+    CLEAR ls_ztmm0026.
+    IF gs_datos-mtart = 'ZPAP' or
+       gs_datos-mtart = 'ZCAB'. "CGV - 10.03.20 - SAT 7000030528 TICKET 59809
+      MOVE gs_datos-matnr+5(5) TO ls_ztmm0026-familia.
+      MOVE gs_datos-matnr+10(4) TO ls_ztmm0026-gramaje.
+      MOVE gs_datos-matnr+14(4) TO ls_ztmm0026-ancho.
+
+      ls_ztmm0026-precio_mv = gs_datos-verpr.
+
+*     Tipo de material.
+      ls_ztmm0026-mtart = gs_datos-mtart.
+
+*     Stock total valorado
+      ls_ztmm0026-LBKUM = gs_datos-LBKUM. "CGV - 05.03.20 - SAT 7000030528 TICKET 59809
+
+      INSERT ztmm0026 FROM ls_ztmm0026.
+    ELSEIF gs_datos-mtart = 'ZCAH'.
+      MOVE-CORRESPONDING gs_datos TO gs_datos_zcah.
+      COLLECT gs_datos_zcah INTO gt_datos_zcah.
+    ENDIF.
+  ENDLOOP.
+
+* Ahora se calcula el precio medio variable unitario para
+* los materiales MTART = ZCAH.
+  SORT gt_datos_zcah BY matnr ASCENDING.
+  LOOP AT gt_datos_zcah INTO gs_datos_zcah.
+    gs_datos_zcah-precio_mv = gs_datos_zcah-salk3 / gs_datos_zcah-lbkum.
+    MODIFY gt_datos_zcah FROM gs_datos_zcah INDEX sy-tabix.
+
+    CLEAR ls_ztmm0026.
+    MOVE gs_datos_zcah-matnr+1(5) TO ls_ztmm0026-familia.
+    MOVE gs_datos_zcah-matnr+6(4) TO ls_ztmm0026-gramaje.
+    MOVE gs_datos_zcah-matnr+10(4) TO ls_ztmm0026-ancho.
+    ls_ztmm0026-precio_mv = gs_datos_zcah-precio_mv * 1000.
+
+*   Stock total valorado
+    ls_ztmm0026-LBKUM = gs_datos_zcah-LBKUM. "CGV - 05.03.20 - SAT 7000030528 TICKET 59809
+
+*   Tipo de material.
+    ls_ztmm0026-mtart = 'ZCAH'.
+
+    INSERT ztmm0026 FROM ls_ztmm0026.
+  ENDLOOP.
+  COMMIT WORK.
+
+* Dependiendo si es DES, QAS o PRD el entorno,
+* habrá un destino u otro para el RFC.
+* (PRD -> HPP_Z001 // DES-QAS -> HPD_Z001 )
+
+* Iniciales del sistema DES
+  SELECT SINGLE low
+    FROM tvarvc
+    INTO lv_sist_des
+    WHERE name = 'Z_ENTORNO_DES'.
+
+* Iniciales del sistema QAS
+  SELECT SINGLE low
+    FROM tvarvc
+    INTO lv_sist_qas
+    WHERE name = 'Z_ENTORNO_QAS'.
+
+* Iniciales del sistema PRD
+  SELECT SINGLE low
+    FROM tvarvc
+    INTO lv_sist_prd
+    WHERE name = 'Z_ENTORNO_PRD'.
+
+  CASE sy-sysid.
+    WHEN lv_sist_des.
+      SELECT SINGLE low
+        FROM tvarvc
+        INTO lv_destino
+        WHERE name = 'Z_DESTINO_MM_PMVAR_DES_Y_QAS'.
+
+    WHEN lv_sist_qas.
+      SELECT SINGLE low
+    FROM tvarvc
+    INTO lv_destino
+    WHERE name = 'Z_DESTINO_MM_PMVAR_DES_Y_QAS'.
+
+    WHEN lv_sist_prd.
+
+      SELECT SINGLE low
+    FROM tvarvc
+    INTO lv_destino
+    WHERE name = 'Z_DESTINO_MM_PMVAR_PRD'.
+  ENDCASE.
+
+
+* Llamada al Proxy de Salida hacia PI
+
+  DATA: lo_proxy          TYPE REF TO zco_si_pmvar_outb_a,
+        lv_log_port       TYPE prx_logical_port_name,
+        lt_ztmm0026_proxy TYPE zmt_pmvar,
+        ls_item           TYPE zdt_pmvar_r.
+
+* Recuperamos los datos de la tabla
+  SELECT mtart familia gramaje ancho precio_mv
+    LBKUM  "CGV - 05.03.20 - SAT 7000030528 TICKET 59809
+    FROM ztmm0026
+    INTO TABLE lt_ztmm0026.
+
+
+* Volcamos los datos de la tabla a la estructura del proxy
+  CLEAR ls_ztmm0026.
+  LOOP AT lt_ztmm0026 INTO ls_ztmm0026
+    where precio_mv is not initial or LBKUM is not initial. "CGV - 09.03.20 - SAT 7000030528 TICKET 59809
+    CLEAR ls_item.
+
+*   Tipo de material
+    ls_item-mtart = ls_ztmm0026-mtart.
+
+    ls_item-familia = ls_ztmm0026-familia.
+    ls_item-gramaje = ls_ztmm0026-gramaje.
+    ls_item-ancho = ls_ztmm0026-ancho.
+    ls_item-premevar = ls_ztmm0026-precio_mv.
+    ls_item-STOCKVALOR = ls_ztmm0026-LBKUM. "CGV - 05.03.20 - SAT 7000030528 TICKET 59809
+
+    APPEND ls_item TO lt_ztmm0026_proxy-mt_pmvar-row.
+  ENDLOOP.
+
+
+  IF lo_proxy IS NOT BOUND.
+    TRY.
+        CREATE OBJECT lo_proxy.
+
+      CATCH cx_ai_system_fault .
+        MESSAGE text-e02 TYPE 'S' DISPLAY LIKE 'E'.
+        EXIT.
+    ENDTRY.
+
+  ENDIF.
+
+  TRY.
+      CALL METHOD lo_proxy->si_pmvar_outb_a
+        EXPORTING
+          output = lt_ztmm0026_proxy.
+
+      COMMIT WORK.
+
+    CATCH cx_ai_system_fault .
+  ENDTRY.
+ENDFORM.
+
+FORM delete_ztmm0026.
+* Elimina los datos de la tabla ZTMM0026 para volver a introducir los valores
+* cada vez que se ejecuta el report.
+  DELETE FROM ztmm0026 WHERE 1 = 1.
+  COMMIT WORK.
+ENDFORM.

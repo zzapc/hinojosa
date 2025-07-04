@@ -1,0 +1,343 @@
+FUNCTION zpp_getdisponibilidad.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(NUM_ORDEN) TYPE  AUFNR OPTIONAL
+*"     VALUE(OPERACION) TYPE  VORNR OPTIONAL
+*"     VALUE(CODIGOMC) TYPE  CHAR255 OPTIONAL
+*"  EXPORTING
+*"     VALUE(T_DISPO) TYPE  ZTTPP_GETDISPO
+*"----------------------------------------------------------------------
+  CONSTANTS: c_werks TYPE werks_d VALUE '4000'.
+
+  TYPES:  BEGIN  OF ty_loteswip,
+            matnr_wip TYPE vbob_ob_rfmat,
+            matnr     TYPE vbob_ob_rfmat,
+          END    OF ty_loteswip.
+  DATA:  lt_loteswip TYPE STANDARD TABLE OF ty_loteswip.
+  DATA:  ls_loteswip TYPE ty_loteswip.
+
+
+  DATA: wa_order_objects TYPE          bapi_pi_order_objects,
+        t_return         TYPE          bapiret2,
+        t_header         TYPE TABLE OF bapi_order_header1,
+        wa_header        TYPE          bapi_order_header1,
+        t_position       TYPE TABLE OF bapi_order_item,
+        t_sequence       TYPE TABLE OF bapi_order_sequence,
+        t_phase          TYPE TABLE OF bapi_order_phase,
+        wa_phase         TYPE          bapi_order_phase,
+        t_trigger_point  TYPE TABLE OF bapi_order_trigger_point,
+        t_component      TYPE TABLE OF bapi_order_component,
+        wa_component     TYPE          bapi_order_component,
+        t_component_aux  TYPE TABLE OF bapi_order_component,
+        t_prod_rel_tool  TYPE TABLE OF bapi_order_prod_rel_tools,
+        t_wmdvsx         TYPE TABLE OF bapiwmdvs,
+        t_wmdvex         TYPE TABLE OF bapiwmdve,
+        t_batches        TYPE TABLE OF bapicharg1,
+        ls_batches       TYPE          bapicharg1,
+        t_return1        TYPE          bapireturn,
+        wa_phase1        TYPE          bapi_order_phase.
+
+  DATA: wa_getdispo TYPE zspp_getdispo.
+  DATA: lv_orden      TYPE aufnr,
+        lv_matkl      TYPE matkl,
+        lv_bwkey      TYPE bwkey,
+        lv_vprsv      TYPE vprsv,
+        lv_verpr      TYPE verpr,
+        lv_stprs      TYPE stprs,
+        lv_peinh      TYPE peinh,
+        lv_lineas     TYPE i,
+        lv_rsnum      TYPE rsnum,
+        lv_lgort      TYPE lgort_d,
+        lv_rgekz      TYPE rgekz,
+        lv_matnr      TYPE matnr,
+        lv_meins      TYPE meins,
+        lv_xchpf      TYPE xchpf,
+        lv_endleadtme LIKE bapicm61m-wzter,
+        lv_av_qty_plt LIKE bapicm61v-wkbst,
+        lv_dialogflag LIKE bapicm61v-diafl,
+        lv_clabs      TYPE labst,
+        lv_vfdat      TYPE vfdat,
+        lv_hsdat      TYPE hsdat,
+        lv_flag       TYPE flag,
+        lv_labst      TYPE labst,
+        lv_ucmat      TYPE vbob_ob_rfmat,
+        lv_objnr      TYPE j_objnr,
+        lv_aufpl      TYPE co_aufpl,
+        lv_stat	      TYPE j_status.
+
+  CLEAR: t_header, t_position, t_sequence, t_phase,
+         t_trigger_point, t_component, t_prod_rel_tool.
+  REFRESH: t_header, t_position, t_sequence, t_phase,
+           t_trigger_point, t_component, t_prod_rel_tool.
+
+
+**  Si no viene por codigo de material, filtramos por la orden, si viene el codigo de material buscamos por codigo.
+  IF codigomc IS INITIAL.
+
+*  Añadimos los 0 para que SAP reconozca bien el numero de orden.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = num_orden
+      IMPORTING
+        output = lv_orden.
+
+*** Indicamos las estructuras a obtener.
+    wa_order_objects-header = 'X'.
+    wa_order_objects-positions = 'X'.
+    wa_order_objects-sequences = ''.
+    wa_order_objects-phases = 'X'.
+    wa_order_objects-components = 'X'.
+    wa_order_objects-prod_rel_tools = ''.
+    wa_order_objects-trigger_points = ''.
+    wa_order_objects-secondary_resources = ''.
+
+    CALL FUNCTION 'BAPI_PROCORD_GET_DETAIL'
+      EXPORTING
+        number        = lv_orden
+        order_objects = wa_order_objects
+      IMPORTING
+        return        = t_return
+      TABLES
+        header        = t_header
+        position      = t_position
+        sequence      = t_sequence
+        phase         = t_phase
+        trigger_point = t_trigger_point
+        component     = t_component
+        prod_rel_tool = t_prod_rel_tool.
+
+
+**  Guardamos una tabla auxiliar para los productos wip
+    t_component_aux[] = t_component[].
+
+    IF operacion IS NOT INITIAL.
+      DELETE t_component WHERE operation <> operacion.
+    ENDIF.
+
+    CLEAR wa_component.
+    LOOP AT t_component INTO wa_component WHERE deletion_indicator <> 'X'.
+
+***   No se comprueba disponibilidad de los matnr mov type 531
+      READ TABLE t_header INTO wa_header INDEX 1.
+      IF sy-subrc = 0.
+        " Número de la OF
+        CLEAR wa_getdispo.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = wa_header-order_number
+          IMPORTING
+            output = wa_getdispo-numeroorden.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = wa_component-operation
+          IMPORTING
+            output = wa_getdispo-operacion.
+      ENDIF.
+
+**    Recuperamos el material WIP del material de cabecera.
+      CLEAR lv_ucmat.
+      SELECT SINGLE ucmat INTO lv_ucmat
+        FROM marc
+        WHERE matnr EQ wa_header-material.
+
+      CLEAR ls_loteswip.
+      ls_loteswip-matnr = wa_header-material.
+      ls_loteswip-matnr_wip = lv_ucmat.
+      COLLECT ls_loteswip INTO lt_loteswip.
+
+      IF wa_component-movement_type = '531'.
+        CONTINUE.
+      ENDIF.
+
+***  Eliminamos los coproductos (No se comprueba disponibilidad de los coproductos).
+      CLEAR lv_lineas.
+      DESCRIBE TABLE t_position LINES lv_lineas.
+
+      IF lv_lineas > 1.
+
+        CLEAR lv_rsnum.
+        SELECT SINGLE rsnum INTO lv_rsnum
+          FROM resb
+          WHERE rsnum = wa_component-reservation_number AND
+                bwart = '101' AND
+                kzkup = 'X' AND
+                matnr EQ wa_component-material.
+
+        IF sy-subrc = 0.
+**        Recuperamos el material WIP del coproducto.
+          CLEAR lv_ucmat.
+          SELECT SINGLE ucmat INTO lv_ucmat
+            FROM marc
+            WHERE matnr EQ wa_component-material.
+
+          CLEAR ls_loteswip.
+          ls_loteswip-matnr = wa_component-material.
+          ls_loteswip-matnr_wip = lv_ucmat.
+          COLLECT ls_loteswip INTO lt_loteswip.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+
+***      Añadimos los 0 para que SAP reconozca bien el material
+      CLEAR lv_matnr.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wa_component-material
+        IMPORTING
+          output = lv_matnr.
+
+
+      PERFORM p_dispo_material  TABLES t_dispo
+                                USING lv_matnr
+                                      wa_getdispo.
+
+    ENDLOOP.
+
+  ELSE.
+
+***   Añadimos los 0 para que SAP reconozca bien el material
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = codigomc
+      IMPORTING
+        output = lv_matnr.
+
+    CLEAR wa_getdispo.
+    PERFORM p_dispo_material  TABLES t_dispo
+                              USING lv_matnr
+                                    wa_getdispo.
+
+  ENDIF.
+** Solo lotes wip para la clase ZC02
+  READ TABLE t_header INTO wa_header INDEX 1.
+  IF wa_header-order_type EQ 'ZC02'.
+
+**  Solo material de cabecera en caso de no tener componentes.
+    IF lt_loteswip[] IS INITIAL.
+
+***   No se comprueba disponibilidad de los matnr mov type 531
+      READ TABLE t_header INTO wa_header INDEX 1.
+      IF sy-subrc = 0.
+
+**    Recuperamos el material WIP del material de cabecera.
+        CLEAR lv_ucmat.
+        SELECT SINGLE ucmat INTO lv_ucmat
+          FROM marc
+          WHERE matnr EQ wa_header-material.
+
+        CLEAR ls_loteswip.
+        ls_loteswip-matnr = wa_header-material.
+        ls_loteswip-matnr_wip = lv_ucmat.
+        COLLECT ls_loteswip INTO lt_loteswip.
+      ENDIF.
+
+      LOOP AT t_component_aux INTO wa_component WHERE deletion_indicator <> 'X'.
+
+        CLEAR lv_lineas.
+        DESCRIBE TABLE t_position LINES lv_lineas.
+
+        IF lv_lineas > 1.
+
+          CLEAR lv_rsnum.
+          SELECT SINGLE rsnum INTO lv_rsnum
+            FROM resb
+            WHERE rsnum = wa_component-reservation_number AND
+                  bwart = '101' AND
+                  kzkup = 'X' AND
+                  matnr EQ wa_component-material.
+
+          IF sy-subrc = 0.
+***  Recuperamos el material WIP del coproducto.
+            CLEAR lv_ucmat.
+            SELECT SINGLE ucmat INTO lv_ucmat
+              FROM marc
+              WHERE matnr EQ wa_component-material.
+
+            CLEAR ls_loteswip.
+            ls_loteswip-matnr = wa_component-material.
+            ls_loteswip-matnr_wip = lv_ucmat.
+            COLLECT ls_loteswip INTO lt_loteswip.
+
+          ENDIF.
+
+        ENDIF.
+
+      ENDLOOP.
+
+    ENDIF.
+
+****  Materiales WIP
+    IF lt_loteswip[] IS NOT INITIAL.
+
+      DELETE t_phase WHERE superior_operation = ''.
+      DELETE t_phase INDEX 1.
+
+      IF operacion IS NOT INITIAL.
+        DELETE t_phase WHERE operation_number <> operacion.
+      ENDIF.
+
+      CLEAR ls_loteswip.
+      LOOP AT lt_loteswip[] INTO ls_loteswip.
+** Eliminamos la primera operacion.
+        LOOP AT t_phase INTO wa_phase.
+
+          READ TABLE t_header INTO wa_header INDEX 1.
+          IF sy-subrc = 0.
+            " Número de la OF
+            CLEAR wa_getdispo.
+            CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+              EXPORTING
+                input  = wa_header-order_number
+              IMPORTING
+                output = wa_getdispo-numeroorden.
+
+**   recuepramos los datos para despues calcular el coste catidad/hora
+            CLEAR lv_aufpl.
+            SELECT SINGLE aufpl INTO lv_aufpl
+              FROM afko
+              WHERE aufnr EQ wa_header-order_number.
+
+            IF lv_aufpl IS NOT INITIAL.
+              CLEAR: lv_objnr.
+              SELECT SINGLE  objnr INTO  lv_objnr
+                FROM afvv INNER JOIN afvc ON afvv~aufpl EQ afvc~aufpl
+                AND afvv~aplzl EQ afvc~aplzl
+                WHERE afvv~aufpl EQ lv_aufpl AND afvc~vornr EQ wa_phase-operation_number.
+            ENDIF.
+
+**  Descartamos las operaciones con el flag de peticion de borrado.
+            IF lv_objnr IS NOT INITIAL.
+              CLEAR lv_stat.
+              SELECT SINGLE stat INTO lv_stat
+                FROM jest
+                WHERE objnr EQ lv_objnr AND stat EQ 'I0013' AND inact <> 'X'.
+
+              IF lv_stat IS NOT INITIAL.
+                CONTINUE.
+              ENDIF.
+            ENDIF.
+
+            CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+              EXPORTING
+                input  = wa_phase-operation_number
+              IMPORTING
+                output = wa_getdispo-operacion.
+          ENDIF.
+
+
+          PERFORM p_dispo_lotewip  TABLES t_dispo
+                                   USING ls_loteswip-matnr_wip
+                                         wa_getdispo
+                                         operacion
+                                         num_orden.
+
+        ENDLOOP.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+
+
+ENDFUNCTION.

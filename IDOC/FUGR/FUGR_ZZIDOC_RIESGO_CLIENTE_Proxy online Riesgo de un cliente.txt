@@ -1,0 +1,215 @@
+FUNCTION zzidoc_riesgo_cliente.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(PI_BUKRS) TYPE  C
+*"     VALUE(PI_KUNNR) TYPE  C
+*"     VALUE(PI_GSBER) TYPE  C OPTIONAL
+*"  EXPORTING
+*"     REFERENCE(PO_PARTIDAS) TYPE  ZTT_IDOC_SITUACION_RIESGO_CLI
+*"  TABLES
+*"      PO_BKPF STRUCTURE  BKPF OPTIONAL
+*"      PO_BSEG STRUCTURE  BSEG OPTIONAL
+*"----------------------------------------------------------------------
+
+  DATA: ls_bsid TYPE bsid,
+        lt_bsid LIKE bsid OCCURS 0.
+  DATA: ls_bkpf     TYPE bkpf,
+        ls_bseg     TYPE bseg,
+        ls_partidas TYPE zsidoc_situacion_riesgo_cli.
+  DATA: lv_dias TYPE i.
+  DATA: ls_kna1 TYPE kna1,
+        lv_togru LIKE knb1-togru,
+        lv_gsber TYPE gsber.
+
+  SELECT SINGLE * INTO ls_kna1
+  FROM kna1
+  WHERE kunnr = pi_kunnr.
+  IF sy-subrc = 0.
+
+* COMPROBAMOS SI LA SOCIEDAD ES 2000 PARA VER SI TENEMOS QUE COMPROBAR EL GRUPO DE TOLERANCIA
+    IF pi_bukrs = '2000'.
+
+* BUSCAMOS EL CAMPO DE TOLERANCIA DEL CLIENTE
+      CLEAR: lv_togru, lv_gsber.
+      SELECT SINGLE togru INTO lv_togru
+      FROM knb1
+      WHERE kunnr = pi_kunnr
+      AND bukrs = pi_bukrs.
+      IF sy-subrc = 0.
+* CONVERTIMOS LA TOLERANCIA
+        CASE lv_togru.
+          WHEN 'XATI'.
+            lv_gsber = 'HIXA'.
+          WHEN 'PACS'.
+            lv_gsber = 'HIPA'.
+          WHEN OTHERS.
+            CLEAR lv_gsber.
+        ENDCASE.
+
+        IF pi_gsber = lv_gsber.
+* EN CASO DE COINCIDIR SE BUSCA POR LA DIVISION SOLICITADA Y LAS BLANCAS
+          CLEAR: lt_bsid.
+          REFRESH lt_bsid.
+          SELECT * INTO CORRESPONDING FIELDS OF TABLE lt_bsid
+          FROM bsid
+          WHERE kunnr = pi_kunnr
+          AND bukrs   = pi_bukrs
+          AND ( gsber = pi_gsber OR gsber   = '' ).
+
+        ELSE.
+* EN CASO DE NO COINCIDIR SE HACE LA BUSQUEDA POR LA DIVISION QUE SE SOLICITE
+          CLEAR: lt_bsid.
+          REFRESH lt_bsid.
+          SELECT * INTO CORRESPONDING FIELDS OF TABLE lt_bsid
+          FROM bsid
+          WHERE kunnr = pi_kunnr
+          AND bukrs   = pi_bukrs
+          AND gsber   = pi_gsber .
+
+        ENDIF.
+
+      ENDIF.
+
+    ELSE.
+* EN CASO DE NO SER LA SOCIEDAD 2000 SE HACE LA BUSQUEDA POR LA DIVISION QUE SE SOLICITE
+      CLEAR: lt_bsid.
+      REFRESH lt_bsid.
+      SELECT * INTO CORRESPONDING FIELDS OF TABLE lt_bsid
+      FROM bsid
+      WHERE kunnr = pi_kunnr
+      AND bukrs   = pi_bukrs
+      AND gsber   = pi_gsber .
+
+    ENDIF.
+
+
+
+    IF NOT lt_bsid[] IS INITIAL.
+
+      LOOP AT lt_bsid INTO ls_bsid.
+
+        SELECT * APPENDING CORRESPONDING FIELDS OF TABLE po_bkpf
+        FROM bkpf
+        WHERE bukrs = ls_bsid-bukrs
+        AND belnr = ls_bsid-belnr
+        AND gjahr = ls_bsid-gjahr.
+
+        SELECT * APPENDING CORRESPONDING FIELDS OF TABLE po_bseg
+        FROM bseg
+        WHERE bukrs = ls_bsid-bukrs
+        AND belnr = ls_bsid-belnr
+        AND gjahr = ls_bsid-gjahr
+        AND buzei = ls_bsid-buzei.
+
+      ENDLOOP.
+
+      CLEAR: ls_partidas, po_partidas.
+      REFRESH: po_partidas.
+
+      LOOP AT po_bseg INTO ls_bseg.
+
+        ls_partidas-kunnr = ls_bseg-kunnr.
+        ls_partidas-bukrs = ls_bseg-bukrs.
+        ls_partidas-zfbdt = ls_bseg-zfbdt.
+        ls_partidas-dmbtr = ls_bseg-dmbtr.
+        IF NOT ls_bseg-zlsch IS INITIAL.
+          ls_partidas-zlsch = ls_bseg-zlsch.
+        ELSE.
+          ls_partidas-zlsch = ls_bseg-umskz.
+        ENDIF.
+
+
+* CALCULAR EL TIPO DE DOCUMENTO
+        CASE ls_bseg-shkzg.
+          WHEN 'S'.   "DEBE
+            CASE ls_bseg-umskz.
+              WHEN 'W'.
+                ls_partidas-tipo = 'F'.
+              WHEN 'L'.
+                ls_partidas-tipo = 'F'.
+              WHEN 'J'.
+                ls_partidas-tipo = 'I'.
+              WHEN 'S'.
+                ls_partidas-tipo = 'I'.
+              WHEN 'H'.
+                ls_partidas-tipo = 'P'.
+              WHEN 'G'.
+                ls_partidas-tipo = 'F'.
+              WHEN 'E'.
+                ls_partidas-tipo = 'F'.
+              WHEN 'D'.
+                ls_partidas-tipo = 'I'.
+              WHEN ''.
+                ls_partidas-tipo = 'F'.
+              WHEN OTHERS.
+                ls_partidas-tipo = ls_bseg-umskz.
+            ENDCASE.
+
+          WHEN 'H'.   "HABER
+            READ TABLE po_bkpf INTO ls_bkpf
+            WITH KEY bukrs = ls_bseg-bukrs
+                     belnr = ls_bseg-belnr
+                     gjahr = ls_bseg-gjahr.
+            IF sy-subrc = 0.
+   IF  ls_bkpf-blart = 'DA' OR ls_bkpf-blart = 'DG'. "Clase de documento
+                ls_partidas-tipo = 'A'.
+              ELSE.
+                ls_partidas-tipo = 'C'.
+              ENDIF.
+            ENDIF.
+          WHEN OTHERS.
+        ENDCASE.
+
+* calcular el plazo con las fechas de vencimiento
+        CLEAR lv_dias.
+        CALL FUNCTION 'DAYS_BETWEEN_TWO_DATES'
+          EXPORTING
+            i_datum_bis             = ls_bseg-zfbdt
+            i_datum_von             = sy-datum
+*           I_KZ_EXCL_VON           = '0'
+*           I_KZ_INCL_BIS           = '0'
+*           I_KZ_ULT_BIS            = ' '
+*           I_KZ_ULT_VON            = ' '
+*           I_STGMETH               = '0'
+*           I_SZBMETH               = '1'
+          IMPORTING
+            e_tage                  = lv_dias
+          EXCEPTIONS
+            days_method_not_defined = 1
+            OTHERS                  = 2.
+
+        IF lv_dias <= 0.
+          ls_partidas-plazo = '0'.
+        ELSEIF lv_dias >= 1 AND lv_dias <= 15.
+          ls_partidas-plazo = '15'.
+        ELSEIF lv_dias >= 16 AND lv_dias <= 30.
+          ls_partidas-plazo = '30'.
+        ELSEIF lv_dias >= 31 AND lv_dias <= 60.
+          ls_partidas-plazo = '60'.
+        ELSEIF lv_dias >= 61 AND lv_dias <= 90.
+          ls_partidas-plazo = '90'.
+        ELSEIF lv_dias >= 91.
+          ls_partidas-plazo = '+90'.
+        ENDIF.
+
+        APPEND ls_partidas TO po_partidas.
+        CLEAR ls_partidas.
+
+      ENDLOOP.
+
+    ELSE.
+* en caso de no tener ninguna partida abierta devolvemos el numero de cliente con importe 0
+      CLEAR ls_partidas.
+      ls_partidas-kunnr = pi_kunnr.
+      ls_partidas-bukrs = pi_bukrs.
+      ls_partidas-dmbtr = 0.
+      ls_partidas-zlsch = 'E'.
+      ls_partidas-tipo = 'F'.
+      APPEND ls_partidas TO po_partidas.
+      CLEAR ls_partidas.
+
+    ENDIF.
+  ENDIF.
+
+ENDFUNCTION.

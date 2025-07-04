@@ -1,0 +1,675 @@
+***********************************************************************
+* TITULO: Lee ficheros y los integra en la cola
+*
+* DESCRIPCION : Lee ficheros y los integra en la cola
+*
+*
+* AUTOR: Andrés Picazo                                FECHA: 30/12/2013
+* ANALISTA: Alfredo Garcia
+*
+* MODIFICACIONES
+*
+***********************************************************************
+REPORT zwhs_in.
+
+*------INCLUDES--------------------------------------------------------*
+
+*------TABLAS/ESTRUCTURAS----------------------------------------------*
+TABLES: zwhs_monitor_sel,
+        zwhs_interlocuto,
+        zwhs_mensaje,
+        sscrfields.
+
+*------TABLAS INTERNAS-------------------------------------------------*
+TYPES: t_listado TYPE zwhs_monitor.
+DATA: i_listado TYPE TABLE OF t_listado,
+      l_listado TYPE t_listado,
+      i_list_mail TYPE TABLE OF t_listado,
+      l_string TYPE string.
+
+DATA: zwhs_cola TYPE zwhs_cola,
+      l_mensaje TYPE bapi_msg.
+
+FIELD-SYMBOLS <listado> TYPE t_listado.
+
+*----------------------------------------------------------------------*
+* CLASS lcl_alv DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv DEFINITION INHERITING FROM zcl_ap_alv_check.
+  PUBLIC SECTION.
+    METHODS: handle_double_click REDEFINITION.
+    METHODS: handle_user_command REDEFINITION.
+ENDCLASS. "lcl_alv DEFINITION
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report DEFINITION INHERITING FROM zcl_ap_dev.
+  PUBLIC SECTION.
+    METHODS: main.
+
+    METHODS:  listado,
+              seleccionar_datos,
+              leer_directorio IMPORTING directorio TYPE string
+                                        idmsg TYPE zidmsg OPTIONAL,
+              leer_ficheros,
+              enviar_mail.
+
+ENDCLASS.                    "REPORT DEFINITION
+
+
+*------VARIABLES-------------------------------------------------------*
+DATA: o_prog TYPE REF TO zcl_report,
+      o_alv TYPE REF TO lcl_alv.
+
+*------PARAMETER/SELECT-OPTIONS EN PANTALLA----------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK 001 WITH FRAME.
+PARAMETERS: p_client TYPE zidcliente_whs DEFAULT 'SII' OBLIGATORY.
+SELECT-OPTIONS: s_idmsg  FOR zwhs_monitor_sel-idmsg,
+                s_objkey FOR zwhs_monitor_sel-objkey,
+                s_fechac FOR zwhs_monitor_sel-fecha_creacion.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS: p_dird AS CHECKBOX DEFAULT 'X' USER-COMMAND dir,
+            p_dir  TYPE text255 MODIF ID dir,
+            p_dirm TYPE text255 MODIF ID dim.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS: p_ejec AS CHECKBOX USER-COMMAND eje,
+            p_nint TYPE i DEFAULT 1 MODIF ID eje,
+            p_secs TYPE i DEFAULT 0 MODIF ID eje,
+            p_max  TYPE i DEFAULT 0 MODIF ID eje,
+            p_cola AS CHECKBOX DEFAULT ''.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS: p_mail TYPE string.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS: p_vari LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK 001.
+SELECTION-SCREEN: FUNCTION KEY 2,
+                  FUNCTION KEY 3,
+                  FUNCTION KEY 4.
+
+
+************************************************************************
+*
+* LOGICA DEL PROGRAMA
+*
+************************************************************************
+
+*----------------------------------------------------------------------*
+* CLASS lcl_alv IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv IMPLEMENTATION.
+  METHOD handle_double_click.
+    READ TABLE i_listado INDEX row INTO l_listado.
+    IF sy-subrc = 0.
+      CASE column.
+        WHEN 'FICHERO'.
+          IF NOT l_listado-fichero IS INITIAL.
+            zcl_ap_ficheros=>ver_fichero_texto( l_listado-fichero ).
+          ENDIF.
+        WHEN OTHERS.
+          zwhs=>muestra_msg( idcola = l_listado-idcola editar = '' ).
+      ENDCASE.
+    ENDIF.
+  ENDMETHOD. "handle_double_click
+  METHOD handle_user_command.
+    DATA: l_row TYPE i.
+
+    CASE e_salv_function.
+      WHEN 'EXCEL'.
+        exportar_excel( ).
+      WHEN 'CREAR'.
+        get_seleccion( ).
+        o_prog->leer_ficheros( ).
+        refresh( ).
+
+      WHEN OTHERS.
+    ENDCASE.
+  ENDMETHOD. "handle_USER_COMMAND
+ENDCLASS. "lcl_alv IMPLEMENTATION
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report IMPLEMENTATION.
+  METHOD main.
+
+
+    seleccionar_datos( ).
+
+    IF p_ejec = 'X'.
+      leer_ficheros( ).
+    ENDIF.
+
+    IF NOT p_mail IS INITIAL.
+      CLEAR i_list_mail.
+      LOOP AT i_listado ASSIGNING <listado> WHERE lights = zcl_ap_alv=>c_sem_rojo.
+        APPEND <listado> TO i_list_mail.
+      ENDLOOP.
+      IF sy-subrc = 0.
+        enviar_mail( ).
+      ENDIF.
+    ENDIF.
+
+* Si estamos en fondo y no hay nada que procesar, no imprimimos nada
+    IF sy-batch = '' OR NOT i_listado IS INITIAL.
+      listado( ).
+    ELSE.
+* Sólo a la hora en punto borramos jobs pasados para no saturar!
+      IF sy-uzeit+3(3) >= '500' AND sy-uzeit+3(3) <= '559'.
+        zcl_ap_jobs=>borrar_jobs( jobname = 'ZWHS_IN' fecha = '99991231' solo_sin_spool = 'X' solo_finalizados = 'X' ).
+      ENDIF.
+    ENDIF.
+
+  ENDMETHOD.                    "REPORT
+
+  METHOD seleccionar_datos.
+    DATA: i_directorios TYPE TABLE OF zap_lista,
+          l_dir TYPE zap_lista,
+          l_idmsg TYPE zidmsg,
+          l_hay_vac.
+
+    CLEAR: i_listado.
+
+    i_directorios = zcl_ap_lista=>get_valores_lista( lista = p_dirm ).
+
+    IF NOT p_dir IS INITIAL.
+      READ TABLE i_directorios TRANSPORTING NO FIELDS WITH KEY subvalor = p_dir.
+      IF sy-subrc NE 0.
+        CLEAR l_dir.
+        l_dir-subvalor = p_dir.
+        APPEND l_dir TO i_directorios.
+      ENDIF.
+    ENDIF.
+
+    LOOP AT i_directorios INTO l_dir.
+      l_idmsg = l_dir-valor.
+      IF l_idmsg IS INITIAL OR l_idmsg IN s_idmsg.
+        leer_directorio( directorio = l_dir-subvalor idmsg = l_idmsg ).
+      ENDIF.
+    ENDLOOP.
+
+    IF NOT s_idmsg[] IS INITIAL.
+      DELETE i_listado WHERE NOT idmsg IN s_idmsg.
+    ENDIF.
+
+* Necesitamos garantizar la secuencia de ciertos mensajes por lo que de estos actualizaré la fecha con el contenido del mensaje
+    IF 'VAC' IN s_idmsg.
+      CLEAR l_hay_vac.
+      READ TABLE i_listado ASSIGNING <listado> WITH KEY idmsg = 'VAC'.
+      IF sy-subrc = 0.
+        l_hay_vac = 'X'.
+      ENDIF.
+
+* Si existe algún fichero VAC, volvemos a leer ficheros MOV por si hay alguno fuera de secuencia
+      IF l_hay_vac = 'X'.
+        IF s_idmsg[] IS INITIAL.
+          LOOP AT i_directorios INTO l_dir WHERE valor = 'MOV'.
+            l_idmsg = l_dir-valor.
+            leer_directorio( directorio = l_dir-subvalor idmsg = l_idmsg ).
+          ENDLOOP.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    IF p_client = 'TET'.
+      MESSAGE 'Inicio modo simulacion' TYPE 'S'.
+      LOOP AT i_listado ASSIGNING <listado> WHERE idmsg = 'MOV' OR idmsg = 'VAC' OR idmsg = 'CSN' OR idmsg = 'EMT' OR idmsg = 'BST'
+                                               OR idmsg = 'XOV' OR idmsg = 'XAC' OR idmsg = 'XSN' OR idmsg = 'XMT' OR idmsg = 'XST'.
+        sgpi_texto( texto1 = 'Inicio simulación mensaje' texto2 = <listado>-idmsg texto3 = <listado>-idcola ).
+
+        zwhs=>fichero_2_cola( EXPORTING ruta    = <listado>-fichero
+                                        idmsg   = <listado>-idmsg
+                                        simulacion = 'X'
+                                        fecha_fichero = <listado>-fecha_fichero
+                                        hora_fichero = <listado>-hora_fichero
+                              IMPORTING mensaje = l_mensaje
+                                        cola    = zwhs_cola
+                                           ).
+
+        <listado>-objkey = zwhs_cola-objkey.
+        <listado>-contenido_ficher = zwhs_cola-contenido_ficher.
+        <listado>-fecha_creacion = zwhs_cola-fecha_creacion.
+        <listado>-hora_creacion = zwhs_cola-hora_creacion.
+        <listado>-fecha_fichero = zwhs_cola-fecha_fichero.
+        <listado>-hora_fichero = zwhs_cola-hora_fichero.
+        <listado>-matnr   = zwhs_cola-matnr.
+        <listado>-charg   = zwhs_cola-charg.
+        <listado>-exidv   = zwhs_cola-exidv.
+        <listado>-entrega = zwhs_cola-entrega.
+        <listado>-aufnr   = zwhs_cola-aufnr.
+        <listado>-lgort   = zwhs_cola-lgort.
+        <listado>-test    = zwhs_cola-test.
+        <listado>-otros   = zwhs_cola-otros.
+*
+*        IF p_client = 'TET' AND sy-sysid = 'T01' AND <listado>-test = 'X'.
+*          <listado>-lights = zcl_ap_alv=>c_sem_rojo.
+*          <listado>-mensaje = 'Fichero con equipo en test. Lo ignoramos'.
+*        ELSEIF p_client = 'TET' AND sy-sysid NE 'T01' AND <listado>-test IS INITIAL.
+*          <listado>-lights = zcl_ap_alv=>c_sem_rojo.
+*          <listado>-mensaje = 'Fichero con equipo productivo. Lo ignoramos'.
+*        ENDIF.
+
+        IF NOT zwhs_cola-contenido_ficher IS INITIAL.
+          MESSAGE s398(00) WITH <listado>-idmsg zwhs_cola-idcola <listado>-fecha_fichero <listado>-hora_fichero.
+
+          IF <listado>-fecha_fichero IS INITIAL.
+            MESSAGE 'Fecha fichero vacía, la cambiamos a la del sistema' TYPE 'S'.
+            <listado>-fecha_fichero = sy-datum.
+            <listado>-hora_fichero = sy-uzeit.
+          ENDIF.
+        ENDIF.
+        sgpi_texto( texto1 = 'Fin simulación mensaje' texto2 = <listado>-idmsg texto3 = <listado>-idcola ).
+      ENDLOOP.
+      MESSAGE 'Fin modo simulacion' TYPE 'S'.
+    ENDIF.
+
+*    SORT i_listado BY fecha_fichero hora fichero.
+    SORT i_listado BY fecha_fichero ASCENDING hora_fichero ASCENDING.
+
+
+  ENDMETHOD.                    "seleccionar_datos
+
+  METHOD leer_directorio.
+    DATA: l_servidor,
+          i_files TYPE rstt_t_files,
+          o_ftp TYPE REF TO zcl_ap_ftp,
+          l_host TYPE string,
+          l_directorio TYPE string,
+          l_ftp,
+          l_fichero TYPE text1000,
+          l_idmsg TYPE zidmsg,
+          l_mayusculas.
+
+
+    FIELD-SYMBOLS <file> TYPE file_info.
+
+    CLEAR: i_files, i_list_mail.
+
+    sgpi_texto( texto1 = 'Leyendo directorio de entrada' texto2 = idmsg texto3 = directorio ).
+
+    IF directorio CS ':'.
+    ELSEIF directorio CS '/' OR directorio CS 'SrvSAP' OR sy-batch = 'X' OR p_dird = 'X'.
+      l_servidor = 'X'.
+    ENDIF.
+
+    sy-tfill = STRLEN( directorio ).
+    IF sy-tfill > 4.
+      IF directorio(4) = 'ftp:'.
+        l_ftp = 'X'.
+      ENDIF.
+    ENDIF.
+
+    IF l_ftp = 'X'.
+      SPLIT directorio+4 AT '/' INTO l_host l_directorio.
+      IF l_host IS INITIAL.
+        SPLIT p_dir AT '/' INTO l_host string.
+      ENDIF.
+
+
+      o_ftp = zwhs_general=>get_ftp( host = l_host directorio = l_directorio idcliente = p_client ).
+
+      i_files = o_ftp->get_lista_ficheros( ).
+
+      LOOP AT i_files ASSIGNING <file>.
+        CONCATENATE l_host '/' l_directorio INTO string.
+        <file>-filename = zcl_ap_ficheros=>concat_ruta( directorio = string fichero = <file>-filename ).
+      ENDLOOP.
+
+      o_ftp->disconnect( ).
+
+    ELSE.
+      l_directorio = directorio.
+      IF sy-sysid(1) = 'D'.
+        l_mayusculas = 'X'.
+      ENDIF.
+
+      i_files = zcl_ap_ficheros=>lista_ficheros_comun( directory = l_directorio servidor = l_servidor max_ficheros = 999 mayusculas = l_mayusculas ).
+    ENDIF.
+
+    LOOP AT i_files ASSIGNING <file> WHERE createdate  IN s_fechac
+                                       AND isdir = 0
+                                       AND filelength > 0.
+      CLEAR l_listado.
+      l_fichero = <file>-filename.
+      REPLACE directorio WITH '' INTO l_fichero.
+      IF l_fichero(1) = ' '.
+        l_fichero = l_fichero+1.
+      ENDIF.
+      IF l_fichero(4) = 'ftp:'.
+        l_fichero = l_fichero+4.
+      ENDIF.
+      l_fichero = zcl_ap_ficheros=>get_nombre_fichero( l_fichero ).
+      l_listado-fichero = <file>-filename.
+      IF idmsg = 'RES' AND zcl_ap_string=>ultimo_caracter( texto = l_listado-fichero num_car = '3' ) = '.cs'.
+        CONCATENATE l_listado-fichero 'v' INTO l_listado-fichero.
+      ENDIF.
+      l_listado-fecha_creacion = l_listado-fecha_fichero = <file>-createdate.
+      l_listado-hora = l_listado-hora_fichero = <file>-createtime.
+      l_listado-check = p_ejec.
+
+      IF idmsg IS INITIAL.
+        l_idmsg = l_fichero(3).
+      ELSE.
+        l_idmsg = idmsg.
+      ENDIF.
+      l_listado-idmsg = l_idmsg.
+      TRANSLATE l_idmsg TO UPPER CASE.
+
+      SELECT SINGLE * FROM zwhs_mensaje
+        INTO zwhs_mensaje
+       WHERE idmsg = l_idmsg.
+      IF sy-subrc NE 0.
+        l_listado-lights = zcl_ap_alv=>c_sem_rojo.
+        CONCATENATE 'No existe el tipo de mensaje' l_idmsg INTO l_listado-mensaje SEPARATED BY space.
+      ELSE.
+        IF zwhs_mensaje-hora_inicio_proc = ''. CLEAR zwhs_mensaje-hora_inicio_proc. ENDIF.
+        IF zwhs_mensaje-hora_fin_proc = ''. CLEAR zwhs_mensaje-hora_fin_proc. ENDIF.
+        IF NOT zwhs_mensaje-hora_inicio_proc IS INITIAL AND NOT zwhs_mensaje-hora_fin_proc IS INITIAL.
+          IF NOT ( sy-uzeit >= zwhs_mensaje-hora_inicio_proc AND sy-uzeit <= zwhs_mensaje-hora_fin_proc ).
+            l_listado-lights = zcl_ap_alv=>c_sem_ambar.
+            l_listado-mensaje = 'No se procesa mensaje por no estar en ventana de proceso'.
+          ENDIF.
+        ENDIF.
+
+        IF l_listado-lights IS INITIAL.
+          IF NOT zwhs_mensaje-func_val IS INITIAL.
+            CALL FUNCTION zwhs_mensaje-func_val
+              IMPORTING
+                error = l_listado-mensaje.
+            IF NOT l_listado-mensaje IS INITIAL.
+              l_listado-lights = zcl_ap_alv=>c_sem_rojo.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      IF l_listado-lights = zcl_ap_alv=>c_sem_rojo OR
+         l_listado-lights = zcl_ap_alv=>c_sem_ambar.
+        CLEAR l_listado-check.
+      ENDIF.
+
+      APPEND l_listado TO i_listado.
+    ENDLOOP.
+
+    SORT i_listado BY fecha_creacion hora fichero.
+
+
+  ENDMETHOD.                    "seleccionar_datos
+
+
+
+  METHOD listado.
+
+    CHECK sy-batch IS INITIAL. "EN fondo no imprimimos ALV
+
+    sgpi_texto( 'Generando informe' ).
+
+    o_alv->set_layout( p_vari ).
+
+    o_alv->show( ).
+
+  ENDMETHOD.                    "
+
+  METHOD leer_ficheros.
+    DATA: l_cont(7),
+          l_erroneos(7),
+          l_ok(7),
+          l_texto1 TYPE string,
+          l_texto2 TYPE string.
+
+    l_cont = 0.
+    LOOP AT i_listado ASSIGNING <listado> WHERE check = 'X'.
+      ADD 1 TO l_cont.
+    ENDLOOP.
+    MESSAGE s398(00) WITH 'Se van a procesar' l_cont 'mensajes en la cola'.
+
+    SORT i_listado BY fecha_fichero ASCENDING hora_fichero ASCENDING.
+
+    l_cont = 0.
+    LOOP AT i_listado ASSIGNING <listado> WHERE check = 'X' AND lights NE zcl_ap_alv=>c_sem_rojo.
+      sgpi_texto( texto1 = 'Procesando mensaje' texto2 = <listado>-idmsg texto3 = <listado>-idcola ).
+      l_texto1 = <listado>-fichero(40).
+      l_texto2 = <listado>-fichero+40.
+      o_prog->sgpi_texto( texto1 = 'Fichero:' texto2 = l_texto1 texto3 = l_texto2 ).
+      zwhs=>fichero_2_cola( EXPORTING ruta    = <listado>-fichero tcode = 'ZWHS_IN'
+                                      backup  = p_dird
+                                      idmsg   = <listado>-idmsg
+                                      fecha_fichero = <listado>-fecha_fichero
+                                      hora_fichero = <listado>-hora_fichero
+                            IMPORTING idcola  = <listado>-idcola
+                                      mensaje = <listado>-mensaje
+                                         ).
+      IF <listado>-idcola IS INITIAL.
+        o_prog->sgpi_texto( texto1 = 'Error:' texto2 = <listado>-mensaje(40) texto3 = <listado>-mensaje+40(40) ).
+        <listado>-lights = zcl_ap_alv=>c_sem_rojo.
+      ELSE.
+        o_prog->sgpi_texto( texto1 = 'Se ha creado cola:' texto2 = <listado>-idcola ).
+        IF p_cola IS INITIAL.
+          o_prog->sgpi_texto( texto1 = 'Procesando id.cola:' texto2 = <listado>-idcola ).
+          zwhs=>procesa_msg( EXPORTING idcola  = <listado>-idcola
+                                          tcode   = 'WHS_IN'
+                                IMPORTING mensaje = <listado>-mensaje ).
+          IF <listado>-mensaje IS INITIAL.
+            o_prog->sgpi_texto( texto1 = 'ID cola:' texto2 = <listado>-idcola texto3 = 'procesado con éxito' ).
+            ADD 1 TO l_ok.
+          ELSE.
+            o_prog->sgpi_texto( texto1 = 'Salida mensaje:' texto2 = <listado>-mensaje(40) texto3 = <listado>-mensaje+40(40) ).
+            ADD 1 TO l_erroneos.
+          ENDIF.
+          IF sy-batch IS INITIAL. "Esta línea es sólo para el listado interactivo, no queremos perder tiempo en batch
+            zwhs=>update_cola_mem( CHANGING monitor = <listado> ).
+          ENDIF.
+        ENDIF.
+        ADD 1 TO l_cont.
+      ENDIF.
+
+      sgpi_texto( texto1 = 'Fin proceso mensaje' texto2 = <listado>-idmsg texto3 = <listado>-idcola ).
+    ENDLOOP.
+    MESSAGE s398(00) WITH 'Se han generado' l_cont 'mensajes en la cola'.
+    IF NOT l_ok IS INITIAL.
+      MESSAGE s398(00) WITH 'Correctos' l_ok.
+    ENDIF.
+    IF NOT l_erroneos IS INITIAL.
+      MESSAGE s398(00) WITH 'Erróneos' l_erroneos.
+    ENDIF.
+
+  ENDMETHOD.                    "leer_ficheros
+
+
+  METHOD enviar_mail.
+    DATA: o_mail TYPE REF TO zcl_ap_envio_mail,
+           l_string TYPE string.
+
+    CREATE OBJECT o_mail.
+
+    o_mail->cabecera_html( ).
+
+    o_mail->add_parrafo_html( 'Se han producido errores en proceso mensajes de entrada' ).
+
+    o_mail->set_text( '<font size="2">' ).
+    o_mail->inicio_tabla_html( longitud = 1024
+                               c1 = 'NºCola'
+                               c2 = 'Tipo mensaje'
+                               c3 = 'Fichero'
+                               c4 = 'Descripción error' ).
+
+    LOOP AT i_list_mail ASSIGNING <listado>.
+      o_mail->add_fila_html( c1 = <listado>-idcola
+                             c2 = <listado>-idmsg
+                             c3 = <listado>-fichero
+                             c4 = <listado>-mensaje ).
+    ENDLOOP.
+
+    o_mail->fin_tabla_html( ).
+    o_mail->set_text( '</font>' ).
+    o_mail->set_text( '</body></html>' ).
+
+    CALL METHOD o_mail->envio_mail
+      EXPORTING
+        direccion = p_mail
+        subject   = 'Se han producido errores en proceso mensajes de entrada'
+        html      = 'X'.
+
+    o_mail->free( ).
+    CLEAR o_mail.
+
+  ENDMETHOD.                    "ENVIAR_MAIL
+ENDCLASS.                    "REPORT IMPLEMENTATION
+
+*----------------------------------------------------------------------*
+* INITIALIZATION
+*----------------------------------------------------------------------*
+INITIALIZATION.
+
+  CREATE OBJECT o_prog
+    EXPORTING
+      status        = 'INICIO'
+      get_nombre_pc = 'X'.
+
+  o_prog->initialization( EXPORTING nombre_pc = o_prog->nombre_pc CHANGING sscrfields = sscrfields ).
+
+  CREATE OBJECT o_alv
+    EXPORTING
+      status = 'STANDARD'
+      lights = 'LIGHTS'.
+  p_vari = o_alv->get_default_layout( ).
+
+  p_dir = zwhs_general=>get_ruta_in( idcliente = p_client ).
+
+AT SELECTION-SCREEN OUTPUT.
+
+  zcl_ap_dynpro=>screen_input( campo = 'P_DIR,P_DIRM' variable = p_dird variable_inv = 'X' ).
+  zcl_ap_dynpro=>screen_visible( group1 = 'EJE' variable = p_ejec  ).
+  IF p_dird = 'X'.
+    p_dir = zwhs_general=>get_ruta_in( idcliente = p_client ).
+
+    CLEAR p_dirm.
+    SELECT * FROM zwhs_mensaje
+     WHERE idcliente = p_client
+       AND e_s       = 'E'
+       AND ruta_mensaje NE ''.
+*      CONCATENATE zwhs_mensaje-idmsg zwhs_mensaje-ruta_mensaje INTO l_string SEPARATED BY ':'.
+*      zcl_ap_lista=>add( EXPORTING valor = l_string CHANGING lista = p_dirm ).
+      zcl_ap_lista=>add_lista( EXPORTING valor = zwhs_mensaje-idmsg subvalor = zwhs_mensaje-ruta_mensaje
+                               CHANGING  lista = p_dirm ).
+    ENDSELECT.
+
+    zcl_ap_dynpro=>screen_visible( group1 = 'DIR' variable = p_dir  input = '0' ).
+    zcl_ap_dynpro=>screen_visible( group1 = 'DIM' variable = p_dirm input = '0' ).
+
+  ENDIF.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_vari.
+
+  p_vari = o_alv->get_f4_layout( ).
+
+************************************************************************
+* AT SELECTION-SCREEN.
+************************************************************************
+AT SELECTION-SCREEN.
+
+  o_prog->at_selection(  ).
+
+
+  SELECT SINGLE * FROM zwhs_interlocuto
+   WHERE idcliente = p_client.
+  IF sy-subrc NE 0.
+    MESSAGE 'No existe el interlocutor' TYPE 'E'.
+  ENDIF.
+
+*----------------------------------------------------------------------
+* START-OF-SELECTION.
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  DATA: l_secs TYPE i,
+        l_fecha TYPE sy-datum,
+        l_hora TYPE sy-uzeit,
+        l_inicio TYPE sy-uzeit,
+        l_num_jobs TYPE i,
+        l_cprog TYPE sy-cprog,
+        l_intento TYPE i.
+
+  l_inicio = sy-uzeit.
+  l_fecha  = sy-datum.
+
+  IF p_client = 'WHS'.
+    l_num_jobs = zcl_ap_jobs=>num_job_activos( 'ZWHS_IN' ).
+  ELSEIF p_client = 'LAC'.
+    l_num_jobs = zcl_ap_jobs=>num_job_activos( 'ZWHS_IN_LAC' ).
+  ELSEIF p_client = 'SII'.
+    l_num_jobs = zcl_ap_jobs=>num_job_activos( 'ZSII_RECEPCION_RESPUESTAS' ).
+  ELSEIF p_client = 'TET'.
+    IF sy-slset = 'JOB_TETRA_PTS'.
+      l_num_jobs = zcl_ap_jobs=>num_job_activos( 'ZTETRA_IN_PTS' ).
+    ELSEIF sy-slset = 'JOB_TETRA'.
+      l_num_jobs = zcl_ap_jobs=>num_job_activos( 'ZTETRA_IN' ).
+    ENDIF.
+  ENDIF.
+  IF ( sy-batch = 'X' AND l_num_jobs > 1 ) OR
+     ( sy-batch = '' AND l_num_jobs > 0 ).
+    MESSAGE 'Saliendo debido a que hay otro job activo' TYPE 'I'.
+    STOP.
+  ENDIF.
+
+
+  IF p_ejec = 'X'.
+    IF zwhs_interlocuto-rec_msg_inm IS INITIAL.
+      CLEAR p_cola.
+      MESSAGE 'La recepción de msg. parada a nivel de interlocutor' TYPE 'W'.
+    ENDIF.
+  ELSE.
+    p_nint = 1.
+    p_secs = 0.
+    p_max  = 0.
+  ENDIF.
+
+  CONCATENATE sy-cprog p_client INTO l_cprog.
+  IF zcl_ap_utils=>bloquear_programa( cprog = l_cprog ) = 'X'.
+    MESSAGE 'Saliendo debido a que el programa ya se está ejecutando.' TYPE 'I'.
+    STOP.
+  ENDIF.
+
+
+
+  DO p_nint TIMES.
+    l_intento = sy-index.
+
+    l_secs = sy-uzeit - l_inicio.
+    o_prog->sgpi_texto( texto1 = 'Segundos desde inicio:' texto2 = l_secs ).
+    IF p_max NE 0 AND l_secs >= p_max.
+      o_prog->sgpi_texto( texto1 = 'Se ha superado el tiempo máximo de proceso' texto2 = p_max ).
+      EXIT.
+    ENDIF.
+
+    IF l_intento > 1.
+      IF sy-datum > l_fecha.
+        MESSAGE 'Saliendo por cambio de día' TYPE 'I'.
+        EXIT.
+      ELSE.
+        l_secs = sy-uzeit - l_hora.
+        IF l_secs >= 0.
+          o_prog->sgpi_texto( texto1 = 'Han transcurrido' texto2 = l_secs texto3 = 'segundos' ).
+          IF l_secs < p_secs.
+            l_secs = p_secs - l_secs.
+            o_prog->sgpi_texto( texto1 = 'Esperamos durante' texto2 = l_secs texto3 = 'segundos' ).
+            WAIT UP TO l_secs SECONDS.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    o_prog->sgpi_texto( texto1 = 'Proceso:' texto2 = sy-index ).
+    l_hora = sy-uzeit.
+    o_prog->main( ).
+
+
+  ENDDO.

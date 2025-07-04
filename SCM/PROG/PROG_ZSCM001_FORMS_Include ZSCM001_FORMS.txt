@@ -1,0 +1,1660 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZSCM001_FORMS
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  RECUPERAR_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM recuperar_datos.
+
+  DATA: lv_kunnr_f TYPE flag.
+
+  CLEAR: gt_alv1[].
+
+* Primero se recuperan los datos de la MCHB
+  SELECT werks lgort matnr charg clabs FROM mchb INTO CORRESPONDING FIELDS OF TABLE gt_alv1
+    WHERE werks IN s_werks
+      AND lgort IN s_lgort
+      AND matnr IN s_matnr
+      AND clabs NE 0.
+
+* Se añaden los datos de la MSKA
+  SELECT werks lgort matnr charg kalab AS clabs vbeln posnr FROM mska APPENDING CORRESPONDING FIELDS OF TABLE gt_alv1
+    WHERE werks IN s_werks
+      AND lgort IN s_lgort
+      AND matnr IN s_matnr
+      AND kalab NE 0.
+
+* Se filtra por pendientes de regularizar si se ha marcado
+  IF p_pend IS NOT INITIAL.
+    DELETE gt_alv1 WHERE charg(1) EQ 'R' OR charg+1(1) EQ 'R'.
+  ENDIF.
+
+  IF gt_alv1[] IS NOT INITIAL.
+    SELECT * FROM makt INTO TABLE @DATA(lt_makt)
+      FOR ALL ENTRIES IN @gt_alv1
+      WHERE matnr EQ @gt_alv1-matnr
+        AND spras EQ 'S'.
+
+    SELECT m~werks,m~matnr,y~prole,y~prowi,y~prohe
+      FROM marc AS m INNER JOIN yhp_idx_td100 AS y ON m~cuobj = y~cuobj
+      FOR ALL ENTRIES IN @gt_alv1
+      WHERE m~matnr EQ @gt_alv1-matnr
+        AND m~werks EQ @gt_alv1-werks
+      INTO TABLE @DATA(lt_marcy).
+
+*    SELECT werks,matnr,charg,zzkunnr FROM mcha
+*      FOR ALL ENTRIES IN @gt_alv1
+*      WHERE werks = @gt_alv1-werks
+*        AND matnr = @gt_alv1-matnr
+*        AND charg = @gt_alv1-charg
+*      INTO TABLE @DATA(lt_mcha).
+    SELECT matnr,charg,zzkunnr,zzbstkd,zzposnr FROM mch1
+      FOR ALL ENTRIES IN @gt_alv1
+      WHERE matnr = @gt_alv1-matnr
+        AND charg = @gt_alv1-charg
+      INTO TABLE @DATA(lt_mch1).
+
+    IF lt_mch1[] IS NOT INITIAL.
+      SELECT kunnr, name1 INTO TABLE @DATA(it_kna1)
+        FROM kna1
+        FOR ALL ENTRIES IN @lt_mch1
+        WHERE kunnr = @lt_mch1-zzkunnr.
+    ENDIF.
+
+    SELECT matnr,meins FROM mara
+      INTO TABLE @DATA(lt_mara)
+      FOR ALL ENTRIES IN @gt_alv1
+      WHERE matnr EQ @gt_alv1-matnr.
+
+
+  ENDIF.
+
+  LOOP AT gt_alv1 ASSIGNING FIELD-SYMBOL(<fs_alv1>).
+    READ TABLE lt_makt INTO DATA(ls_makt) WITH KEY matnr = <fs_alv1>-matnr.
+    IF sy-subrc EQ 0.
+      <fs_alv1>-maktx = ls_makt-maktx.
+    ENDIF.
+
+    READ TABLE lt_marcy INTO DATA(ls_marcy) WITH KEY werks = <fs_alv1>-werks matnr = <fs_alv1>-matnr.
+    IF sy-subrc EQ 0.
+      <fs_alv1>-prole = ls_marcy-prole.
+      <fs_alv1>-prowi = ls_marcy-prowi.
+      <fs_alv1>-prohe = ls_marcy-prohe.
+    ENDIF.
+
+*    READ TABLE lt_mcha INTO DATA(ls_mcha) WITH KEY werks = <fs_alv1>-werks matnr = <fs_alv1>-matnr charg = <fs_alv1>-charg.
+*    IF sy-subrc EQ 0.
+*      <fs_alv1>-zzkunnr = ls_mcha-zzkunnr.
+*    ENDIF.
+    READ TABLE lt_mch1 INTO DATA(ls_mch1) WITH KEY matnr = <fs_alv1>-matnr charg = <fs_alv1>-charg.
+    IF sy-subrc EQ 0.
+      <fs_alv1>-zzkunnr = ls_mch1-zzkunnr.
+      <fs_alv1>-vbeln = ls_mch1-zzbstkd.
+      <fs_alv1>-posnr = ls_mch1-zzposnr.
+      READ TABLE it_kna1 INTO DATA(ls_kna1) WITH KEY kunnr = ls_mch1-zzkunnr.
+      IF sy-subrc = 0.
+        <fs_alv1>-name1 = ls_kna1-name1.
+      ENDIF.
+    ENDIF.
+
+    READ TABLE lt_mara INTO DATA(ls_mara) WITH KEY matnr = <fs_alv1>-matnr.
+    IF sy-subrc EQ 0.
+      <fs_alv1>-meins = ls_mara-meins.
+    ENDIF.
+
+    CALL FUNCTION 'ZUI5_CM_STATUS_LOTE'
+      EXPORTING
+        i_werks       = <fs_alv1>-werks
+        i_lgort       = <fs_alv1>-lgort
+        i_charg       = <fs_alv1>-charg
+      IMPORTING
+        o_status      = <fs_alv1>-status
+        o_status_text = <fs_alv1>-status_text.
+
+    IF <fs_alv1>-vbeln IS NOT INITIAL AND <fs_alv1>-posnr IS NOT INITIAL.
+      PERFORM calc_tarifas USING ' ' CHANGING lv_kunnr_f <fs_alv1>.
+    ENDIF.
+
+  ENDLOOP.
+
+* Se filtra el resultado por cliente, si se ha indicado en la pantalla de selección
+  IF s_kunnr[] IS NOT INITIAL.
+    DELETE gt_alv1 WHERE zzkunnr NOT IN s_kunnr.
+    DELETE gt_alv2 WHERE zzkunnr NOT IN s_kunnr.
+  ENDIF.
+
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form HANDLE_TOOLBAR
+*&---------------------------------------------------------------------*
+* text
+*----------------------------------------------------------------------*
+* -->P_E_OBJECT text
+*----------------------------------------------------------------------*
+FORM handle_toolbar USING i_object TYPE REF TO cl_alv_event_toolbar_set.
+
+  DATA: ls_toolbar TYPE stb_button.
+
+  CLEAR ls_toolbar.
+  MOVE 'ADD' TO ls_toolbar-function.
+  MOVE icon_next_object TO ls_toolbar-icon.
+  MOVE 'Añadir' TO ls_toolbar-text.
+  MOVE 'Añadir a pedido' TO ls_toolbar-quickinfo.
+  MOVE ' ' TO ls_toolbar-disabled.
+  APPEND ls_toolbar TO i_object->mt_toolbar.
+
+  IF p_todo = 'X'.
+    CLEAR ls_toolbar.
+    MOVE 'ANUL' TO ls_toolbar-function.
+    MOVE icon_previous_object TO ls_toolbar-icon.
+    MOVE 'Anular' TO ls_toolbar-text.
+    MOVE 'Anular Reg.' TO ls_toolbar-quickinfo.
+    MOVE ' ' TO ls_toolbar-disabled.
+    APPEND ls_toolbar TO i_object->mt_toolbar.
+  ENDIF.
+
+ENDFORM. " HANDLE_TOOLBAR
+
+*&---------------------------------------------------------------------*
+*&      Form  HANDLE_TOOLBAR2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_E_OBJECT  text
+*----------------------------------------------------------------------*
+FORM handle_toolbar2 USING i_object TYPE REF TO cl_alv_event_toolbar_set.
+
+  DATA: ls_toolbar TYPE stb_button.
+
+  CLEAR ls_toolbar.
+  MOVE 'CREAR' TO ls_toolbar-function.
+  MOVE icon_create TO ls_toolbar-icon.
+  MOVE 'Crear Ped.Reg.' TO ls_toolbar-text.
+  MOVE 'Crear pedido regulación' TO ls_toolbar-quickinfo.
+  MOVE ' ' TO ls_toolbar-disabled.
+  APPEND ls_toolbar TO i_object->mt_toolbar.
+
+  CLEAR ls_toolbar.
+  MOVE 'SAVE' TO ls_toolbar-function.
+  MOVE icon_system_save TO ls_toolbar-icon.
+  MOVE 'Guardar Ped.Reg.' TO ls_toolbar-text.
+  MOVE 'Guardar pedido regulación' TO ls_toolbar-quickinfo.
+  MOVE ' ' TO ls_toolbar-disabled.
+  APPEND ls_toolbar TO i_object->mt_toolbar.
+
+  CLEAR ls_toolbar.
+  MOVE 'CLEAR' TO ls_toolbar-function.
+  MOVE icon_delete TO ls_toolbar-icon.
+  MOVE 'Eliminar Ped.Reg.' TO ls_toolbar-text.
+  MOVE 'Eliminar pedido regulación' TO ls_toolbar-quickinfo.
+  MOVE ' ' TO ls_toolbar-disabled.
+  APPEND ls_toolbar TO i_object->mt_toolbar.
+
+  CLEAR ls_toolbar.
+  MOVE 'DEL' TO ls_toolbar-function.
+  MOVE icon_incomplete TO ls_toolbar-icon.
+  MOVE 'Eliminar' TO ls_toolbar-text.
+  MOVE 'Eliminar del pedido' TO ls_toolbar-quickinfo.
+  MOVE ' ' TO ls_toolbar-disabled.
+  APPEND ls_toolbar TO i_object->mt_toolbar.
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form HANDLE_USER_COMMAND
+*&---------------------------------------------------------------------*
+* text
+*----------------------------------------------------------------------*
+* -->P_E_UCOMM text
+*----------------------------------------------------------------------*
+FORM handle_user_command USING i_ucomm TYPE syucomm.
+
+  DATA: lt_rows      TYPE lvc_t_row,
+        ls_konp      TYPE konp,
+        lv_kunnr_f   TYPE flag,
+        lv_quest     TYPE string,
+        lv_answer(1) TYPE c.
+
+
+  CASE i_ucomm.
+
+
+    WHEN 'ANUL'.
+
+      lv_quest = 'Seguro que desea anular el pedido de regularización de stock?'.
+
+      CALL FUNCTION 'POPUP_TO_CONFIRM'
+        EXPORTING
+          text_question         = lv_quest
+          display_cancel_button = ' '
+        IMPORTING
+          answer                = lv_answer
+        EXCEPTIONS
+          text_not_found        = 1
+          OTHERS                = 2.
+
+      IF lv_answer = '1'.
+        PERFORM anular_reg.
+      ENDIF.
+
+    WHEN 'ADD'.
+
+      IF gv_kunnr IS INITIAL OR gv_kunnr IS INITIAL OR gv_lgort IS INITIAL.
+        MESSAGE 'Debe crear un pedido antes de añadir posiciones.' TYPE 'I'.
+        EXIT.
+      ENDIF.
+
+      CALL METHOD grid1->get_selected_rows
+        IMPORTING
+          et_index_rows = lt_rows.
+
+      CLEAR lv_kunnr_f.
+      LOOP AT lt_rows INTO DATA(ls_rows).
+        CLEAR: ls_alv1, ls_alv2.
+        READ TABLE gt_alv1 INTO ls_alv1 INDEX ls_rows-index.
+
+        " con la info de la linea se muestra pantalla para pedir cantidad y se pasa al ALV de abajo primero rellenando los datos que flatan del ALV de abajo.
+*        CALL SCREEN '9200' STARTING AT 2 2.
+
+*        IF gv_clabs IS NOT INITIAL AND gv_clabs LE ls_alv1-clabs.
+        MOVE-CORRESPONDING ls_alv1 TO ls_alv2.
+*          ls_alv2-clabs = gv_clabs.
+
+        PERFORM calc_tarifas USING 'X' CHANGING lv_kunnr_f ls_alv2.
+
+*        IF lv_kunnr_f IS INITIAL.
+        APPEND ls_alv2 TO gt_alv2.
+*        ENDIF.
+
+*        ELSE.
+*          MESSAGE 'La cantidad introducida no puede ser mayor que la existente.' TYPE 'I'.
+*          CLEAR gv_clabs.
+*        ENDIF.
+
+
+      ENDLOOP.
+
+      gv_kunnr = |{ gv_kunnr ALPHA = OUT }|.
+
+      PERFORM refresh_alvs.
+
+      IF lv_kunnr_f = 'X'.  "VRS 11.06.2024
+        MESSAGE 'El lote seleccionado está reservado para otro cliente' TYPE 'I'.
+      ENDIF.
+
+    WHEN OTHERS.
+  ENDCASE.
+
+ENDFORM. " HANDLE_USER_COMMAND
+
+*&---------------------------------------------------------------------*
+*&      Form  HANDLE_USER_COMMAND2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_E_UCOMM  text
+*----------------------------------------------------------------------*
+FORM handle_user_command2 USING i_ucomm TYPE syucomm.
+
+  DATA: lt_rows TYPE lvc_t_row.
+
+  CASE i_ucomm.
+    WHEN 'CREAR'.
+
+      IF gv_werks IS NOT INITIAL AND gv_lgort IS NOT INITIAL AND gv_kunnr IS NOT INITIAL.
+        MESSAGE 'Pedido en curso.' TYPE 'I'.
+      ELSE.
+        CALL SCREEN '9100' STARTING AT 2 2.
+        PERFORM refresh_alvs. "VRS 12.06.2024
+      ENDIF.
+
+    WHEN 'SAVE'.
+
+      PERFORM crear_pedido.
+
+    WHEN 'CLEAR'.
+
+      CLEAR: gv_werks, gv_lgort, gv_kunnr, gv_clabs, gt_alv2[].
+      PERFORM recuperar_datos.
+      PERFORM refresh_alvs.
+      MESSAGE 'Pedido eliminado.' TYPE 'S'.
+
+    WHEN 'DEL'.
+
+      CLEAR: ls_alv1, ls_alv2.
+
+      CALL METHOD grid2->get_selected_rows
+        IMPORTING
+          et_index_rows = lt_rows.
+
+      LOOP AT lt_rows INTO DATA(ls_rows).
+        DELETE gt_alv2 INDEX ls_rows-index.
+      ENDLOOP.
+
+      PERFORM recuperar_datos.
+      PERFORM refresh_alvs.
+
+  ENDCASE.
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CARGAR_ALVS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM cargar_alvs.
+
+  DATA: x_stbl TYPE lvc_s_stbl.
+  x_stbl-row = abap_true.
+  x_stbl-col = abap_true.
+
+  SET PF-STATUS 'STANDARD'.
+
+  DATA: ls_layout   TYPE lvc_s_layo,
+        ls_variant  TYPE disvariant,
+        ls_layout2  TYPE lvc_s_layo,
+        ls_variant2 TYPE disvariant.
+
+*  SET PF-STATUS 'TEST'.
+
+  CREATE OBJECT container
+    EXPORTING
+      container_name = 'CONTENEDOR'.
+
+  CREATE OBJECT splitter1
+    EXPORTING
+      parent  = container
+      rows    = 2
+      columns = 1.
+
+  CALL METHOD splitter1->get_container
+    EXPORTING
+      row       = 1
+      column    = 1
+    RECEIVING
+      container = container1.
+
+  CALL METHOD splitter1->get_container
+    EXPORTING
+      row       = 2
+      column    = 1
+    RECEIVING
+      container = container2.
+
+* ----------------------------------------------
+
+  IF grid1 IS INITIAL.
+
+    CREATE OBJECT grid1
+      EXPORTING
+        i_parent = container1.
+
+    CLEAR: ls_layout, ls_variant.
+
+    PERFORM preparefieldcatalog1 CHANGING it_fieldcat1.
+
+    ls_variant-report = sy-repid.
+
+    ls_layout-zebra           = 'X'.
+    ls_layout-cwidth_opt      = 'X'.
+    ls_layout-sel_mode        = 'X'.
+*  ls_layout-box_fname       = 'SEL'.
+    ls_layout-grid_title      = 'Listado de stocks'.
+*  ls_layout-info_fname      = 'COLOR_LINE'.
+*  ls_layout-ctab_fname      = 'COLOR_CELL'.
+*  ls_layout-stylefname      = 'CELLTAB'.
+
+    CALL METHOD grid1->set_table_for_first_display
+      EXPORTING
+        i_structure_name = 'ZSCM001_ALV2'     "VRS 25.06.2024: Antes 'ZSCM001_ALV1'
+        is_layout        = ls_layout
+        is_variant       = ls_variant
+        i_save           = 'A'
+      CHANGING
+        it_outtab        = gt_alv1
+        it_fieldcatalog  = it_fieldcat1.
+
+    CREATE OBJECT gr_event_handler .
+    SET HANDLER gr_event_handler->handle_toolbar FOR grid1.
+    SET HANDLER gr_event_handler->handle_user_command FOR grid1.
+    SET HANDLER gr_event_handler->hotspot_click FOR grid1.
+
+    CALL METHOD grid1->set_ready_for_input
+      EXPORTING
+        i_ready_for_input = 1.
+
+  ELSE.
+    CALL METHOD grid1->refresh_table_display
+      EXPORTING
+        is_stable = x_stbl.
+  ENDIF.
+* ----------------------------------------------
+*  IF gv_werks IS NOT INITIAL AND gv_lgort IS NOT INITIAL AND gv_kunnr IS NOT INITIAL.
+  IF grid2 IS INITIAL.
+
+    CREATE OBJECT grid2
+      EXPORTING
+        i_parent = container2.
+
+    CLEAR: ls_layout2, ls_variant2.
+
+    ls_variant2-report = sy-repid.
+
+    ls_layout2-zebra = 'X'.
+    ls_layout2-cwidth_opt = 'X'.
+    ls_layout2-sel_mode = 'X'.
+    ls_layout2-grid_title = 'Sin datos para pedido de regularización'.
+
+    CALL METHOD grid2->set_table_for_first_display
+      EXPORTING
+        i_structure_name = 'ZSCM001_ALV2'
+        is_layout        = ls_layout2
+        is_variant       = ls_variant2
+        i_save           = 'A'
+      CHANGING
+        it_outtab        = gt_alv2.
+
+    CREATE OBJECT gr_event_handler2.
+    SET HANDLER gr_event_handler2->handle_toolbar2 FOR grid2.
+    SET HANDLER gr_event_handler2->handle_user_command2 FOR grid2.
+
+    CALL METHOD grid2->set_ready_for_input
+      EXPORTING
+        i_ready_for_input = 1.
+
+  ELSE.
+    CALL METHOD grid2->refresh_table_display
+      EXPORTING
+        is_stable = x_stbl.
+  ENDIF.
+*  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  REFRESH_ALVS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM refresh_alvs.
+
+  DATA: x_stbl     TYPE lvc_s_stbl,
+        ls_layout2 TYPE lvc_s_layo.
+  x_stbl-row = abap_true.
+  x_stbl-col = abap_true.
+
+  "Antes de actualizar se eliminan del ALV1 los registros del ALV2
+  LOOP AT gt_alv2 INTO ls_alv2.
+    DELETE gt_alv1 WHERE matnr EQ ls_alv2-matnr AND charg EQ ls_alv2-charg AND clabs EQ ls_alv2-clabs.
+  ENDLOOP.
+
+  IF grid1 IS NOT INITIAL.
+    CALL METHOD grid1->refresh_table_display
+      EXPORTING
+        is_stable = x_stbl.
+  ENDIF.
+
+  IF grid2 IS NOT INITIAL.
+
+    IF gv_werks IS NOT INITIAL AND gv_lgort IS NOT INITIAL AND gv_kunnr IS NOT INITIAL.
+      ls_layout2-zebra = 'X'.
+      ls_layout2-cwidth_opt = 'X'.
+      ls_layout2-sel_mode = 'X'.
+      CONCATENATE 'Pedido de regularización: Centro' gv_werks '| Almacen' gv_lgort '| Cliente' gv_kunnr
+          INTO ls_layout2-grid_title SEPARATED BY space.
+
+      CALL METHOD grid2->set_frontend_layout
+        EXPORTING
+          is_layout = ls_layout2.
+    ELSE.
+      ls_layout2-zebra = 'X'.
+      ls_layout2-cwidth_opt = 'X'.
+      ls_layout2-sel_mode = 'X'.
+      ls_layout2-grid_title = 'Sin datos para pedido de regularización'.
+
+      CALL METHOD grid2->set_frontend_layout
+        EXPORTING
+          is_layout = ls_layout2.
+    ENDIF.
+
+    CALL METHOD grid2->refresh_table_display
+      EXPORTING
+        is_stable = x_stbl.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_PEDIDO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_pedido.
+
+  CHECK gv_werks IS NOT INITIAL AND gv_lgort IS NOT INITIAL AND gv_kunnr IS NOT INITIAL AND gt_alv2[] IS NOT INITIAL.
+
+  DATA: lv_order_header_in     TYPE bapisdhd1,
+        lt_order_partners      TYPE TABLE OF bapiparnr,
+        lt_order_items_in      TYPE TABLE OF bapisditm,
+        ls_order_items_in      TYPE bapisditm,
+        lt_order_schedules_in  TYPE TABLE OF bapischdl,
+        lt_order_conditions_in TYPE TABLE OF bapicond,
+        lt_extensionin         TYPE TABLE OF bapiparex,
+        ls_extensionin         TYPE bapiparex,
+        wl_vbape               TYPE bape_vbap,
+        wl_vbapex              TYPE bape_vbapx,
+        ls_bape_vbap           TYPE bape_vbap,
+        ls_bape_vbapx          TYPE bape_vbapx,
+        lv_salesdocument       TYPE bapivbeln-vbeln,
+        lt_return              TYPE TABLE OF bapiret2,
+        lv_itm_number          TYPE bapisditm-itm_number,
+        lv_kunnr               TYPE kunnr.
+
+  DATA: ls_log_header TYPE bal_s_log,
+        lt_log_handle TYPE bal_t_logh,
+        lv_text(100)  TYPE c.
+
+  REFRESH gt_matdoc[].
+
+  FIELD-SYMBOLS: <fs_extin> TYPE bapiparex.
+
+  CLEAR ls_log_header.
+  ls_log_header-object    = 'ZSCM001'.
+  ls_log_header-subobject = 'ZSCM001'.
+  ls_log_header-aldate    = sy-datum.
+  ls_log_header-altime    = sy-uzeit.
+  ls_log_header-aluser    = sy-uname.
+  ls_log_header-altcode   = sy-tcode.
+  ls_log_header-alprog    = sy-repid.
+
+  CALL FUNCTION 'BAL_LOG_REFRESH'
+    EXPORTING
+      i_log_handle  = gv_log_handle
+    EXCEPTIONS
+      log_not_found = 1
+      OTHERS        = 2.
+
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log                 = ls_log_header
+    IMPORTING
+      e_log_handle            = gv_log_handle
+    EXCEPTIONS
+      log_header_inconsistent = 1
+      OTHERS                  = 2.
+
+  CLEAR lv_text.
+  lv_text = 'Creación de pedido:'.
+  CALL FUNCTION 'BAL_LOG_MSG_ADD_FREE_TEXT'
+    EXPORTING
+      i_log_handle     = gv_log_handle
+      i_msgty          = 'S'
+      i_probclass      = '1'
+      i_text           = lv_text
+    EXCEPTIONS
+      log_not_found    = 1
+      msg_inconsistent = 2
+      log_is_full      = 3
+      OTHERS           = 4.
+  CLEAR lv_text.
+  CONCATENATE 'Centro' gv_werks INTO lv_text SEPARATED BY space.
+  CALL FUNCTION 'BAL_LOG_MSG_ADD_FREE_TEXT'
+    EXPORTING
+      i_log_handle     = gv_log_handle
+      i_msgty          = 'S'
+      i_probclass      = '1'
+      i_text           = lv_text
+    EXCEPTIONS
+      log_not_found    = 1
+      msg_inconsistent = 2
+      log_is_full      = 3
+      OTHERS           = 4.
+  CLEAR lv_text.
+  CONCATENATE 'Almacén' gv_lgort INTO lv_text SEPARATED BY space.
+  CALL FUNCTION 'BAL_LOG_MSG_ADD_FREE_TEXT'
+    EXPORTING
+      i_log_handle     = gv_log_handle
+      i_msgty          = 'S'
+      i_probclass      = '1'
+      i_text           = lv_text
+    EXCEPTIONS
+      log_not_found    = 1
+      msg_inconsistent = 2
+      log_is_full      = 3
+      OTHERS           = 4.
+
+  CLEAR: lv_order_header_in, lt_order_partners[], lt_order_items_in[], lv_itm_number, lv_salesdocument, lt_return[].
+
+  "Cabecera.
+  lv_order_header_in-sales_org  = p_vkorg.
+  lv_order_header_in-distr_chan = '10'.
+  lv_order_header_in-division   = '10'.
+  lv_order_header_in-purch_no_c = 'FACTURACIÓN DE EXISTENCIAS'.
+  lv_order_header_in-req_date_h = sy-datum.
+  lv_order_header_in-doc_type   = 'ZTF1'.
+
+  "Interlocutores
+  lv_kunnr = |{ gv_kunnr ALPHA = IN }|.
+  lt_order_partners = VALUE #( ( partn_role = 'AG' partn_numb = lv_kunnr )
+                                 ( partn_role = 'WE' partn_numb = lv_kunnr )
+                                 ( partn_role = 'RE' partn_numb = lv_kunnr ) ).
+
+  "Obtenemos la Condición de expedición
+  READ TABLE gt_alv2 INTO ls_alv2 INDEX 1.
+  SELECT SINGLE * FROM tvstz
+    INTO @DATA(ls_tvstz)
+    WHERE werks = @ls_alv2-werks
+    AND vsbed LIKE 'Y%'
+    AND ( vstel = @ls_alv2-lgort OR vste1 = @ls_alv2-lgort OR vste2 = @ls_alv2-lgort OR vste3 = @ls_alv2-lgort OR
+          vste4 = @ls_alv2-lgort OR vste5 = @ls_alv2-lgort OR vste6 = @ls_alv2-lgort OR vste7 = @ls_alv2-lgort OR
+          vste8 = @ls_alv2-lgort OR vste9 = @ls_alv2-lgort OR vste10 = @ls_alv2-lgort OR vste11 = @ls_alv2-lgort ).
+  IF sy-subrc = 0.
+    lv_order_header_in-ship_cond =  ls_tvstz-vsbed.
+*    order_header_inx-ship_cond = 'X'.
+  ENDIF.
+
+  "Posiciones
+  LOOP AT gt_alv2 INTO ls_alv2.
+    CLEAR ls_order_items_in.
+    ADD 10 TO lv_itm_number.
+    ls_order_items_in-itm_number = lv_itm_number.
+    ls_order_items_in-material = ls_alv2-matnr.
+    ls_order_items_in-plant = ls_alv2-werks.
+    ls_order_items_in-store_loc = ls_alv2-lgort.
+    ls_order_items_in-ship_point = ls_alv2-lgort.
+    ls_order_items_in-target_qty = ls_alv2-clabs.
+    ls_order_items_in-target_qu = ls_alv2-meins.
+    PERFORM regularizar USING ls_alv2 CHANGING ls_order_items_in-batch.
+*    ls_order_items_in-val_type = 'SINVALOR'.
+*    ls_order_items_in-batch = ls_alv2-charg.
+    ls_order_items_in-ref_doc = ls_alv2-vbeln.
+    ls_order_items_in-ref_doc_it = ls_alv2-posnr.
+    ls_order_items_in-ref_doc_ca = 'B'.
+    APPEND ls_order_items_in TO lt_order_items_in.
+
+    " Se rellena tabién el campo Z
+    CLEAR: wl_vbape, wl_vbapex, ls_extensionin.
+    wl_vbape-posnr = lv_itm_number.
+    wl_vbape-zzmontaje = 'X'.
+    wl_vbapex-posnr = lv_itm_number.
+    wl_vbapex-zzmontaje = 'X'.
+
+    APPEND INITIAL LINE TO lt_extensionin ASSIGNING <fs_extin>.
+    <fs_extin>-structure = 'BAPE_VBAP'.
+    cl_abap_container_utilities=>fill_container_c( EXPORTING im_value  = wl_vbape
+                                                   IMPORTING ex_container = <fs_extin>+30 ).
+
+    APPEND INITIAL LINE TO lt_extensionin ASSIGNING <fs_extin>.
+    <fs_extin>-structure = 'BAPE_VBAPX'.
+    cl_abap_container_utilities=>fill_container_c( EXPORTING im_value  = wl_vbapex
+                                                   IMPORTING ex_container = <fs_extin>+30 ).
+  ENDLOOP.
+
+  CHECK lt_order_items_in[] IS NOT INITIAL.
+
+  CALL FUNCTION 'BAPI_SALESORDER_CREATEFROMDAT2'
+    EXPORTING
+      order_header_in     = lv_order_header_in
+    IMPORTING
+      salesdocument       = lv_salesdocument
+    TABLES
+      return              = lt_return
+      order_items_in      = lt_order_items_in
+*     order_schedules_in  = lt_order_schedules_in
+      order_conditions_in = lt_order_conditions_in
+      order_partners      = lt_order_partners
+      extensionin         = lt_extensionin.
+
+  LOOP AT lt_return TRANSPORTING NO FIELDS WHERE type CA 'EA'.
+    EXIT.
+  ENDLOOP.
+  IF sy-subrc EQ 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    READ TABLE lt_return INTO DATA(ls_return) WITH KEY type = 'E'.
+*    MESSAGE ls_return-message TYPE 'I'.
+
+    CLEAR lv_text.
+    lv_text = ls_return-message.
+    CALL FUNCTION 'BAL_LOG_MSG_ADD_FREE_TEXT'
+      EXPORTING
+        i_log_handle     = gv_log_handle
+        i_msgty          = 'E'
+        i_probclass      = '1'
+        i_text           = lv_text
+      EXCEPTIONS
+        log_not_found    = 1
+        msg_inconsistent = 2
+        log_is_full      = 3
+        OTHERS           = 4.
+
+    CLEAR lv_text.
+    lv_text = 'No se ha creado el pedido.'.   "VRS 27.11.2024
+    CALL FUNCTION 'BAL_LOG_MSG_ADD_FREE_TEXT'
+      EXPORTING
+        i_log_handle     = gv_log_handle
+        i_msgty          = 'E'
+        i_probclass      = '1'
+        i_text           = lv_text
+      EXCEPTIONS
+        log_not_found    = 1
+        msg_inconsistent = 2
+        log_is_full      = 3
+        OTHERS           = 4.
+
+    PERFORM anular_matdoc TABLES lt_order_items_in.   "VRS 27.11.2024
+
+    CLEAR: gt_alv2[].
+    PERFORM recuperar_datos.
+    PERFORM refresh_alvs.
+  ELSE.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'   "VRS 19.09.2024
+      EXPORTING
+        wait = 'X'.
+
+    " Si ha ido bien, se informan pedido, posicion y deudor en la MCH1
+    LOOP AT lt_order_items_in INTO ls_order_items_in.
+      UPDATE mch1 SET zzkunnr = lv_kunnr    "gv_kunnr
+                      zzbstkd = lv_salesdocument
+                      zzposnr = ls_order_items_in-itm_number
+        WHERE matnr EQ ls_order_items_in-material
+          AND charg EQ ls_order_items_in-batch.
+    ENDLOOP.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+    WAIT UP TO 1 SECONDS.
+    CONCATENATE 'Pedido de regularizacion' lv_salesdocument 'creado' INTO DATA(lv_mess) SEPARATED BY space.
+*    MESSAGE lv_mess TYPE 'I'.
+
+    CLEAR lv_text.
+    lv_text = lv_mess.
+    CALL FUNCTION 'BAL_LOG_MSG_ADD_FREE_TEXT'
+      EXPORTING
+        i_log_handle     = gv_log_handle
+        i_msgty          = 'S'
+        i_probclass      = '1'
+        i_text           = lv_text
+      EXCEPTIONS
+        log_not_found    = 1
+        msg_inconsistent = 2
+        log_is_full      = 3
+        OTHERS           = 4.
+
+    CLEAR: gv_werks, gv_lgort, gv_kunnr, gv_clabs, gt_alv1[], gt_alv2[].
+    PERFORM recuperar_datos.
+    PERFORM refresh_alvs.
+  ENDIF.
+
+  CLEAR lt_log_handle[].
+  APPEND gv_log_handle TO lt_log_handle.
+
+  CALL FUNCTION 'BAL_DB_SAVE'
+    EXPORTING
+      i_client         = sy-mandt
+      i_in_update_task = ''
+      i_save_all       = ''
+      i_t_log_handle   = lt_log_handle
+    EXCEPTIONS
+      log_not_found    = 1
+      save_not_allowed = 2
+      numbering_error  = 3
+      OTHERS           = 4.
+
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+    EXPORTING
+      wait = 'X'.
+
+  DATA: l_s_display_profile TYPE bal_s_prof.
+
+  CALL FUNCTION 'BAL_DSP_PROFILE_POPUP_GET'
+    IMPORTING
+      e_s_display_profile = l_s_display_profile
+    EXCEPTIONS
+      OTHERS              = 1.
+
+  l_s_display_profile-disvariant-report = sy-repid.
+  l_s_display_profile-disvariant-handle = 'LOG'.
+
+  CALL FUNCTION 'BAL_DSP_LOG_DISPLAY'
+    EXPORTING
+      i_s_display_profile = l_s_display_profile
+    EXCEPTIONS
+      OTHERS              = 1.
+
+*  CALL FUNCTION 'BAL_DSP_LOG_DISPLAY'
+*    EXPORTING
+*      i_t_log_handle = lt_log_handle
+*      i_amodal       = 'X'
+*    EXCEPTIONS
+*      OTHERS         = 1.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  REGULARIZAR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM regularizar USING ls_alv TYPE zscm001_alv2
+              CHANGING p_charg TYPE charg_d.
+
+*  LOOP AT gt_alv2 INTO ls_alv2.
+
+  IF ls_alv-charg(1) EQ 'R' OR ls_alv-charg+1(1) EQ 'R'.
+    " Se comprueba si existe el lote regularizado en 2D y en 3D
+    SELECT SINGLE * FROM mch1 INTO @DATA(ls_mch1) WHERE charg EQ @ls_alv-charg.
+    IF sy-subrc EQ 0.
+      p_charg = ls_alv-charg.
+    ELSE.
+      PERFORM crear_lote USING ls_alv 'R' CHANGING p_charg.
+    ENDIF.
+  ELSE.
+    PERFORM crear_lote USING ls_alv ' ' CHANGING p_charg.
+  ENDIF.
+
+*  ENDLOOP.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_LOTE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_lote USING ls_alv TYPE zscm001_alv2
+                      ls_type
+             CHANGING p_charg TYPE charg_d.
+
+  DATA: lt_return        TYPE bapiret2_t,
+        lt_return_temp   TYPE bapiret2_t,
+        goodsmvt_header  TYPE  bapi2017_gm_head_01,
+        lv_charg_2d      TYPE charg_d,
+        lv_charg_3d      TYPE charg_d,
+*        lv_charg_c       TYPE charg_d,
+        goodsmvt_code    TYPE  bapi2017_gm_code,
+        goodsmvt_item    TYPE TABLE OF  bapi2017_gm_item_create,
+        objectkeynew     TYPE  bapi1003_key-object,
+        objecttablenew   TYPE  bapi1003_key-objecttable,
+        classnumnew      TYPE  bapi1003_key-classnum,
+        classtypenew     TYPE  bapi1003_key-classtype,
+        classif_status   TYPE  bapi1003_key-status,
+        materialdocument TYPE  bapi2017_gm_head_ret-mat_doc,
+        matdocumentyear  TYPE  bapi2017_gm_head_ret-doc_year,
+        batch            TYPE  bapibatchkey-batch,
+        batchattributes  TYPE  bapibatchatt,
+        extension1       TYPE  bapibncomz,
+        ls_stock         TYPE  zui5s_cm_stock,
+        v_status         TYPE zui5_cm_sm_status,
+        wa_stock         TYPE zui5s_cm_stock,
+        wa_matdoc        TYPE ty_matdoc.
+
+  DATA: wa_headdata   TYPE bapimathead,
+        wa_valuation  TYPE bapi_mbew,
+        wa_valuationx TYPE bapi_mbewx,
+        wa_ret        TYPE bapiret2,
+        lv_af         TYPE aufnr.
+
+  DATA: r_charg TYPE RANGE OF charg_d,
+        lv_val  TYPE bwtar_d.
+
+  " Obtenemos la información del lote 2D.
+  CALL FUNCTION 'ZUI5_CM_STOCK'
+    EXPORTING
+      i_werks = ls_alv-werks
+      i_lgort = ls_alv-lgort
+      i_matnr = ls_alv-matnr
+      i_charg = ls_alv-charg
+    IMPORTING
+      o_stock = ls_stock.
+
+  CALL FUNCTION 'ZUI5_CM_STATUS_LOTE'
+    EXPORTING
+      i_werks   = ls_alv-werks
+      i_lgort   = ls_alv-lgort
+      i_charg   = ls_alv-charg
+    IMPORTING
+      o_status  = v_status
+      o_lote_2d = lv_charg_2d
+      o_lote_3d = lv_charg_3d.
+
+  IF ls_alv-charg EQ lv_charg_2d.
+    p_charg = 'R' && lv_charg_2d.
+  ELSE.
+    DATA(len) = strlen( lv_charg_3d ).
+    IF len > 1.   "VRS 20.06.2024
+      len = len - 1.
+      p_charg = lv_charg_3d(1) && 'R' && lv_charg_3d+1(len).
+    ENDIF.
+  ENDIF.
+
+  SELECT mch1~matnr, mch1~charg, mcha~bwtar
+      FROM mch1
+      LEFT JOIN mcha ON mcha~matnr EQ mch1~matnr AND mcha~charg EQ mch1~charg AND mcha~werks = @ls_alv-werks
+      INTO TABLE @DATA(t_mch1)
+        WHERE mch1~charg EQ @p_charg
+        AND mch1~matnr EQ @ls_alv-matnr
+        AND mch1~lvorm <> 'X'.
+
+  IF sy-subrc NE 0.
+    "Si no hay lote creamos uno con la codificación correcta.
+    batchattributes-val_type = 'SINVALOR'. "Nombre nuevo de la clase de valoración del lote regularizado
+    IF ls_type = 'R'.
+      extension1-zzkunnr = ls_alv-zzkunnr.     "VRS 27.11.2024
+    ENDIF.
+    SELECT SINGLE hsdat INTO batchattributes-prod_date FROM mch1 WHERE matnr EQ ls_alv-matnr AND charg EQ ls_alv-charg. "Fecha de fab. del lote original
+
+    CALL FUNCTION 'BAPI_BATCH_CREATE'
+      EXPORTING
+        material             = ls_alv-matnr
+        batch                = p_charg
+        plant                = ls_alv-werks
+        batchstoragelocation = ls_alv-lgort
+        batchattributes      = batchattributes
+        extension1           = extension1
+      IMPORTING
+        batch                = batch
+      TABLES
+        return               = lt_return.
+
+    READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+    ENDIF.
+
+  ENDIF.
+
+  READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+  IF sy-subrc NE 0.
+
+    " Antes del traslado hay que crear la clase de valoracion 0
+*    " Se recupera la clase de valoracion del lote no regularizado.
+    SELECT SINGLE * FROM mbew INTO @DATA(ls_mbew) WHERE matnr = @ls_alv-matnr AND bwtar = @ls_alv-charg.
+*
+*    SELECT SINGLE mtart, mbrsh FROM mara WHERE matnr = @ls_alv-matnr INTO @DATA(lv_mtart).
+*
+*    CLEAR: wa_headdata, wa_valuation, wa_valuationx, wa_ret, lv_af.
+*
+*    wa_headdata-material = ls_alv-matnr.
+*    wa_headdata-account_view = abap_true.
+*    wa_headdata-ind_sector = lv_mtart-mbrsh.
+*    wa_headdata-matl_type = lv_mtart-mtart.
+*
+*    wa_valuation-val_area = wa_valuationx-val_area = gv_werks.
+*    wa_valuation-val_type = wa_valuationx-val_type = p_charg.
+*    wa_valuation-del_flag = ls_mbew-lvorm.
+*    wa_valuationx-del_flag = 'X'.
+*    wa_valuation-price_ctrl = ls_mbew-vprsv.
+*    wa_valuationx-price_ctrl = 'X'.
+*    wa_valuation-moving_pr = ls_mbew-verpr.
+*    wa_valuationx-moving_pr = 'X'.
+*    wa_valuation-std_price = 0. "ls_mbew-stprs.
+*    wa_valuationx-std_price = 'X'.
+*    wa_valuation-price_unit = ls_mbew-peinh.
+*    wa_valuationx-price_unit = 'X'.
+*    wa_valuation-val_class = ls_mbew-bklas.
+*    wa_valuationx-val_class = 'X'.
+*    wa_valuation-pr_ctrl_pp = 'S'. "ls_mbew-vmvpr. "Sin valor da error
+*    wa_valuationx-pr_ctrl_pp = 'X'.
+*    wa_valuation-mov_pr_pp = ls_mbew-vmver.
+*    wa_valuationx-mov_pr_pp = 'X'.
+*    wa_valuation-std_pr_pp = ls_mbew-vmstp.
+*    wa_valuationx-std_pr_pp = 'X'.
+*    wa_valuation-pr_unit_pp = ls_mbew-vmpei.
+*    wa_valuationx-pr_unit_pp = 'X'.
+*    wa_valuation-vclass_pp = ls_mbew-vmbkl.
+*    wa_valuationx-vclass_pp = 'X'.
+*    wa_valuation-pr_ctrl_py = 'S'. "ls_mbew-vjvpr. "Sin valor da error
+*    wa_valuationx-pr_ctrl_py = 'X'.
+*    wa_valuation-mov_pr_py = ls_mbew-vjver.
+*    wa_valuationx-mov_pr_py = 'X'.
+*    wa_valuation-std_pr_py = ls_mbew-vjstp.
+*    wa_valuationx-std_pr_py = 'X'.
+*    wa_valuation-vclass_py = ls_mbew-vjbkl.
+*    wa_valuationx-vclass_py = 'X'.
+*    wa_valuation-pr_unit_py = ls_mbew-vjpei.
+*    wa_valuationx-pr_unit_py = 'X'.
+*    wa_valuation-val_cat = ls_mbew-bwtty.
+*    wa_valuationx-val_cat = 'X'.
+*    wa_valuation-future_pr = ls_mbew-zkprs.
+*    wa_valuationx-future_pr = 'X'.
+*    wa_valuation-valid_from = ls_mbew-zkdat.
+*    wa_valuationx-valid_from = 'X'.
+*    wa_valuation-taxprice_1 = ls_mbew-bwprs.
+*    wa_valuationx-taxprice_1 = 'X'.
+*    wa_valuation-commprice1 = ls_mbew-bwprh.
+*    wa_valuationx-commprice1 = 'X'.
+*    wa_valuation-taxprice_3 = ls_mbew-vjbws.
+*    wa_valuationx-taxprice_3 = 'X'.
+*    wa_valuation-commprice3 = ls_mbew-vjbwh.
+*    wa_valuationx-commprice3 = 'X'.
+*    wa_valuation-plnd_price = ls_mbew-zplpr.
+*    wa_valuationx-plnd_price = 'X'.
+*    wa_valuation-plndprice1 = ls_mbew-zplp1.
+*    wa_valuationx-plndprice1 = 'X'.
+*    wa_valuation-plndprice2 = ls_mbew-zplp2.
+*    wa_valuationx-plndprice2 = 'X'.
+*    wa_valuation-plndprice3 = ls_mbew-zplp3.
+*    wa_valuationx-plndprice3 = 'X'.
+*    wa_valuation-plndprdate1 = ls_mbew-zpld1.
+*    wa_valuationx-plndprdate1 = 'X'.
+*    wa_valuation-plndprdate2 = ls_mbew-zpld2.
+*    wa_valuationx-plndprdate2 = 'X'.
+*    wa_valuation-plndprdate3 = ls_mbew-zpld3.
+*    wa_valuationx-plndprdate3 = 'X'.
+*    wa_valuation-lifo_fifo = ls_mbew-xlifo.
+*    wa_valuationx-lifo_fifo = 'X'.
+*    wa_valuation-poolnumber = ls_mbew-mypol.
+*    wa_valuationx-poolnumber = 'X'.
+*    wa_valuation-taxprice_2 = ls_mbew-bwps1.
+*    wa_valuationx-taxprice_2 = 'X'.
+*    wa_valuation-commprice2 = ls_mbew-bwph1.
+*    wa_valuationx-commprice2 = 'X'.
+*    wa_valuation-deval_ind = ls_mbew-abwkz.
+*    wa_valuationx-deval_ind = 'X'.
+*    wa_valuation-orig_group = ls_mbew-hrkft.
+*    wa_valuationx-orig_group = 'X'.
+*    wa_valuation-overhead_grp = ls_mbew-kosgr.
+*    wa_valuationx-overhead_grp = 'X'.
+*    wa_valuation-qty_struct = ls_mbew-ekalr.
+*    wa_valuationx-qty_struct = 'X'.
+*    wa_valuation-ml_active = ls_mbew-mlmaa.
+*    wa_valuationx-ml_active = 'X'.
+*    wa_valuation-ml_settle = ls_mbew-mlast.
+*    wa_valuationx-ml_settle = 'X'.
+*    wa_valuation-orig_mat = ls_mbew-hkmat.
+*    wa_valuationx-orig_mat = 'X'.
+*    wa_valuation-vm_so_stk = ls_mbew-eklas.
+*    wa_valuationx-vm_so_stk = 'X'.
+*    wa_valuation-vm_p_stock = ls_mbew-qklas.
+*    wa_valuationx-vm_p_stock = 'X'.
+*    wa_valuation-matl_usage = ls_mbew-mtuse.
+*    wa_valuationx-matl_usage = 'X'.
+*    wa_valuation-mat_origin = ls_mbew-mtorg.
+*    wa_valuationx-mat_origin = 'X'.
+*    wa_valuation-in_house = ls_mbew-ownpr.
+*    wa_valuationx-in_house = 'X'.
+*    wa_valuation-tax_cml_un = ls_mbew-bwpei.
+*    wa_valuationx-tax_cml_un = 'X'.
+*
+*    CALL FUNCTION 'BAPI_MATERIAL_SAVEDATA'
+*      EXPORTING
+*        headdata       = wa_headdata
+*        valuationdata  = wa_valuation
+*        valuationdatax = wa_valuationx
+*      IMPORTING
+*        return         = wa_ret.
+"INI ARA 09.01.25 Correcciones creación clase valoración.
+" Consulto si ya existe la clase de valoración para stock regularizado (SINVALOR).
+      "Si no existe la creo.
+    SELECT SINGLE stprs FROM mbew INTO @DATA(ls_mbew_sv) WHERE matnr = @ls_alv-matnr AND bwtar = 'SINVALOR'.
+      IF sy-subrc NE 0.
+       CALL METHOD zspp_clase_valoracion_of=>crear_clase_valoracion
+         EXPORTING
+           i_matnr = ls_alv-matnr
+*          i_aufnr =
+           i_werks = gv_werks
+*           i_bwtar = p_charg   "ARA 05.12.24 Modificación creación clase de valoración a SINVALOR
+           i_bwtar = 'SINVALOR' "ARA 05.12.24 Modificación creación clase de valoración a SINVALOR
+           i_bklas = ls_mbew-bklas
+         RECEIVING
+           o_clase = lv_val.
+      ENDIF.
+"FIN ARA 09.01.25 Correcciones creación clase valoración.
+    CLEAR: lt_return.
+
+    "Datos de Cabecera
+    goodsmvt_header-doc_date = sy-datum.
+    goodsmvt_header-pstng_date = sy-datum.
+    goodsmvt_code-gm_code = '04'.
+
+    "Datos de Posición
+    APPEND INITIAL LINE TO goodsmvt_item ASSIGNING FIELD-SYMBOL(<ls_item>).
+    <ls_item>-material = ls_alv-matnr.
+    <ls_item>-plant = ls_alv-werks.
+    <ls_item>-batch = ls_alv-charg.
+    <ls_item>-stge_loc = ls_alv-lgort.
+    <ls_item>-entry_uom = ls_alv-meins.
+    <ls_item>-entry_qnt = ls_alv-clabs.
+    <ls_item>-move_type = '309'.
+
+    CALL FUNCTION 'CONVERSION_EXIT_CUNIT_INPUT'
+      EXPORTING
+        input          = ls_alv-meins
+      IMPORTING
+        output         = <ls_item>-entry_uom
+      EXCEPTIONS
+        unit_not_found = 1
+        OTHERS         = 2.
+
+    <ls_item>-move_mat = ls_alv-matnr.
+    <ls_item>-move_plant = ls_alv-werks.
+    <ls_item>-move_stloc = ls_alv-lgort.
+    <ls_item>-move_batch = p_charg.
+
+    CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+      EXPORTING
+        goodsmvt_header  = goodsmvt_header
+        goodsmvt_code    = goodsmvt_code
+      IMPORTING
+        materialdocument = materialdocument
+        matdocumentyear  = matdocumentyear
+      TABLES
+        goodsmvt_item    = goodsmvt_item
+        return           = lt_return.
+
+    READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+
+      MOVE-CORRESPONDING ls_alv TO wa_matdoc.
+      wa_matdoc-mat_doc = materialdocument.
+      wa_matdoc-doc_year = matdocumentyear.
+      APPEND wa_matdoc TO gt_matdoc.
+
+*    CONCATENATE 'Documento' materialdocument '/' matdocumentyear 'creado' INTO DATA(lv_mess) SEPARATED BY space.
+*    MESSAGE lv_mess TYPE 'I'.
+*    PERFORM regularizar.
+
+*      "En caso de pasar cantidad bloqueo, lanzamos el MF ZUI5_CM_STOCK_BLOQUEO Bloqueo Crear
+*      IF i_montaje-cant_bloqueo IS NOT INITIAL.
+*        CALL FUNCTION 'ZUI5_CM_STOCK_BLOQUEO'
+*          EXPORTING
+*            i_montaje = i_montaje
+*          IMPORTING
+**           O_STOCK   =
+*            o_return  = lt_return_temp.
+*        APPEND LINES OF lt_return_temp TO lt_return.
+*      ENDIF.
+
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    ENDIF.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+*    APPEND INITIAL LINE TO lt_return ASSIGNING <ls_return>.
+*    <ls_return>-id = 'ZUI5_CM'.
+*    <ls_return>-type = 'S'.
+*    <ls_return>-number = '002'.
+*    <ls_return>-message_v1 = lv_charg_3d.
+  ENDIF.
+
+*  APPEND LINES OF lt_return TO o_return.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ANULAR_REG
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM anular_reg.
+
+  DATA: lt_rows          TYPE lvc_t_row,
+        lv_charg_c       TYPE charg_d,
+        lt_return        TYPE bapiret2_t,
+        goodsmvt_header  TYPE  bapi2017_gm_head_01,
+        goodsmvt_code    TYPE  bapi2017_gm_code,
+        goodsmvt_item    TYPE TABLE OF  bapi2017_gm_item_create,
+        materialdocument TYPE  bapi2017_gm_head_ret-mat_doc,
+        matdocumentyear  TYPE  bapi2017_gm_head_ret-doc_year.
+
+  CALL METHOD grid1->get_selected_rows
+    IMPORTING
+      et_index_rows = lt_rows.
+
+  LOOP AT lt_rows INTO DATA(ls_rows).
+    CLEAR: ls_alv1, ls_alv2, goodsmvt_item[].
+    READ TABLE gt_alv1 INTO ls_alv1 INDEX ls_rows-index.
+    IF ls_alv1-charg(1) EQ 'R'.
+      DATA(len) = strlen( ls_alv1-charg ).
+      len = len - 1.
+      lv_charg_c = ls_alv1-charg+1(len).
+    ELSEIF ls_alv1-charg+1(1) EQ 'R'.
+      len = strlen( ls_alv1-charg ).
+      len = len - 2.
+      lv_charg_c = ls_alv1-charg(1) && ls_alv1-charg+2(len).
+    ELSE.
+      MESSAGE 'No se puede anular un lote no regularizado.' TYPE 'I'.
+      EXIT.
+    ENDIF.
+
+    CLEAR: lt_return.
+
+    "Datos de Cabecera
+    goodsmvt_header-doc_date = sy-datum.
+    goodsmvt_header-pstng_date = sy-datum.
+    goodsmvt_code-gm_code = '04'.
+
+    "Datos de Posición
+    APPEND INITIAL LINE TO goodsmvt_item ASSIGNING FIELD-SYMBOL(<ls_item>).
+    <ls_item>-material = ls_alv1-matnr.
+    <ls_item>-plant = ls_alv1-werks.
+    <ls_item>-batch = ls_alv1-charg.
+    <ls_item>-stge_loc = ls_alv1-lgort.
+    <ls_item>-entry_uom = ls_alv1-meins.
+    <ls_item>-entry_qnt = ls_alv1-clabs.
+    <ls_item>-move_type = '309'.
+
+    CALL FUNCTION 'CONVERSION_EXIT_CUNIT_INPUT'
+      EXPORTING
+        input          = ls_alv1-meins
+      IMPORTING
+        output         = <ls_item>-entry_uom
+      EXCEPTIONS
+        unit_not_found = 1
+        OTHERS         = 2.
+
+    <ls_item>-move_mat = ls_alv1-matnr.
+    <ls_item>-move_plant = ls_alv1-werks.
+    <ls_item>-move_stloc = ls_alv1-lgort.
+    <ls_item>-move_batch = lv_charg_c.
+
+    CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+      EXPORTING
+        goodsmvt_header  = goodsmvt_header
+        goodsmvt_code    = goodsmvt_code
+      IMPORTING
+        materialdocument = materialdocument
+        matdocumentyear  = matdocumentyear
+      TABLES
+        goodsmvt_item    = goodsmvt_item
+        return           = lt_return.
+
+    READ TABLE lt_return INTO DATA(ls_return) WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+      " Ahora se busca el pedido y se informa motivo de rechazo
+*      SELECT SINGLE * FROM vbap INTO @DATA(ls_vbap) WHERE charg EQ @ls_alv1-charg. "VRS 20.06.2024: Antes @lv_charg_c.
+*      IF sy-subrc EQ 0.
+      UPDATE vbap SET abgru = 'Z6'
+       WHERE charg EQ ls_alv1-charg "VRS 20.06.2024: Antes lv_charg_c
+         AND vbeln EQ ls_alv1-vbeln  "VRS 20.06.2024ls_vbap-vbeln
+         AND posnr EQ ls_alv1-posnr. "VRS 20.06.2024ls_vbap-posnr.
+*      ENDIF.
+
+      " Se elimina también del lote el cliente, pedido y posición
+      UPDATE mch1 SET zzkunnr = ''
+                      zzbstkd = ''
+                      zzposnr = ''
+        WHERE matnr EQ ls_alv1-matnr
+          AND charg EQ ls_alv1-charg.
+
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+
+      DATA(anul) = lines( lt_rows ).
+      IF anul LE 1.
+        MESSAGE 'Posición anulada.' TYPE 'S'.
+      ELSE.
+        MESSAGE 'Posiciones anuladas.' TYPE 'S'.
+      ENDIF.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      MESSAGE ls_return-message TYPE 'I'.
+    ENDIF.
+
+  ENDLOOP.
+
+  PERFORM recuperar_datos.
+  PERFORM refresh_alvs.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AUTORIZACION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_autorizacion CHANGING permiso.
+
+  permiso = 'X'.
+
+  AUTHORITY-CHECK OBJECT 'ZSCM_WERKS'
+  ID 'WERKS' FIELD s_werks-low
+  ID 'ACTVT' FIELD '03'.
+
+  IF sy-subrc <> 0.
+    CLEAR permiso.
+    MESSAGE 'No tiene autorización para el centro informado.' TYPE 'S'.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PREPAREFIELDCATALOG1
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_ESTRUC  text
+*      <--P_IT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM preparefieldcatalog1 CHANGING it_fieldcat1 TYPE lvc_t_fcat.
+
+  DATA: l_fieldcat TYPE LINE OF lvc_t_fcat.
+
+  REFRESH it_fieldcat1.
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_buffer_active        = 'X'
+      i_structure_name       = 'ZSCM001_ALV2'     "VRS 25.06.2024: Antes 'ZSCM001_ALV1'
+      i_bypassing_buffer     = 'X'
+    CHANGING
+      ct_fieldcat            = it_fieldcat1[]
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+  LOOP AT it_fieldcat1 INTO l_fieldcat.
+    IF p_pend = 'X'.
+      CASE l_fieldcat-fieldname.
+        WHEN 'VBELN'.
+          l_fieldcat-no_out = 'X'.
+        WHEN 'POSNR'.
+          l_fieldcat-no_out = 'X'.
+        WHEN 'TARIFA'.
+          l_fieldcat-no_out = 'X'.
+        WHEN 'TARIFA_MIL'.
+          l_fieldcat-no_out = 'X'.
+        WHEN 'RECARGO'.
+          l_fieldcat-no_out = 'X'.
+        WHEN 'TOTAL'.
+          l_fieldcat-no_out = 'X'.
+      ENDCASE.
+    ELSE.
+      CASE l_fieldcat-fieldname.
+        WHEN 'VBELN'.
+          l_fieldcat-hotspot = 'X'.
+      ENDCASE.
+    ENDIF.
+    MODIFY it_fieldcat1 FROM l_fieldcat.
+  ENDLOOP.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CALC_TARIFAS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_ALV2  text
+*----------------------------------------------------------------------*
+FORM calc_tarifas  USING add TYPE flag
+                   CHANGING p_kunnr_f TYPE flag
+                            ls_alv2 TYPE zscm001_alv2.
+
+  DATA: ls_konp TYPE konp.
+
+  IF add = 'X'.
+
+    gv_kunnr = |{ gv_kunnr ALPHA = IN }|.
+
+    IF ls_alv2-zzkunnr IS NOT INITIAL.      "VRS 11.06.2024
+      SELECT SINGLE kunnr INTO ls_alv2-zzkunnr
+        FROM knvp
+        WHERE kunn2 = ls_alv2-zzkunnr
+          AND kunnr <> ls_alv2-zzkunnr
+          AND parvw = 'WE'.
+
+      ls_alv2-zzkunnr = |{ ls_alv2-zzkunnr ALPHA = IN }|.
+      IF ls_alv2-zzkunnr <> gv_kunnr.
+        p_kunnr_f = 'X'.
+      ENDIF.
+    ELSE.
+      ls_alv2-zzkunnr = gv_kunnr.
+    ENDIF.
+*
+*    CHECK p_kunnr_f IS INITIAL.
+  ELSE.
+    ls_alv2-zzkunnr = |{ ls_alv2-zzkunnr ALPHA = IN }|.
+    gv_kunnr = ls_alv2-zzkunnr.
+  ENDIF.
+
+*        ls_alv2-zzkunnr = |{ ls_alv2-zzkunnr ALPHA = IN }|.
+  SELECT SINGLE name1 INTO ls_alv2-name1
+    FROM kna1
+    WHERE kunnr = ls_alv2-zzkunnr.
+
+  " Tarifa 1000 UN
+  SELECT * FROM t682i INTO TABLE @DATA(lt_t) WHERE kozgf = 'ZPRC'.
+  SORT lt_t BY kolnr ASCENDING.
+
+  LOOP AT lt_t INTO DATA(ls_t).
+    CASE ls_t-kotabnr.
+      WHEN '927'.
+        SELECT SINGLE inco1 FROM knvv INTO @DATA(lv_inco) WHERE kunnr = @gv_kunnr
+                                                            AND vkorg = @p_vkorg.         "VRS 27.11.2024
+        SELECT SINGLE a~knumh INTO @DATA(lv_knumh)
+          FROM a927 AS a
+          INNER JOIN konp AS k ON a~knumh = k~knumh   "VRS 25.06.2024
+          WHERE a~kschl EQ 'ZPRC'
+            AND vkorg EQ @p_vkorg
+            AND vtweg EQ '10'
+            AND kunwe EQ @gv_kunnr
+            AND matnr EQ @ls_alv2-matnr
+            AND inco1 EQ @lv_inco
+            AND k~loevm_ko EQ @space                  "VRS 25.06.2024
+            AND datab LE @sy-datum
+            AND datbi GE @sy-datum.
+        IF sy-subrc EQ 0.
+          EXIT.
+        ENDIF.
+
+      WHEN '928'.
+        SELECT SINGLE a~knumh INTO lv_knumh
+          FROM a928 AS a
+          INNER JOIN konp AS k ON a~knumh = k~knumh   "VRS 25.06.2024
+          WHERE a~kschl EQ 'ZPRC'
+            AND vkorg EQ p_vkorg
+            AND vtweg EQ '10'
+            AND kunwe EQ gv_kunnr
+            AND matnr EQ ls_alv2-matnr
+            AND k~loevm_ko EQ space                  "VRS 25.06.2024
+            AND datab LE sy-datum
+            AND datbi GE sy-datum.
+        IF sy-subrc EQ 0.
+          EXIT.
+        ENDIF.
+
+      WHEN '929'.
+        SELECT SINGLE inco1 FROM knvv INTO lv_inco WHERE kunnr = gv_kunnr
+                                                     AND vkorg = p_vkorg.   "VRS 27.11.2024
+        SELECT SINGLE a~knumh INTO lv_knumh
+          FROM a929 AS a
+          INNER JOIN konp AS k ON a~knumh = k~knumh   "VRS 25.06.2024
+          WHERE a~kschl EQ 'ZPRC'
+            AND vkorg EQ p_vkorg
+            AND vtweg EQ '10'
+            AND a~kunnr EQ gv_kunnr
+            AND matnr EQ ls_alv2-matnr
+            AND inco1 EQ lv_inco
+            AND k~loevm_ko EQ space                  "VRS 25.06.2024
+            AND datab LE sy-datum
+            AND datbi GE sy-datum.
+        IF sy-subrc EQ 0.
+          EXIT.
+        ENDIF.
+
+      WHEN '305'.
+        SELECT SINGLE a~knumh INTO lv_knumh
+          FROM a305 AS a
+          INNER JOIN konp AS k ON a~knumh = k~knumh   "VRS 25.06.2024
+          WHERE a~kschl EQ 'ZPRC'
+            AND vkorg EQ p_vkorg
+            AND vtweg EQ '10'
+            AND a~kunnr EQ gv_kunnr
+            AND matnr EQ ls_alv2-matnr
+            AND k~loevm_ko EQ space                  "VRS 25.06.2024
+            AND datab LE sy-datum
+            AND datbi GE sy-datum.
+        IF sy-subrc EQ 0.
+          EXIT.
+        ENDIF.
+
+      WHEN '941'.
+        SELECT SINGLE a~knumh INTO lv_knumh
+          FROM a941 AS a
+          INNER JOIN konp AS k ON a~knumh = k~knumh   "VRS 25.06.2024
+          WHERE a~kschl EQ 'ZPRC'
+            AND vkorg EQ p_vkorg
+            AND vtweg EQ '10'
+            AND spart EQ '10'
+            AND matnr EQ ls_alv2-matnr
+            AND k~loevm_ko EQ space                  "VRS 25.06.2024
+            AND datab LE sy-datum
+            AND datbi GE sy-datum.
+        IF sy-subrc EQ 0.
+          EXIT.
+        ENDIF.
+
+      WHEN '982'.
+        SELECT SINGLE mtart INTO @DATA(lv_mtart) FROM mara WHERE matnr EQ @ls_alv1-matnr.
+        SELECT SINGLE a~knumh INTO lv_knumh
+          FROM a982 AS a
+          INNER JOIN konp AS k ON a~knumh = k~knumh   "VRS 25.06.2024
+          WHERE a~kschl EQ 'ZPRC'
+            AND vkorg EQ p_vkorg
+            AND vtweg EQ '10'
+            AND spart EQ '10'
+            AND mtart EQ lv_mtart
+            AND k~loevm_ko EQ space                  "VRS 25.06.2024
+            AND datab LE sy-datum
+            AND datbi GE sy-datum.
+        IF sy-subrc EQ 0.
+          EXIT.
+        ENDIF.
+
+      WHEN '981'.
+        SELECT SINGLE a~knumh INTO lv_knumh
+          FROM a981 AS a
+          INNER JOIN konp AS k ON a~knumh = k~knumh   "VRS 25.06.2024
+          WHERE a~kschl EQ 'ZPRC'
+            AND vkorg EQ p_vkorg
+            AND vtweg EQ '10'
+            AND spart EQ '10'
+            AND k~loevm_ko EQ space                  "VRS 25.06.2024
+            AND datab LE sy-datum
+            AND datbi GE sy-datum.
+        IF sy-subrc EQ 0.
+          EXIT.
+        ENDIF.
+
+    ENDCASE.
+  ENDLOOP.
+
+  IF lv_knumh IS NOT INITIAL.
+    CLEAR ls_konp.
+    SELECT SINGLE * FROM konp INTO ls_konp WHERE knumh EQ lv_knumh.
+    IF ls_konp-kpein NE 0.
+      ls_alv2-tarifa_mil = ( ls_konp-kbetr / ls_konp-kpein ) * 1000.
+      ls_alv2-tarifa = ( ls_konp-kbetr / ls_konp-kpein ) * ls_alv2-clabs.
+    ELSE.
+      ls_alv2-tarifa_mil = 0.
+      ls_alv2-tarifa = 0.
+    ENDIF.
+  ENDIF.
+
+  " Recargo por montaje 1000 UN
+  SELECT * FROM t682i INTO TABLE lt_t WHERE kozgf = 'ZR01'.
+  SORT lt_t BY kolnr ASCENDING.
+  CLEAR lv_knumh.
+  LOOP AT lt_t INTO ls_t.
+    CASE ls_t-kotabnr.
+      WHEN '960'.
+        SELECT SINGLE a~knumh INTO lv_knumh
+          FROM a960 AS a
+          INNER JOIN konp AS k ON a~knumh = k~knumh   "VRS 25.06.2024
+          WHERE a~kschl EQ 'ZR01'
+            AND vkorg EQ p_vkorg
+            AND werks EQ ls_alv2-werks
+            AND zzlgort EQ ls_alv2-lgort
+            AND a~kunnr EQ gv_kunnr
+            AND matnr EQ ls_alv2-matnr
+            AND zzmontaje EQ 'X'
+            AND k~loevm_ko EQ space                   "VRS 25.06.2024
+            AND datab LE sy-datum
+            AND datbi GE sy-datum.
+        IF sy-subrc EQ 0.
+          EXIT.
+        ENDIF.
+
+    ENDCASE.
+  ENDLOOP.
+
+  IF lv_knumh IS NOT INITIAL.
+    CLEAR ls_konp.
+    SELECT SINGLE * FROM konp INTO ls_konp WHERE knumh EQ lv_knumh.
+    IF ls_konp-kpein NE 0.
+      ls_alv2-recargo = ( ls_konp-kbetr / ls_konp-kpein ) * 1000.
+    ELSE.
+      ls_alv2-recargo = 0.
+    ENDIF.
+  ENDIF.
+
+  ls_alv2-total = ls_alv2-tarifa + ( ls_alv2-recargo / 1000 ) * ls_alv2-clabs.
+
+  IF add IS INITIAL.
+    CLEAR gv_kunnr.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ANULAR_MATDOC
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_ITEMS  text
+*----------------------------------------------------------------------*
+FORM anular_matdoc  TABLES p_items TYPE bapisditm_tt.
+
+  DATA it_return TYPE TABLE OF bapiret2.
+
+  LOOP AT p_items INTO DATA(wa_items).
+
+    READ TABLE gt_matdoc INTO DATA(wa_matdoc)
+      WITH KEY matnr = wa_items-material werks = wa_items-plant lgort = wa_items-store_loc.
+
+    IF sy-subrc = 0.
+
+      CALL FUNCTION 'BAPI_GOODSMVT_CANCEL'
+        EXPORTING
+          materialdocument = wa_matdoc-mat_doc
+          matdocumentyear  = wa_matdoc-doc_year
+        TABLES
+          return           = it_return.
+
+      IF sy-subrc = 0.
+        COMMIT WORK.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.

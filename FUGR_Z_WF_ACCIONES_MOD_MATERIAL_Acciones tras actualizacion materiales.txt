@@ -1,0 +1,218 @@
+FUNCTION z_wf_acciones_mod_material .
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(MATNR) TYPE  MARA-MATNR
+*"----------------------------------------------------------------------
+  DATA: l_mara  TYPE mara,
+        l_marc  TYPE marc,
+        cdhdr   TYPE cdhdr,
+        i_cdpos TYPE cdpos_tab.
+
+  DATA(o_log) = NEW zcl_ap_log( object = 'WF_MOD_MAT' clave = matnr ).
+
+* No queremos que haya dos WF con el mismo material a la vez
+  IF zcl_ap_utils=>bloquear_programa( cprog = 'WF_MOD_MAT-' && matnr intentos = 5 espera = 1 ).
+    o_log->log( p1 = |Existe otro WF en ejecución| msgty = 'I' ).
+  ENDIF.
+
+  DO 5 TIMES.
+    SELECT SINGLE * FROM mara
+      INTO CORRESPONDING FIELDS OF l_mara
+     WHERE matnr = matnr.
+    IF sy-subrc NE 0.
+      WAIT UP TO 1 SECONDS.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDDO.
+  IF l_mara IS INITIAL.
+    o_log->log( p1 = 'No existe material. salimos' ).
+    RETURN.
+  ENDIF.
+
+* En los logs, queremos el usuario de última modificación de la orden
+  IF NOT l_mara-aenam IS INITIAL.
+    DATA(l_uname) = l_mara-aenam.
+  ELSE.
+    l_uname = l_mara-ernam.
+  ENDIF.
+
+
+  IF l_mara-laeda IS INITIAL.
+* El material es nuevo
+    SELECT * FROM marc
+      INTO l_marc
+      UP TO 1 ROWS
+     WHERE matnr = matnr
+      ORDER BY PRIMARY KEY.
+    ENDSELECT.
+  ELSE.
+    PERFORM buscar_cambios USING 'MATERIAL' matnr
+                    CHANGING cdhdr  i_cdpos.
+
+* Si se ha modificado el centro tomamos este
+    ASSIGN i_cdpos[ tabname = 'MARC' ]-tabkey TO FIELD-SYMBOL(<tabkey_marc>).
+    IF sy-subrc = 0.
+      SELECT SINGLE * FROM marc
+        INTO l_marc
+       WHERE matnr = matnr
+         AND werks = <tabkey_marc>+21.
+    ELSE.
+      SELECT * FROM marc
+        INTO l_marc
+        UP TO 1 ROWS
+       WHERE matnr = matnr
+        ORDER BY PRIMARY KEY.
+      ENDSELECT.
+    ENDIF.
+
+
+    IF l_mara-mtart EQ 'ZTRO' OR l_mara-mtart EQ 'ZCLI' AND NOT l_marc IS INITIAL.
+      IF NEW zhcl_core_wrk( )->es_full_sap_omp( l_marc-werks ).
+
+* Verificamos si se ha producido un cambio de status de bloqueo de centro
+        ASSIGN i_cdpos[ fname = 'MMSTA'
+                        value_new = l_marc-mmsta ]-value_old TO FIELD-SYMBOL(<mmsta_old>).
+        IF sy-subrc = 0.
+          DATA(l_cambio_bloqueo_centro) = 'X'.
+          o_log->log( uname = l_uname p1 = |Se cambia bloqueo del centro { l_marc-werks } de { <mmsta_old> } a { l_marc-mmsta }| msgty = 'I' ).
+        ENDIF.
+
+        ASSIGN i_cdpos[ fname = 'MSTAE'
+                        value_new = l_mara-mstae ]-value_old TO FIELD-SYMBOL(<mstae_old>).
+        IF sy-subrc = 0.
+          DATA(l_cambio_bloqueo_material) = 'X'.
+          o_log->log( uname = l_uname p1 = |Se cambia bloqueo del material de { <mstae_old> } a { l_mara-mstae }| msgty = 'I' ).
+        ENDIF.
+
+
+
+
+
+*  "Si los status son bloqueado o desbloqueado, lanzaremos el IDOC de STOP CODES si procede
+**  Status TP  Descr.  Comentario  Status SAP (CHAR 2)
+**  YAMD   Modificación    Se establece durante el proceso de modificación / modificación menor  3 Bloqueo fabricación
+**  YAPP   Aprobado  NO en uso, solo si la aprobación de ventas está activa
+**  YARC   Archivado   Se establece durante el proceso de archivado  ZZ  Bloqueo compras y fabric.
+**  YDAM   Dañado  Se establece durante el proceso de dañado   3 Bloqueo fabricación
+**  YDES   Destruido   Se establece durante el proceso de desguace   Z2  Bloqueo excepto compras
+**  YEXR   Útil externo devuelto   Se establece durante devoluciones a proveedor externo   3 Bloqueo fabricación
+**  YEXT   Útil externo  Status inicial, si se ha marcado como útil externo  Z1  Bloqueo compras
+**  YNEW   Nuevo   Status inicial, si NO se ha marcado como herramienta externa  3 Bloqueo fabricación
+**  YNIH   NO propio   Se establece durante el proceso de daño – uso externo   3 Bloqueo fabricación
+**  YORD   Pedido  Se establece durante el proceso de pedido   3 Bloqueo fabricación
+**  YORR   Pedido devuelto   Se establece durante el proceso de Desarrollo de producto O aprovisionamiento   3 Bloqueo fabricación
+**  YPDD   Desarrollo de Producto OK   Se establece durante el proceso externo de recepción de externos, Desarrollo de producto O aprovisionamiento.   3 Bloqueo fabricación
+**  YPRO   Aprovisionamiento OK  Se establece durante el proceso externo de recepción de externos y aprovisionamiento    3 Bloqueo fabricación
+**  YREE   Reparación externa  Se establece durante el proceso de reparación   3 Bloqueo fabricación
+**  YREI   Reparación interna  Se establece durante el proceso de reparación y modificaciones  ZZ  Bloqueo compras y fabric.
+**  YREL   Liberado  Se establece durante el proceso de liberación de archivado, liberación de reparación interna, liberación de producción  Z1  Bloqueo compras
+**  YRPL   Remplazo  Se establece durante el proceso de remplazo   3 Bloqueo fabricación
+**  Para el caso:
+**  Serían todos bloqueo de útil excepto los estados de material Z1, es decir liberado y útil externo.
+        DATA l_status TYPE char20.
+        o_log->s_log-object = 'WF_MOD_MAT_IDOC'.
+        l_status = zcl_ap_temp=>get_st_valor1( clave = 'STOPCODES'
+                                               subclave = matnr ).
+        IF NOT l_status IS INITIAL.
+          o_log->log( p1 = |Lanzamos función ZSPP_IDOC_ORDERS_STOPCODES CON { l_status } FORZADO| msgty = 'I' ).
+          CALL FUNCTION 'ZSPP_IDOC_ORDERS_STOPCODES'
+            EXPORTING
+              i_matnr  = matnr
+              i_status = l_status.
+          zcl_ap_temp=>delete_st( clave = 'STOPCODES'
+                                  subclave = matnr ).
+        ELSE.
+          IF l_cambio_bloqueo_centro = 'X' OR l_cambio_bloqueo_material = 'X'.
+            IF l_cambio_bloqueo_centro = 'X' AND ( l_marc-mmsta IS INITIAL OR l_marc-mmsta EQ '00' OR l_marc-mmsta EQ 'Z1' )
+            OR l_cambio_bloqueo_material = 'X' AND ( l_mara-mstae IS INITIAL OR l_mara-mstae EQ '00' OR l_mara-mstae EQ 'Z1' ).
+              "Si se ha producido un cambio de status hacia uno de desbloqueo
+
+              o_log->log( uname = l_uname p1 = |Lanzamos función ZSPP_IDOC_ORDERS_STOPCODES con UNBLOQ| msgty = 'I' ).
+              CALL FUNCTION 'ZSPP_IDOC_ORDERS_STOPCODES'
+                EXPORTING
+                  i_matnr  = matnr
+                  i_status = 'UNBLOQ'.
+            ELSE.
+              o_log->log( uname = l_uname p1 = |Lanzamos función ZSPP_IDOC_ORDERS_STOPCODES con BLOQ| msgty = 'I' ).
+              CALL FUNCTION 'ZSPP_IDOC_ORDERS_STOPCODES'
+                EXPORTING
+                  i_matnr  = matnr
+                  i_status = 'BLOQ'.
+            ENDIF.
+
+            GET PARAMETER ID 'ZIDOC_DOCNUM' FIELD DATA(docnum).
+            IF NOT docnum IS INITIAL.
+              o_log->log( uname = l_uname p1 = 'Se ha lanzado ZSPP_IDOC_ORDERS_STOPCODES y creado IDOC' p2 = docnum msgty = 'I' ).
+            ELSE.
+              GET PARAMETER ID 'ZIDOC_ERROR' FIELD DATA(error).
+              IF NOT error IS INITIAL.
+                o_log->log( uname = l_uname p1 = 'Se ha lanzado ZSPP_IDOC_ORDERS_STOPCODES con error' p2 = error msgty = 'E' ).
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  zcl_ap_utils=>desbloquear_programa( cprog = 'WF_MOD_MAT-' && matnr  ).
+
+
+ENDFUNCTION.
+
+FORM buscar_cambios USING pe_tipo pe_clave
+                  CHANGING cdhdr TYPE cdhdr
+                           i_cdpos TYPE cdpos_tab.
+
+  DATA(l_udate) = sy-datum.
+  DATA(l_utime) = sy-uzeit.
+
+* Buscamos si hay modificaciones (miro el último cambio posible en los últimos 30 segundos.
+  IF NOT sy-batch IS INITIAL OR sy-tcode IS INITIAL AND l_utime > '000030'.
+    l_utime = l_utime - 30.
+
+* Si se procesan varios registros muy seguidos nos aseguramos que de que no coje uno ya procesado
+    DATA(l_changenr) = zcl_ap_temp=>get_st_valor1( clave = pe_tipo subclave = pe_clave ).
+    IF NOT l_changenr IS INITIAL.
+      DATA r_changenr TYPE RANGE OF cdhdr-changenr.
+      r_changenr = VALUE #( ( option = 'GT' sign = 'I' low = l_changenr ) ).
+    ENDIF.
+  ELSE.
+    l_utime = '000000'.
+  ENDIF.
+
+  DO 5 TIMES.
+    SELECT * FROM cdhdr
+      INTO @cdhdr
+      UP TO 1 ROWS
+     WHERE objectclas = @pe_tipo
+       AND objectid   = @pe_clave
+       AND changenr  IN @r_changenr
+       AND udate = @l_udate
+       AND utime > @l_utime
+    ORDER BY changenr ASCENDING.
+    ENDSELECT.
+    IF sy-subrc = 0.
+      EXIT.
+    ELSE.
+      IF NOT sy-batch IS INITIAL OR sy-tcode IS INITIAL.
+* En fondo, por si acaso no se han grabado los cambios esperamos
+        WAIT UP TO 1 SECONDS.
+      ENDIF.
+    ENDIF.
+  ENDDO.
+
+  IF NOT cdhdr-changenr  IS INITIAL.
+    "Nos guardamos la última modificación procesada
+    zcl_ap_temp=>set_st( clave = pe_tipo subclave = pe_clave valor1 = cdhdr-changenr ).
+    SELECT * FROM cdpos
+      INTO TABLE @i_cdpos
+     WHERE objectclas = @pe_tipo
+       AND objectid   = @pe_clave
+       AND changenr   >= @cdhdr-changenr
+    ORDER BY changenr DESCENDING.
+  ENDIF.
+
+ENDFORM.

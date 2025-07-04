@@ -1,0 +1,836 @@
+
+class ZSSD_UTILS definition
+  public
+  final
+  create public .
+
+public section.
+
+  methods _AT_LINE_REJECTION
+    importing
+      !I_VBELN type VBELN
+      !I_POSNR type POSNR .
+  methods _AT_DATE_CHANGE
+    importing
+      !I_VBELN type VBELN
+      !I_POSNR type POSNR
+      !I_EDATU type EDATU
+      !I_MENGE type MENGE_D .
+  methods CONSTRUCTOR .
+  methods CHECKS_ORDER_PRODUTION
+    importing
+      value(I_XVBAP) type TAB_XYVBAP optional
+      value(I_YVBAP) type TAB_XYVBAP optional
+      value(I_XVBEP) type TAB_XYVBEP optional
+      value(I_YVBEP) type TAB_XYVBEP optional .
+  class-methods RE_SCHEDULE_ORDEN_FAB
+    importing
+      !I_AUFNR type AUFNR
+    exporting
+      !O_ERROR type XFELD .
+  methods CREATION_PROD_ORD
+    importing
+      !I_VBELN type VBELN_VA
+      !I_POSNR type POSNR .
+protected section.
+
+  types:
+    BEGIN OF ty_pedpos,
+           vbeln TYPE vbeln,
+           posnr TYPE posnr,
+           edatu TYPE edatu,
+           menge TYPE menge_d,
+         END OF ty_pedpos .
+private section.
+
+  methods ZBAPI_PRODORD_CHANGE
+    importing
+      !NUMBER type AUFNR
+      !ORDERDATA type BAPI_PP_ORDER_CHANGE
+      !ORDERDATAX type BAPI_PP_ORDER_CHANGEX
+    exporting
+      !RETURN type BAPIRET2
+      !ORDER_TYPE type AUFART
+      !ORDER_STATUS type BAPI_ORDER_STATUS
+      !MASTER_DATA_READ type BAPIFLAG-BAPIFLAG .
+endclass. "ZSSD_UTILS definition
+class ZSSD_UTILS implementation.
+  METHOD _at_date_change.
+
+    DATA: rg_semis TYPE RANGE OF mtart,
+          rg_pto   TYPE RANGE OF mtart.
+    FREE: rg_semis, rg_pto.
+
+    "MTS: 24.11.2022: Si la cantidad es 0 no hacemos nada. Se tiene que marcar un motirvo de rechazo.
+    CHECK i_menge > 0.
+
+    SELECT sign, opti, low, high INTO TABLE @rg_pto FROM tvarvc WHERE name EQ 'ZSPP_UPD_MTART_PTE'.
+    SELECT sign, opti, low, high INTO TABLE @rg_semis FROM tvarvc WHERE name EQ 'ZSPP_UPD_MTART_SEM'.
+
+    "buscar las órdenes generadas a partir de la posición
+    "Sólo aquellas con status ABIE
+    SELECT t1~aufnr
+      INTO TABLE @DATA(it_ofs)
+      FROM caufv AS t1 INNER JOIN jest AS t2 ON t1~objnr EQ t2~objnr
+      WHERE kdauf = @i_vbeln
+      AND kdpos = @i_posnr
+      AND t2~stat EQ 'I0001'
+      AND inact EQ @space.
+    IF sy-subrc <> 0.
+      "Si no está en AUFK, buscamos en tabla Z por si acaso
+      SELECT t1~aufnr
+        INTO TABLE @it_ofs
+        FROM zpp0002 AS t3 INNER JOIN aufk AS t1 ON t1~aufnr EQ t3~aufnr
+        INNER JOIN jest AS t2 ON t1~objnr EQ t2~objnr
+        WHERE t3~kdauf = @i_vbeln
+        AND t3~kdpos = @i_posnr
+        AND t2~stat EQ 'I0001'
+        AND inact EQ @space.
+
+*      SELECT SINGLE t1~aufnr INTO @lv_aufnr_semi
+*        FROM afko AS t1 INNER JOIN aufk AS t2 ON t1~aufnr EQ t2~aufnr
+*        INNER JOIN zpp0002 AS t5 ON t5~aufnr EQ t1~aufnr
+*        INNER JOIN mara AS t3 ON t1~plnbez EQ t3~matnr
+*        INNER JOIN jest AS t4 ON t2~objnr EQ t4~objnr
+*        WHERE mtart IN @rg_semis
+*        AND t5~kdauf EQ @i_vbeln
+*        AND t5~kdpos EQ @i_posnr
+*        AND t4~stat EQ 'I0001'
+*        AND t4~inact EQ @space.
+    ENDIF.
+    IF sy-subrc = 0.
+
+      SORT it_ofs BY aufnr ASCENDING.
+      DELETE ADJACENT DUPLICATES FROM it_ofs COMPARING aufnr.
+
+      DATA: lv_semi TYPE xfeld,
+            lv_pto  TYPE xfeld.
+
+      LOOP AT it_ofs ASSIGNING FIELD-SYMBOL(<fs_of>).
+
+        CLEAR: lv_pto, lv_semi.
+
+        DATA: lv_number     TYPE bapi_order_key-order_number,
+              wa_orderdata  TYPE bapi_pp_order_change,
+              wa_orderdatax TYPE bapi_pp_order_changex,
+              wa_return     TYPE bapiret2.
+        CLEAR: lv_number, wa_orderdata, wa_orderdatax, wa_return.
+
+        "Modificamos la OF del PTE (ZPTO) primero (Si hubiera PTE y SEMI (ZPSE) )
+        SELECT SINGLE t1~aufnr, gamng
+*          UP TO 1 ROWS
+          FROM afko AS t1 INNER JOIN mara AS t2 ON t1~plnbez EQ t2~matnr
+*          FOR ALL ENTRIES IN @it_ofs
+          WHERE t1~aufnr EQ @<fs_of>-aufnr
+          AND mtart IN @rg_pto
+          INTO ( @lv_number, @DATA(lv_cant_of) ).
+
+        IF sy-subrc <> 0.
+          "Buscamos a ver si es un SEMI
+          SELECT SINGLE t1~aufnr, gamng
+            FROM afko AS t1 INNER JOIN mara AS t2 ON t1~plnbez EQ t2~matnr
+            WHERE t1~aufnr EQ @<fs_of>-aufnr
+            AND mtart IN @rg_semis
+            INTO ( @lv_number, @lv_cant_of ).
+
+          IF sy-subrc = 0.
+            lv_semi = abap_true.
+          ENDIF.
+
+        ELSE.
+          lv_pto = abap_true.
+        ENDIF.
+
+        IF lv_semi IS INITIAL AND lv_pto IS INITIAL.
+          "Si no es ni semi ni PTE pasamos
+          CONTINUE.
+        ENDIF.
+
+        IF lv_pto = abap_true.
+          "La fecha de fin de la OF de semi será la de inicio del PTE
+          "Buscamos la OF de SEMI relacionada, pues habrá que modificarla también si está ABIE
+          SELECT SINGLE t1~aufnr INTO @DATA(lv_aufnr_semi)
+            FROM afko AS t1 INNER JOIN aufk AS t2 ON t1~aufnr EQ t2~aufnr
+            INNER JOIN mara AS t3 ON t1~plnbez EQ t3~matnr
+            INNER JOIN jest AS t4 ON t2~objnr EQ t4~objnr
+            WHERE mtart IN @rg_semis
+            AND t2~kdauf EQ @i_vbeln
+            AND t2~kdpos EQ @i_posnr
+            AND t4~stat EQ 'I0001'
+            AND t4~inact EQ @space.
+          IF sy-subrc <> 0.
+            "Si no está en AUFK, buscamos en tabla Z por si acaso
+            SELECT SINGLE t1~aufnr INTO @lv_aufnr_semi
+              FROM afko AS t1 INNER JOIN aufk AS t2 ON t1~aufnr EQ t2~aufnr
+              INNER JOIN zpp0002 AS t5 ON t5~aufnr EQ t1~aufnr
+              INNER JOIN mara AS t3 ON t1~plnbez EQ t3~matnr
+              INNER JOIN jest AS t4 ON t2~objnr EQ t4~objnr
+              WHERE mtart IN @rg_semis
+              AND t5~kdauf EQ @i_vbeln
+              AND t5~kdpos EQ @i_posnr
+              AND t4~stat EQ 'I0001'
+              AND t4~inact EQ @space.
+            IF sy-subrc <> 0.
+              CLEAR lv_aufnr_semi.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+        IF lv_semi EQ abap_true.
+          "Tenemos que ver la fecha de inicio de la OF
+          SELECT SINGLE gstrp
+            FROM afko
+            WHERE aufnr EQ @lv_number
+            INTO @DATA(lv_fecha_semi_new).
+        ENDIF.
+
+        IF i_edatu IS NOT INITIAL.
+          SELECT SINGLE gstrp INTO @DATA(lv_fecha_inicio) FROM afko WHERE aufnr EQ @lv_number.
+          wa_orderdata-basic_end_date = i_edatu.
+          IF lv_fecha_semi_new IS NOT INITIAL.
+            wa_orderdata-basic_end_date = lv_fecha_semi_new.
+          ENDIF.
+          wa_orderdatax-basic_end_date = abap_true.
+
+          IF wa_orderdata-basic_end_date < lv_fecha_inicio.
+            wa_orderdata-basic_start_date = wa_orderdata-basic_end_date.
+            wa_orderdatax-basic_start_date = abap_true.
+          ENDIF.
+        ENDIF.
+
+        IF i_menge IS NOT INITIAL.
+          wa_orderdata-quantity = i_menge. "lv_cant_of +
+          wa_orderdatax-quantity = abap_true.
+        ENDIF.
+
+        IF wa_orderdata IS NOT INITIAL.
+
+*          SET UPDATE TASK LOCAL.
+
+*          me->zbapi_prodord_change(
+*            EXPORTING
+*              number           = lv_number
+*              orderdata        = wa_orderdata
+*              orderdatax       = wa_orderdatax
+*            IMPORTING
+*              return           = wa_return
+**              order_type       =
+**              order_status     =
+**              master_data_read =
+*          ).
+
+          CALL FUNCTION 'BAPI_PRODORD_CHANGE' IN BACKGROUND TASK AS SEPARATE UNIT
+            EXPORTING
+              number     = lv_number
+              orderdata  = wa_orderdata
+              orderdatax = wa_orderdatax
+            IMPORTING
+              return     = wa_return
+*             order_type =
+*             order_status     =
+*             master_data_read =
+            .
+
+          IF wa_return-type EQ 'A' OR wa_return-type EQ 'E' OR wa_return-type EQ 'X'.
+            "Sin se produce error, guardamos en tabla Z para reprocesarlo vía JOB
+            DATA wa_reproceso TYPE zspp_upd_ofs_job.
+            wa_reproceso-vbeln = i_vbeln.
+            wa_reproceso-posnr = i_posnr.
+            wa_reproceso-menge = i_menge.
+            wa_reproceso-edatu = i_edatu.
+            wa_reproceso-evento = 'DATCHG'.
+*            wa_reproceso-evento = 'LINEREJ'.
+            MODIFY zspp_upd_ofs_job FROM wa_reproceso.
+            "Dejamos de procesar la del semi y la del PTE
+*            FREE it_ofs.
+            EXIT.
+          ENDIF.
+
+          re_schedule_orden_fab(
+            EXPORTING
+              i_aufnr = lv_number
+            IMPORTING
+              o_error = DATA(lv_error)
+          ).
+
+          IF lv_error IS NOT INITIAL.
+
+            wa_reproceso-vbeln = i_vbeln.
+            wa_reproceso-posnr = i_posnr.
+            wa_reproceso-menge = i_menge.
+            wa_reproceso-edatu = i_edatu.
+            wa_reproceso-evento = 'DATCHG'.
+            MODIFY zspp_upd_ofs_job FROM wa_reproceso.
+*            FREE it_ofs.
+            EXIT.
+*            CONTINUE.
+
+          ENDIF.
+        ENDIF.
+
+
+
+        DATA it_orders TYPE zspp_tt_update_ordenes.
+        FREE it_orders.
+
+        APPEND INITIAL LINE TO it_orders ASSIGNING FIELD-SYMBOL(<ord>).
+        <ord>-aufnr = <fs_of>-aufnr.
+        <ord>-fecha_fin = i_edatu.
+        <ord>-menge = i_menge.
+*        ENDLOOP.
+
+        CALL FUNCTION 'ZSPP_ENVIO_ORDERS_BACKGROUND' IN BACKGROUND TASK AS SEPARATE UNIT
+          EXPORTING
+            it_aufnr = it_orders.
+
+        IF lv_aufnr_semi IS NOT INITIAL.
+          "Si habíamos encontrado una OF de SEMI relacionada, tendremos también que modificar sus fechas
+          "Obteniendo la fecha de inicio del terminado y pasándola como fecha de fin del semi
+          SELECT SINGLE gstrp
+            FROM afko
+            WHERE aufnr EQ @lv_number
+            INTO @DATA(lv_fecha_semi).
+
+          CLEAR: wa_orderdatax, wa_orderdata.
+          IF lv_fecha_semi IS NOT INITIAL.
+            wa_orderdata-basic_end_date = lv_fecha_semi.
+            wa_orderdatax-basic_end_date = abap_true.
+
+
+            SELECT SINGLE gstrp INTO @DATA(lv_fecha_inicio_semi) FROM afko WHERE aufnr EQ @lv_aufnr_semi.
+            IF wa_orderdata-basic_end_date < lv_fecha_inicio_semi.
+              wa_orderdata-basic_start_date = wa_orderdata-basic_end_date.
+              wa_orderdatax-basic_start_date = abap_true.
+            ENDIF.
+
+          ENDIF.
+
+          IF i_menge IS NOT INITIAL.
+            wa_orderdata-quantity = i_menge. "lv_cant_of +
+
+            "La relación no es 1 a 1 siempre, de modo que tenemos que rescatar la cantidad de la RESB del PT
+            SELECT SINGLE bdmng INTO @DATA(lv_menge_semi)
+              FROM resb
+              WHERE aufnr EQ @<fs_of>-aufnr
+              AND matnr EQ ( SELECT plnbez FROM afko WHERE aufnr EQ @lv_aufnr_semi ).
+            wa_orderdata-quantity = lv_menge_semi.
+            wa_orderdatax-quantity = abap_true.
+          ENDIF.
+
+          IF wa_orderdata IS NOT INITIAL.
+*            SET UPDATE TASK LOCAL.
+*            me->zbapi_prodord_change(
+*              EXPORTING
+*                number           = lv_aufnr_semi
+*                orderdata        = wa_orderdata
+*                orderdatax       = wa_orderdatax
+*              IMPORTING
+*                return           = wa_return
+**                order_type       =     " Clase de orden
+**                order_status     =     " Indicador de status de orden
+**                master_data_read =     " Indicador de una posición
+*            ).
+
+            CALL FUNCTION 'BAPI_PRODORD_CHANGE' IN BACKGROUND TASK AS SEPARATE UNIT
+              EXPORTING
+                number     = lv_aufnr_semi
+                orderdata  = wa_orderdata
+                orderdatax = wa_orderdatax
+              IMPORTING
+                return     = wa_return
+*               order_type =
+*               order_status     =
+*               master_data_read =
+              .
+
+            IF wa_return-type EQ 'A' OR wa_return-type EQ 'E' OR wa_return-type EQ 'X'.
+              "Sin se produce error, guardamos en tabla Z para reprocesarlo vía JOB
+*              DATA wa_reproceso TYPE zspp_upd_ofs_job.
+              wa_reproceso-vbeln = i_vbeln.
+              wa_reproceso-posnr = i_posnr.
+              wa_reproceso-menge = i_menge.
+              wa_reproceso-edatu = i_edatu.
+              wa_reproceso-evento = 'DATCHG'.
+              MODIFY zspp_upd_ofs_job FROM wa_reproceso.
+*              FREE it_ofs.
+              EXIT.
+*            SET UPDATE TASK LOCAL.
+*            COMMIT WORK AND WAIT.
+*              CONTINUE.
+            ENDIF.
+
+
+            re_schedule_orden_fab(
+              EXPORTING
+                i_aufnr = lv_aufnr_semi
+              IMPORTING
+                o_error = lv_error
+            ).
+
+            IF lv_error IS NOT INITIAL.
+
+              wa_reproceso-vbeln = i_vbeln.
+              wa_reproceso-posnr = i_posnr.
+              wa_reproceso-menge = i_menge.
+              wa_reproceso-edatu = i_edatu.
+
+              wa_reproceso-evento = 'DATCHG'.
+              MODIFY zspp_upd_ofs_job FROM wa_reproceso.
+*              FREE it_ofs.
+              EXIT.
+*              CONTINUE.
+
+            ENDIF.
+          ENDIF.
+
+
+*          DATA it_orders TYPE zspp_tt_update_ordenes.
+          FREE it_orders.
+
+          APPEND INITIAL LINE TO it_orders ASSIGNING <ord>.
+          <ord>-aufnr = lv_aufnr_semi.
+          <ord>-fecha_fin = lv_fecha_semi.
+          <ord>-menge = i_menge.
+*        ENDLOOP.
+
+          CALL FUNCTION 'ZSPP_ENVIO_ORDERS_BACKGROUND' IN BACKGROUND TASK AS SEPARATE UNIT
+            EXPORTING
+              it_aufnr = it_orders.
+
+
+          DELETE it_ofs WHERE aufnr EQ lv_aufnr_semi.
+
+          DELETE FROM zspp_upd_ofs_job WHERE vbeln = i_vbeln AND posnr EQ i_posnr AND evento = 'DATCHG'.
+
+        ELSE.
+
+          DELETE FROM zspp_upd_ofs_job WHERE vbeln = i_vbeln AND posnr EQ i_posnr AND evento = 'DATCHG'.
+
+        ENDIF.
+
+        CLEAR lv_aufnr_semi.
+
+      ENDLOOP.
+
+      "Actualizamos el pedido de compra
+      IF lv_fecha_semi IS INITIAL.
+        lv_fecha_semi = i_edatu.
+      ENDIF.
+      CALL FUNCTION 'ZSPP_MOD_PEDIDO_COMPRA'
+        EXPORTING
+          i_vbeln = i_vbeln
+          i_posnr = i_posnr
+          i_edatu = lv_fecha_semi
+          i_menge = i_menge.
+
+
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD _at_line_rejection.
+
+*    "Buscar las órdenes generadas a partir de la posición
+*    "Sólo aquellas con status ABIE
+*    SELECT t1~aufnr
+*      INTO TABLE @DATA(it_ofs)
+*      FROM aufk AS t1 INNER JOIN jest AS t2 ON t1~objnr EQ t2~objnr
+*      WHERE kdauf = @i_vbeln
+*      AND kdpos = @i_posnr
+*      AND t2~stat EQ 'I0001'
+*      AND inact EQ @space.
+*    IF sy-subrc <> 0.
+*      "Si no está en AUFK, buscamos en tabla Z por si acaso
+*      SELECT t1~aufnr
+*        INTO TABLE @it_ofs
+*        FROM zpp0002 AS t3 INNER JOIN aufk AS t1 ON t1~aufnr EQ t3~aufnr
+*        INNER JOIN jest AS t2 ON t1~objnr EQ t2~objnr
+*        WHERE t3~kdauf = @i_vbeln
+*        AND t3~kdpos = @i_posnr
+*        AND t2~stat EQ 'I0001'
+*        AND inact EQ @space.
+*    ENDIF.
+
+    DATA: rg_semis TYPE RANGE OF mtart,
+          rg_pto   TYPE RANGE OF mtart.
+    FREE: rg_semis, rg_pto.
+
+    SELECT sign, opti, low, high INTO TABLE @rg_pto FROM tvarvc WHERE name EQ 'ZSPP_UPD_MTART_PTE'.
+    SELECT sign, opti, low, high INTO TABLE @rg_semis FROM tvarvc WHERE name EQ 'ZSPP_UPD_MTART_SEM'.
+
+    "buscar las órdenes generadas a partir de la posición
+    "Sólo aquellas con status ABIE
+    SELECT t1~aufnr
+      INTO TABLE @DATA(it_ofs)
+      FROM aufk AS t1 INNER JOIN jest AS t2 ON t1~objnr EQ t2~objnr
+      WHERE kdauf = @i_vbeln
+      AND kdpos = @i_posnr
+      AND t2~stat EQ 'I0001'
+      AND inact EQ @space.
+    IF sy-subrc <> 0.
+      "Si no está en AUFK, buscamos en tabla Z por si acaso
+      SELECT t1~aufnr
+        INTO TABLE @it_ofs
+        FROM zpp0002 AS t3 INNER JOIN aufk AS t1 ON t1~aufnr EQ t3~aufnr
+        INNER JOIN jest AS t2 ON t1~objnr EQ t2~objnr
+        WHERE t3~kdauf = @i_vbeln
+        AND t3~kdpos = @i_posnr
+        AND t2~stat EQ 'I0001'
+        AND inact EQ @space.
+    ENDIF.
+    IF sy-subrc = 0.
+
+      DATA: it_orders  TYPE TABLE OF bapi_order_key,
+            it_det_ret TYPE TABLE OF bapi_order_return.
+
+      LOOP AT it_ofs ASSIGNING FIELD-SYMBOL(<fs_of>).
+        APPEND INITIAL LINE TO it_orders ASSIGNING FIELD-SYMBOL(<ord>).
+        <ord>-order_number = <fs_of>-aufnr.
+      ENDLOOP.
+
+*      SET UPDATE TASK LOCAL.
+      CALL FUNCTION 'BAPI_PRODORD_SET_DELETION_FLAG'
+* EXPORTING
+*   WORK_PROCESS_GROUP       = 'COWORK_BAPI'
+*   WORK_PROCESS_MAX         = 99
+* IMPORTING
+*   RETURN                   =
+        TABLES
+          orders        = it_orders
+          detail_return = it_det_ret
+*         APPLICATION_LOG          =
+        .
+
+*      CALL FUNCTION 'BAPI_PRODORD_COMPLETE_TECH'
+*        EXPORTING
+*          scope_compl_tech   = '1'
+*          work_process_group = 'COWORK_BAPI'
+*          work_process_max   = 99
+**         IMPORTING
+**         RETURN             =
+*        TABLES
+*          orders             = it_orders
+*          detail_return      = it_det_ret
+**         APPLICATION_LOG    =
+*        .
+
+*      COMMIT WORK AND WAIT.
+      LOOP AT it_det_ret TRANSPORTING NO FIELDS WHERE type EQ 'E' OR type EQ 'A' OR type EQ 'X'.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc = 0.
+        DATA wa_reproceso TYPE zspp_upd_ofs_job.
+        wa_reproceso-vbeln = i_vbeln.
+        wa_reproceso-posnr = i_posnr.
+        wa_reproceso-menge = ''.
+        wa_reproceso-edatu = ''.
+        wa_reproceso-evento = 'LINEREJ'.
+        MODIFY zspp_upd_ofs_job FROM wa_reproceso.
+        RETURN.
+      ENDIF.
+
+
+      CALL FUNCTION 'ZSPP_ENVIO_DELETE_BACKGROUND' IN BACKGROUND TASK
+        TABLES
+          it_aufnr = it_orders.
+
+      IF it_orders[] IS NOT INITIAL.
+        DELETE FROM zspp_upd_ofs_job WHERE vbeln = i_vbeln AND posnr EQ i_posnr AND evento = 'LINEREJ'.
+      ENDIF.
+
+      CALL FUNCTION 'ZSPP_MOD_PEDIDO_COMPRA' IN BACKGROUND TASK
+        EXPORTING
+          i_vbeln = i_vbeln
+          i_posnr = i_posnr.
+
+
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD checks_order_prodution.
+
+    "JVM  -
+    DATA it_pila TYPE sys_callst.
+    CALL FUNCTION 'SYSTEM_CALLSTACK'
+*  EXPORTING
+*    max_level    = 0
+      IMPORTING
+*       callstack    =
+        et_callstack = it_pila.   " System Callstack Table
+    READ TABLE it_pila TRANSPORTING NO FIELDS WITH KEY eventname = 'ZSSDPP_CHANGE_BEDAE'.
+    IF sy-subrc = 0.
+      "Si la llamada viene derivada ya de un cambio desde producción, no hacemos nada
+      RETURN.
+    ENDIF.
+    "FJVM
+
+    IF i_xvbap[] IS NOT INITIAL AND i_yvbap[] IS NOT INITIAL.
+
+      LOOP AT i_xvbap ASSIGNING FIELD-SYMBOL(<xvbap>) WHERE abgru <> space.
+        READ TABLE i_yvbap WITH KEY posnr = <xvbap>-posnr abgru = space ASSIGNING FIELD-SYMBOL(<yvbap>).
+        IF sy-subrc = 0.
+          CHECK <xvbap>-updkz = 'U' AND <yvbap>-updkz = space.
+          "La posición no estaba con motivo de rechazo y ahora si
+          me->_at_line_rejection(
+            EXPORTING
+              i_vbeln = <xvbap>-vbeln
+              i_posnr = <xvbap>-posnr
+          ).
+        ENDIF.
+      ENDLOOP.
+
+    ENDIF.
+
+    DATA it_pedpos TYPE STANDARD TABLE OF ty_pedpos.
+
+    IF i_xvbep[] IS NOT INITIAL AND i_yvbep[] IS NOT INITIAL.
+      LOOP AT i_xvbap ASSIGNING FIELD-SYMBOL(<xvbap2>) WHERE abgru = space AND updkz = 'U'.
+        "Chequeamos la modificación de fechas
+        LOOP AT i_xvbep ASSIGNING FIELD-SYMBOL(<xvbep>) WHERE posnr = <xvbap2>-posnr
+                                                          AND ( bmeng > 0 OR ( bmeng = 0 AND etenr = 1 ) ).
+          READ TABLE i_yvbep WITH KEY posnr = <xvbep>-posnr ASSIGNING FIELD-SYMBOL(<yvbep>).
+          IF sy-subrc = 0.
+            CHECK <xvbep>-updkz = 'U' AND <yvbep>-updkz = space AND <xvbep>-mbdat <> <yvbep>-mbdat.
+            APPEND INITIAL LINE TO it_pedpos ASSIGNING FIELD-SYMBOL(<add>).
+            <add>-vbeln = <xvbap2>-vbeln.
+            <add>-posnr = <xvbap2>-posnr.
+            <add>-edatu = <xvbep>-mbdat."<xvbep>-edatu.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+
+        "Chequeamos la modificación de cantidades
+        READ TABLE i_yvbap WITH KEY posnr = <xvbap2>-posnr ASSIGNING FIELD-SYMBOL(<yvbap2>).
+        IF sy-subrc = 0.
+          CHECK <xvbap2>-updkz = 'U' AND <yvbap2>-updkz = space AND <xvbap2>-kwmeng <> <yvbap2>-kwmeng.
+          READ TABLE it_pedpos ASSIGNING FIELD-SYMBOL(<add2>) WITH KEY vbeln = <xvbap2>-vbeln posnr = <xvbap2>-posnr.
+          IF sy-subrc = 0.
+            <add2>-menge = <xvbap2>-kwmeng.
+          ELSE.
+            APPEND INITIAL LINE TO it_pedpos ASSIGNING FIELD-SYMBOL(<add3>).
+            <add3>-vbeln = <xvbap2>-vbeln.
+            <add3>-posnr = <xvbap2>-posnr.
+            <add3>-menge = <xvbap2>-kwmeng." - <yvbap2>-kwmeng.
+          ENDIF.
+        ENDIF.
+
+      ENDLOOP.
+
+      "Recorremos las modificaciones para realizar los cambios
+      LOOP AT it_pedpos ASSIGNING FIELD-SYMBOL(<pedpos>).
+        IF <pedpos>-menge IS INITIAL.
+          READ TABLE i_xvbap ASSIGNING FIELD-SYMBOL(<xvbap3>) WITH KEY vbeln = <pedpos>-vbeln posnr = <pedpos>-posnr.
+          IF sy-subrc = 0.
+            <pedpos>-menge = <xvbap3>-kwmeng.
+          ENDIF.
+        ENDIF.
+        me->_at_date_change(
+        EXPORTING
+          i_vbeln = <pedpos>-vbeln
+          i_posnr = <pedpos>-posnr
+          i_edatu = <pedpos>-edatu
+          i_menge = <pedpos>-menge
+          ).
+      ENDLOOP.
+
+    ENDIF.
+
+  ENDMETHOD.
+  method CONSTRUCTOR.
+  endmethod.
+  METHOD creation_prod_ord.
+
+    DATA: jobname            TYPE tbtcjob-jobname VALUE 'ZCREA_ORDEN_PRODUCCION',
+          jobcount           TYPE  tbtcjob-jobcount,
+          host               TYPE msxxlist-host,
+          starttimeimmediate TYPE btch0000-char1 VALUE 'X'.
+
+* Job open
+    CALL FUNCTION 'JOB_OPEN'
+      EXPORTING
+        delanfrep        = ' '
+        jobgroup         = ' '
+        jobname          = jobname
+        sdlstrtdt        = sy-datum
+        sdlstrttm        = sy-uzeit
+      IMPORTING
+        jobcount         = jobcount
+      EXCEPTIONS
+        cant_create_job  = 01
+        invalid_job_data = 02
+        jobname_missing  = 03.
+    IF sy-subrc NE 0.
+      "error processing
+    ENDIF.
+
+* Insert process into job
+    SUBMIT zspp_crear_of_pedido AND RETURN
+                                WITH p_vbeln = i_vbeln
+                                WITH p_posnr = i_posnr
+                                USER sy-uname
+                                VIA JOB jobname
+                                NUMBER jobcount.
+    IF sy-subrc > 0.
+      "error processing
+    ENDIF.
+
+* Close job
+*    starttime-sdlstrtdt = sy-datum.
+*    starttime-sdlstrttm = sy-uzeit.
+    CALL FUNCTION 'JOB_CLOSE'
+      EXPORTING
+        "            event_id             = starttime-eventid
+        "            event_param          = starttime-eventparm
+        "            event_periodic       = starttime-periodic
+        jobcount             = jobcount
+        jobname              = jobname
+"       laststrtdt           = starttime-laststrtdt
+"       laststrttm           = starttime-laststrttm
+"       prddays              = 1
+"       prdhours             = 0
+"       prdmins              = 0
+"       prdmonths            = 0
+"       prdweeks             = 0
+"       sdlstrtdt            = starttime-sdlstrtdt
+"       sdlstrttm            = starttime-sdlstrttm
+        strtimmed            = starttimeimmediate
+"       targetsystem         = host
+      EXCEPTIONS
+        cant_start_immediate = 01
+        invalid_startdate    = 02
+        jobname_missing      = 03
+        job_close_failed     = 04
+        job_nosteps          = 05
+        job_notex            = 06
+        lock_failed          = 07
+        OTHERS               = 99.
+    IF sy-subrc EQ 0.
+      "error processing
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD re_schedule_orden_fab.
+
+    DATA it_aufnr TYPE TABLE OF bapi_order_key.
+    DATA it_return TYPE TABLE OF bapi_order_return.
+    DATA num_intentos TYPE i.
+    DATA lv_reintentos TYPE i.
+    DATA lv_waitsec TYPE p DECIMALS 2.
+
+    lv_waitsec = '0.5'.
+
+    lv_reintentos = 4.
+
+    CLEAR: it_aufnr, it_aufnr[], it_return[], it_return.
+    APPEND INITIAL LINE TO it_aufnr ASSIGNING FIELD-SYMBOL(<orden>).
+    <orden>-order_number = i_aufnr.
+
+    CLEAR num_intentos.
+
+    DO lv_reintentos TIMES.
+
+      num_intentos = num_intentos + 1.
+
+      CALL FUNCTION 'BAPI_PRODORD_SCHEDULE' IN BACKGROUND TASK AS SEPARATE UNIT
+*            EXPORTING
+*              sched_type         =
+*              fwd_dlv_origin     =
+*              fwd_dlv_date       =
+*              fwd_dlv_time       =
+*              fwd_dlv_offset     =
+*              fwd_dlv_unit       =
+*              fwd_beg_origin     =
+*              fwd_beg_date       =
+*              fwd_beg_time       =
+*              fwd_beg_offset     =
+*              fwd_beg_unit       =
+*              bck_dlv_origin     =
+*              bck_dlv_date       =
+*              bck_dlv_time       =
+*              bck_dlv_offset     =
+*              bck_dlv_unit       =
+*              bck_beg_origin     =
+*              bck_beg_date       =
+*              bck_beg_time       =
+*              bck_beg_offset     =
+*              bck_beg_unit       =
+*              work_process_group = 'COWORK_BAPI'
+*              work_process_max   = 99
+*            IMPORTING
+*              return             =
+        TABLES
+          orders        = it_aufnr
+          detail_return = it_return
+*         application_log    =
+        .
+
+*      COMMIT WORK AND WAIT.
+      IF lv_waitsec IS INITIAL.
+        WAIT UP TO '2' SECONDS.
+      ELSE.
+        WAIT UP TO lv_waitsec SECONDS.
+      ENDIF.
+      IF lv_reintentos = num_intentos.
+        EXIT.
+      ENDIF.
+      LOOP AT it_return TRANSPORTING NO FIELDS WHERE type EQ 'A' OR type EQ 'E' OR type EQ 'X'.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc = 0.
+        WAIT UP TO 2 SECONDS.
+        CONTINUE.
+      ELSE.
+        "No hay errores
+        EXIT.
+      ENDIF.
+
+    ENDDO.
+
+  ENDMETHOD.
+  METHOD zbapi_prodord_change.
+
+
+    DATA: l_sybatch TYPE sybatch.
+
+* store background indicator
+    l_sybatch = sy-batch.
+*ENHANCEMENT-POINT l2005_bapiu11_01 SPOTS es_sapl2005_bapi .
+
+    CALL FUNCTION 'COXT_BAPI_ORDER_CHANGE'
+      EXPORTING
+        i_order_number   = number
+        is_header        = orderdata
+        is_headerx       = orderdatax
+        i_order_category = '10'
+      IMPORTING
+        es_return        = return
+        e_order_type     = order_type
+        e_order_status   = order_status
+        e_new_explosion  = master_data_read
+                           EXCEPTIONS
+                           error_message.
+
+* restore background indicator
+    sy-batch = l_sybatch.
+
+    IF sy-subrc <> 0.
+      IF return IS INITIAL.
+        CALL FUNCTION 'BALW_BAPIRETURN_GET2'
+          EXPORTING
+            type   = sy-msgty
+            cl     = sy-msgid
+            number = sy-msgno
+            par1   = sy-msgv1
+            par2   = sy-msgv2
+            par3   = sy-msgv3
+            par4   = sy-msgv4
+          IMPORTING
+            return = return.
+      ENDIF.
+    ENDIF.
+
+    IF NOT return IS INITIAL.
+      CALL FUNCTION 'CO_EXT_ORDER_RESET'.
+*      ROLLBACK WORK.
+    ENDIF.
+
+  ENDMETHOD.

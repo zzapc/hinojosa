@@ -1,0 +1,375 @@
+FUNCTION zzidoc_output_mov_mcia .
+*"----------------------------------------------------------------------
+*"*"Interfase global
+*"  IMPORTING
+*"     VALUE(OBJECT) LIKE  NAST STRUCTURE  NAST
+*"     VALUE(CONTROL_RECORD_IN) LIKE  EDIDC STRUCTURE  EDIDC
+*"  EXPORTING
+*"     VALUE(CONTROL_RECORD_OUT) LIKE  EDIDC STRUCTURE  EDIDC
+*"     VALUE(OBJECT_TYPE) LIKE  WFAS1-ASGTP
+*"  TABLES
+*"      INT_EDIDD STRUCTURE  EDIDD
+*"  EXCEPTIONS
+*"      ERROR_MESSAGE_RECEIVED
+*"      DATA_NOT_RELEVANT_FOR_SENDING
+*"----------------------------------------------------------------------
+
+
+  DATA: lv_mblnr LIKE mkpf-mblnr,
+        lv_mjahr LIKE mkpf-mjahr,
+        lv_budat LIKE mkpf-budat,
+        lv_bwart LIKE mseg-bwart,
+        lv_zeile LIKE mseg-zeile.
+  DATA: lt_zsmm_idoc_emcia LIKE zsmm_idoc_emcias_str OCCURS 0,
+        ls_zsmm_idoc_emcia TYPE zsmm_idoc_emcias_str.
+  DATA: ls_mkpf TYPE mkpf,
+        ls_mseg TYPE mseg.
+
+  DATA: edidc        TYPE edidc,
+        ls_edidc     TYPE edidc,
+        lt_dd03n     LIKE dd03n OCCURS 0,
+        ls_dd03n     TYPE dd03n,
+        lt_comm_idoc LIKE edidc OCCURS 0,
+        ls_comm_idoc TYPE edidc,
+        lt_edidd     LIKE edidd OCCURS 0,
+        ls_edidd     TYPE edidd,
+        t_comm_idoc  LIKE edidc OCCURS 0 WITH HEADER LINE,
+        t_edidd      LIKE edidd OCCURS 0 WITH HEADER LINE.
+  DATA: ls_0006 TYPE ztpi0006.
+
+  DATA: lt_class LIKE conf_out OCCURS 0,
+        ls_class TYPE conf_out.
+  DATA ls_mbew TYPE mbew.
+  DATA so_lifnr TYPE RANGE OF elifn WITH HEADER LINE. " cvivo - 02.05.2018 48500 Lo hacemos configurable por tx STVARV, y ponemos solo papeleras
+  DATA ls_tvarvc TYPE tvarvc.
+
+  DATA: t_mseg TYPE STANDARD TABLE OF mseg.
+
+  lv_mblnr = object-objky(10).
+  lv_mjahr = object-objky+10(4).
+  lv_zeile = object-objky+14(10).
+
+  SELECT * APPENDING  CORRESPONDING FIELDS OF TABLE lt_zsmm_idoc_emcia
+       FROM zsmm_idoc_emcias WHERE mblnr  = lv_mblnr
+                              AND mjahr   = lv_mjahr
+                              AND zeile   = lv_zeile.
+*                              AND bwart  = lv_bwart.
+
+  IF lt_zsmm_idoc_emcia[] IS INITIAL.
+    RAISE data_not_relevant_for_sending.
+  ENDIF.
+
+  SORT lt_zsmm_idoc_emcia.
+  READ TABLE lt_zsmm_idoc_emcia INTO ls_zsmm_idoc_emcia INDEX 1.
+
+* Registro de control
+* ---------------------------------------------------------------------
+  MOVE-CORRESPONDING control_record_in TO control_record_out.
+
+
+
+  REFRESH : t_comm_idoc, t_edidd.
+  CLEAR ls_mkpf.
+  SELECT SINGLE * INTO ls_mkpf
+  FROM mkpf
+  WHERE mblnr EQ ls_zsmm_idoc_emcia-mblnr
+  AND mjahr EQ ls_zsmm_idoc_emcia-mjahr.
+
+  MOVE-CORRESPONDING ls_mkpf TO e1mbxyh.
+  CLEAR t_edidd.
+* el sistema externo requiere del campo XBLNR relleno
+  IF e1mbxyh-xblnr IS INITIAL.
+    CONCATENATE ls_zsmm_idoc_emcia-mblnr ls_zsmm_idoc_emcia-mjahr INTO e1mbxyh-xblnr SEPARATED BY '/'.
+  ENDIF.
+
+  t_edidd-segnam = 'E1MBXYH'.
+  t_edidd-sdata  = e1mbxyh.
+  APPEND t_edidd.
+
+  CLEAR: e1mbxyi, ls_mseg.
+
+  IF ls_zsmm_idoc_emcia-werks = '2052'.
+    SELECT  * INTO TABLE t_mseg
+       FROM mseg
+       WHERE mblnr EQ ls_zsmm_idoc_emcia-mblnr
+         AND mjahr EQ ls_zsmm_idoc_emcia-mjahr
+         AND lgort EQ space.
+  ELSE.
+    SELECT  * INTO TABLE t_mseg
+        FROM mseg
+        WHERE mblnr EQ ls_zsmm_idoc_emcia-mblnr
+          AND mjahr EQ ls_zsmm_idoc_emcia-mjahr
+          AND lgort NE space. " 23.04.2018 cvivo - 48323 - Posiciones sin almacén no se envían, si no el mensaje no sale de PI
+**      AND zeile EQ t_zsmm_idoc_emcia-zeile.
+  ENDIF.
+
+  LOOP AT t_mseg INTO ls_mseg.
+    MOVE-CORRESPONDING ls_mseg TO e1mbxyi.
+
+*   SE MODIFICA LA CANTIDAD EN UM ENTRADA POR LA CANTIDAD EN UMB
+    e1mbxyi-erfmg = ls_mseg-menge.
+    e1mbxyi-erfme = ls_mseg-meins.
+
+*   DETERMINAR EL NUMERO DE BULTOS PARA IMPRIMIR EL NUMERO DE ETIQUETAS
+    IF ls_mseg-weanz IS INITIAL.
+      e1mbxyi-bdmng = '1'.
+    ELSE.
+      e1mbxyi-bdmng = ls_mseg-weanz.
+    ENDIF.
+
+*   RECUPERAR DATOS DEL LOTE
+    SELECT SINGLE licha INTO e1mbxyi-fipex
+      FROM mch1
+      WHERE matnr = ls_mseg-matnr
+      AND charg   = ls_mseg-charg.
+
+* ini.del - cvivo - 02.05.2018 48500 Lo hacemos configurable por tx STVARV, y ponemos solo papeleras
+** SCT 19072017 Incluimos papelera Sarria.
+**    IF ls_mseg-lifnr = 'P3000'.
+*    IF ls_mseg-lifnr(1) = 'P'.
+** Fin SCT 190720175
+* fin.del - cvivo - 02.05.2018 48500 Lo hacemos configurable por tx STVARV, y ponemos solo papeleras
+* ini - cvivo - 02.05.2018 48500 Lo hacemos configurable por tx STVARV, y ponemos solo papeleras
+    SELECT * FROM tvarvc
+      WHERE name EQ 'ZZIDOC_LOTE_PROV'
+      INTO TABLE @DATA(lt_tvarvc).
+
+    IF sy-subrc EQ 0.
+      LOOP AT lt_tvarvc INTO ls_tvarvc.
+        MOVE ls_tvarvc-sign TO so_lifnr-sign.
+        MOVE ls_tvarvc-opti TO so_lifnr-option.
+        MOVE ls_tvarvc-low TO so_lifnr-low.
+        MOVE ls_tvarvc-high TO so_lifnr-high.
+        APPEND so_lifnr. CLEAR so_lifnr.
+      ENDLOOP.
+
+      IF ls_mseg-lifnr IN so_lifnr AND so_lifnr[] IS NOT INITIAL."si el proveedor está configurado para mostrar lote interno SAP
+        e1mbxyi-fipex = ls_mseg-charg.
+      ENDIF.
+    ENDIF.
+*   fin - cvivo - 02.05.2018 48500 Lo hacemos configurable por tx STVARV, y ponemos solo papeleras
+
+    IF ls_mseg-werks = '4000'.
+*      CLEAR e1mbxyi-sgtxt.
+      e1mbxyi-fipex = e1mbxyi-sgtxt.
+    ENDIF.
+
+*   RECUPERAR CLASIFICACION
+    CLEAR lt_class.
+    REFRESH lt_class.
+    CALL FUNCTION 'VB_BATCH_VALUES_FOR_OUTPUT'
+      EXPORTING
+        material               = ls_mseg-matnr
+        plant                  = ls_mseg-werks
+        batch                  = ls_mseg-charg
+*       BATCH_CUOBJ            =
+        language               = sy-langu
+      TABLES
+*       OBJECTS                =
+        classification         = lt_class
+      EXCEPTIONS
+        no_classification_data = 1
+        OTHERS                 = 2.
+
+    READ TABLE lt_class INTO ls_class WITH KEY atnam = 'Z_CAS_CUS'.
+    IF sy-subrc = 0.
+      e1mbxyi-umzst = ls_class-atwrt.
+    ENDIF.
+
+*   Para el cálculo del precio unitario, y solo en los 311/312 movimientos,
+*   mapearemos el valor del precio medio variable,
+*   dividido por la cantidad base en el campo E1MBXYI-DMBTR.
+*   Siendo el precio el del centro del movimiento MSEG-WERKS
+    IF ls_mseg-bwart BETWEEN '311' AND '312'.
+      CLEAR ls_mbew.
+      SELECT SINGLE * INTO ls_mbew
+       FROM mbew
+       WHERE matnr = ls_mseg-matnr
+         AND bwkey = ls_mseg-werks.
+      IF sy-subrc = 0.
+        e1mbxyi-dmbtr = ls_mbew-verpr / ls_mbew-peinh.
+      ELSE.
+        e1mbxyi-dmbtr = 0.
+      ENDIF.
+    ENDIF.
+
+*-> INI fcardona 22.04.2021 Proceso subcontratación OE
+
+    IF ls_mseg-bwart BETWEEN '541' AND '542'.
+      CLEAR ls_mbew.
+      SELECT SINGLE * INTO ls_mbew
+       FROM mbew
+       WHERE matnr = ls_mseg-matnr
+         AND bwkey = ls_mseg-werks.
+      IF sy-subrc = 0.
+        e1mbxyi-dmbtr = ls_mbew-verpr / ls_mbew-peinh.
+      ELSE.
+        e1mbxyi-dmbtr = 0.
+      ENDIF.
+    ENDIF.
+
+*<- FIN fcardona 22.04.2021 Proceso subcontratación OE
+
+*   26/07/2018 UDF - Recuperamos del pedido de compras la orden de impresion
+    IF ls_mseg-ebeln IS NOT INITIAL AND ls_mseg-ebelp IS NOT INITIAL.
+      SELECT SINGLE zzorden_imp
+        FROM ekpo
+        INTO e1mbxyi-sgtxt
+        WHERE ebeln = ls_mseg-ebeln AND
+              ebelp = ls_mseg-ebelp.
+    ENDIF.
+*   26/07/2018 UDF
+
+*APC20250205 Ajuste para Porriño
+    IF ls_mseg-bwart BETWEEN '961' AND '962' and ls_mseg-werks = '2060'.
+      e1mbxyi-lifnr = 'P2060'.
+      e1mbxyi-bpmng = e1mbxyi-erfmg.
+      e1mbxyi-BPRME = e1mbxyi-ERFME.
+      e1mbxyi-ebeln = '42'.
+    endif.
+
+    CLEAR t_edidd.
+    t_edidd-segnam = 'E1MBXYI'.
+    t_edidd-sdata  = e1mbxyi.
+    APPEND t_edidd.
+
+    CLEAR e1mbxyj.
+
+    MOVE-CORRESPONDING ls_mseg TO e1mbxyj.
+
+    CLEAR t_edidd.
+    t_edidd-segnam = 'E1MBXYJ'.
+    t_edidd-sdata  = e1mbxyj.
+    APPEND t_edidd.
+
+  ENDLOOP.
+
+*  CLEAR: e1mbxyi, ls_mseg.
+*  SELECT  * INTO ls_mseg
+*    FROM mseg
+*    WHERE mblnr EQ ls_zsmm_idoc_emcia-mblnr
+*      AND mjahr EQ ls_zsmm_idoc_emcia-mjahr
+*      AND lgort NE space. " 23.04.2018 cvivo - 48323 - Posiciones sin almacén no se envían, si no el mensaje no sale de PI
+***      AND zeile EQ t_zsmm_idoc_emcia-zeile.
+*
+*    MOVE-CORRESPONDING ls_mseg TO e1mbxyi.
+*
+**   SE MODIFICA LA CANTIDAD EN UM ENTRADA POR LA CANTIDAD EN UMB
+*    e1mbxyi-erfmg = ls_mseg-menge.
+*    e1mbxyi-erfme = ls_mseg-meins.
+*
+**   DETERMINAR EL NUMERO DE BULTOS PARA IMPRIMIR EL NUMERO DE ETIQUETAS
+*    IF ls_mseg-weanz IS INITIAL.
+*      e1mbxyi-bdmng = '1'.
+*    ELSE.
+*      e1mbxyi-bdmng = ls_mseg-weanz.
+*    ENDIF.
+*
+**   RECUPERAR DATOS DEL LOTE
+*    SELECT SINGLE licha INTO e1mbxyi-fipex
+*      FROM mch1
+*      WHERE matnr = ls_mseg-matnr
+*      AND charg   = ls_mseg-charg.
+*
+** ini.del - cvivo - 02.05.2018 48500 Lo hacemos configurable por tx STVARV, y ponemos solo papeleras
+*** SCT 19072017 Incluimos papelera Sarria.
+***    IF ls_mseg-lifnr = 'P3000'.
+**    IF ls_mseg-lifnr(1) = 'P'.
+*** Fin SCT 190720175
+** fin.del - cvivo - 02.05.2018 48500 Lo hacemos configurable por tx STVARV, y ponemos solo papeleras
+** ini - cvivo - 02.05.2018 48500 Lo hacemos configurable por tx STVARV, y ponemos solo papeleras
+*      SELECT * FROM tvarvc
+*        WHERE name EQ 'ZZIDOC_LOTE_PROV'
+*        INTO TABLE @DATA(lt_tvarvc).
+*
+*        IF sy-subrc EQ 0.
+*          LOOP AT lt_tvarvc INTO ls_tvarvc.
+*            MOVE ls_tvarvc-sign TO so_lifnr-sign.
+*            MOVE ls_tvarvc-opti TO so_lifnr-option.
+*            MOVE ls_tvarvc-low TO so_lifnr-low.
+*            MOVE ls_tvarvc-high TO so_lifnr-high.
+*            APPEND so_lifnr. CLEAR so_lifnr.
+*          ENDLOOP.
+*
+*          IF ls_mseg-lifnr IN so_lifnr AND so_lifnr[] IS NOT INITIAL."si el proveedor está configurado para mostrar lote interno SAP
+*            e1mbxyi-fipex = ls_mseg-charg.
+*          ENDIF.
+*        ENDIF.
+**   fin - cvivo - 02.05.2018 48500 Lo hacemos configurable por tx STVARV, y ponemos solo papeleras
+*
+*        IF ls_mseg-werks = '4000'.
+**      CLEAR e1mbxyi-sgtxt.
+*          e1mbxyi-fipex = e1mbxyi-sgtxt.
+*        ENDIF.
+*
+**   RECUPERAR CLASIFICACION
+*        CLEAR lt_class.
+*        REFRESH lt_class.
+*        CALL FUNCTION 'VB_BATCH_VALUES_FOR_OUTPUT'
+*          EXPORTING
+*            material               = ls_mseg-matnr
+*            plant                  = ls_mseg-werks
+*            batch                  = ls_mseg-charg
+**           BATCH_CUOBJ            =
+*            language               = sy-langu
+*          TABLES
+**           OBJECTS                =
+*            classification         = lt_class
+*          EXCEPTIONS
+*            no_classification_data = 1
+*            OTHERS                 = 2.
+*
+*        READ TABLE lt_class INTO ls_class WITH KEY atnam = 'Z_CAS_CUS'.
+*        IF sy-subrc = 0.
+*          e1mbxyi-umzst = ls_class-atwrt.
+*        ENDIF.
+*
+**   Para el cálculo del precio unitario, y solo en los 311/312 movimientos,
+**   mapearemos el valor del precio medio variable,
+**   dividido por la cantidad base en el campo E1MBXYI-DMBTR.
+**   Siendo el precio el del centro del movimiento MSEG-WERKS
+*        IF ls_mseg-bwart BETWEEN '311' AND '312'.
+*          CLEAR ls_mbew.
+*          SELECT SINGLE * INTO ls_mbew
+*           FROM mbew
+*           WHERE matnr = ls_mseg-matnr
+*             AND bwkey = ls_mseg-werks.
+*            IF sy-subrc = 0.
+*              e1mbxyi-dmbtr = ls_mbew-verpr / ls_mbew-peinh.
+*            ELSE.
+*              e1mbxyi-dmbtr = 0.
+*            ENDIF.
+*          ENDIF.
+*
+**   26/07/2018 UDF - Recuperamos del pedido de compras la orden de impresion
+*          IF ls_mseg-ebeln IS NOT INITIAL AND ls_mseg-ebelp IS NOT INITIAL.
+*            SELECT SINGLE zzorden_imp
+*              FROM ekpo
+*              INTO e1mbxyi-sgtxt
+*              WHERE ebeln = ls_mseg-ebeln AND
+*                    ebelp = ls_mseg-ebelp.
+*            ENDIF.
+**   26/07/2018 UDF
+*
+*            CLEAR t_edidd.
+*            t_edidd-segnam = 'E1MBXYI'.
+*            t_edidd-sdata  = e1mbxyi.
+*            APPEND t_edidd.
+*
+*            CLEAR e1mbxyj.
+*
+*            MOVE-CORRESPONDING ls_mseg TO e1mbxyj.
+*
+*            CLEAR t_edidd.
+*            t_edidd-segnam = 'E1MBXYJ'.
+*            t_edidd-sdata  = e1mbxyj.
+*            APPEND t_edidd.
+*
+*          ENDSELECT.
+
+
+  int_edidd[] = t_edidd[].
+
+
+
+ENDFUNCTION.

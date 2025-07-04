@@ -1,0 +1,154 @@
+INCLUDE zdyn_cl_msg===================ccmac.
+CLASS zdyn_cl_rest_routty_exp_ap DEFINITION
+  PUBLIC
+  INHERITING FROM zdyn_cl_rest_routty_exp
+  CREATE PUBLIC .
+
+  PUBLIC SECTION.
+
+    DATA mo_ap TYPE REF TO zdyn_cl_ap .
+
+    METHODS set_ap_logic
+      IMPORTING
+        !io_ap TYPE REF TO zdyn_cl_ap OPTIONAL .
+
+    METHODS transform_data_to_xml
+      IMPORTING
+        !ic_xslt  TYPE cxsltdesc
+        !ist_data TYPE any
+      EXPORTING
+        !es_xml   TYPE string
+      EXCEPTIONS
+        error_occurred .
+
+    METHODS set_input_documents_ap
+         REDEFINITION .
+  PROTECTED SECTION.
+  PRIVATE SECTION.
+endclass. "ZDYN_CL_REST_ROUTTY_EXP_AP definition
+class ZDYN_CL_REST_ROUTTY_EXP_AP implementation.
+  METHOD set_ap_logic.
+
+    zdyn_cl_msg=>add_to_call_stack( ).
+
+    IF io_ap IS NOT INITIAL.
+      mo_ap = io_ap.
+    ELSE.
+      CREATE OBJECT mo_ap.
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD set_input_documents_ap.
+
+    DATA: lt_docs     TYPE zdyn_linvoice_header,
+          ls_xml      TYPE string,
+          lst_doc     LIKE LINE OF lt_docs,
+          lst_doc_int LIKE LINE OF lst_doc-documents,
+          lb_ok       TYPE abap_bool.
+    FIELD-SYMBOLS: <st_doc>  LIKE LINE OF lt_docs.
+
+    zdyn_cl_msg=>add_to_call_stack( ).
+
+    set_ap_logic( ).
+    CLEAR mi_entry_counter.
+
+    cleanup_register( EXCEPTIONS OTHERS = 1 ).
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+
+    mo_ap->get_ap_documents( EXPORTING it_sel_comp_code   = it_sel_comp_code
+                                       it_sel_doc_num     = it_sel_doc_num
+                                       it_sel_ref_num     = it_sel_ref_num
+                                       it_sel_fiscal_year = it_sel_fiscal_year
+                                       it_sel_doc_type    = it_sel_doc_type
+                                       it_sel_ent_date    = it_sel_ent_date
+                                       is_land            = is_land
+                                       is_tax_num         = is_tax_num
+                                       ip_round           = ip_round
+                                       ib_normal          = ib_normal
+                                       ib_corr            = ib_corr
+                                       ib_final           = ib_final
+                                       ib_flip_sign       = ib_flip_sign
+                                       ib_use_register    = ib_use_register
+                             IMPORTING et_docs            = lt_docs ).
+
+* TODO this logic could be simplified by changes in GET_AP_DOCUMENTS
+* TODO add check register
+    LOOP AT lt_docs ASSIGNING <st_doc>.
+      lst_doc = <st_doc>.
+      LOOP AT <st_doc>-documents INTO lst_doc_int.
+        CLEAR lst_doc-documents.
+        APPEND lst_doc_int TO lst_doc-documents.
+        transform_data_to_xml( EXPORTING  ic_xslt  = mst_config-xslt
+                                          ist_data = lst_doc
+                               IMPORTING  es_xml   = ls_xml
+                               EXCEPTIONS OTHERS   = 1 ).
+        IF sy-subrc = 0.
+          IF mo_file->is_doc_to_file( ) = abap_false.
+            lb_ok = send_document( is_doc_no = lst_doc_int-document_number
+                                   is_xml    = ls_xml ).
+          ELSE.
+            lb_ok = mo_file->save_doc_in_xml_file( is_doc_no = lst_doc_int-document_number
+                                                   is_xml    = ls_xml ).
+            mi_entry_counter = mi_entry_counter + 1.
+          ENDIF.
+
+          IF ib_use_register = abap_true AND lb_ok = abap_true.
+*         TODO add type, CC and GJAHR
+            register_document( EXPORTING  ic_doc_number = lst_doc_int-document_number
+                               EXCEPTIONS OTHERS        = 1 ).
+            IF sy-subrc <> 0.
+              RETURN.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+
+    zdyn_cl_msg=>add_batch_info( ii_entry_count = mi_entry_counter ).
+
+  ENDMETHOD.
+  METHOD transform_data_to_xml.
+
+    DATA: lo_cx_root  TYPE REF TO cx_root,
+          ls_abap_xml TYPE string,
+          lst_data    TYPE abap_trans_resbind,
+          lt_data     TYPE abap_trans_resbind_tab,
+          lt_messages TYPE bapiret2_t.
+
+    zdyn_cl_msg=>add_to_call_stack( ).
+
+    CHECK NOT ist_data IS INITIAL.
+
+    lst_data-name = zdyn_if_rest_data=>con_pdiv_document_root.
+    GET REFERENCE OF ist_data INTO lst_data-value.
+    APPEND lst_data TO lt_data.
+
+    TRY.
+
+        CALL TRANSFORMATION id
+             SOURCE (lt_data)
+             RESULT XML ls_abap_xml.
+      CATCH cx_root INTO lo_cx_root.
+        CALL FUNCTION 'RS_EXCEPTION_TO_BAPIRET2'
+          EXPORTING
+            i_r_exception = lo_cx_root
+          CHANGING
+            c_t_bapiret2  = lt_messages.
+        zdyn_cl_msg=>add_msgs( lt_messages ).
+        RAISE error_occurred.
+
+    ENDTRY.
+
+    CHECK NOT ic_xslt IS INITIAL.
+
+    transform_xml_to_xml( EXPORTING  is_xml      = ls_abap_xml
+                                     ic_xslt     = ic_xslt
+                          IMPORTING  es_xml      = es_xml
+                          EXCEPTIONS OTHERS      = 1 ).
+    IF sy-subrc <> 0.
+      RAISE error_occurred.
+    ENDIF.
+
+  ENDMETHOD.

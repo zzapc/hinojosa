@@ -1,0 +1,2718 @@
+*&---------------------------------------------------------------------*
+*&  Include           SAPMZPP0001_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  USER_COMMAND_010
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM user_command_0100.
+
+  DATA: lv_ok    TYPE sy-ucomm,
+        lv_subrc TYPE char1.
+  DATA ls_msg TYPE bal_s_msg.
+
+  lv_ok = gv_okcode100.
+  CLEAR gv_okcode100.
+
+  CLEAR gv_field.
+
+  PERFORM crear_log.
+
+  CASE lv_ok.
+
+    WHEN 'REPRO'.
+      PERFORM reprocesar.
+
+    WHEN 'CANCEL'.
+      PERFORM limpiar_campos.
+
+    WHEN 'LOG'.
+      PERFORM mostrar_log.
+
+* 63971 - Añadir botón "DESGUACE" ->mov. 551
+    WHEN 'DESGUACE'.
+      CHECK g_material_ok = 'X'.
+      PERFORM pop_up_desguace CHANGING lv_subrc.
+      CHECK lv_subrc EQ 1.
+
+      PERFORM crear_mov_regularizacion USING '551' gv_matnr gv_charg gv_peso.
+
+      IF NOT line_exists( gt_return[ type = 'E' ] ).
+
+
+
+        ls_msg-msgty = 'S'.
+        ls_msg-msgid = 'ZPP'.
+        ls_msg-msgno = 360. " Bobina & enviada a desguace correctamente.
+        ls_msg-msgv1 = gv_charg.
+
+        CALL FUNCTION 'BAL_LOG_MSG_ADD'
+          EXPORTING
+            i_log_handle     = gv_log_handle
+            i_s_msg          = ls_msg
+          EXCEPTIONS
+            log_not_found    = 1
+            msg_inconsistent = 2
+            log_is_full      = 3
+            OTHERS           = 4.
+        PERFORM mostrar_log.
+        PERFORM limpiar_campos.
+
+*        MESSAGE |Lote { gv_charg ALPHA = OUT } enviado a desguace correctamente. | TYPE 'S'.
+      ELSE.
+        PERFORM mostrar_log.
+
+      ENDIF.
+
+    WHEN OTHERS .
+      PERFORM cursor_en_campo.
+
+
+  ENDCASE.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  EXIT_0100
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM exit_0100 .
+
+  DATA: lv_ok TYPE sy-ucomm.
+
+  lv_ok = gv_okcode100.
+  CLEAR gv_okcode100.
+
+  CASE lv_ok.
+
+    WHEN 'BACK'.
+      SET SCREEN 0.
+      LEAVE SCREEN.
+
+    WHEN 'EXIT' OR 'CANCEL'.
+      LEAVE PROGRAM.
+
+  ENDCASE.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  REPROCESAR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM reprocesar .
+
+  DATA lv_subrc TYPE char1.
+
+  IF gv_charg IS INITIAL.
+    PERFORM limpiar_campos.
+
+    MESSAGE |Informar lote de bobina.| TYPE 'I' DISPLAY LIKE 'E'.
+    EXIT.
+  ENDIF.
+
+  PERFORM pop_up CHANGING lv_subrc.
+  CHECK lv_subrc EQ 1.
+  PERFORM checks CHANGING lv_subrc.
+  IF lv_subrc EQ abap_true.
+    PERFORM crear_nuevas_bobinas.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PBO_0100
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM pbo_0100 .
+
+  DATA: lv_objek TYPE ausp-objek,
+        lv_cuobj TYPE inob-cuobj,
+        lv_index TYPE numc2.
+
+  TYPES: BEGIN OF tipo_reproceso,
+           atwrt TYPE atwrt,
+           atwtb TYPE atwtb.
+  TYPES: END OF tipo_reproceso.
+  TYPES: tty_tipo_reproceso TYPE TABLE OF tipo_reproceso.
+
+  DATA: lt_zvpp_carac_recha TYPE TABLE OF zvpp_carac_recha,
+        ls_zvpp_carac_recha TYPE          zvpp_carac_recha,
+        lt_zvpp_carac_repr  TYPE TABLE OF zvpp_carac_repr,
+        ls_zvpp_carac_repr  TYPE          zvpp_carac_repr.
+
+  CONSTANTS: lc_mch1 TYPE char4 VALUE 'MCH1'.
+
+  TYPES: BEGIN OF ty_ancho,
+           ancho LIKE gv_ancho1,
+           tipo  LIKE gv_tipobobina1,
+         END OF ty_ancho,
+         ty_t_ancho TYPE STANDARD TABLE OF ty_ancho WITH DEFAULT KEY.
+
+
+* CMS 63971 - Añadir boton desguace
+  LOOP AT SCREEN.
+    IF screen-name = 'BTN_DESGUACE'.
+
+      IF g_material_ok = ' ' OR gv_charg IS INITIAL.
+        screen-input = 0.
+      ELSE.
+        screen-input = 1.
+      ENDIF.
+
+      MODIFY SCREEN.
+
+    ENDIF.
+
+  ENDLOOP.
+
+
+  IF gv_werks IS INITIAL.
+*    GET PARAMETER ID 'WRK' FIELD gv_werks.
+*    GET PARAMETER ID 'MAT' FIELD gv_matnr.
+*    GET PARAMETER ID 'CHA' FIELD gv_charg.
+
+    SELECT SINGLE parva INTO gv_werks FROM usr05
+      WHERE bname = sy-uname AND parid = 'WRK'.
+
+    IF gv_werks IS INITIAL AND NOT gv_charg IS INITIAL AND NOT gv_matnr IS INITIAL.
+      SELECT SINGLE werks INTO gv_werks FROM mcha
+        WHERE matnr = gv_matnr AND charg = gv_charg.
+      IF sy-subrc <> 0.
+        MESSAGE text-021 TYPE 'I'.RETURN..
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+
+  IF NOT gv_werks IS INITIAL AND gv_name1 IS INITIAL.
+    SELECT SINGLE name1 INTO gv_name1 FROM t001w WHERE werks = gv_werks.
+  ENDIF.
+
+  SELECT SINGLE * FROM mchb INTO @DATA(ls_mchb)
+                     WHERE matnr = @gv_matnr
+                       AND charg = @gv_charg
+
+* 02/11/2021 - 69304 - CMS - Añadir validaciíónn sobre tabla ZTPP0024.
+                           AND lgort IN @zcl_utils_hpap_pp=>gtr_alm_reproceso[]
+
+*                       AND ( lgort = @gc_4001 OR
+*                             lgort = @gc_4011 OR
+*                             lgort = @gc_4012 OR
+*                             lgort = @gc_4013 )
+                          .
+  IF sy-subrc <> 0.
+    RETURN.
+  ENDIF.
+
+  IF NOT gv_matnr IS INITIAL AND gv_maktx IS INITIAL.
+
+    SELECT SINGLE maktx INTO gv_maktx FROM makt
+       WHERE matnr = gv_matnr AND spras = sy-langu.
+
+    IF sy-subrc <> 0.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = gv_matnr
+        IMPORTING
+          output = gv_matnr.
+
+      SELECT SINGLE maktx INTO gv_maktx FROM makt
+         WHERE matnr = gv_matnr AND spras = sy-langu.
+
+    ENDIF.
+
+  ENDIF.
+
+  IF gv_operario IS INITIAL.
+    SELECT SINGLE name_text INTO gv_operario FROM v_usr_name WHERE bname = sy-uname.
+  ENDIF.
+
+
+
+
+  CONCATENATE gv_matnr gv_charg INTO lv_objek.
+  SELECT SINGLE cuobj INTO lv_cuobj FROM inob
+    WHERE objek = lv_objek AND obtab = lc_mch1.
+
+  SELECT SINGLE zzancho INTO gv_ancho FROM mara WHERE matnr = gv_matnr.
+
+  IF gv_atinn_diametro IS INITIAL.
+    SELECT SINGLE atinn INTO gv_atinn_diametro FROM cabn WHERE atnam = gc_z_diametro.
+  ENDIF.
+
+  IF gv_atinn_peso IS INITIAL.
+    SELECT SINGLE atinn INTO gv_atinn_peso FROM cabn WHERE atnam = gc_z_peso.
+  ENDIF.
+
+  IF gv_atinn_longitud IS INITIAL.
+    SELECT SINGLE atinn INTO gv_atinn_longitud FROM cabn WHERE atnam = gc_z_longitud.
+  ENDIF.
+
+  SELECT SINGLE atflv INTO gv_diametro FROM ausp
+    WHERE objek = lv_cuobj AND atinn = gv_atinn_diametro
+      AND klart = gc_023.
+
+  SELECT SINGLE atflv INTO gv_peso FROM ausp
+    WHERE objek = lv_cuobj AND atinn = gv_atinn_peso
+      AND klart = gc_023.
+
+  SELECT SINGLE atflv INTO gv_longitud FROM ausp
+    WHERE objek = lv_cuobj AND atinn = gv_atinn_longitud
+      AND klart = gc_023.
+
+
+*  SELECT SINGLE clabs FROM mchb INTO gv_peso WHERE matnr = gv_matnr AND werks = gv_werks
+*                                               AND lgort = gc_4001 AND charg = gv_charg .
+*  IF sy-subrc NE 0.
+*
+*    SELECT SINGLE clabs FROM mchb INTO gv_peso WHERE matnr = gv_matnr AND werks = gv_werks
+*                                               AND lgort = gc_4011 AND charg = gv_charg .
+*    IF sy-subrc NE 0.
+*      SELECT SINGLE clabs FROM mchb INTO gv_peso WHERE matnr = gv_matnr AND werks = gv_werks
+*                                               AND lgort = gc_4012 AND charg = gv_charg .
+*    ENDIF.
+*  ENDIF.
+*
+*  gv_peso_p = gv_peso." TO gv_peso_p DECIMALS 2 EXPONENT 0.
+  gv_longitud_p = gv_longitud." TO gv_longitud_p DECIMALS 2 EXPONENT 0.
+  gv_diametro_p = gv_diametro." TO gv_diametro_p DECIMALS 2 EXPONENT 0.
+
+  gv_difancho = gv_ancho - gv_ancho1 - gv_ancho2 - gv_ancho3.
+  IF gv_difancho LT 0.
+    gv_icon_ancho = icon_red_light.
+  ELSE.
+    gv_icon_ancho = icon_green_light.
+  ENDIF.
+
+  gv_difpeso = gv_peso - gv_peso1 - gv_peso2 - gv_peso3.
+  IF gv_difpeso LT 0.
+    gv_icon_peso = icon_red_light.
+  ELSE.
+    gv_icon_peso = icon_green_light.
+  ENDIF.
+
+  REFRESH gt_list.
+  gv_name_lb = 'GV_TIPOBOBINA1'.
+  gv_name_lb1 = 'GV_TIPOBOBINA2'.
+  gv_name_lb2 = 'GV_TIPOBOBINA3'.
+  gv_name_lb3 = 'GV_MOTIVO1'.
+  gv_name_lb4 = 'GV_MOTIVO2'.
+  gv_name_lb5 = 'GV_MOTIVO3'.
+
+  gs_value-key = '01'.
+  gs_value-text = text-003.
+  APPEND gs_value TO gt_list.
+
+  gs_value-key = '02'.
+  gs_value-text = text-004.
+  APPEND gs_value TO gt_list.
+
+  gs_value-key = '03'.
+  gs_value-text = text-005.
+  APPEND gs_value TO gt_list.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = gv_name_lb
+      values = gt_list.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = gv_name_lb1
+      values = gt_list.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = gv_name_lb2
+      values = gt_list.
+
+  REFRESH gt_list.
+
+  IF gv_tipobobina1 EQ '01'.
+
+    SELECT * FROM zvpp_carac_recha INTO TABLE lt_zvpp_carac_recha.
+    LOOP AT lt_zvpp_carac_recha INTO ls_zvpp_carac_recha.
+      gs_value-key  = ls_zvpp_carac_recha-atzhl.
+      gs_value-text = ls_zvpp_carac_recha-atwtb.
+      APPEND gs_value TO gt_list.
+
+    ENDLOOP.
+
+  ELSEIF gv_tipobobina1 EQ '02'.
+
+    SELECT * FROM zvpp_carac_repr INTO TABLE lt_zvpp_carac_repr.
+    LOOP AT lt_zvpp_carac_repr INTO ls_zvpp_carac_repr.
+      gs_value-key = ls_zvpp_carac_repr-atzhl.
+      gs_value-text = ls_zvpp_carac_repr-atwtb.
+      APPEND gs_value TO gt_list.
+    ENDLOOP.
+
+  ENDIF.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = gv_name_lb3
+      values = gt_list.
+
+  REFRESH gt_list.
+  IF gv_tipobobina2 EQ '01'.
+
+    SELECT * FROM zvpp_carac_recha INTO TABLE lt_zvpp_carac_recha.
+    LOOP AT lt_zvpp_carac_recha INTO ls_zvpp_carac_recha.
+      gs_value-key  = ls_zvpp_carac_recha-atzhl.
+      gs_value-text = ls_zvpp_carac_recha-atwtb.
+      APPEND gs_value TO gt_list.
+
+    ENDLOOP.
+
+  ELSEIF gv_tipobobina2 EQ '02'.
+
+    SELECT * FROM zvpp_carac_repr INTO TABLE lt_zvpp_carac_repr.
+    LOOP AT lt_zvpp_carac_repr INTO ls_zvpp_carac_repr.
+      gs_value-key  = ls_zvpp_carac_repr-atzhl.
+      gs_value-text = ls_zvpp_carac_repr-atwtb.
+      APPEND gs_value TO gt_list.
+    ENDLOOP.
+
+  ENDIF.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = gv_name_lb4
+      values = gt_list.
+
+  REFRESH gt_list.
+  IF gv_tipobobina3 EQ '01'.
+
+    SELECT * FROM zvpp_carac_recha INTO TABLE lt_zvpp_carac_recha.
+    LOOP AT lt_zvpp_carac_recha INTO ls_zvpp_carac_recha.
+      gs_value-key = lv_index.
+      gs_value-text = ls_zvpp_carac_recha-atwtb.
+      APPEND gs_value TO gt_list.
+      lv_index = lv_index + 1.
+    ENDLOOP.
+
+  ELSEIF gv_tipobobina3 EQ '02'.
+
+    SELECT * FROM zvpp_carac_repr INTO TABLE lt_zvpp_carac_repr.
+    LOOP AT lt_zvpp_carac_repr INTO ls_zvpp_carac_repr.
+      gs_value-key = lv_index.
+      gs_value-text = ls_zvpp_carac_repr-atwtb.
+      APPEND gs_value TO gt_list.
+      lv_index = lv_index + 1.
+    ENDLOOP.
+
+  ENDIF.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = gv_name_lb5
+      values = gt_list.
+
+*  ENDIF.
+
+  LOOP AT SCREEN.
+    IF screen-group1 EQ '001'.
+*        screen-required = 1.
+      screen-value_help = '0'.
+      MODIFY SCREEN.
+    ELSEIF screen-group1 EQ '002'.
+      IF gv_tipobobina1 EQ '01' OR gv_tipobobina1 EQ '02'.
+*        screen-required = 1.
+        screen-input = 1.
+        MODIFY SCREEN.
+      ELSE.
+*        screen-required = 0.
+        screen-input = 0.
+        MODIFY SCREEN.
+      ENDIF.
+    ELSEIF screen-group1 EQ '003'.
+      IF gv_tipobobina2 EQ '01' OR gv_tipobobina2 EQ '02'.
+*        screen-required = 1.
+        screen-input = 1.
+        MODIFY SCREEN.
+      ELSE.
+*        screen-required = 0.
+        screen-input = 0.
+        MODIFY SCREEN.
+      ENDIF.
+    ELSEIF screen-group1 EQ '004'.
+      IF gv_tipobobina3 EQ '01' OR gv_tipobobina3 EQ '02'.
+*        screen-required = 1.
+        screen-input = 1.
+        MODIFY SCREEN.
+      ELSE.
+*        screen-required = 0.
+        screen-input = 0.
+        MODIFY SCREEN.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  IF gv_field IS NOT INITIAL.
+    SET CURSOR FIELD gv_field.
+  ENDIF.
+  IF gv_charg IS NOT INITIAL.
+    LOOP AT SCREEN.
+      IF screen-name EQ 'GV_CHARG' OR screen-name CS 'GV_CLIENTE'.
+        screen-input = 0.
+        MODIFY SCREEN.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  LOOP AT SCREEN.
+    IF screen-name EQ  'GV_CLIENTE1' .
+      IF gv_tipobobina1 = '03'.
+        screen-input = '1'.
+      ELSE.
+        screen-input = '0'.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+    IF screen-name EQ  'GV_CLIENTE2' .
+      IF gv_tipobobina2 = '03'.
+        screen-input = '1'.
+      ELSE.
+        screen-input = '0'.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+    IF screen-name EQ  'GV_CLIENTE3' .
+      IF gv_tipobobina3 = '03'.
+        screen-input = '1'.
+      ELSE.
+        screen-input = '0'.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+
+
+  ENDLOOP.
+
+
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_MATERIAL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_material .
+
+  DATA: lt_valuesnum       TYPE TABLE OF bapi1003_alloc_values_num,
+        lt_valueschar      TYPE TABLE OF bapi1003_alloc_values_char,
+        lt_valuescurr      TYPE TABLE OF bapi1003_alloc_values_curr,
+        lt_return          TYPE bapiret2_t,
+        lv_mtart           TYPE mtart,
+        lv_code            LIKE sy-subrc,
+        lv_objek           TYPE ausp-objek,
+        lv_cuobj           TYPE inob-cuobj,
+        lv_decision_empleo TYPE cawn-atwrt,
+        lv_msg             TYPE char100,
+        lv_matnr           TYPE matnr.
+
+  CONSTANTS: lc_mch1 TYPE char4 VALUE 'MCH1',
+             lc_zpap TYPE char4 VALUE 'ZPAP'.
+
+  g_material_ok = ' '.
+
+  CHECK gv_charg IS NOT INITIAL.
+
+  TRANSLATE gv_charg TO UPPER CASE.
+
+* INI CMS Selecion de material de BOBINA y NO de Rollo. Obtener el material más reciente en caso de conversiones (309)
+******  check
+  SELECT * FROM mseg
+      WHERE werks = @gv_werks
+        AND charg = @gv_charg
+  ORDER BY  cpudt_mkpf DESCENDING,
+            cputm_mkpf DESCENDING,
+            zeile      DESCENDING "DTM
+  INTO TABLE @DATA(lt_mseg_order).
+
+  IF sy-subrc = 0.
+
+    gv_matnr = lt_mseg_order[ 1 ]-matnr. "Coger el material mas reciente
+
+  ELSE.
+
+    PERFORM limpiar_campos.
+
+    MESSAGE |Lote no encontrado.| TYPE 'I' DISPLAY LIKE 'E'.
+
+    EXIT.
+
+  ENDIF.
+
+*  SELECT  a~matnr , MAX( a~ersda ) AS fecha
+*    FROM mchb AS a
+*    INNER JOIN mara AS m ON a~matnr = m~matnr
+*    INTO TABLE @DATA(lt_mcha)
+*    WHERE a~werks = @gv_werks AND charg = @gv_charg
+*          AND m~mtart = 'ZPAP'
+*    GROUP BY a~matnr.
+*
+*  SORT lt_mcha BY fecha DESCENDING.
+*
+*  TRY.
+*      gv_matnr = lt_mcha[ 1 ]-matnr. "Coger el material mas reciente
+*    CATCH cx_sy_itab_line_not_found.
+*  ENDTRY.
+
+* FIN CMS Selecion de material de BOBINA y NO de Rollo
+
+*  IF sy-subrc <> 0.
+  IF gv_matnr IS INITIAL.
+
+    MESSAGE text-001 TYPE 'I'.
+    CLEAR: gv_ancho,gv_diametro_p,gv_longitud_p,gv_cliente,gv_decision_empleo,gv_decision_empleo_icon,
+           gv_nombre_cliente,gv_peso_p.
+
+    RETURN.
+
+  ELSE.
+
+    CALL FUNCTION 'COPC_CHECK_MBEW_KEKO'
+      EXPORTING
+        material = gv_matnr
+        bwkey    = gv_werks
+        status   = 'FR'
+      IMPORTING
+        rcode    = lv_code.
+
+    IF lv_code <> 0.
+
+      lv_msg = text-002.
+      lv_matnr = |{ gv_matnr ALPHA = OUT }|.
+      REPLACE '&' IN lv_msg WITH lv_matnr.
+      MESSAGE lv_msg TYPE 'I'.
+
+      RETURN.
+
+    ELSE.
+
+      SELECT SINGLE maktx INTO gv_maktx FROM makt
+        WHERE matnr = gv_matnr AND spras = sy-langu.
+
+    ENDIF.
+
+  ENDIF.
+
+* Validación del almacen correcto { Almacen bobinas a reprocesar(4001),
+*                                   Almacén ficticio de reproceso [proveedor](4011),
+*                                   Almacén 2o para reproceso (4012) }
+
+  " nuevo almacén ABRACRISA 26/10/2021 CMS
+  SELECT SINGLE * FROM mchb INTO @DATA(ls_mchb)
+                         WHERE"  matnr = @gv_matnr
+                            werks = @gv_werks
+                           AND charg = @gv_charg
+
+* 02/11/2021 - 69304 - CMS - Añadir validaciíónn sobre tabla ZTPP0024.
+                           AND lgort IN @zcl_utils_hpap_pp=>gtr_alm_reproceso[]
+*                           AND ( lgort = @gc_4001 OR
+*                                 lgort = @gc_4011 OR
+*                                 lgort = @gc_4012 OR
+*                                 lgort = @gc_4013 )
+                              .
+  IF sy-subrc <> 0.
+
+    MESSAGE text-024 TYPE 'I'.
+    PERFORM limpiar_campos.
+
+    RETURN.
+
+  ENDIF.
+
+  SELECT SINGLE lgort,clabs FROM mchb INTO ( @gv_lgort, @gv_peso )
+                       WHERE matnr = @gv_matnr
+                         AND werks = @gv_werks
+                         AND charg = @gv_charg
+
+* 02/11/2021 - 69304 - CMS - Añadir validaciíónn sobre tabla ZTPP0024.
+                           AND lgort IN @zcl_utils_hpap_pp=>gtr_alm_reproceso[]
+*                         AND ( lgort = @gc_4001 OR
+*                               lgort = @gc_4011 OR
+*                               lgort = @gc_4012 OR
+*                               lgort = @gc_4013 )
+                         AND clabs NE 0.
+
+  IF sy-subrc NE 0.
+
+    MESSAGE text-024 TYPE 'I'.
+    PERFORM limpiar_campos.
+
+    RETURN.
+
+  ENDIF.
+
+  IF gv_werks IS INITIAL.
+
+    SELECT SINGLE werks INTO gv_werks FROM mcha
+      WHERE matnr = gv_matnr AND charg = gv_charg.
+
+    IF sy-subrc <> 0.
+
+      MESSAGE text-021 TYPE 'I'.
+      RETURN.
+
+    ENDIF.
+
+  ENDIF.
+
+  CONCATENATE gv_matnr gv_charg INTO lv_objek.
+
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = lv_objek
+      objecttable     = 'MCH1'
+      classnum        = gc_z_bobina
+      classtype       = '023'
+    TABLES
+      allocvaluesnum  = lt_valuesnum
+      allocvalueschar = lt_valueschar
+      allocvaluescurr = lt_valuescurr
+      return          = lt_return.
+
+  IF line_exists( lt_return[ type = 'E' ] ).
+
+    RETURN.
+
+  ENDIF.
+
+  SELECT SINGLE zzancho INTO gv_ancho FROM mara WHERE matnr = gv_matnr.
+
+  TRY.
+
+      gv_diametro = lt_valuesnum[ charact = gc_z_diametro ]-value_from.
+
+    CATCH cx_sy_itab_line_not_found.
+
+  ENDTRY.
+
+  TRY.
+
+      gv_longitud = lt_valuesnum[ charact = gc_z_longitud ]-value_from.
+
+    CATCH cx_sy_itab_line_not_found.
+
+  ENDTRY.
+
+  TRY.
+
+      gv_cliente = lt_valueschar[ charact = gc_z_cliente ]-value_char.
+
+    CATCH cx_sy_itab_line_not_found.
+
+  ENDTRY.
+
+  SELECT SINGLE name1 INTO gv_nombre_cliente FROM kna1 WHERE kunnr = gv_cliente.
+
+* CMS Acceso a la decisión de empleo de la bobina. Si no se encuentra, mostramos msg de error. 03/06/2019
+  TRY.
+
+      gv_decision_empleo = lt_valueschar[ charact = gc_z_decision_empleo ]-value_neutral.
+
+    CATCH cx_sy_itab_line_not_found.
+
+      CLEAR: gv_decision_empleo , gv_decision_empleo_icon.
+      PERFORM limpiar_campos.
+      MESSAGE text-027 TYPE 'I'.
+      RETURN.
+
+  ENDTRY.
+
+*
+*  SELECT SINGLE clabs FROM mchb INTO gv_peso WHERE matnr = gv_matnr AND werks = gv_werks
+*                                               AND lgort = gc_4001 AND charg = gv_charg .
+*  IF sy-subrc NE 0.
+*
+*    SELECT SINGLE clabs FROM mchb INTO gv_peso WHERE matnr = gv_matnr AND werks = gv_werks
+*                                               AND lgort = gc_4011 AND charg = gv_charg .
+*    IF sy-subrc NE 0.
+*      SELECT SINGLE clabs FROM mchb INTO gv_peso WHERE matnr = gv_matnr AND werks = gv_werks
+*                                               AND lgort = gc_4012 AND charg = gv_charg .
+*    ENDIF.
+*  ENDIF.
+
+  gv_peso_p     = gv_peso." TO gv_peso_p DECIMALS 2 EXPONENT 0.
+  gv_longitud_p = gv_longitud." TO gv_longitud_p DECIMALS 2 EXPONENT 0.
+  gv_diametro_p = gv_diametro." TO gv_diametro_p DECIMALS 2 EXPONENT 0.
+
+  gv_difancho = gv_ancho - gv_ancho1 - gv_ancho2 - gv_ancho3.
+
+  IF gv_difancho LT 0.
+
+    gv_icon_ancho = icon_red_light.
+
+  ELSE.
+
+    gv_icon_ancho = icon_green_light.
+
+  ENDIF.
+
+  gv_difpeso = gv_peso - gv_peso1 - gv_peso2 - gv_peso3.
+
+  IF gv_difpeso LT 0.
+
+    gv_icon_peso = icon_red_light.
+
+  ELSE.
+
+    gv_icon_peso = icon_green_light.
+  ENDIF.
+
+  IF gv_decision_empleo EQ 'DE       A'.
+
+    gv_decision_empleo_icon = icon_green_light.
+
+  ELSEIF gv_decision_empleo EQ 'DE       R'.
+
+    gv_decision_empleo_icon = icon_red_light.
+
+  ELSE.
+
+    gv_decision_empleo_icon = icon_yellow_light.
+
+  ENDIF.
+
+* DTM - Listado de clientes internos, externos y papeleras
+
+  SELECT ztsd0006~kunnr, kna1~name1 FROM ztsd0006
+    JOIN kna1 ON ztsd0006~kunnr EQ kna1~kunnr
+    WHERE ztsd0006~werks EQ @gv_werks
+     AND ( ztsd0006~tp_cliente EQ 'H' OR ztsd0006~tp_cliente EQ 'X' )
+    ORDER BY ztsd0006~kunnr DESCENDING
+  INTO TABLE @DATA(lt_clientes).
+
+* Se quitan los ceros de la izquierda
+
+  LOOP AT lt_clientes ASSIGNING FIELD-SYMBOL(<lfs_clientes>).
+
+    <lfs_clientes>-kunnr = |{ <lfs_clientes>-kunnr ALPHA = OUT }|.
+
+  ENDLOOP.
+
+* DTM
+
+  LOOP AT lt_clientes ASSIGNING FIELD-SYMBOL(<lfs_cl_val>).
+
+    APPEND INITIAL LINE TO gt_list ASSIGNING FIELD-SYMBOL(<lfs_value>).
+    <lfs_value>-key  = <lfs_cl_val>-kunnr.
+    <lfs_value>-text = <lfs_cl_val>-name1.
+
+  ENDLOOP.
+
+  CLEAR: gs_value.
+  CASE gv_werks.
+
+    WHEN '3000'.
+
+      gs_value-key  = |C{ gv_werks }|.
+      gs_value-text = 'PAPELERA DE LA ALQUERÍA S.L.'.
+
+    WHEN '3020'.
+
+      gs_value-key  = |C{ gv_werks }|.
+      gs_value-text = 'PAPELERA DE SARRIA'.
+
+    WHEN OTHERS.
+
+  ENDCASE.
+
+  APPEND gs_value TO gt_list.
+
+* DTM
+
+  SORT gt_list BY key DESCENDING.
+
+* DTM
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = 'GV_CLIENTE1'
+      values = gt_list.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = 'GV_CLIENTE2'
+      values = gt_list.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = 'GV_CLIENTE3'
+      values = gt_list.
+
+  g_material_ok = 'X'.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PAI_0100
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM pai_0100 .
+
+  CHECK gv_ancho IS NOT INITIAL.
+
+  gv_difancho = gv_ancho - gv_ancho1 - gv_ancho2 - gv_ancho3.
+  IF gv_difancho LT 0.
+    gv_icon_ancho = icon_red_light.
+  ELSE.
+    gv_icon_ancho = icon_green_light.
+  ENDIF.
+
+  gv_difpeso = gv_peso_p - gv_peso1 - gv_peso2 - gv_peso3.
+  IF gv_difpeso LT 0.
+    gv_icon_peso = icon_red_light.
+  ELSE.
+    gv_icon_peso = icon_green_light.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECKS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM checks CHANGING p_ok.
+
+  DATA: ls_marc TYPE marc,
+        lv_code LIKE sy-subrc.
+
+  DATA: l_msg   TYPE char100,
+        l_matnr TYPE matnr.
+
+  DATA l_answer TYPE c.
+
+* Validar si informados los motivos para los tipos de bobina...
+  CASE gv_tipobobina1.
+    WHEN '01'.
+      IF gv_motivo1 IS  INITIAL.
+        MESSAGE text-006 TYPE 'I'.
+        RETURN.
+      ENDIF.
+    WHEN '02'.
+      IF gv_motivo1 IS  INITIAL.
+        MESSAGE text-022 TYPE 'I'.
+        RETURN.
+      ENDIF.
+  ENDCASE.
+  CASE gv_tipobobina2.
+    WHEN '01'.
+      IF gv_motivo2 IS  INITIAL.
+        MESSAGE text-006 TYPE 'I'.
+        RETURN.
+      ENDIF.
+    WHEN '02'.
+      IF gv_motivo2 IS  INITIAL.
+        MESSAGE text-022 TYPE 'I'.
+        RETURN.
+      ENDIF.
+  ENDCASE.
+  CASE gv_tipobobina3.
+    WHEN '01'.
+      IF gv_motivo3 IS  INITIAL.
+        MESSAGE text-006 TYPE 'I'.
+        RETURN.
+      ENDIF.
+    WHEN '02'.
+      IF gv_motivo3 IS  INITIAL.
+        MESSAGE text-022 TYPE 'I'.
+        RETURN.
+      ENDIF.
+  ENDCASE.
+
+*
+*  IF gv_tipobobina1 EQ '01' AND gv_motivo1 IS INITIAL.
+*    MESSAGE text-006 TYPE 'I'.
+*    RETURN.
+*  ENDIF.
+*
+*  IF gv_tipobobina2 EQ '01' AND gv_motivo2 IS INITIAL.
+*    MESSAGE text-006 TYPE 'I'.
+*    RETURN.
+*  ENDIF.
+*
+*  IF gv_tipobobina3 EQ '01' AND gv_motivo3 IS INITIAL.
+*    MESSAGE text-006 TYPE 'I'.
+*    RETURN.
+*  ENDIF.
+
+  SELECT SINGLE * FROM mchb INTO @DATA(ls_mchb)
+                         WHERE matnr = @gv_matnr
+                           AND charg = @gv_charg
+
+* 02/11/2021 - 69304 - CMS - Añadir validaciíónn sobre tabla ZTPP0024.
+                           AND lgort IN @zcl_utils_hpap_pp=>gtr_alm_reproceso[]
+*                           AND ( lgort = @gc_4001 OR
+*                                 lgort = @gc_4011 OR
+*                                 lgort = @gc_4012 OR
+*                                 lgort = @gc_4013 )
+                              .
+  IF sy-subrc <> 0.
+    MESSAGE text-024 TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+
+*Validar que se introducen los valores correspondientes a una bobina reprocesada
+  IF NOT gv_ancho1 IS INITIAL OR NOT gv_peso1 IS INITIAL
+    OR NOT gv_longitud1 IS INITIAL OR NOT gv_diametro1 IS INITIAL
+    OR NOT gv_tipobobina1 IS INITIAL.
+
+    IF gv_ancho1 IS INITIAL OR gv_peso1 IS INITIAL
+      OR gv_longitud1 IS INITIAL OR gv_diametro1 IS INITIAL
+      OR gv_tipobobina1 IS INITIAL.
+      MESSAGE text-007 TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+  ENDIF.
+
+  IF NOT gv_ancho2 IS INITIAL OR NOT gv_peso2 IS INITIAL
+    OR NOT gv_longitud2 IS INITIAL OR NOT gv_diametro2 IS INITIAL
+    OR NOT gv_tipobobina2 IS INITIAL.
+
+    IF gv_ancho2 IS INITIAL OR gv_peso2 IS INITIAL
+      OR gv_longitud2 IS INITIAL OR gv_diametro2 IS INITIAL
+      OR gv_tipobobina2 IS INITIAL.
+      MESSAGE text-008 TYPE 'I'.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+  IF NOT gv_ancho3 IS INITIAL OR
+     NOT gv_peso3 IS INITIAL OR
+     NOT gv_longitud3 IS INITIAL OR
+     NOT gv_diametro3 IS INITIAL OR
+     NOT gv_tipobobina3 IS INITIAL.
+
+    IF gv_ancho3 IS INITIAL OR gv_peso3 IS INITIAL
+      OR gv_longitud3 IS INITIAL OR gv_diametro3 IS INITIAL
+      OR gv_tipobobina3 IS INITIAL.
+      MESSAGE text-009 TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+  ENDIF.
+
+*Validar que la suma de los anchos para las bobinas reprocesadas es igual o menor que el
+*ancho de la bobina a reprocesar
+  IF gv_difancho LT 0.
+
+
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+*       TITLEBAR              = ' '
+*       DIAGNOSE_OBJECT       = ' '
+        text_question         = text-010
+*       TEXT_BUTTON_1         = 'Ja'(001)
+*       ICON_BUTTON_1         = ' '
+*       TEXT_BUTTON_2         = 'Nein'(002)
+*       ICON_BUTTON_2         = ' '
+        default_button        = '2'
+        display_cancel_button = ''
+*       USERDEFINED_F1_HELP   = ' '
+*       START_COLUMN          = 25
+*       START_ROW             = 6
+*       POPUP_TYPE            =
+*       IV_QUICKINFO_BUTTON_1 = ' '
+*       IV_QUICKINFO_BUTTON_2 = ' '
+      IMPORTING
+        answer                = l_answer
+*     TABLES
+*       PARAMETER             =
+*     EXCEPTIONS
+*       TEXT_NOT_FOUND        = 1
+*       OTHERS                = 2
+      .
+    IF sy-subrc <> 0.
+* Implement suitable error handling here
+    ENDIF.
+    IF l_answer NE 1.
+      RETURN.
+    ENDIF.
+
+  ENDIF.
+
+  IF gv_difpeso LT 0.
+*    MESSAGE text-011 TYPE 'I'.
+*    RETURN.
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+*       TITLEBAR              = ' '
+        default_button        = '2'
+*       icon_button_1         = '@1A@'
+        text_question         = text-011
+        display_cancel_button = ''
+      IMPORTING
+        answer                = l_answer
+*     TABLES
+*       PARAMETER             =
+      EXCEPTIONS
+        text_not_found        = 1
+        OTHERS                = 2.
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+    IF l_answer NE 1.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+*Validar que los materiales de las bobinas reprocesadas existen para el centro en cuestión
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = gv_matnr
+    IMPORTING
+      output = gv_matnr.
+
+  IF NOT gv_ancho1 IS INITIAL.
+    CONCATENATE gv_matnr(14) gv_ancho1 INTO gv_matnr1.
+    SELECT SINGLE * FROM marc INTO ls_marc
+      WHERE matnr = gv_matnr1 AND werks = gv_werks.
+    IF sy-subrc <> 0.
+      l_msg = text-012.
+      REPLACE '&' WITH gv_matnr1 INTO l_msg.
+      MESSAGE l_msg TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+    CALL FUNCTION 'COPC_CHECK_MBEW_KEKO'
+      EXPORTING
+        material = gv_matnr1
+        bwkey    = gv_werks
+        status   = 'FR'
+      IMPORTING
+        rcode    = lv_code.
+
+    IF lv_code <> 0.
+      l_msg = text-002.
+      l_matnr = |{ gv_matnr1 ALPHA = OUT }|.
+      REPLACE '&' IN l_msg WITH l_matnr.
+      MESSAGE l_msg TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+  ENDIF.
+
+  IF NOT gv_ancho2 IS INITIAL.
+    CONCATENATE gv_matnr(14) gv_ancho2 INTO gv_matnr2.
+    SELECT SINGLE * FROM marc INTO ls_marc
+      WHERE matnr = gv_matnr2 AND werks = gv_werks.
+    IF sy-subrc <> 0.
+      l_msg = text-012.
+      REPLACE '&' WITH gv_matnr1 INTO l_msg.
+      MESSAGE l_msg TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+    CALL FUNCTION 'COPC_CHECK_MBEW_KEKO'
+      EXPORTING
+        material = gv_matnr2
+        bwkey    = gv_werks
+        status   = 'FR'
+      IMPORTING
+        rcode    = lv_code.
+
+    IF lv_code <> 0.
+      l_msg = text-002.
+      l_matnr = |{ gv_matnr1 ALPHA = OUT }|.
+      REPLACE '&' IN l_msg WITH l_matnr.
+      MESSAGE l_msg TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+  ENDIF.
+
+  IF NOT gv_ancho3 IS INITIAL.
+    CONCATENATE gv_matnr(14) gv_ancho3 INTO gv_matnr3.
+    SELECT SINGLE * FROM marc INTO ls_marc
+      WHERE matnr = gv_matnr3 AND werks = gv_werks.
+    IF sy-subrc <> 0.
+      l_msg = text-012.
+      REPLACE '&' WITH gv_matnr1 INTO l_msg.
+      MESSAGE l_msg TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+    CALL FUNCTION 'COPC_CHECK_MBEW_KEKO'
+      EXPORTING
+        material = gv_matnr3
+        bwkey    = gv_werks
+        status   = 'FR'
+      IMPORTING
+        rcode    = lv_code.
+
+    IF lv_code <> 0.
+      l_msg = text-002.
+      l_matnr = |{ gv_matnr1 ALPHA = OUT }|.
+      REPLACE '&' IN l_msg WITH l_matnr.
+      MESSAGE l_msg TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+  ENDIF.
+
+
+
+  p_ok = abap_true.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  POP_UP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LV_SUBRC  text
+*----------------------------------------------------------------------*
+FORM pop_up  CHANGING p_subrc.
+
+  DATA lv_answer TYPE char1.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+*     TITLEBAR              = ' '
+*     DIAGNOSE_OBJECT       = ' '
+      text_question         = text-013
+*     TEXT_BUTTON_1         = 'Ja'(001)
+*     ICON_BUTTON_1         = ' '
+*     TEXT_BUTTON_2         = 'Nein'(002)
+*     ICON_BUTTON_2         = ' '
+      default_button        = '3'
+      display_cancel_button = ''
+*     USERDEFINED_F1_HELP   = ' '
+*     START_COLUMN          = 25
+*     START_ROW             = 6
+*     POPUP_TYPE            =
+*     IV_QUICKINFO_BUTTON_1 = ' '
+*     IV_QUICKINFO_BUTTON_2 = ' '
+    IMPORTING
+      answer                = lv_answer
+* TABLES
+*     PARAMETER             =
+    EXCEPTIONS
+      text_not_found        = 1
+      OTHERS                = 2.
+
+  p_subrc = sy-subrc.
+  CHECK p_subrc = 0 AND lv_answer <> 'A'.
+
+  p_subrc = lv_answer.
+
+ENDFORM.
+
+FORM pop_up_desguace  CHANGING p_subrc.
+
+  DATA lv_answer TYPE char1.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+*     TITLEBAR              = ' '
+*     DIAGNOSE_OBJECT       = ' '
+      text_question         = text-028
+*     TEXT_BUTTON_1         = 'Ja'(001)
+*     ICON_BUTTON_1         = ' '
+*     TEXT_BUTTON_2         = 'Nein'(002)
+*     ICON_BUTTON_2         = ' '
+      default_button        = '3'
+      display_cancel_button = ''
+*     USERDEFINED_F1_HELP   = ' '
+*     START_COLUMN          = 25
+*     START_ROW             = 6
+*     POPUP_TYPE            =
+*     IV_QUICKINFO_BUTTON_1 = ' '
+*     IV_QUICKINFO_BUTTON_2 = ' '
+    IMPORTING
+      answer                = lv_answer
+* TABLES
+*     PARAMETER             =
+    EXCEPTIONS
+      text_not_found        = 1
+      OTHERS                = 2.
+
+  p_subrc = sy-subrc.
+  CHECK p_subrc = 0 AND lv_answer <> 'A'.
+
+  p_subrc = lv_answer.
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_NUEVAS_BOBINAS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_nuevas_bobinas .
+
+  DATA: lv_matnr TYPE matnr,
+        lv_charg TYPE charg_d,
+        lv_go    TYPE char1.
+
+
+  DATA: l_charg_1 TYPE charg_d,
+        l_charg_2 TYPE charg_d,
+        l_charg_3 TYPE charg_d.
+
+  DATA: l_matnr_1 TYPE matnr,
+        l_matnr_2 TYPE matnr,
+        l_matnr_3 TYPE matnr.
+
+  IF gv_tipobobina1 IS INITIAL AND
+     gv_tipobobina2 IS INITIAL AND
+     gv_tipobobina3 IS INITIAL.
+    MESSAGE 'Indicar al menos una bobina a procesar'(025) TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+
+  CASE gv_tipobobina1.
+
+    WHEN '01'. "bobina pulper
+
+      PERFORM crear_bobina_pulper USING gv_peso1 gv_diametro1 gv_longitud1 gv_empalmes1 gv_motivo1
+                                  CHANGING lv_go l_charg_1.
+
+
+
+    WHEN '02'. "bobina reproceso
+
+      PERFORM crear_bobina_reproceso USING gv_matnr1
+                                           gv_peso1
+                                           gv_diametro1
+                                           gv_longitud1
+                                           gv_empalmes1
+                                           gv_motivo1
+                                           gv_cliente1
+                                     CHANGING lv_go l_charg_1.
+
+
+    WHEN '03'. "bobina nueva
+
+      PERFORM crear_bobina_nueva USING gv_matnr1
+                                       gv_peso1
+                                       gv_diametro1
+                                       gv_longitud1
+                                       gv_empalmes1
+                                       gv_motivo1
+                                       gv_cliente1
+                                 CHANGING lv_go l_charg_1.
+
+  ENDCASE.
+  IF lv_go EQ abap_false.
+    PERFORM mostrar_log.
+    RETURN.
+  ENDIF.
+
+  CASE gv_tipobobina2.
+
+    WHEN '01'.
+
+      PERFORM crear_bobina_pulper USING gv_peso2 gv_diametro2 gv_longitud2 gv_empalmes2 gv_motivo2
+                                  CHANGING lv_go l_charg_2.
+
+
+    WHEN '02'.
+
+      PERFORM crear_bobina_reproceso USING  gv_matnr2
+                                            gv_peso2
+                                            gv_diametro2
+                                            gv_longitud2
+                                            gv_empalmes2
+                                            gv_motivo2
+                                            gv_cliente2
+                                     CHANGING lv_go l_charg_2.
+
+
+    WHEN '03'.
+
+      PERFORM crear_bobina_nueva USING  gv_matnr2
+                                         gv_peso2
+                                         gv_diametro2
+                                         gv_longitud2
+                                         gv_empalmes2
+                                         gv_motivo2
+                                         gv_cliente2
+                                  CHANGING lv_go l_charg_2.
+  ENDCASE.
+  IF lv_go EQ abap_false.
+    PERFORM mostrar_log.
+    RETURN.
+  ENDIF.
+
+  CASE gv_tipobobina3.
+
+    WHEN '01'.
+
+      PERFORM crear_bobina_pulper USING gv_peso3 gv_diametro3 gv_longitud3 gv_empalmes3 gv_motivo3
+             CHANGING lv_go l_charg_3.
+
+
+    WHEN '02'.
+
+
+      PERFORM crear_bobina_reproceso USING  gv_matnr3
+                                            gv_peso3
+                                            gv_diametro3
+                                            gv_longitud3
+                                            gv_empalmes3
+                                            gv_motivo3
+                                            gv_cliente3
+                                      CHANGING lv_go l_charg_3.
+
+
+    WHEN '03'.
+
+      PERFORM crear_bobina_nueva USING gv_matnr3
+                                       gv_peso3
+                                       gv_diametro3
+                                         gv_longitud3
+                                         gv_empalmes3
+                                         gv_motivo3
+                                         gv_cliente3
+                                  CHANGING lv_go l_charg_3.
+
+  ENDCASE.
+
+  IF lv_go EQ abap_false.
+    PERFORM mostrar_log.
+    RETURN.
+  ENDIF.
+
+  IF gv_difpeso GT 0.
+    PERFORM crear_mov_regularizacion USING '551' gv_matnr gv_charg gv_difpeso.
+*  ELSEIF gv_difpeso LT 0.
+*    gv_difpeso = abs( gv_difpeso ).
+*    PERFORM crear_mov_regularizacion USING '552' gv_matnr gv_charg gv_difpeso.
+  ENDIF.
+
+*Împresion etiquetas.
+  CASE gv_tipobobina1.
+    WHEN '01'.
+      PERFORM imprimir_etiqueta_pulper USING gc_matnr_bobpulper l_charg_1 gv_werks
+                                             '1000' .
+    WHEN '02'.
+      PERFORM imprimir_etiqueta USING gv_matnr1 l_charg_1 gv_diametro2
+                                        gv_longitud2 '4001' gv_cliente1
+                          CHANGING lv_go.
+    WHEN '03'.
+      PERFORM imprimir_etiqueta USING gv_matnr1 l_charg_1 gv_diametro3
+                                gv_longitud3 '1040' gv_cliente1
+                  CHANGING lv_go.
+  ENDCASE.
+  CASE gv_tipobobina2.
+    WHEN '01'.
+      PERFORM imprimir_etiqueta_pulper USING gc_matnr_bobpulper l_charg_2 gv_werks
+                                             '1000' .
+    WHEN '02'.
+      PERFORM imprimir_etiqueta USING gv_matnr2 l_charg_2 gv_diametro2
+                                        gv_longitud2 '4001' gv_cliente2
+                          CHANGING lv_go.
+    WHEN '03'.
+      PERFORM imprimir_etiqueta USING gv_matnr2 l_charg_2 gv_diametro3
+                                gv_longitud3 '1040' gv_cliente2
+                  CHANGING lv_go.
+  ENDCASE.
+  CASE gv_tipobobina3.
+    WHEN '01'.
+      PERFORM imprimir_etiqueta_pulper USING gc_matnr_bobpulper l_charg_3 gv_werks
+                                             '1000' .
+    WHEN '02'.
+      PERFORM imprimir_etiqueta USING gv_matnr3 l_charg_3 gv_diametro2
+                                        gv_longitud2 '4001' gv_cliente3
+                          CHANGING lv_go.
+    WHEN '03'.
+      PERFORM imprimir_etiqueta USING gv_matnr3 l_charg_3 gv_diametro3
+                                gv_longitud3 '1040' gv_cliente3
+                  CHANGING lv_go.
+  ENDCASE.
+
+  PERFORM mostrar_log.
+
+  IF NOT line_exists( gt_return[ type = 'E' ] ).
+    PERFORM limpiar_campos.
+  ENDIF.
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_LOTE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_1275   text
+*----------------------------------------------------------------------*
+FORM crear_lote  USING p_matnr
+                       p_charg
+                       p_peso
+                       p_diametro
+                       p_longitud
+                       p_empalmes
+                       p_operario
+                       p_motivo
+                       p_cliente
+                       p_situacion
+                       p_fsc
+                 CHANGING p_go
+                          p_charg2.
+
+  DATA l_klass TYPE bapi1003_key-classnum.
+
+  DATA: "lv_batch           TYPE charg_d,
+    lt_return          TYPE TABLE OF bapiret2 WITH HEADER LINE,
+    lv_objectkeynew    TYPE bapi1003_key-object,
+    lv_objectkey       TYPE bapi1003_key-object,
+    lv_objecttablenew  TYPE bapi1003_key-objecttable,
+    ls_goodsmvt_header TYPE bapi2017_gm_head_01,
+    lt_goodsmvt_item   TYPE TABLE OF bapi2017_gm_item_create,
+    lv_gmcode          TYPE bapi2017_gm_code VALUE '309',
+    lv_classtypenew    TYPE bapi1003_key-classtype,
+    lv_mtart           TYPE mara-mtart,
+    lt_valuesnum       TYPE TABLE OF bapi1003_alloc_values_num,
+    lt_valueschar      TYPE TABLE OF bapi1003_alloc_values_char,
+    lt_valuescurr      TYPE TABLE OF bapi1003_alloc_values_curr,
+    ls_valuesnum       TYPE bapi1003_alloc_values_num,
+    ls_valueschar      TYPE bapi1003_alloc_values_char,
+    ls_valuescurr      TYPE bapi1003_alloc_values_curr.
+
+  SELECT SINGLE mtart INTO lv_mtart FROM mara WHERE matnr = p_matnr.
+  CLEAR p_go.
+
+*  IF p_matnr NE gv_matnr . "CREAR NUEVO LOTE
+
+  CALL FUNCTION 'ZMFMM0002'
+    EXPORTING
+      i_werks = gv_werks
+      i_mtart = lv_mtart
+      i_matnr = p_matnr
+    IMPORTING
+      o_charg = p_charg2
+    EXCEPTIONS
+      1       = 1
+      OTHERS  = 2.
+
+  CALL FUNCTION 'BAPI_BATCH_CREATE'
+    EXPORTING
+      material = p_matnr
+      batch    = p_charg2
+      plant    = gv_werks
+    IMPORTING
+      batch    = p_charg2
+    TABLES
+      return   = lt_return.
+
+  LOOP AT lt_return WHERE type = 'E' OR type = 'A' OR type = 'X'.
+    PERFORM add_log TABLES lt_return.
+    EXIT.
+  ENDLOOP.
+
+  IF sy-subrc = 0.
+* Mostrar mensajes de error...
+    PERFORM add_log TABLES lt_return.
+  ELSE.
+
+    PERFORM add_log TABLES lt_return.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+
+    CALL FUNCTION 'DEQUEUE_ALL'
+      EXPORTING
+        _synchron = abap_true.
+
+    CALL FUNCTION 'BUFFER_REFRESH_ALL'.
+
+    WAIT UP TO 1 SECONDS.
+    REFRESH lt_return.
+
+  ENDIF.
+*  ENDIF.
+
+  CONCATENATE gv_matnr p_charg INTO lv_objectkey.
+
+*   Lectura del lote Origen - clase Z_BOBINA
+
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = lv_objectkey
+      objecttable     = 'MCH1'
+      classnum        = gc_z_bobina
+      classtype       = '023'
+    TABLES
+      allocvaluesnum  = lt_valuesnum
+      allocvalueschar = lt_valueschar
+      allocvaluescurr = lt_valuescurr
+      return          = lt_return.
+
+  LOOP AT lt_return WHERE type = 'E' OR type = 'A' OR type = 'X'.
+    EXIT.
+  ENDLOOP.
+
+  IF sy-subrc = 0.
+* Mostrar mensajes de error...
+    PERFORM add_log TABLES lt_return.
+  ELSE.
+
+    PERFORM add_log TABLES lt_return.
+
+    REFRESH lt_return.
+
+
+    CALL FUNCTION 'DEQUEUE_ALL'
+      EXPORTING
+        _synchron = abap_true.
+
+
+* Añadir caracteristicas, ancho, diametro, longitud, peso...
+    READ TABLE lt_valuesnum INTO ls_valuesnum WITH KEY charact = gc_z_diametro.
+    IF sy-subrc = 0.
+      ls_valuesnum-value_from = p_diametro.
+      MODIFY lt_valuesnum FROM ls_valuesnum INDEX sy-tabix.
+    ELSE.
+      ls_valuesnum-charact = gc_z_diametro.
+      ls_valuesnum-value_from = p_diametro.
+      APPEND ls_valuesnum TO lt_valuesnum.
+    ENDIF.
+
+    CLEAR ls_valuesnum.
+
+    READ TABLE lt_valuesnum INTO ls_valuesnum WITH KEY charact = gc_z_longitud.
+    IF sy-subrc = 0.
+      ls_valuesnum-value_from = p_longitud.
+      MODIFY lt_valuesnum FROM ls_valuesnum INDEX sy-tabix.
+    ELSE.
+      ls_valuesnum-charact = gc_z_longitud.
+      ls_valuesnum-value_from = p_longitud.
+      APPEND ls_valuesnum TO lt_valuesnum.
+    ENDIF.
+
+    CLEAR ls_valuesnum.
+
+    READ TABLE lt_valuesnum INTO ls_valuesnum WITH KEY charact = gc_z_peso.
+    IF sy-subrc = 0.
+      ls_valuesnum-value_from = p_peso.
+      MODIFY lt_valuesnum FROM ls_valuesnum INDEX sy-tabix.
+    ELSE.
+      ls_valuesnum-charact = gc_z_peso.
+      ls_valuesnum-value_from = p_peso.
+      APPEND ls_valuesnum TO lt_valuesnum.
+    ENDIF.
+
+    CLEAR ls_valuesnum.
+
+    READ TABLE lt_valuesnum INTO ls_valuesnum WITH KEY charact = gc_z_empalmes.
+    IF sy-subrc = 0.
+      ls_valuesnum-value_from = p_empalmes.
+      MODIFY lt_valuesnum FROM ls_valuesnum INDEX sy-tabix.
+    ELSE.
+      ls_valuesnum-charact = gc_z_empalmes.
+      ls_valuesnum-value_from = p_empalmes.
+      APPEND ls_valuesnum TO lt_valuesnum.
+    ENDIF.
+
+* INI 25/09/2020 - 62887 - CMS - Añadir %FSC a bobina pulper
+    IF p_fsc = 100.
+      CLEAR ls_valuesnum.
+
+      READ TABLE lt_valuesnum INTO ls_valuesnum WITH KEY charact = 'Z_FSC_PORCENTAJE'.
+      IF sy-subrc = 0.
+        ls_valuesnum-value_from = p_fsc.
+        MODIFY lt_valuesnum FROM ls_valuesnum INDEX sy-tabix.
+      ELSE.
+        ls_valuesnum-charact = 'Z_FSC_PORCENTAJE'.
+        ls_valuesnum-value_from = p_fsc.
+        APPEND ls_valuesnum TO lt_valuesnum.
+      ENDIF.
+    ENDIF.
+* FIN 25/09/2020 - 62887 - CMS - Añadir %FSC a bobina pulper
+
+
+    CLEAR ls_valueschar.
+
+    READ TABLE lt_valueschar INTO ls_valueschar WITH KEY charact = gc_z_operario.
+    IF sy-subrc = 0.
+      ls_valueschar-value_char    = p_operario.
+      ls_valueschar-value_neutral = p_operario.
+      MODIFY lt_valueschar FROM ls_valueschar INDEX sy-tabix.
+    ELSE.
+
+      ls_valueschar-charact       = gc_z_operario.
+      ls_valueschar-value_char    = p_operario.
+      ls_valueschar-value_neutral = p_operario.
+      APPEND ls_valueschar TO lt_valueschar.
+    ENDIF.
+
+    IF p_cliente IS NOT INITIAL.
+      READ TABLE lt_valueschar INTO ls_valueschar WITH KEY charact = gc_z_cliente.
+      IF sy-subrc = 0.
+        ls_valueschar-value_char    = p_cliente.
+        ls_valueschar-value_neutral = p_cliente.
+        MODIFY lt_valueschar FROM ls_valueschar INDEX sy-tabix.
+      ELSE.
+        ls_valueschar-charact       = gc_z_cliente.
+        ls_valueschar-value_char    = p_cliente.
+        ls_valueschar-value_neutral = p_cliente.
+        APPEND ls_valueschar TO lt_valueschar.
+      ENDIF.
+    ENDIF.
+
+    IF p_matnr EQ gc_matnr_bobpulper.
+      l_klass = gc_z_bobina_pulper.
+      DELETE: lt_valuesnum  WHERE charact = gc_z_empalmes, " OR
+*                                  charact CS 'FSC',
+              lt_valueschar WHERE charact = gc_z_decision_empleo OR
+                                  charact = gc_z_pedido OR
+                                  charact = gc_z_posicion OR
+                                  charact = gc_z_reproceso OR
+                                  charact = 'ZPPI_MOTIVO_REPROCESO_BOBINA'OR
+                                  charact = 'Z_MOTIVO_REPROCESO_BOBINA'OR
+                                  charact = 'ZPPI_PUESTO_TRABAJO' OR
+                                  charact = 'Z_PUESTO_TRABAJO' OR
+* 07/2019 CMS Se añaden caract.que no se deben trasladar a Z_BOBINA_PULPER.
+                                  charact = 'Z_NOTA_INSP' OR
+                                  charact = 'Z_DEFECTOS1' OR
+                                  charact = 'Z_DEFECTOS2' OR
+                                  charact = 'Z_DEFECTOS3'
+                                  .
+
+      IF p_situacion = ''.
+        DELETE lt_valueschar WHERE charact = 'Z_CONTRAMAESTRE'.
+      ENDIF.
+
+
+      SELECT SINGLE atwrt INTO @DATA(l_motivo) FROM zvpp_carac_recha WHERE atzhl = @p_motivo.
+
+      READ TABLE lt_valueschar INTO ls_valueschar WITH KEY charact = 'ZPPI_MOTIVO_RECHAZO'.
+      IF sy-subrc = 0.
+        ls_valueschar-value_char    = l_motivo.
+        ls_valueschar-value_neutral = l_motivo.
+        MODIFY lt_valueschar FROM ls_valueschar INDEX sy-tabix.
+      ELSE.
+        ls_valueschar-charact = 'ZPPI_MOTIVO_RECHAZO'.
+        ls_valueschar-value_char    = l_motivo.
+        ls_valueschar-value_neutral = l_motivo.
+        APPEND ls_valueschar TO lt_valueschar.
+      ENDIF.
+    ELSE.
+      l_klass = gc_z_bobina.
+    ENDIF.
+
+    IF p_situacion EQ 'NUEVA'.
+      DELETE lt_valueschar WHERE charact = 'ZPPI_MOTIVO_REPROCESO_BOBINA'OR
+                                 charact = 'ZPPI_MOTIVO_RECHAZO' OR
+                                 charact = 'Z_PEDIDO' OR
+                                 charact = 'Z_POSICION' OR
+                                 charact = 'Z_NOTA_INSP' OR
+                                 charact = 'Z_DEFECTOS1' OR
+                                 charact = 'Z_DEFECTOS2' OR
+                                 charact = 'Z_DEFECTOS3' OR
+                                 charact CS 'REPROCESO'.
+
+    ELSEIF p_situacion EQ 'REPROCESO'.
+
+      SELECT SINGLE atwrt INTO l_motivo FROM zvpp_carac_repr WHERE atzhl = p_motivo.
+      IF sy-subrc EQ 0.
+        APPEND VALUE bapi1003_alloc_values_char( charact    = 'ZPPI_MOTIVO_REPROCESO_BOBINA'
+                                          value_char = l_motivo ) TO lt_valueschar.
+
+        APPEND VALUE bapi1003_alloc_values_char( charact        = 'Z_REPROCESO'
+                                                 value_neutral = '1'
+                                                ) TO lt_valueschar.
+      ENDIF.
+
+
+    ENDIF.
+
+
+    IF line_exists( lt_valueschar[ charact = 'Z_ROLLO_ORIGEN_V2' ] ).
+      ASSIGN lt_valueschar[ charact = 'Z_ROLLO_ORIGEN_V2' ]-value_char TO FIELD-SYMBOL(<fs>).
+      IF sy-subrc EQ 0.
+        <fs> = gv_matnr.
+        ASSIGN lt_valueschar[ charact = 'Z_ROLLO_ORIGEN_V2' ]-value_neutral TO <fs>.
+        IF sy-subrc EQ 0.
+          <fs> =  gv_matnr.
+        ENDIF.
+      ENDIF.
+      ASSIGN lt_valueschar[ charact = 'Z_LOTE_ORIGEN' ]-value_neutral TO <fs>.
+      IF sy-subrc EQ 0.
+        <fs> =  p_charg.
+      ENDIF.
+    ELSE.
+      APPEND VALUE bapi1003_alloc_values_char( charact    = 'Z_ROLLO_ORIGEN_V2'
+                                              value_char = gv_matnr ) TO lt_valueschar.
+      APPEND VALUE bapi1003_alloc_values_char( charact    = 'Z_LOTE_ORIGEN'
+                                                  value_char = p_charg ) TO lt_valueschar.
+
+    ENDIF.
+
+
+    IF p_charg2 IS NOT INITIAL.
+
+      CONCATENATE p_matnr p_charg2 INTO lv_objectkeynew.
+
+      CALL FUNCTION 'BAPI_OBJCL_CREATE'
+        EXPORTING
+          objectkeynew    = lv_objectkeynew
+          objecttablenew  = 'MCH1'
+          classnumnew     = l_klass
+          classtypenew    = gc_023
+        TABLES
+          allocvaluesnum  = lt_valuesnum
+          allocvalueschar = lt_valueschar
+          allocvaluescurr = lt_valuescurr
+          return          = lt_return.
+
+    ELSE.
+      CALL FUNCTION 'BAPI_OBJCL_CHANGE'
+        EXPORTING
+          objectkey          = lv_objectkey
+          objecttable        = 'MCH1'
+          classnum           = l_klass
+          classtype          = gc_023
+        TABLES
+          allocvaluesnumnew  = lt_valuesnum
+          allocvaluescharnew = lt_valueschar
+          allocvaluescurrnew = lt_valuescurr
+          return             = lt_return.
+
+    ENDIF.
+
+
+
+
+    LOOP AT lt_return WHERE type = 'E' OR type = 'A' OR type = 'X'.
+      EXIT.
+    ENDLOOP.
+
+    IF sy-subrc = 0.
+* Mostrar mensajes de error...
+      PERFORM add_log TABLES lt_return.
+    ELSE.
+      p_go = gc_true.
+      PERFORM add_log TABLES lt_return.
+
+      REFRESH lt_return.
+
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+
+
+      CALL FUNCTION 'DEQUEUE_ALL'
+        EXPORTING
+          _synchron = abap_true.
+
+
+      CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+        EXPORTING
+          percentage = 25
+          text       = text-017.
+
+      IF p_charg2 IS INITIAL. "NO SE HA CREADO NUEVO LOTE
+        p_charg2 = gv_charg.
+      ENDIF.
+
+    ENDIF.
+
+  ENDIF.
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_309
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LV_MATNR  text
+*      -->P_LV_CHARG  text
+*----------------------------------------------------------------------*
+FORM crear_309  USING p_matnr_origen p_matnr_destino p_charg p_charg2 p_kg p_lgort p_lgort2
+                 CHANGING p_go.
+
+  DATA: ls_goodsmvt_header TYPE bapi2017_gm_head_01,
+        ls_goodsmvt_item   TYPE bapi2017_gm_item_create,
+        lt_goodsmvt_item   TYPE TABLE OF bapi2017_gm_item_create,
+        lt_return          TYPE TABLE OF bapiret2 WITH HEADER LINE,
+        lv_gmcode          TYPE bapi2017_gm_code VALUE '04',
+        lv_mblnr           TYPE mblnr,
+        lv_objectkeynew    TYPE bapi1003_key-object.
+
+
+  IF gv_difpeso LT 0.
+    DATA(l_peso) = abs( gv_difpeso ).
+    PERFORM crear_mov_regularizacion USING '552' gv_matnr gv_charg l_peso.
+  ENDIF.
+
+  CLEAR p_go.
+
+  ls_goodsmvt_header-pstng_date = sy-datum .
+  ls_goodsmvt_header-doc_date   = sy-datum .
+  ls_goodsmvt_header-header_txt = 'Reproceso de bobinas'(026).
+
+  ls_goodsmvt_item-material  = p_matnr_origen.
+  ls_goodsmvt_item-plant     = gv_werks.
+  ls_goodsmvt_item-stge_loc  = p_lgort.
+  ls_goodsmvt_item-batch     = p_charg.
+  ls_goodsmvt_item-move_type = '309'.
+
+  ls_goodsmvt_item-move_mat   = p_matnr_destino.
+  ls_goodsmvt_item-entry_qnt  = p_kg.
+  ls_goodsmvt_item-move_plant = gv_werks.
+  ls_goodsmvt_item-move_stloc = p_lgort2.
+  ls_goodsmvt_item-move_batch = p_charg2.
+
+  APPEND ls_goodsmvt_item TO lt_goodsmvt_item.
+
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header  = ls_goodsmvt_header
+      goodsmvt_code    = lv_gmcode
+    IMPORTING
+      materialdocument = lv_mblnr
+    TABLES
+      goodsmvt_item    = lt_goodsmvt_item
+      return           = lt_return.
+
+  PERFORM add_log TABLES lt_return.
+
+  IF NOT lv_mblnr IS INITIAL.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+
+    p_go = gc_true.
+
+    CONCATENATE p_matnr_destino p_charg2 INTO lv_objectkeynew.
+
+    "Para cada nuevo lote se envian los datos de la bobina a E80.
+    CALL FUNCTION 'Z_E80_ENVIO_STOCK_BOBINA'
+      EXPORTING
+        i_werks          = gv_werks
+*       I_CHARG          =
+        i_objek          = lv_objectkeynew
+        i_par_origen     = '0'
+      EXCEPTIONS
+        lote_inexistente = 1
+        OTHERS           = 2.
+    IF sy-subrc <> 0.
+* Implement suitable error handling here
+    ENDIF.
+
+  ENDIF.
+
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      percentage = 50
+      text       = text-018.
+
+ENDFORM.
+
+FORM imprimir_etiqueta_pulper USING
+                                    p_matnr TYPE matnr
+                                    p_charg TYPE charg_d
+                                    p_werks TYPE werks_d
+                                    p_lgort TYPE lgort_d
+
+
+      .
+  DATA: lt_valuesnum  TYPE TABLE OF bapi1003_alloc_values_num,
+        lt_valueschar TYPE TABLE OF bapi1003_alloc_values_char,
+        lt_valuescurr TYPE TABLE OF bapi1003_alloc_values_curr,
+        lt_return     TYPE bapiret2_t.
+
+  DATA ls_aufm TYPE aufm.
+
+  DATA ls_bobina_pulper TYPE zspp_etiq_bobina_pulper .
+
+*  DATA(l_objectkey_source) = |{ gv_matnr }{ gv_charg }|.
+*
+*  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+*    EXPORTING
+*      objectkey       = CONV bapi1003_key-object( l_objectkey_source )
+*      objecttable     = gc_mch1
+*      classnum        = gc_z_bobina
+*      classtype       = gc_023
+*    TABLES
+*      allocvaluesnum  = lt_valuesnum
+*      allocvalueschar = lt_valueschar
+*      allocvaluescurr = lt_valuescurr
+*      return          = lt_return.
+*
+*  TRY.
+*      ls_bobina_pulper-pedido = lt_valueschar[ charact = gc_z_pedido ]-value_neutral.
+*    CATCH cx_sy_itab_line_not_found.
+*  ENDTRY.
+*
+*
+*  TRY.
+*      ls_bobina_pulper-posicion = lt_valueschar[ charact = gc_z_posicion ]-value_neutral.
+*    CATCH cx_sy_itab_line_not_found.
+**  ENDTRY.
+*
+*  REFRESH: lt_valueschar,
+*           lt_valuescurr,
+*           lt_valuesnum.
+
+
+  DATA(l_objectkey) = |{ p_matnr }{ p_charg }|.
+
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = CONV bapi1003_key-object( l_objectkey )
+      objecttable     = gc_mch1
+      classnum        = gc_z_bobina_pulper
+      classtype       = gc_023
+    TABLES
+      allocvaluesnum  = lt_valuesnum
+      allocvalueschar = lt_valueschar
+      allocvaluescurr = lt_valuescurr
+      return          = lt_return.
+
+
+
+  " Datos para llamar a la función bobina:
+  ls_bobina_pulper-matnr           = gc_matnr_bobpulper.
+  ls_bobina_pulper-werks           = p_werks.
+  ls_bobina_pulper-lgort           = p_lgort .
+  ls_bobina_pulper-charg           = p_charg.
+  ls_bobina_pulper-plnbez          = gv_matnr.
+
+
+
+  IF line_exists( lt_valuesnum[ charact = gc_z_diametro ] ).
+    ls_bobina_pulper-diametro        =    lt_valuesnum[ charact = gc_z_diametro ]-value_from.
+  ENDIF.
+
+  IF line_exists( lt_valuesnum[ charact = gc_z_peso ] ).
+    ls_bobina_pulper-peso        =    lt_valuesnum[ charact = gc_z_peso ]-value_from.
+  ENDIF.
+
+  IF line_exists( lt_valuesnum[ charact = gc_z_fechafab ] ).
+    ls_bobina_pulper-fec_fabricacion      =    lt_valuesnum[ charact = gc_z_fechafab ]-value_from.
+  ENDIF.
+
+  IF line_exists( lt_valuesnum[ charact = gc_z_longitud ] ).
+    ls_bobina_pulper-longitud     =    lt_valuesnum[ charact = gc_z_longitud ]-value_from.
+  ENDIF.
+
+
+  ls_bobina_pulper-cod_barras = l_objectkey.
+
+  SELECT SINGLE aufnr FROM aufm INTO ls_bobina_pulper-aufnr
+                               WHERE bwart = '101' AND
+                                     matnr = gv_matnr AND
+                                     charg = gv_charg .
+
+
+  CALL FUNCTION 'ZMFPP_ETIQ_BOBINA_PULPER'
+    EXPORTING
+      i_bobina   = ls_bobina_pulper
+      i_nodialog = abap_false.
+
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  IMPRIMIR_ETIQUETA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM imprimir_etiqueta USING p_matnr p_charg p_diametro p_longitud p_lgort p_cliente
+                       CHANGING p_go.
+
+  DATA: ls_etiqueta TYPE zspp_etiq_bobina,
+        lv_zebelp1  TYPE posnr_va.
+
+  DATA: lv_object            TYPE objnum,
+        lt_alloc_values_num  TYPE tt_bapi1003_alloc_values_num,
+        lt_alloc_values_char TYPE tt_bapi1003_alloc_values_char,
+        lt_alloc_values_curr TYPE tt_bapi1003_alloc_values_curr,
+        lt_return            TYPE bapiret2_tab,
+        ls_alloc_values_char TYPE bapi1003_alloc_values_char.
+  DATA ls_msg TYPE bal_s_msg.
+
+  CLEAR: ls_etiqueta, lv_zebelp1.
+  CLEAR p_go.
+
+  CLEAR: lv_object, ls_alloc_values_char.
+  CLEAR: lt_alloc_values_num, lt_alloc_values_char, lt_alloc_values_curr, lt_return.
+  REFRESH: lt_alloc_values_num, lt_alloc_values_char, lt_alloc_values_curr, lt_return.
+
+  ls_etiqueta-diametro = p_diametro.
+  ls_etiqueta-charg = p_charg.
+*  ls_etiqueta-aufnr = gv_aufnr.
+  ls_etiqueta-fec_fabricacion = sy-datum.
+  ls_etiqueta-lgort = p_lgort.
+  ls_etiqueta-longitud = p_longitud.
+
+*  SELECT SINGLE afko~plnbez aufk~werks aufk~zzkunnr1 aufk~zzebeln1 aufk~zzebelp1
+*          INTO (ls_etiqueta-matnr, ls_etiqueta-werks, ls_etiqueta-kunnr, ls_etiqueta-pedido, lv_zebelp1)
+*  FROM aufk
+*  INNER JOIN afko ON afko~aufnr = aufk~aufnr
+*  WHERE aufk~aufnr = gv_aufnr.
+
+*  SELECT SINGLE arbpl FROM ztpp0008 INTO ls_etiqueta-arbpl_ent WHERE werks = gv_werks.
+
+  CASE gv_werks.
+    WHEN '3000'. ls_etiqueta-arbpl_ent = 'BOBI_01'.
+    WHEN '3020'. ls_etiqueta-arbpl_ent = 'BOBI_10'.
+    WHEN OTHERS.
+  ENDCASE.
+
+*ls_etiqueta-arbpl_ent = ''.
+  ls_etiqueta-matnr = p_matnr.
+  ls_etiqueta-werks = gv_werks.
+  ls_etiqueta-kunnr = p_cliente.
+  ls_etiqueta-posicion = lv_zebelp1.
+  ls_etiqueta-werks_ent = gv_werks.
+
+  "JCB 21.02.23. Sentido desbobinado
+  ls_etiqueta-lgort = gv_lgort.
+
+  IF ls_etiqueta-kunnr IS INITIAL OR ls_etiqueta-pedido IS INITIAL OR ls_etiqueta-posicion IS INITIAL.
+* Mirar si cliente, pedido o posición vienen vacíos:
+    CONCATENATE ls_etiqueta-matnr ls_etiqueta-charg INTO lv_object.
+
+    CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+      EXPORTING
+        objectkey       = lv_object
+        objecttable     = 'MCH1'
+        classnum        = 'Z_BOBINA'
+        classtype       = '023'
+      TABLES
+        allocvaluesnum  = lt_alloc_values_num
+        allocvalueschar = lt_alloc_values_char
+        allocvaluescurr = lt_alloc_values_curr
+        return          = lt_return.
+
+    LOOP AT lt_alloc_values_char INTO ls_alloc_values_char.
+      CASE ls_alloc_values_char-charact.
+        WHEN 'Z_CLIENTE'.
+          IF ls_etiqueta-kunnr IS INITIAL.
+            CONDENSE ls_alloc_values_char-value_char.
+            ls_etiqueta-kunnr = ls_alloc_values_char-value_char.
+          ENDIF.
+        WHEN 'Z_PEDIDO'.
+          IF ls_etiqueta-pedido IS INITIAL.
+            CONDENSE ls_alloc_values_char-value_char.
+            ls_etiqueta-pedido = ls_alloc_values_char-value_char.
+          ENDIF.
+        WHEN 'Z_POSICION'.
+          IF ls_etiqueta-posicion IS INITIAL.
+            CONDENSE ls_alloc_values_char-value_char.
+            ls_etiqueta-posicion = ls_alloc_values_char-value_char.
+          ENDIF.
+      ENDCASE.
+    ENDLOOP.
+
+  ENDIF.
+
+
+  CALL FUNCTION 'ZMFPP_ETIQ_BOBINA'
+    EXPORTING
+      i_bobina   = ls_etiqueta
+      i_nodialog = abap_false.
+
+  IF sy-subrc = 0.
+    ls_msg-msgty = 'S'.
+    ls_msg-msgid = 'ZPP'.
+    ls_msg-msgno = '000'.
+    ls_msg-msgv1 = text-014.
+    p_go = gc_true.
+  ELSE.
+    ls_msg-msgty = 'E'.
+    ls_msg-msgid = 'ZPP'.
+    ls_msg-msgno = '000'.
+    ls_msg-msgv1 = text-015.
+  ENDIF.
+
+  CALL FUNCTION 'BAL_LOG_MSG_ADD'
+    EXPORTING
+      i_log_handle     = gv_log_handle
+      i_s_msg          = ls_msg
+    EXCEPTIONS
+      log_not_found    = 1
+      msg_inconsistent = 2
+      log_is_full      = 3
+      OTHERS           = 4.
+
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      percentage = 75
+      text       = text-019.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_551
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_gv_matnr  text
+*      -->P_gv_charg  text
+*      -->P_GV_DIFF_PESO  text
+*----------------------------------------------------------------------*
+FORM crear_mov_regularizacion USING p_bwart p_matnr p_charg p_difpeso.
+
+  DATA: ls_goodsmvt_header TYPE bapi2017_gm_head_01,
+        ls_goodsmvt_item   TYPE bapi2017_gm_item_create,
+        lt_goodsmvt_item   TYPE TABLE OF bapi2017_gm_item_create,
+        lt_return          TYPE TABLE OF bapiret2 WITH HEADER LINE,
+        lv_gmcode          TYPE bapi2017_gm_code VALUE '06',
+        lv_mblnr           TYPE mblnr.
+
+  CHECK p_difpeso GT 0.
+
+  ls_goodsmvt_header-pstng_date = sy-datum  .
+  ls_goodsmvt_header-doc_date   = sy-datum .
+  ls_goodsmvt_header-header_txt = 'Reproceso de bobinas'(026).
+
+  ls_goodsmvt_item-material  = p_matnr.
+  ls_goodsmvt_item-plant     = gv_werks.
+  ls_goodsmvt_item-stge_loc  = gv_lgort.
+  ls_goodsmvt_item-batch     = p_charg.
+  ls_goodsmvt_item-move_type = p_bwart.
+
+  ls_goodsmvt_item-move_mat = p_matnr.
+  ls_goodsmvt_item-entry_qnt = p_difpeso.
+  ls_goodsmvt_item-move_plant = gv_werks.
+  ls_goodsmvt_item-costcenter = |{ gv_werks }3400|.
+  ls_goodsmvt_item-move_batch = p_charg.
+  ls_goodsmvt_item-move_stloc = '4001'.
+
+  APPEND ls_goodsmvt_item TO lt_goodsmvt_item.
+
+
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header  = ls_goodsmvt_header
+      goodsmvt_code    = lv_gmcode
+    IMPORTING
+      materialdocument = lv_mblnr
+    TABLES
+      goodsmvt_item    = lt_goodsmvt_item
+      return           = lt_return.
+
+  PERFORM add_log TABLES lt_return.
+
+  IF lv_mblnr IS NOT INITIAL.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+
+  ENDIF.
+
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      percentage = 100
+      text       = text-020.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ADD_LOG
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LT_RETURN  text
+*----------------------------------------------------------------------*
+FORM add_log  TABLES lt_return STRUCTURE bapiret2.
+
+  DATA ls_msg TYPE bal_s_msg.
+
+  LOOP AT lt_return.
+
+    ls_msg-msgty = lt_return-type.
+    ls_msg-msgid = lt_return-id.
+    ls_msg-msgno = lt_return-number.
+    ls_msg-msgv1 = lt_return-message_v1.
+    ls_msg-msgv2 = lt_return-message_v2.
+    ls_msg-msgv3 = lt_return-message_v3.
+    ls_msg-msgv4 = lt_return-message_v4.
+
+    CALL FUNCTION 'BAL_LOG_MSG_ADD'
+      EXPORTING
+        i_log_handle     = gv_log_handle
+        i_s_msg          = ls_msg
+      EXCEPTIONS
+        log_not_found    = 1
+        msg_inconsistent = 2
+        log_is_full      = 3
+        OTHERS           = 4.
+
+  ENDLOOP.
+
+  APPEND LINES OF lt_return TO gt_return.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_LOG
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_log .
+
+  DATA: ls_log        TYPE bal_s_log.
+
+  IF NOT gv_log_handle IS INITIAL.
+    CALL FUNCTION 'BAL_LOG_REFRESH'
+      EXPORTING
+        i_log_handle = gv_log_handle.
+
+    CLEAR gv_log_handle.
+  ENDIF.
+
+  ls_log-extnumber = text-016.
+
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log                 = ls_log
+    IMPORTING
+      e_log_handle            = gv_log_handle
+    EXCEPTIONS
+      log_header_inconsistent = 1.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  MOSTRAR_LOG
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM mostrar_log .
+
+  DATA ls_display_profile TYPE bal_s_prof.
+
+  CALL FUNCTION 'BAL_DSP_PROFILE_POPUP_GET'
+    EXPORTING
+      start_col           = 5
+      start_row           = 5
+      end_col             = 87
+      end_row             = 25
+    IMPORTING
+      e_s_display_profile = ls_display_profile.
+
+  CALL FUNCTION 'BAL_DSP_LOG_DISPLAY'
+    EXPORTING
+      i_s_display_profile  = ls_display_profile
+    EXCEPTIONS
+      profile_inconsistent = 1
+      internal_error       = 2
+      no_data_available    = 3
+      no_authority         = 4
+      OTHERS               = 5.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  GESTION_CURSOR_CAMPOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM gestion_cursor_campos .
+
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CURSOR_EN_CAMPO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM cursor_en_campo .
+  DATA: l_field TYPE char20.
+
+  DATA: lt_fields TYPE TABLE OF char30.
+
+  lt_fields = VALUE #(
+      ( 'GV_ANCHO' )
+      ( 'GV_PESO' )
+      ( 'GV_LONGITUD' )
+      ( 'GV_DIAMETRO' )
+      ( 'GV_EMPALMES' )
+      ( 'GV_TIPOBOBINA' )
+      ( 'GV_MOTIVO' )
+      ( 'GV_CLIENTE' )
+  ).
+
+  GET CURSOR FIELD l_field.
+  IF l_field IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  DATA(l_len) = strlen( l_field ) - 1.
+
+  DATA(l_num) = CONV numc1( l_field+l_len(1) ).
+
+
+
+  DATA(l_field_no_number) = CONV string( l_field(l_len) ).
+
+  READ TABLE lt_fields INTO DATA(ls_field) WITH KEY table_line = l_field_no_number.
+  IF sy-subrc NE 0.
+    RETURN.
+  ENDIF.
+
+  DATA(l_tabix) = sy-tabix + 1.
+
+  READ TABLE lt_fields INTO ls_field INDEX l_tabix.
+  IF sy-subrc NE 0.
+    "No encuentra el ultimo
+    ADD 1 TO l_num.
+    IF l_num EQ 4.
+      l_num = 1.
+    ENDIF.
+    l_field_no_number = lt_fields[ 1 ].
+  ELSE.
+    l_field_no_number = ls_field.
+  ENDIF.
+
+  gv_field = |{ l_field_no_number }{ l_num }|.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  LIMPIAR_CAMPOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM limpiar_campos .
+
+
+  CLEAR:
+          gv_werks,
+            gv_name1         ,
+          gv_charg          ,
+          gv_charg1         ,
+          gv_charg2         ,
+          gv_charg3         ,
+          gv_matnr          ,
+          gv_matnr1,
+          gv_matnr2 ,
+          gv_matnr3         ,
+          gv_maktx          ,
+          gv_ancho          ,
+          gv_peso           ,
+          gv_peso_p         ,
+          gv_longitud       ,
+          gv_longitud_p     ,
+          gv_diametro       ,
+          gv_diametro_p     ,
+          gv_operario       ,
+          gv_difancho       ,
+          gv_difpeso        ,
+          gv_ancho1         ,
+          gv_peso1          ,
+          gv_longitud1      ,
+          gv_diametro1      ,
+          gv_empalmes1      ,
+          gv_tipobobina1    ,
+          gv_lgort,
+          gv_motivo1  ,
+          gv_cliente1  ,
+          gv_ancho2     ,
+          gv_peso2       ,
+          gv_longitud2    ,
+          gv_diametro2     ,
+          gv_empalmes2      ,
+          gv_tipobobina2    ,
+          gv_motivo2  ,
+          gv_cliente2  ,
+          gv_ancho3     ,
+          gv_peso3       ,
+          gv_longitud3    ,
+          gv_diametro3     ,
+          gv_empalmes3      ,
+          gv_tipobobina3    ,
+          gv_motivo3  ,
+          gv_cliente3 ,
+          gv_atinn_ancho    ,
+          gv_atinn_peso     ,
+          gv_atinn_diametro ,
+          gv_atinn_longitud ,
+          gv_icon_ancho     ,
+          gv_icon_peso      ,
+          gv_cliente        ,
+          gv_nombre_cliente ,
+          gv_decision_empleo ,
+          gv_decision_empleo_icon ,
+          gv_name_lb ,
+          gv_name_lb1,
+          gv_name_lb2,
+          gv_name_lb3,
+          gv_name_lb4,
+          gv_name_lb5,
+          gt_list    ,
+          gs_value   .
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_BOBINA_PULPER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_bobina_pulper USING p_peso p_diametro p_longitud p_empalmes p_motivo
+                         CHANGING p_go p_charg.
+
+* Creacion de bobina a pulper
+* 309 a material pulper con kilos P_PESO
+* del almacen origen 4001 al 1000(materia prima)
+
+
+  DATA: lv_go    TYPE abap_bool,
+        lv_charg TYPE charg_d.
+
+  PERFORM crear_lote USING gc_matnr_bobpulper
+                           gv_charg
+                           p_peso
+                           p_diametro
+                           p_longitud
+                           p_empalmes
+                           gv_operario
+                           p_motivo
+                           ''
+                           ''
+                           100
+                  CHANGING lv_go
+                           lv_charg.
+
+  IF lv_go IS NOT INITIAL.
+
+    PERFORM crear_309 USING gv_matnr
+                            gc_matnr_bobpulper
+                            gv_charg
+                            lv_charg
+                            p_peso
+                            gv_lgort
+                            '1000'
+
+                      CHANGING lv_go.
+
+  ENDIF.
+
+  p_go = lv_go.
+  p_charg = lv_charg.
+
+
+ENDFORM.
+
+FORM crear_bobina_reproceso USING p_matnr p_peso p_diametro p_longitud p_empalmes p_motivo p_cliente
+                            CHANGING p_go p_charg.
+
+
+  DATA: lv_go    TYPE abap_bool,
+        lv_charg TYPE charg_d.
+
+
+  PERFORM crear_lote USING p_matnr
+                           gv_charg
+                           p_peso
+                           p_diametro
+                           p_longitud
+                           p_empalmes
+                           gv_operario
+                           p_motivo
+                           p_cliente
+                           'REPROCESO'
+                           0
+                       CHANGING lv_go
+                                lv_charg.
+
+  IF lv_go IS NOT INITIAL.
+
+    PERFORM crear_309 USING gv_matnr
+                            p_matnr
+                            gv_charg
+                            lv_charg
+                            p_peso
+                            gv_lgort
+                            '4001'
+                       CHANGING lv_go.
+
+  ENDIF.
+
+
+  p_go = lv_go.
+  p_charg = lv_charg.
+ENDFORM.
+
+FORM crear_bobina_nueva USING p_matnr  p_peso p_diametro p_longitud p_empalmes p_motivo p_cliente
+                        CHANGING p_go p_charg.
+
+
+  DATA: lv_go    TYPE abap_bool,
+        lv_charg TYPE charg_d.
+
+
+  PERFORM crear_lote USING p_matnr
+                           gv_charg
+                           p_peso
+                           p_diametro
+                           p_longitud
+                           p_empalmes
+                           gv_operario
+                           p_motivo
+                           p_cliente
+                           'NUEVA'
+                           0
+                     CHANGING lv_go lv_charg.
+
+  IF lv_go IS NOT INITIAL.
+    PERFORM crear_309 USING gv_matnr "origen
+                            p_matnr  "destino
+                            gv_charg
+                            lv_charg
+                            p_peso
+                            gv_lgort
+                            '1040'
+                      CHANGING lv_go.
+
+  ENDIF.
+
+
+  IF lv_go EQ abap_true.
+    PERFORM enviar_mail USING p_matnr lv_charg p_cliente.
+  ENDIF.
+  p_go = lv_go.
+  p_charg = lv_charg.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ENVIAR_MAIL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM enviar_mail USING p_matnr TYPE matnr p_charg TYPE charg_d
+                       p_kunnr TYPE kunnr .
+
+  DATA: send_request TYPE REF TO cl_bcs,
+        document     TYPE REF TO cl_document_bcs,
+        recipient    TYPE REF TO if_recipient_bcs,
+        li_sender2   TYPE REF TO cl_sapuser_bcs,
+        l_count_mail TYPE so_obj_len,
+        t_attach     TYPE solix_tab,
+        wa_attach    TYPE solix.
+
+
+  DATA: lt_bodytext    TYPE bcsy_text,
+        l_bodytext_row TYPE soli.
+
+  DATA: li_sender TYPE REF TO cl_cam_address_bcs,
+        l_new.
+
+  IF p_kunnr IS INITIAL OR p_kunnr EQ gv_cliente.
+    RETURN.
+  ENDIF.
+
+*  rfrances@palqueria.com<mailto:rfrances@palqueria.com> para el centro 3000 y cpita@psarria.com<mailto:cpita@psarria.com> para el centro 3020 con el siguiente asunto: “cambio de cliente en bobina reprocesada” y
+*  el siguiente cuerpo “la bobina material / lote del cliente cxxxx ha sido reprocesada en el material / lote y se ha modificado el cliente original al cliente cxxxx.”
+
+  TRY.
+      CALL METHOD cl_bcs=>create_persistent
+        RECEIVING
+          result = send_request.
+  ENDTRY.
+
+  SELECT SINGLE name1 FROM kna1 INTO @DATA(l_name) WHERE kunnr = @p_kunnr.
+
+  IF p_kunnr IS NOT INITIAL.
+    DATA(l_text) = |La bobina { gv_matnr ALPHA = OUT }/ { gv_charg } del cliente { gv_cliente }-{ gv_nombre_cliente } ha sido reprocesada |
+                   & |en el { p_matnr ALPHA = OUT }/ { p_charg } y se ha modificado el cliente original al cliente { p_kunnr }-{ l_name }.|.
+
+  ENDIF.
+  APPEND VALUE soli( line = l_text ) TO lt_bodytext.
+
+  TRY.
+      CALL METHOD cl_document_bcs=>create_document
+        EXPORTING
+          i_type    = 'HTM'
+          i_subject = 'Cambio de cliente en bobina reprocesada'
+          i_text    = lt_bodytext
+        RECEIVING
+          result    = document.
+    CATCH cx_document_bcs .
+  ENDTRY.
+
+
+  CALL METHOD send_request->set_document( document ).
+
+
+  li_sender ?= cl_cam_address_bcs=>create_internet_address( i_address_string = CONV adr6-smtp_addr( zclpp_recetas_reparto_pulper=>gc_remitente_mail ) ).
+
+  CALL METHOD send_request->set_sender
+    EXPORTING
+      i_sender = li_sender.
+
+  DATA: l_mail LIKE  adr6-smtp_addr.
+
+  CASE gv_werks.
+    WHEN '3000'.
+      l_mail = 'rfrances@palqueria.com'.
+    WHEN '3020'.
+      l_mail = 'cpita@psarria.com'.
+  ENDCASE.
+
+
+  recipient = cl_cam_address_bcs=>create_internet_address( l_mail ).
+  CALL METHOD send_request->add_recipient( i_recipient = recipient ).
+
+
+
+  CALL METHOD send_request->send( ).
+
+
+  COMMIT WORK AND WAIT.
+
+ENDFORM.

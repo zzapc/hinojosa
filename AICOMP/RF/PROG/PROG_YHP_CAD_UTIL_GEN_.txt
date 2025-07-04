@@ -1,0 +1,481 @@
+*&---------------------------------------------------------------------*
+*& Report YCADIF_TEST_GEN
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+report YHP_CAD_UTIL_GEN.
+
+data: LF_POSNR type POSNR,
+      LF_CUOBJ type CUOBJ,
+      LF_INCPO type INCPO,
+      LF_INCUP type INCUP.
+data: LS_ORDER_VIEW type ORDER_VIEW.
+data: LR_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC,
+      LR_MSG      type ref to /VCXI/CL_CKXM_MESSAGE,
+      LR_SVC      type ref to /VCXI/CL_VKSRA_SVC.
+
+selection-screen begin of block SD with frame title TEXT-T02.
+parameters: PA_VBELN type VBELN memory id AGN.
+parameters: PA_AUART type AUART   default 'ZOF',
+            PA_VKORG type VKORG   default '2001',
+            PA_VTWEG type VTWEG   default '10',
+            PA_SPART type SPART   default '10',
+            PA_KUNAG type KUNAG   default '0000118777' matchcode object DEBI,
+            PA_KUNWE type KUNWE   default '0000801822' matchcode object DEBI,
+            PA_MATNR type MATNR   default 'SINGLE',
+            PA_WERKS type WERKS_D default '2001'.
+selection-screen end of block SD.
+selection-screen begin of block VC with frame title TEXT-T03.
+parameters: PA_SABOA type ZVCXI_PCSS_SABOA  default '15001B',
+            PA_PACKU type YHP_SVCS_PACKU    default 'A',
+            PA_TDCUT type ZVCXI_P0SS_TDCUT  default 'ALL'.
+selection-screen end of block VC.
+selection-screen begin of block TC with frame title TEXT-T01.
+parameters: PA_TC01 type FLAG radiobutton group TC default 'X',
+            PA_TC02 type FLAG radiobutton group TC,
+            PA_TC03 type FLAG radiobutton group TC,
+            PA_TC04 type FLAG radiobutton group TC.
+selection-screen end of block TC.
+selection-screen begin of block OP with frame title TEXT-T04.
+parameters: PA_SVCUI type ABAP_BOOL as checkbox default ABAP_TRUE,
+            PA_TESTR type ABAP_BOOL as checkbox default ABAP_FALSE.
+selection-screen end of block OP.
+
+start-of-selection.
+
+  try.
+***------------------------------------------------------------------------------------------------
+***   Create Business Object
+      LR_BOB_SDOC = new #( ).
+
+***   Define the view relevant
+      LS_ORDER_VIEW = value #( HEADER     = ABAP_TRUE
+                               ITEM       = ABAP_TRUE
+                               SDSCHEDULE = ABAP_TRUE
+                               BUSINESS   = ABAP_TRUE
+                               PARTNER    = ABAP_TRUE
+                               SDCOND     = ABAP_TRUE
+                               CONFIGURE  = ABAP_TRUE ).
+
+***   Define new Sales Document
+      if PA_VBELN is initial.
+***     Define the view relevant
+        LR_BOB_SDOC->S_ORDER_VIEW = LS_ORDER_VIEW.
+***     Define Header
+        LR_BOB_SDOC->S_VBAK = value #( AUART = PA_AUART
+                                       VKORG = PA_VKORG
+                                       VTWEG = PA_VTWEG
+                                       SPART = PA_SPART ).
+***     Define Partner
+        LR_BOB_SDOC->T_VBPA = value #( ( PARVW = 'AG'  KUNNR = PA_KUNAG )
+                                       ( PARVW = 'WE'  KUNNR = PA_KUNWE ) ).
+
+      else.
+***     Load existing Sales Document
+        LR_BOB_SDOC->INIT_FROM_DB( IF_VBELN      = PA_VBELN
+                                   IS_ORDER_VIEW = LS_ORDER_VIEW ).
+      endif.
+
+***------------------------------------------------------------------------------------------------
+***   Define next Position Number
+      LF_POSNR = reduce POSNR_VA( init MAX = 0
+                           for LS_VBAP in LR_BOB_SDOC->T_VBAP
+                           next MAX = cond #( when LS_VBAP-POSNR > MAX then LS_VBAP-POSNR else MAX ) ) + 10.
+
+***   Add Line Item
+      perform ADD_ITEM using LR_BOB_SDOC
+                             LF_POSNR PA_MATNR PA_WERKS 23000 'ST'.
+
+***   Add Configuration
+      perform ADD_CNF using LR_BOB_SDOC LF_POSNR.
+
+***   Run Configuration of Item
+      LF_CUOBJ = LR_BOB_SDOC->RUN_CONFIG( IF_POSNR = LF_POSNR ).
+
+***   Get SmartVC API Instance
+      LR_SVC = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LF_CUOBJ ) ).
+
+***   Update SmartVC via Fast Data (Run Configuration afterwards to ensure Routing Supervisor gets executed)
+      perform UPDATE_VIA_FASTD using LR_SVC.
+      perform UPDATE_CADIF_PRJ using LR_SVC.
+      LR_SVC->UPDATE_DC( ).
+      LF_CUOBJ = LR_BOB_SDOC->RUN_CONFIG( IF_POSNR = LF_POSNR ).
+
+***   Call SmartVC UI to check current Status
+      if PA_SVCUI eq ABAP_TRUE.
+        LR_SVC = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LF_CUOBJ ) ).
+        LR_SVC->START_UI( ).
+        LR_SVC->UPDATE_DC( ).
+        LF_CUOBJ = LR_BOB_SDOC->RUN_CONFIG( IF_POSNR = LF_POSNR ).
+      endif.
+
+***   Create Integration Data for SmartVC
+      perform BUILD_IDAT using LR_BOB_SDOC LF_POSNR.
+
+
+***------------------------------------------------------------------------------------------------
+***   Create Sales Document
+      LR_MSG = LR_BOB_SDOC->SAVE( IF_TESTRUN = PA_TESTR ).
+      if LR_MSG is bound.
+        LR_MSG->DISPLAY_MSG( ).
+      endif.
+
+    catch /VCXI/CX_CKX into data(LR_CX_CKX).
+      LR_CX_CKX->SHOW_MESSAGE( ).
+  endtry.
+
+
+*&---------------------------------------------------------------------*
+*& Form ADD_ITEM
+*&---------------------------------------------------------------------*
+*& Add new Line Item
+*&---------------------------------------------------------------------*
+form ADD_ITEM  using   IR_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC
+                       IF_POSNR    type POSNR
+                       IF_MATNR    type MATNR
+                       IF_WERKS    type WERKS_D
+                       IF_KWMENG   type KWMENG
+                       IF_VRKME    type VRKME
+                raising /VCXI/CX_CKX.
+
+  data: LS_MARA type MARA.
+
+  call function 'MARA_SINGLE_READ'
+    exporting
+      MATNR             = IF_MATNR
+    importing
+      WMARA             = LS_MARA
+    exceptions
+      LOCK_ON_MATERIAL  = 1
+      LOCK_SYSTEM_ERROR = 2
+      WRONG_CALL        = 3
+      NOT_FOUND         = 4.
+  if SY-SUBRC ne 0.
+    /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+  endif.
+
+*** Add Item
+  append value #( POSNR  = IF_POSNR
+                  MATNR  = IF_MATNR
+                  WERKS  = IF_WERKS
+                  SPART  = IR_BOB_SDOC->S_VBAK-SPART
+                  KWMENG = IF_KWMENG
+                  VRKME  = IF_VRKME
+                  MEINS  = LS_MARA-MEINS
+                  UMVKZ  = 1
+                  UMVKN  = 1
+                  STDAT  = SY-DATUM
+                ) to IR_BOB_SDOC->T_VBAP.
+
+*** Schedule Lines Data
+  append value #( POSNR = IF_POSNR
+                  ETENR = '0001'
+                  WMENG = IF_KWMENG
+                  VRKME = IF_VRKME
+                  MEINS = LS_MARA-MEINS
+                ) to IR_BOB_SDOC->T_VBEP.
+
+endform.
+
+*&---------------------------------------------------------------------*
+*& Form ADD_CNF
+*&---------------------------------------------------------------------*
+*& Add Line Item Configuration
+*&---------------------------------------------------------------------*
+form ADD_CNF   using   IR_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC
+                       IF_POSNR type POSNR
+               raising /VCXI/CX_CKX.
+
+  data: LF_CUOBJ     type CUOBJ,
+        LF_CONFIG_ID type CUX_CFG_ID value '000001',
+        LF_INST_ID   type CU_INST_ID value '00000001'.
+  data: LS_VBAP type VBAP,
+        LS_CUCO type CUCO.
+
+
+*** Get Position
+  LS_VBAP = value #( IR_BOB_SDOC->T_VBAP[ POSNR = IF_POSNR ] optional ).
+  if LS_VBAP-POSNR ne IF_POSNR.
+    /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+  endif.
+
+***----------------------------------------------------------------------------
+*** Get Profile Settings
+  select single CUOBJ
+         from MARC
+         into LF_CUOBJ
+        where MATNR eq LS_VBAP-MATNR
+  and  WERKS eq LS_VBAP-WERKS.
+  check SY-SUBRC eq 0.
+
+  call function 'CUCB_GET_PROFILE_OF_INSTANCE'
+    exporting
+      INSTANCE                     = LF_CUOBJ
+    importing
+      PROFILE_WA                   = LS_CUCO
+    exceptions
+      INVALID_INSTANCE             = 1
+      INSTANCE_IS_A_CLASSIFICATION = 2
+      PROFILE_NOT_FOUND            = 3
+      INVALID_INPUT                = 4.
+  check SY-SUBRC eq 0.
+
+
+*** Reference Order Item / Instance in Configuration
+  append value #( POSEX     = LS_VBAP-POSNR
+                  CONFIG_ID = LF_CONFIG_ID
+                  INST_ID   = LF_INST_ID
+                ) to IR_BOB_SDOC->T_CFGS_REFINST.
+
+*** Instances
+  append value #( CONFIG_ID     = LF_CONFIG_ID
+                  INST_ID       = LF_INST_ID
+                  OBJ_TYPE      = LS_CUCO-OBTAB
+                  CLASS_TYPE    = LS_CUCO-KLART
+                  OBJ_KEY       = LS_CUCO-OBJEK
+                  QUANTITY      = LS_VBAP-KWMENG
+                  QUANTITY_UNIT = LS_VBAP-VRKME
+                  COMPLETE      = 'F'
+                  CONSISTENT    = 'F'
+                ) to IR_BOB_SDOC->T_CFGS_INST.
+
+*** Configuration Data
+  append value #( POSEX         = LS_VBAP-POSNR
+                  CONFIG_ID     = LF_CONFIG_ID
+                  ROOT_ID       = LF_INST_ID
+                  COMPLETE      = 'F'
+                  CONSISTENT    = 'F'
+                ) to IR_BOB_SDOC->T_CFGS_REF.
+
+*** Update Flag for Configuration
+  append value #( POSNR = LS_VBAP-POSNR
+                  UPDKZ = 'I'
+                ) to IR_BOB_SDOC->T_CFGS_UPDKZ.
+
+endform.
+*&---------------------------------------------------------------------*
+*& Form UPDATE_VIA_FASTD
+*&---------------------------------------------------------------------*
+*& Perform Update via Fast Data
+*&---------------------------------------------------------------------*
+form UPDATE_VIA_FASTD  using  IR_SVC type ref to /VCXI/CL_VKSRA_SVC
+                       raising /VCXI/CX_CKX.
+
+  data: LF_IFDMV  type ZVCXI_PXSS_IFDMV.
+  data: LS_FDI_CORR       type ZVCXI_P1SS_S_FDI_CORR,
+        LS_FDI_CFG        type YHP_SVCS_S_FDI_CFG,   "ZVCXI_P1SS_S_FDI_CFG,
+        LS_FDI_CSTEP_DCUT type ZVCXI_P1SS_S_FDI_CSTEP_DCUT.
+  data: LT_SVCEL       type /VCXI/CKX_TT_OBJECT,
+        LT_FDAPI_XCOMP type ZVCXI_PXSS_TT_FDAPI_XCOMP.
+  data: LR_EA_FASTD  type ref to ZCL_VCXI_PXSS_EA_FASTD,
+        LR_API_FDMDL type ref to ZCL_VCXI_PXSS_API_FDMDL.
+  field-symbols: <S_FDAPI_XCOMP>      type ZVCXI_PXSS_S_FDAPI_XCOMP,
+                 <S_FDAPI_XCOMP_DATA> type ZVCXI_PXSS_S_FDAPI_XCOMP_DATA,
+                 <S_DATA>             type ANY.
+
+*** Get Fast Data
+  LT_SVCEL = IR_SVC->GET_SVC_ELEMENTS( IF_IEALI = 'UI_FASTD' ).
+  check LT_SVCEL is not initial.
+
+  LR_EA_FASTD ?= cast /VCXI/CL_VKSRA_SVC_ELEMENT( LT_SVCEL[ 1 ] )->GET_CLSEA( ).
+  check LR_EA_FASTD is bound.
+
+*** Define Variant based on Test Case
+  case ABAP_TRUE.
+    when PA_TC01.   "Test Case 1: Inline 0201 300x300x300
+      LF_IFDMV = ZCL_VCXI_P1SS_BL_FDMDL=>C_IFDMV_INL.
+    when PA_TC02.   "Test Case 2: Die Cut 0215 200x200x180 with 2 Color Flexo
+      LF_IFDMV = ZCL_VCXI_P1SS_BL_FDMDL=>C_IFDMV_DCT.
+    when PA_TC03.   "Test Case 3: Inline 0201 300x300x300 with Review
+      LF_IFDMV = ZCL_VCXI_P1SS_BL_FDMDL=>C_IFDMV_INL.
+    when PA_TC04.   "Test Case 4: Die Cut 1000 (New Design)
+      LF_IFDMV = ZCL_VCXI_P1SS_BL_FDMDL=>C_IFDMV_DCT.
+  endcase.
+
+*** Create Fast Data Model for Corrugated Inline Product
+  LR_API_FDMDL = LR_EA_FASTD->CREATE_FDMDL( IF_FDMDL = 'CFG'
+                                            IF_IFDMV = LF_IFDMV ).
+
+*** Get Fast Data Structure
+  LT_FDAPI_XCOMP = LR_API_FDMDL->GET_STRC( ).
+
+*** Fill Fast Data Information Structures
+  loop at LT_FDAPI_XCOMP assigning <S_FDAPI_XCOMP>.
+
+*** Fill existing Elements
+    loop at <S_FDAPI_XCOMP>-T_DATA assigning <S_FDAPI_XCOMP_DATA>.
+      assign <S_FDAPI_XCOMP_DATA>-R_DATA->* to <S_DATA>.
+      case <S_FDAPI_XCOMP_DATA>-ISELF.
+        when 'CORR'.
+          LS_FDI_CORR = corresponding #( <S_DATA> ).
+          LS_FDI_CORR-SABOA = PA_SABOA. "'B_01315_S'.
+          move-corresponding LS_FDI_CORR to <S_DATA>.
+
+        when 'CFG'.
+          LS_FDI_CFG = corresponding #( <S_DATA> ).
+          case ABAP_TRUE.
+            when PA_TC01.   "Test Case 1: Inline 0201 300x300x300
+              LS_FDI_CFG-FEFCO = '0201'.
+              LS_FDI_CFG-PROLE = 300.
+              LS_FDI_CFG-PROWI = 300.
+              LS_FDI_CFG-PROHE = 300.
+              LS_FDI_CFG-KDMAT = TEXT-T01 && |# | && 1.
+              LS_FDI_CFG-KDPTX = TEXT-TC1.
+            when PA_TC02.   "Test Case 2: Die Cut 0215 200x200x180 with 2 Color Flexo
+              LS_FDI_CFG-FEFCO = '0215'.
+              LS_FDI_CFG-PROLE = 200.
+              LS_FDI_CFG-PROWI = 200.
+              LS_FDI_CFG-PROHE = 180.
+              LS_FDI_CFG-KDMAT = TEXT-T01 && |# | && 2.
+              LS_FDI_CFG-KDPTX = TEXT-TC2.
+            when PA_TC03.   "Test Case 3: Inline 0201 300x300x300 with Review
+              LS_FDI_CFG-FEFCO = '0201'.
+              LS_FDI_CFG-PROLE = 300.
+              LS_FDI_CFG-PROWI = 300.
+              LS_FDI_CFG-PROHE = 300.
+              LS_FDI_CFG-KDMAT = TEXT-T01 && |# | && 3.
+              LS_FDI_CFG-KDPTX = TEXT-TC3.
+            when PA_TC04.   "Test Case 4: Die Cut 1000 (New Design)
+              LS_FDI_CFG-FEFCO = '1000'.
+              LS_FDI_CFG-KDMAT = TEXT-T01 && |# | && 4.
+              LS_FDI_CFG-KDPTX = TEXT-TC4.
+          endcase.
+          move PA_PACKU to LS_FDI_CFG-PACKU.
+*          move 'TEST DESCRIPTION' to: LS_FDI_CFG-KDMAT, LS_FDI_CFG-KDPTX, LS_FDI_CFG-MAKTX.
+          move-corresponding LS_FDI_CFG to <S_DATA>.
+
+        when 'CSTEP_DCUT'.
+          LS_FDI_CSTEP_DCUT = corresponding #( <S_DATA> ).
+          case ABAP_TRUE.
+            when PA_TC02.   "Test Case 2: Die Cut 0215 200x200x180 with 2 Color Flexo
+              LS_FDI_CSTEP_DCUT-NOUTW = 1.
+              LS_FDI_CSTEP_DCUT-NOUTL = 1.
+              LS_FDI_CSTEP_DCUT-TDCUT = PA_TDCUT.
+            when PA_TC04.   "Test Case 4: Die Cut 1000 (New Design)
+
+          endcase.
+          move-corresponding LS_FDI_CSTEP_DCUT to <S_DATA>.
+
+      endcase.
+    endloop.
+
+*** Add Printing Step
+    case ABAP_TRUE.
+      when PA_TC02.   "Test Case 2: Die Cut 0215 200x200x180 with 2 Color Flexo
+        append value #( IPARE = 'CONV'
+                        ISELF = 'CSTEP_PRINT'
+                        R_DATA = new ZVCXI_P1SS_S_FDI_CSTEP_PRINT( TPRIN = 'FLEXO'
+                                                                   PRSID = 'O'
+                                                                   NOCOL = 2 )
+                      ) to <S_FDAPI_XCOMP>-T_DATA.
+    endcase.
+
+**** Add Closing Step
+*    append value #( IPARE = 'CONV'
+*                    ISELF = 'CSTEP_CLOS'
+*                    R_DATA = new ZVCXI_P1SS_S_FDI_CSTEP_CLOS( JOITY = 'B1' )
+*                  ) to <S_FDAPI_XCOMP>-T_DATA.
+  endloop.
+
+*** Set Fast Data Structure
+  LR_API_FDMDL->SET_STRC( IT_FDAPI_XCOMP = LT_FDAPI_XCOMP ).
+
+endform.
+
+*&---------------------------------------------------------------------*
+*& Form UPDATE_CADIF_PRJ
+*&---------------------------------------------------------------------*
+*& Perform Update of CAD Project Info
+*&---------------------------------------------------------------------*
+form UPDATE_CADIF_PRJ  using  IR_SVC type ref to /VCXI/CL_VKSRA_SVC
+                       raising /VCXI/CX_CKX.
+
+  data: LT_SVCEL      type /VCXI/CKX_TT_OBJECT,
+        LT_CADPS_NEXT type ZVCXI_PXS_TT_CADPS.
+  data: LR_EA_CADIF_PRJ type ref to ZCL_VCXI_PXSS_EA_CADIF_PRJ.
+
+
+*** Get CAD Interface - Project
+  LT_SVCEL = IR_SVC->GET_SVC_ELEMENTS( IF_ID = 'CADIF_PRJ' ).
+  check LT_SVCEL is not initial.
+
+  LR_EA_CADIF_PRJ ?= cast /VCXI/CL_VKSRA_SVC_ELEMENT( LT_SVCEL[ 1 ] )->GET_CLSEA( ).
+  check LR_EA_CADIF_PRJ is bound.
+
+  case ABAP_TRUE.
+    when PA_TC03.   "Test Case 3: Inline 0201 300x300x300 with Review
+      LR_EA_CADIF_PRJ->SET_FREVR( IF_FREVR = ABAP_TRUE
+                                  IF_SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_USER ).
+      LR_EA_CADIF_PRJ->SET_LTEXT( IF_LTEXT = 'Please add handholes in the two width panels'
+                                  IF_SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_USER ).
+
+    when PA_TC04.   "Test Case 4: Die Cut 1000 (New Design)
+      LR_EA_CADIF_PRJ->SET_LTEXT( IF_LTEXT = 'Please design a box to hold a computer keyboard.  Sample of product has been posted for your attention.'
+                                  IF_SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_USER ).
+
+  endcase.
+
+*** Set Ready for Design Status
+  LR_EA_CADIF_PRJ->GET_CADPS( importing ET_CADPS_NEXT = LT_CADPS_NEXT ).
+  if LINE_EXISTS( LT_CADPS_NEXT[ TABLE_LINE = 'RD' ] ).
+    LR_EA_CADIF_PRJ->SET_CADPS( IF_CADPS = 'RD' ).
+  endif.
+
+endform.
+
+*&---------------------------------------------------------------------*
+*& Form BUILD_IDAT
+*&---------------------------------------------------------------------*
+*& Build Integration Data
+*&---------------------------------------------------------------------*
+form BUILD_IDAT  using    IR_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC
+                          IF_POSNR type POSNR
+                  raising /VCXI/CX_CKX.
+
+  data: LR_SVC      type ref to /VCXI/CL_VKSRA_SVC,
+        LR_IDAT_SVC type ref to ZCL_VCXI_XCI_IDAT_SVC,
+        LR_CUELMNT  type ref to /VCXI/CL_VKSC_CUELMNT,
+        LR_SVCEL    type ref to /VCXI/CL_VKSRA_SVC_ELEMENT,
+        LR_OBJECT   type ref to /VCXI/IF_CKX_OBJECT.
+
+*** Get SmartVC API Instance
+  LR_SVC = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LR_BOB_SDOC->T_VBAP[ POSNR = IF_POSNR ]-CUOBJ ) ).
+
+*** Build Integration Data Service
+  LR_IDAT_SVC = ZCL_VCXI_XCI_IDAT_SVC=>CREATE( IS_CMPRK = LR_SVC->S_CMPRK
+                                               IF_IEALI = 'X_IDATSPV' ).
+
+*** Get Integration Data Supervisor
+  LR_CUELMNT = ZCL_VCXI_XCI_IDAT_SVC=>FIND_CUELMNT( IR_CUPRFL = LR_IDAT_SVC->R_CUPRFL
+                                                    IF_IEALI  = LR_IDAT_SVC->F_IEALI ).
+
+*** Get Root Elements
+  loop at LR_SVC->GET_SVC_ELEMENTS( IR_SVC_ELEMENT_PARENT = value #( ) ) into LR_OBJECT.
+    LR_SVCEL ?= LR_OBJECT.
+
+*** Filter to Supervised Root Elements
+    clear LR_OBJECT.
+    loop at LR_CUELMNT->/VCXI/IF_VKSC_CUELMNT_SPV~T_SPVRT into LR_OBJECT.
+      if LR_OBJECT->GET_ID( ) ne LR_SVCEL->/VCXI/IF_CKX_OBJECT~GET_ID( ).
+        clear LR_OBJECT.
+      else.
+        exit.
+      endif.
+    endloop.
+    check LR_OBJECT is bound.
+
+*** Fill by SmartVC Element
+    LR_IDAT_SVC->FILL_BY_SVCEL( IF_IPARE   = value #( )
+                                IF_CPARE   = value #( )
+                                IR_SVC     = LR_SVC
+                                IR_SVCEL   = LR_SVCEL
+                                IR_CUELMNT = cast #( LR_OBJECT ) ).
+  endloop.
+
+*** Set Integradion Data Number to Buffer for later processing
+  call function 'ZVCXI_XCC_IDAT_SET_NIDAT'
+    exporting
+      IF_POSNR = IF_POSNR
+      IF_NIDAT = conv ZVCXI_XCI_NIDAT( LR_IDAT_SVC->/VCXI/IF_CKX_OBJECT~GET_GUID( ) ).
+
+endform.

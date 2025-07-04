@@ -1,0 +1,667 @@
+*----------------------------------------------------------------------*
+***INCLUDE ZRPP0058_F01.
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM obtener_datos_r_a.
+
+  TYPES: BEGIN OF wa,
+           changenr TYPE cdchangenr,
+           contador TYPE i,
+         END OF wa.
+  DATA  lt_cont_pos TYPE TABLE OF wa WITH EMPTY KEY.
+  DATA: l_matnr TYPE matnr.
+  DATA: l_charg TYPE charg_d.
+
+  CLEAR gt_no_ok[].
+
+  SELECT hdr~objectid , hdr~changenr , pos~tabname , pos~tabkey , pos~fname , hdr~udate , hdr~utime , hdr~username , hdr~tcode ,
+     pos~value_old , pos~value_new , pos~chngind
+    INTO TABLE @DATA(lt_pos)
+     FROM cdhdr AS hdr
+     INNER JOIN cdpos AS pos ON pos~objectid = hdr~objectid AND
+                                pos~changenr = hdr~changenr
+     WHERE hdr~objectclas = 'CLASSIFY' AND
+           hdr~udate IN @s_fecha       AND
+           ( hdr~tcode IN ( 'BMBC', 'MSC1N' , 'MSC2N' , 'ZPP0006' , 'QA11' ) OR
+             hdr~username = 'SAPJOB'
+           ) AND
+           pos~objectclas = 'CLASSIFY' AND
+           pos~tabkey LIKE '%9999999414%'
+    ORDER BY pos~changenr.
+
+* Tabla para saber nº registros en CDPOS.
+  SELECT pos~changenr , COUNT( * ) AS contador
+    INTO  TABLE @lt_cont_pos
+     FROM cdhdr AS hdr
+     INNER JOIN cdpos AS pos ON pos~objectid = hdr~objectid AND
+                                pos~changenr = hdr~changenr
+     WHERE hdr~objectclas = 'CLASSIFY' AND
+           hdr~udate IN @s_fecha       AND
+           ( hdr~tcode IN ( 'BMBC', 'MSC1N' , 'MSC2N' , 'ZPP0006' , 'QA11' ) OR
+             hdr~username = 'SAPJOB'
+           ) AND
+           pos~objectclas = 'CLASSIFY' AND
+           pos~tabkey LIKE '%9999999414%'
+     GROUP BY pos~changenr.
+
+* Comprobamos que los CHANGENR sean agrupaciones de 1 o 2 registros.
+  LOOP AT lt_cont_pos INTO DATA(ls_cont_pos2) WHERE contador > 2.
+    WRITE :/ |Existe "CHANGENR" { ls_cont_pos2-changenr }con { ls_cont_pos2-contador } registros|.
+  ENDLOOP.
+
+  LOOP AT lt_pos ASSIGNING FIELD-SYMBOL(<fs_pos>).
+
+    IF line_exists( gt_no_ok[ changenr = <fs_pos>-changenr ] ).
+      CONTINUE.
+    ENDIF.
+
+* Se eliminan los reg. con CHAGNR único , DE=A->DE=P , DE=P->DE=A,
+    TRY.
+        DATA(l_num_reg) = lt_cont_pos[ changenr = <fs_pos>-changenr ]-contador.
+        IF l_num_reg = 1 AND
+        ( ( <fs_pos>-value_old = 'DE       A'  AND <fs_pos>-value_new IS INITIAL ) OR
+          ( <fs_pos>-value_old IS INITIAL  AND <fs_pos>-value_new = 'DE       A' )
+          ).
+          CONTINUE.
+        ENDIF.
+      CATCH cx_root .
+*        WRITE :/ |Error CHGNR no encontrado: { <fs_pos>-changenr }|.
+    ENDTRY.
+
+    TRY.
+        IF l_num_reg > 1.
+          IF <fs_pos>-value_new IS INITIAL.
+            <fs_pos>-value_new = lt_pos[ changenr = <fs_pos>-changenr value_old = ' ' ]-value_new.
+          ELSEIF <fs_pos>-value_old IS INITIAL.
+            <fs_pos>-value_old = lt_pos[ changenr = <fs_pos>-changenr value_new = ' ' ]-value_old.
+          ENDIF.
+        ENDIF.
+
+
+* Convertimos los pendientes a Blancos.
+*        IF <fs_pos>-value_old = 'DE       P'.
+*          CLEAR <fs_pos>-value_old.
+*        ENDIF.
+
+*        IF <fs_pos>-value_new = 'DE       P'.
+*          CLEAR <fs_pos>-value_new.
+*        ENDIF.
+
+        IF  ( <fs_pos>-value_old <> 'DE       R' AND <fs_pos>-value_new <> 'DE       R' ).
+          CONTINUE.
+        ENDIF.
+
+      CATCH cx_root .
+        CONTINUE.
+    ENDTRY.
+
+
+* Limpiamos los rollos, y nos quedamos solo con cambios de DE de bobinas
+    DATA: l_cuobj TYPE cuobj.
+    l_cuobj = |{ <fs_pos>-objectid ALPHA = IN }|.
+
+    SELECT SINGLE objek
+      INTO @DATA(l_objek)
+      FROM inob
+      WHERE cuobj = @l_cuobj.
+
+    IF sy-subrc <> 0.
+      WRITE :/ |Error acceso INOB: { l_cuobj }|.
+      CLEAR <fs_pos>-objectid.
+      CONTINUE.
+    ELSE.
+      l_matnr = |{ l_objek(18) ALPHA = IN }|.
+      l_charg = l_objek+18(10) .
+
+      IF l_charg NOT IN s_lote[].
+        CONTINUE.
+      ENDIF.
+
+* Obtener el último mov. del centro/material/lote de los almacenes 1040 o 4001
+      SELECT cpudt_mkpf , cputm_mkpf , usnam_mkpf , lgort , matkl
+        INTO TABLE @DATA(lt_mseg_pulper)
+        FROM mseg AS s
+        INNER JOIN mara AS m ON m~matnr = s~matnr
+        WHERE werks       = @p_werks    AND
+              s~matnr     = @l_matnr    AND
+              s~charg     = @l_charg    AND
+              matkl       IN @s_matkl    AND
+*              budat_mkpf  IN @s_fecha   AND
+              charg       IN @s_lote   AND
+* 04/11/2021 Dia de Sant Carles
+*
+              lgort       IN ( '1040' , '4001' , '4005' )
+              ORDER BY cpudt_mkpf DESCENDING ,
+                       cputm_mkpf DESCENDING.
+
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ELSE.
+        DATA(ls_mseg_pulper) = lt_mseg_pulper[ 1 ].
+* Grabar tabla Datos Bobinas no OK
+        APPEND INITIAL LINE TO gt_no_ok ASSIGNING FIELD-SYMBOL(<fs_no_ok>).
+
+        <fs_no_ok>-werks            = p_werks.
+        <fs_no_ok>-meins            = 'KG'.
+        <fs_no_ok>-lgort            = ls_mseg_pulper-lgort.
+        <fs_no_ok>-matkl            = ls_mseg_pulper-matkl.
+        <fs_no_ok>-changenr         = <fs_pos>-changenr.
+        <fs_no_ok>-matnr_bobina     = l_matnr.
+        <fs_no_ok>-charg_bobina     = l_charg.
+        <fs_no_ok>-fecha_modif      = <fs_pos>-udate.
+        <fs_no_ok>-hora_modif       = <fs_pos>-utime.
+        <fs_no_ok>-usuario_modif    = <fs_pos>-username.
+        <fs_no_ok>-transaccion      = <fs_pos>-tcode.
+        <fs_no_ok>-anter_de         = <fs_pos>-value_old+9(1).
+        <fs_no_ok>-nueva_de         = <fs_pos>-value_new+9(1).
+        <fs_no_ok>-descr_matnr_bob  = zclpp_recetas_reparto_pulper=>obtener_descr_material( <fs_no_ok>-matnr_bobina ).
+
+        PERFORM obtener_caract_lote CHANGING <fs_no_ok>.
+
+        IF <fs_no_ok>-nueva_de  <> 'R'.
+          <fs_no_ok>-menge = <fs_no_ok>-menge * ( -1 ).
+        ENDIF.
+
+
+*        IF <fs_no_ok>-anter_de = 'R' and <fs_no_ok>-nueva_de <> ' '.
+*          <fs_no_ok>-menge = <fs_no_ok>-menge * ( -1 ).
+*        ENDIF.
+
+      ENDIF.
+
+    ENDIF.
+* Asignación de color
+    DATA:     ls_s_color TYPE lvc_s_scol.
+    CLEAR ls_s_color.
+    CASE <fs_no_ok>-nueva_de.
+      WHEN 'R'.    ls_s_color-color-col = 5.
+      WHEN 'A' OR 'P'.    ls_s_color-color-col = 6.
+      WHEN ' '.    ls_s_color-color-col = 6. " r->blanc
+      WHEN OTHERS.
+    ENDCASE.
+    ls_s_color-fname     = 'MENGE'.
+    ls_s_color-color-int = 0.
+    ls_s_color-color-inv = 0.
+    APPEND ls_s_color TO <fs_no_ok>-color.
+
+  ENDLOOP.
+
+ENDFORM.
+
+*FORM obtener_matkl USING p_matnr
+*                CHANGING p_matkl.
+*
+*
+*  TRY.
+*      p_matkl =    gt_matkls[ matnr = p_matnr ]-matkl.
+*
+*    CATCH cx_root .
+*      SELECT SINGLE matkl INTO     p_matkl
+*
+*        FROM mara
+*        WHERE matnr = p_matnr. "AND
+**                spras = sy-langu.
+*      IF sy-subrc = 0.
+*        APPEND INITIAL LINE TO gt_matkls ASSIGNING FIELD-SYMBOL(<fs_makt>).
+*        <fs_makt>-matnr = p_matnr.
+*        <fs_makt>-matkl = p_matkl.
+*      ELSE.
+*        CLEAR p_matkl.
+*      ENDIF.
+*
+*  ENDTRY.
+*
+*
+*ENDFORM.
+FORM obtener_caract_lote CHANGING p_datos TYPE ty_nook.
+
+  DATA l_objkey TYPE objnum.
+  DATA lt_allocvaluesnum  TYPE STANDARD TABLE OF  bapi1003_alloc_values_num .
+  DATA lt_allocvalueschar TYPE STANDARD TABLE OF  bapi1003_alloc_values_char .
+  DATA lt_allocvaluescurr TYPE STANDARD TABLE OF  bapi1003_alloc_values_curr .
+  DATA lt_return          TYPE STANDARD TABLE OF bapiret2.
+
+  CONCATENATE p_datos-matnr_bobina p_datos-charg_bobina INTO l_objkey.
+
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = l_objkey
+      objecttable     = 'MCH1'
+      classnum        = 'Z_BOBINA'
+      classtype       = '023'
+    TABLES
+      allocvaluesnum  = lt_allocvaluesnum
+      allocvalueschar = lt_allocvalueschar
+      allocvaluescurr = lt_allocvaluescurr
+      return          = lt_return.
+
+  TRY.
+      p_datos-motivo_repro  = lt_allocvalueschar[ charact = 'ZPPI_MOTIVO_REPROCESO_BOBINA' ]-value_char.
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      p_datos-nota_repr_cal  = lt_allocvalueschar[ charact = 'Z_NOTA_INSP' ]-value_char.
+    CATCH cx_root .
+  ENDTRY.
+
+
+  TRY.
+      p_datos-menge         = lt_allocvaluesnum[  charact = 'Z_PESO' ]-value_from.
+    CATCH cx_root .
+  ENDTRY.
+  TRY.
+      p_datos-de_bobina     = lt_allocvalueschar[ charact = 'LOBM_UDCODE' ]-value_char+9(1).
+    CATCH cx_root .
+  ENDTRY.
+  TRY.
+      p_datos-kunnr         = lt_allocvalueschar[ charact = 'Z_CLIENTE' ]-value_char.
+    CATCH cx_root .
+  ENDTRY.
+  TRY.
+      DATA: l_int TYPE i.
+      l_int = lt_allocvaluesnum[ charact = 'Z_FECHA_FABRICACION' ]-value_from.
+      WRITE l_int TO p_datos-fecha_fab_bob.
+    CATCH cx_root .
+  ENDTRY.
+  TRY.
+      p_datos-lgort         = lt_allocvalueschar[ charact = 'Z_UBICACION' ]-value_char.
+    CATCH cx_root .
+  ENDTRY.
+  TRY.
+      p_datos-operario      = lt_allocvalueschar[ charact = 'Z_OPERARIO' ]-value_char.
+    CATCH cx_root .
+  ENDTRY.
+
+* Datos del rollo
+  TRY.
+      p_datos-charg_rollo   = lt_allocvalueschar[ charact = 'Z_LOTE_ORIGEN' ]-value_char.
+      p_datos-matnr_rollo   = lt_allocvalueschar[ charact = 'Z_ROLLO_ORIGEN_V2' ]-value_char.
+
+      DATA: l_matnr_in TYPE matnr.
+
+      l_matnr_in = |{ p_datos-matnr_rollo ALPHA = IN }|.
+
+      p_datos-descr_matnr_rollo   = zclpp_recetas_reparto_pulper=>obtener_descr_material( l_matnr_in ).
+      CONCATENATE l_matnr_in p_datos-charg_rollo INTO l_objkey.
+
+      CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+        EXPORTING
+          objectkey       = l_objkey
+          objecttable     = 'MCH1'
+          classnum        = 'Z_ROLLO'
+          classtype       = '023'
+        TABLES
+          allocvaluesnum  = lt_allocvaluesnum
+          allocvalueschar = lt_allocvalueschar
+          allocvaluescurr = lt_allocvaluescurr
+          return          = lt_return.
+
+      p_datos-de_rollo            = lt_allocvalueschar[ charact = 'LOBM_UDCODE' ]-value_char+9(1).
+      l_int = lt_allocvaluesnum[ charact = 'LOBM_HSDAT' ]-value_from.
+      IF l_int IS NOT INITIAL.
+        WRITE l_int TO p_datos-fecha_fab_rollo.
+      ENDIF.
+
+      DATA: l_matnr TYPE matnr.
+      l_matnr = |{ p_datos-matnr_rollo ALPHA = IN }|.
+
+    CATCH cx_root .
+  ENDTRY.
+
+ENDFORM.
+
+FORM obtener_datos_pulper.
+
+
+  SELECT mblnr , s~matnr , charg , menge , cpudt_mkpf , cputm_mkpf , usnam_mkpf , matkl
+    INTO TABLE @DATA(lt_mseg_pulper)
+    FROM mseg AS s
+    INNER JOIN mara AS m ON m~matnr = s~matnr
+    WHERE bwart       = '309'       AND
+          werks       = @p_werks    AND
+          matkl       IN @s_matkl   AND
+          budat_mkpf  IN @s_fecha   AND
+          charg       IN @s_lote    AND
+
+* 04/11/2021 - 69336 - CMS - Añadir almacén de reservas 4005
+*          lgort = '1040' AND
+          lgort       IN ( '1040' , '4005' ) AND
+
+          umlgo = '1000'.
+
+  LOOP AT lt_mseg_pulper INTO DATA(ls_pulper).
+
+*    * Grabar tabla Datos Bobinas no OK
+    APPEND INITIAL LINE TO gt_no_ok ASSIGNING FIELD-SYMBOL(<fs_no_ok>).
+
+    <fs_no_ok>-werks            = p_werks.
+    <fs_no_ok>-lgort            = '1000'. " Almacén pulper (1000)
+    <fs_no_ok>-meins            = 'KG'.
+    <fs_no_ok>-matkl            = ls_pulper-matkl.
+    <fs_no_ok>-changenr         = ls_pulper-mblnr.
+    <fs_no_ok>-matnr_bobina     = ls_pulper-matnr.
+    <fs_no_ok>-charg_bobina     = ls_pulper-charg.
+    <fs_no_ok>-fecha_modif      = ls_pulper-cpudt_mkpf.
+    <fs_no_ok>-hora_modif       = ls_pulper-cputm_mkpf.
+    <fs_no_ok>-usuario_modif    = ls_pulper-usnam_mkpf.
+    <fs_no_ok>-nueva_de         = 'Pulper'.
+    <fs_no_ok>-descr_matnr_bob  = zclpp_recetas_reparto_pulper=>obtener_descr_material( <fs_no_ok>-matnr_bobina ).
+
+    PERFORM obtener_caract_lote CHANGING <fs_no_ok>.
+    IF <fs_no_ok>-de_bobina <> 'R'. "Las bobinas que no sean originalmente "R" no interesan.
+      CLEAR <fs_no_ok>.
+      CONTINUE.
+    ELSE.
+      <fs_no_ok>-anter_de = <fs_no_ok>-de_bobina.
+    ENDIF.
+    <fs_no_ok>-menge = <fs_no_ok>-menge * ( -1 ).
+
+    DATA:     ls_s_color TYPE lvc_s_scol.
+    CLEAR ls_s_color.
+    ls_s_color-fname     = 'MENGE'.
+    ls_s_color-color-col = 3.
+    ls_s_color-color-int = 1.
+    ls_s_color-color-inv = 1.
+    APPEND ls_s_color TO <fs_no_ok>-color.
+*    CLEAR ls_s_color.
+*    ls_s_color-fname     = 'CHANGENR'.
+*    ls_s_color-color-col = 3.
+*    ls_s_color-color-int = 1.
+*    ls_s_color-color-inv = 1.
+    APPEND ls_s_color TO <fs_no_ok>-color.
+  ENDLOOP.
+
+  DELETE gt_no_ok WHERE charg_bobina IS INITIAL.
+ENDFORM.
+
+FORM mostrar_datos.
+
+  DATA: lr_functions TYPE REF TO cl_salv_functions_list,
+        lo_column2   TYPE REF TO cl_salv_column_table,
+
+        lo_column    TYPE REF TO cl_salv_column,
+        lo_columns   TYPE REF TO cl_salv_columns_table.
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = gr_alv
+        CHANGING
+          t_table      = gt_no_ok ).
+    CATCH cx_salv_msg.                                  "#EC NO_HANDLER
+  ENDTRY.
+
+*  gr_alv->set_screen_status(
+*    pfstatus      =  'SALV_STANDARD'
+*    report        =  'ZRPP0054'
+*    set_functions = gr_alv->c_functions_all ) .
+
+  DATA(gr_layout) = gr_alv->get_layout( ).
+  key-report = sy-repid.
+  gr_layout->set_key( key ).
+  gr_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  gr_layout->set_default( abap_true ).
+  IF p_lay06 IS NOT INITIAL.
+    gr_layout->set_initial_layout( p_lay06 ).
+  ENDIF.
+  lo_columns = gr_alv->get_columns( ).
+
+  TRY.
+      lo_column2 ?= lo_columns->get_column( 'CHARG_BOBINA' ).
+      lo_column2->set_cell_type( if_salv_c_cell_type=>hotspot ).
+
+      lo_column ?= lo_columns->get_column( 'CHARG_BOBINA' ).
+      lo_column->set_short_text( 'Lote bobin' ).
+      lo_column->set_medium_text( 'Lote bobina' ).
+      lo_column->set_long_text( 'Lote bobina' ).
+
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'MATNR_BOBINA' ).
+      lo_column->set_short_text( 'Mat.bobina' ).
+      lo_column->set_medium_text( 'Material bobina' ).
+      lo_column->set_long_text( 'Material bobina' ).
+    CATCH cx_root .
+  ENDTRY.
+  TRY.
+      lo_column ?= lo_columns->get_column( 'DESCR_MATNR_BOB' ).
+      lo_column->set_short_text( 'Desc. bob.' ).
+      lo_column->set_medium_text( 'Descripción bobina' ).
+      lo_column->set_long_text( 'Descripción material bobina' ).
+    CATCH cx_root .
+  ENDTRY.
+  TRY.
+      lo_column ?= lo_columns->get_column( 'DESCR_MATNR_ROLLO' ).
+      lo_column->set_short_text( 'Desc. rol.' ).
+      lo_column->set_medium_text( 'Descripción rollo' ).
+      lo_column->set_long_text( 'Descripción material rollo' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'MENGE' ).
+      lo_column->set_short_text( 'Peso bob.' ).
+      lo_column->set_medium_text( 'Peso bobina' ).
+      lo_column->set_long_text( 'Peso bobina' ).
+
+      lo_column->set_sign( 'X' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'MJAHR' ).
+      lo_column->set_short_text( 'Ejercicio' ).
+      lo_column->set_medium_text( 'Ejercicio' ).
+      lo_column->set_long_text( 'Ejercicio' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'FECHA_FAB_BOB' ).
+      lo_column->set_short_text( 'F.fab.bobi' ).
+      lo_column->set_medium_text( 'F. fabric.bobina' ).
+      lo_column->set_long_text( 'F. fabric.bobina' ).
+    CATCH cx_root .
+  ENDTRY.
+
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'DE_BOBINA' ).
+      lo_column->set_short_text( 'DE bobina' ).
+      lo_column->set_medium_text( 'DE bobina' ).
+      lo_column->set_long_text( 'DE bobina' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'MOTIVO_REPRO' ).
+      lo_column->set_short_text( 'Motivo rep' ).
+      lo_column->set_medium_text( 'Motivo reproceso' ).
+      lo_column->set_long_text( 'Motivo reproceso' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'NOTA_REPR_CAL' ).
+      lo_column->set_short_text( 'Nota calid' ).
+      lo_column->set_medium_text( 'Nota calidad' ).
+      lo_column->set_long_text( 'Nota calidad' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'OPERARIO' ).
+      lo_column->set_short_text( 'Operario' ).
+      lo_column->set_medium_text( 'Operario' ).
+      lo_column->set_long_text( 'Operario' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'KUNNR' ).
+      lo_column->set_short_text( 'Cliente' ).
+      lo_column->set_medium_text( 'Cliente' ).
+      lo_column->set_long_text( 'Cliente' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'MATNR_ROLLO' ).
+      lo_column->set_short_text( 'Mat. rollo' ).
+      lo_column->set_medium_text( 'Material rollo' ).
+      lo_column->set_long_text( 'Material rollo' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column2 ?= lo_columns->get_column( 'CHARG_ROLLO' ).
+      lo_column2->set_cell_type( if_salv_c_cell_type=>hotspot ).
+
+      lo_column ?= lo_columns->get_column( 'CHARG_ROLLO' ).
+      lo_column->set_short_text( 'Lote rollo' ).
+      lo_column->set_medium_text( 'Lote rollo' ).
+      lo_column->set_long_text( 'Lote rollo' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'FECHA_FAB_ROLLO' ).
+      lo_column->set_short_text( 'F.fab.roll' ).
+      lo_column->set_medium_text( 'F. fabric. rollo' ).
+      lo_column->set_long_text( 'F. fabric. rollo' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'DE_ROLLO' ).
+      lo_column->set_short_text( 'DE rollo' ).
+      lo_column->set_medium_text( 'DE rollo' ).
+      lo_column->set_long_text( 'DE rollo' ).
+    CATCH cx_root .
+  ENDTRY.
+
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'FECHA_MODIF' ).
+      lo_column->set_short_text( 'F.modif' ).
+      lo_column->set_medium_text( 'Fecha modificación' ).
+      lo_column->set_long_text( 'Fecha modificación' ).
+    CATCH cx_root .
+  ENDTRY.
+
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'HORA_MODIF' ).
+      lo_column->set_short_text( 'H.modif' ).
+      lo_column->set_medium_text( 'Hora modificación' ).
+      lo_column->set_long_text( 'Hora modificación' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'USUARIO_MODIF' ).
+      lo_column->set_short_text( 'Usu.modif' ).
+      lo_column->set_medium_text( 'Usuario modificación' ).
+      lo_column->set_long_text( 'Usuario modificación' ).
+    CATCH cx_root .
+  ENDTRY.
+
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'TRANSACCION' ).
+      lo_column->set_short_text( 'Tx' ).
+      lo_column->set_medium_text( 'Transacción' ).
+      lo_column->set_long_text( 'Transacción' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'ANTER_DE' ).
+      lo_column->set_short_text( 'Ant.DE' ).
+      lo_column->set_medium_text( 'Anterior DE' ).
+      lo_column->set_long_text( 'Anterior DE' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column2 ?= lo_columns->get_column( 'CHANGENR' ).
+      lo_column2->set_cell_type( if_salv_c_cell_type=>hotspot ).
+    CATCH cx_root .
+  ENDTRY.
+
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'NUEVA_DE' ).
+      lo_column->set_short_text( 'Nueva DE' ).
+      lo_column->set_medium_text( 'Nueva DE' ).
+      lo_column->set_long_text( 'Nueva DE' ).
+    CATCH cx_root .
+  ENDTRY.
+
+
+
+
+*-- events
+  gr_events = gr_alv->get_event( ).
+  CREATE OBJECT event_handler.
+  SET HANDLER event_handler->on_user_command FOR gr_events.
+  SET HANDLER event_handler->on_link_click FOR gr_events.
+
+**... §3.1 activate ALV generic Functions
+  lr_functions = gr_alv->get_functions( ).
+  lr_functions->set_all( 'X' ).
+
+*-- Selection
+  DATA:   lo_cols_tab TYPE REF TO cl_salv_columns_table.
+
+  lo_cols_tab = gr_alv->get_columns( ).
+  lo_cols_tab->set_optimize( ).
+  TRY.
+      lo_cols_tab->set_color_column( 'COLOR' ).
+
+    CATCH cx_salv_data_error.                           "#EC NO_HANDLER
+  ENDTRY.
+
+
+  gr_alv->display( ).
+
+ENDFORM.
+
+
+FORM buscar_variante  CHANGING p_vari TYPE disvariant-variant.
+
+  DATA: ls_variant TYPE disvariant,
+        l_exit     TYPE char1.
+
+  ls_variant-report = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant = ls_variant
+      i_save     = 'A'
+*     it_default_fieldcat =
+    IMPORTING
+      e_exit     = l_exit
+      es_variant = ls_variant
+    EXCEPTIONS
+      not_found  = 2.
+  IF sy-subrc = 2.
+    MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSE.
+    IF l_exit EQ space.
+      p_vari = ls_variant-variant.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " BUSCAR_VARIANTE

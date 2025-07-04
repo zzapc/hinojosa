@@ -1,0 +1,186 @@
+*&---------------------------------------------------------------------*
+*& Report ZVCXI_XCE_MM_TOOL_LIFETIME
+*&---------------------------------------------------------------------*
+*& The report supports 3 cases:
+*& 1. Reordering of Tools: Create new Tool Order with possibility to
+*&    adjust the Price.
+*& 2. Scrapping of Tools: Withdrawal of Tool for Scrapping from
+*&    unrestricteduse and blocked stock based on specific Batch.
+*& 3. Transfer Tools to Damaged: Transfer Posting of Tool based on
+*&    specific Batch into Storage Location 'Damaged' (blocked stock).
+*&---------------------------------------------------------------------*
+report ZVCXI_XCE_MM_TOOL_LIFETIME.
+types:
+  begin of YS_SDOC,
+    AUART type AUART,
+    KUNAG type KUNAG,
+    KUNWE type KUNWE,
+    KUNNR type KUNNR,
+    VKORG type VKORG,
+    VTWEG type VTWEG,
+    SPART type SPART,
+    PARVW type PARVW,
+  end of YS_SDOC .
+types:
+  begin of YS_COND,
+    TPRCE       type KBETR,
+    TPRCE_KSTAR type KSCHL,
+    TDISC       type KBETR,
+    TDISC_KSTAR type KSCHL,
+  end of YS_COND .
+
+data: LF_NO_SALES_ORDER_FOUND        type ABAP_BOOL value ABAP_FALSE,
+      LF_NO_ENTRY_IN_MANDATORY_FIELD type ABAP_BOOL value ABAP_FALSE,
+      LF_DISCOUNT_CORRECTION         type KBETR value 0.
+data: LS_SDOC type YS_SDOC,
+      LS_COND type YS_COND.
+data: LT_SDOC type standard table of YS_SDOC with default key.
+data: GR_CX_CKX   type ref to /VCXI/CX_CKX.
+
+*** General Parameters
+selection-screen begin of block SEL with frame.
+  parameters: PA_MATNR type MATNR   obligatory,
+              PA_WERKS type WERKS_D obligatory,
+              PA_CHARG type CHARG_D matchcode object MCH1.
+selection-screen end of block SEL.
+
+*** Radio Buttons to select whether Reordering, Scrapping or Transfer to Damaged is processed
+parameters: PA_REORD radiobutton group RB1 user-command FRB1 default 'X',
+            PA_SCRAP radiobutton group RB1,
+            PA_DAMGD radiobutton group RB1.
+
+selection-screen begin of block CST with frame.
+  parameters: PA_VDATU type EDATU_VBAK default SY-DATUM modif id CST,
+              PA_YP00  type KBETR modif id CST,
+              PA_YRA1  type KBETR modif id CST.
+selection-screen end of block CST.
+
+***----------------------------------------------------------------------------
+*** I N I T I A L I Z A T I O N
+***----------------------------------------------------------------------------
+initialization.
+  data(GR_LIFETIME) = new ZCL_VCXI_XCE_MM_TOOL_LIFETIME( ).
+  data(GR_MSG) = new /VCXI/CL_CKXM_MESSAGE( ).
+
+***------------------------------------------------------------------------------------------------
+*** Modify Parameters displayed on Selection Screen based on selected Radio Button
+***------------------------------------------------------------------------------------------------
+at selection-screen output.
+  try.
+      if PA_MATNR is not initial and
+         PA_WERKS is not initial and
+         PA_REORD eq ABAP_TRUE.
+***     Get Last Order
+        data(LR_BOB_SDOC_SEL) = GR_LIFETIME->GET_LAST_ORDER( IF_MATNR = PA_MATNR
+                                                             IF_WERKS = PA_WERKS ).
+***     Load Condition Records
+        LS_COND = GR_LIFETIME->GET_COND( IF_MATNR = PA_MATNR
+                                         IF_WERKS = PA_WERKS
+                                         IR_BOB_SDOC = LR_BOB_SDOC_SEL ).
+***     If a discount was found, keep it for correction later
+        if PA_YRA1 is not initial.
+          LF_DISCOUNT_CORRECTION = LS_COND-TDISC / 10.
+        endif.
+***     Do not overwrite user input!
+        if PA_YP00 is initial and PA_YRA1 is initial.
+          PA_YP00 = LS_COND-TPRCE.
+          PA_YRA1 = LS_COND-TDISC / 10.
+        endif.
+      endif.
+
+    catch /VCXI/CX_CKX into GR_CX_CKX.
+      LF_NO_SALES_ORDER_FOUND = ABAP_TRUE.
+  endtry.
+
+  loop at screen.
+*** Lock Input for Sales Order Information and deactivate Display if not in Reorder Case
+    if SCREEN-GROUP1 = 'LST'.
+      SCREEN-INPUT = 0.
+      if PA_REORD ne ABAP_TRUE.
+        SCREEN-ACTIVE = 0.
+      endif.
+
+    endif.
+*** Deactivate Display if not in Reorder Case
+    if SCREEN-GROUP1 = 'CST'.
+      if PA_REORD ne ABAP_TRUE.
+        SCREEN-ACTIVE = 0.
+      endif.
+    endif.
+
+*** Batch Managed?
+    select single XCHPF
+           from MARC
+           into @data(LF_XCHPF)
+          where MATNR eq @PA_MATNR
+           and  WERKS eq @PA_WERKS.
+
+*** Check if batch is mandatory
+    if SCREEN-NAME = 'PA_CHARG'.
+      case ABAP_TRUE.
+        when PA_REORD.
+          SCREEN-INPUT = '0'.
+        when LF_XCHPF.
+          SCREEN-REQUIRED = '2'.
+        when PA_DAMGD.
+          SCREEN-REQUIRED = '2'.
+        when others.
+          SCREEN-INPUT = '0'.
+      endcase.
+    endif.
+
+    modify screen.
+  endloop.
+
+
+***------------------------------------------------------------------------------------------------
+*** Process based on Selection
+***------------------------------------------------------------------------------------------------
+start-of-selection.
+  try.
+      if LF_NO_SALES_ORDER_FOUND eq ABAP_TRUE and PA_REORD eq ABAP_TRUE.
+***     No Sales Order found for Material &1 in Plant &2
+        GR_MSG->ADD_MESSAGE( IF_MSGTY = 'E'
+                             IF_MSGID = 'ZVCXI_XCE_MM'
+                             IF_MSGNO = '019'
+                             IF_MSGV1 = PA_MATNR
+                             IF_MSGV2 = PA_WERKS ).
+      endif.
+      if LF_NO_SALES_ORDER_FOUND eq ABAP_TRUE.
+        GR_MSG->DISPLAY_MSG( ).
+        LF_NO_SALES_ORDER_FOUND = ABAP_FALSE.
+        exit.
+      endif.
+
+      case ABAP_TRUE.
+***     Reordering of Tools
+        when PA_REORD.
+          GR_LIFETIME->REORDER( exporting IT_REORDER = value #( ( MATNR       = PA_MATNR
+                                                                  WERKS       = PA_WERKS
+                                                                  VDATU       = PA_VDATU
+                                                                  TPRCE       = PA_YP00
+                                                                  TPRCE_KSTAR = LS_COND-TPRCE_KSTAR
+                                                                  TDISC       = PA_YRA1 - LF_DISCOUNT_CORRECTION
+                                                                  TDISC_KSTAR = LS_COND-TDISC_KSTAR ) )
+                                 changing CR_MSG     = GR_MSG ).
+
+***     Scrapping of Tools
+        when PA_SCRAP.
+          GR_LIFETIME->SCRAP( exporting IT_SCRAP    = value #( ( MATNR   = PA_MATNR
+                                                                 WERKS   = PA_WERKS
+                                                                 CHARG   = PA_CHARG ) )
+                               changing CR_MSG      = GR_MSG ).
+
+***     Transfer Tools to Damaged
+        when PA_DAMGD.
+          GR_LIFETIME->SET_DAMAGED( exporting IT_DAMAGED  = value #( ( MATNR   = PA_MATNR
+                                                                       WERKS   = PA_WERKS
+                                                                       CHARG   = PA_CHARG ) )
+                                    changing  CR_MSG      = GR_MSG ).
+      endcase.
+
+      GR_MSG->DISPLAY_MSG( ).
+
+    catch /VCXI/CX_CKX into GR_CX_CKX.
+      GR_CX_CKX->SHOW_MESSAGE( IF_TYPE = 'S' ).
+  endtry.

@@ -1,0 +1,384 @@
+
+*CLASS zsmm_bom_subco DEFINITION
+*  PUBLIC
+*  FINAL
+*  CREATE PUBLIC .
+*
+*  PUBLIC SECTION.
+*  PROTECTED SECTION.
+*  PRIVATE SECTION.
+*ENDCLASS.
+*
+*
+*
+*CLASS zsmm_bom_subco IMPLEMENTATION.
+*ENDCLASS.
+*start-of-selection.
+*
+*  if p_expl eq abap_true.
+*
+*    lcl_subcontracting=>explode_po_bom(
+*        i_order         = p_ebeln
+*        i_position      = p_ebelp
+*        i_show_messages = abap_true  ).
+*
+*  elseif p_del eq abap_true.
+*
+*    lcl_subcontracting=>delete_po_bom(
+*         i_order         = p_ebeln
+*         i_position      = p_ebelp
+*         i_show_messages = abap_true  ).
+*  endif.
+
+
+CLASS zsmm_bom_subco DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC .
+  PUBLIC SECTION.
+    CONSTANTS: action_delete  TYPE c VALUE 'D',
+               action_explode TYPE c VALUE 'M'.
+
+    CLASS-METHODS: explode_po_bom IMPORTING VALUE(i_order)         TYPE ebeln
+                                            VALUE(i_position)      TYPE ebelp
+                                            VALUE(i_show_messages) TYPE abap_bool DEFAULT abap_false
+                                  RETURNING VALUE(r_re_exploded)   TYPE abap_bool.
+
+
+
+    CLASS-METHODS: delete_po_bom IMPORTING VALUE(i_order)         TYPE ebeln
+                                           VALUE(i_position)      TYPE ebelp
+                                           VALUE(i_show_messages) TYPE abap_bool DEFAULT abap_false
+                                 RETURNING VALUE(r_deleted)       TYPE abap_bool.
+
+
+    CLASS-METHODS: call_components_update IMPORTING VALUE(i_order)         TYPE ebeln
+                                                    VALUE(i_position)      TYPE ebelp
+                                                    VALUE(i_show_messages) TYPE abap_bool DEFAULT abap_false
+                                                    VALUE(i_action_type)   TYPE c
+                                          RETURNING VALUE(r_messages)      TYPE mepo_t_messages_bapi ,
+
+      prepare_po_mdpa
+        IMPORTING
+          i_header          TYPE REF TO if_purchase_order_mm OPTIONAL
+          VALUE(i_order)    TYPE ebeln
+          VALUE(i_position) TYPE ebelp
+        EXPORTING
+          VALUE(e_mdpa)     TYPE mdpa
+          VALUE(e_mdlb)     TYPE mdlb,
+
+      get_components
+        IMPORTING
+          VALUE(mdpa)    TYPE mdpa
+          VALUE(i_ebeln) TYPE ebeln
+          VALUE(i_ebelp) TYPE ebelp
+          VALUE(i_txz01) TYPE ekpo-txz01
+        EXPORTING
+          o_mdpmx        TYPE mmpur_t_mdpm.
+
+  PROTECTED SECTION.
+  PRIVATE SECTION.
+endclass. "ZSMM_BOM_SUBCO definition
+class ZSMM_BOM_SUBCO implementation.
+  METHOD call_components_update.
+    cl_message_handler_mm=>get_handler(  IMPORTING
+                                     ex_handler = DATA(message_handler)
+                                     ).
+    message_handler->co_handler_start( ).
+    message_handler->set_config_for_bapi( ).
+
+    CALL FUNCTION 'ME_COMPONENTS_REFRESH'.
+    DATA: ekpo     TYPE                   ekpo,
+          mdpa     TYPE                   mdpa,
+          mdlb     TYPE                   mdlb,
+          mdlb_tab TYPE STANDARD TABLE OF mdlb.
+
+
+    SELECT SINGLE * INTO CORRESPONDING FIELDS OF ekpo
+    FROM ekpo
+    WHERE ebeln EQ i_order
+    AND   ebelp EQ i_position.
+
+    prepare_po_mdpa( EXPORTING i_order = i_order i_position = i_position
+                     IMPORTING e_mdpa = mdpa e_mdlb = mdlb ).
+
+    CHECK mdpa IS NOT INITIAL AND mdlb IS NOT INITIAL.
+
+    APPEND mdlb TO mdlb_tab.
+
+    DATA: e_updkz TYPE c,
+          e_rcode TYPE cm61q-rcode,
+          e_verid TYPE eket-verid,
+          e_mdpm  TYPE mmpur_t_mdpm.
+
+    CALL FUNCTION 'ME_COMPONENTS_MAINTAIN'
+      EXPORTING
+        i_ebeln    = i_order
+        i_ebelp    = i_position
+        i_fcall    = abap_true
+        i_mdpa     = mdpa
+        i_mdpa_old = mdpa
+        i_txz01    = ekpo-txz01
+        i_vorga    = i_action_type
+      IMPORTING
+        e_updkz    = e_updkz
+        e_rcode    = e_rcode
+        e_verid    = e_verid
+        e_mdpm     = e_mdpm.
+
+    DATA it_mdpmx TYPE TABLE OF mdpm.
+
+    CALL FUNCTION 'ME_COMPONENTS_READ_MDPMX'
+      TABLES
+        et_mdpmx = it_mdpmx.
+
+
+*    CALL FUNCTION 'ME_COMPONENTS_UPDATE_PREPARE'
+*      EXPORTING
+*        i_number = i_order
+*      TABLES
+*        t_mdlb   = mdlb_tab.
+
+    message_handler->co_handler_stop( ).
+    r_messages = message_handler->get_list_for_bapi( ).
+
+    COMMIT WORK.
+    IF i_show_messages EQ abap_true.
+      message_handler->show( im_amodal = abap_true ).
+    ENDIF.
+
+
+  ENDMETHOD.
+  METHOD delete_po_bom.
+    DATA(messages) = call_components_update(
+            i_order         = i_order
+            i_position      = i_position
+            i_show_messages = i_show_messages
+            i_action_type   = action_delete
+        ).
+    IF NOT line_exists( messages[ msgty = 'E' ] ).
+      r_deleted = abap_true.
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD explode_po_bom.
+    DATA(messages) = call_components_update(
+            i_order         = i_order
+            i_position      = i_position
+            i_show_messages = i_show_messages
+            i_action_type   = action_explode
+        ).
+    IF line_exists( messages[ msgid = 'ME' msgno = '638' ] ).
+      r_re_exploded = abap_true.
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD get_components.
+
+    FREE o_mdpmx.
+
+    DATA: e_updkz TYPE c,
+          e_rcode TYPE cm61q-rcode,
+          e_verid TYPE eket-verid,
+          e_mdpm  TYPE mmpur_t_mdpm.
+    "Llamamos a esta fucnión para obtener la información, ya que si no hay cambios que afecten directamente a la BOM
+    "por defecto no la trae y hay que forzarlo
+    CALL FUNCTION 'ME_COMPONENTS_MAINTAIN'
+      EXPORTING
+        i_ebeln    = i_ebeln
+        i_ebelp    = i_ebelp
+        i_fcall    = abap_true
+        i_mdpa     = mdpa
+        i_mdpa_old = mdpa
+        i_txz01    = i_txz01
+        i_vorga    = 'C'
+      IMPORTING
+        e_updkz    = e_updkz
+        e_rcode    = e_rcode
+        e_verid    = e_verid
+        e_mdpm     = e_mdpm.
+
+    DATA it_mdpmx TYPE TABLE OF mdpm.
+
+    CALL FUNCTION 'ME_COMPONENTS_READ_MDPMX'
+      TABLES
+        et_mdpmx = it_mdpmx.
+
+    o_mdpmx = it_mdpmx.
+
+  ENDMETHOD.
+  METHOD prepare_po_mdpa.
+    DATA: header       TYPE        mepoheader,
+          item         TYPE        mepoitem,
+          schedule     TYPE        meposchedule,
+          eban         TYPE        eban,
+          mt06e        TYPE        mt06e,
+          float        TYPE        f,
+          t001w        TYPE        t001w,
+          accounting   TYPE        mepoaccounting,
+          order_handle TYPE REF TO cl_po_header_handle_mm,
+          order        TYPE REF TO if_purchase_order_mm.
+*    IF i_header IS SUPPLIED AND i_header IS NOT INITIAL.
+*      order_handle = CAST cl_po_header_handle_mm( i_header ).
+*    ELSE.
+    order_handle = NEW cl_po_header_handle_mm(  im_po_number = i_order ).
+    order_handle->po_initialize(  ).
+*    ENDIF.
+    order_handle->po_read(
+      EXPORTING
+        im_tcode     = 'ME23N'
+        im_trtyp     = 'A'    " Transaction Type
+        im_aktyp     = 'A'    " Activity Category
+        im_po_number = i_order    " Document Number
+      IMPORTING
+        ex_result    = DATA(po_was_read)
+            ).
+    CHECK po_was_read EQ abap_true.
+
+    order ?= order_handle.
+
+    header = order->get_data( ).
+    DATA(items) = order->get_items( ).
+    LOOP AT items ASSIGNING FIELD-SYMBOL(<item>).
+      item = <item>-item->get_data( ).
+      IF item-ebelp EQ i_position.
+        EXIT.
+      ELSE.
+        CLEAR item.
+      ENDIF.
+    ENDLOOP.
+
+    CHECK item IS NOT INITIAL AND item-sobkz EQ 'E'.
+    DATA(schedule_lines) =  <item>-item->get_schedules( ).
+    LOOP AT schedule_lines ASSIGNING FIELD-SYMBOL(<schline>).
+      schedule = <schline>-schedule->get_data( ).
+      EXIT.
+    ENDLOOP.
+
+    CHECK item-attyp NE cl_mmpur_constants=>attyp_01.   "no generic article
+
+* populate mdpa structure
+    CLEAR: e_mdpa, e_mdlb.
+    e_mdlb-ebeln = i_order.
+    e_mdlb-ebelp = i_position.
+    e_mdlb-kzbws = item-kzbws.
+    e_mdpa-matnr = item-matnr.
+    e_mdpa-pwwrk = item-werks.
+    e_mdpa-lgort = item-lgort.
+    e_mdpa-paart = header-bsart.
+    e_mdpa-beskz = 'F'.
+    e_mdpa-sobes = cl_mmpur_constants=>pstyp_3.
+    e_mdpa-gsmng = schedule-menge.
+    e_mdpa-flief = header-lifnr.
+    IF item-meins NE item-lmein AND NOT item-lmein IS INITIAL.
+      e_mdpa-gsmng = float = schedule-menge * item-umrez / item-umren.
+    ENDIF.
+
+    e_mdpa-lagme = item-lmein.
+    IF e_mdpa-lagme IS INITIAL AND e_mdpa-matnr IS INITIAL.
+      e_mdpa-lagme = item-meins.
+    ENDIF.
+    IF schedule-eindt IS INITIAL.
+      e_mdpa-psttr = header-bedat.
+    ELSE.
+*-- reference to requisition-----------------------------------------*
+      IF schedule-banfn NE space.
+        CALL FUNCTION 'MEREQS_EBAN_LOOKUP'
+          EXPORTING
+            im_banfn = schedule-banfn
+            im_bnfpo = schedule-bnfpo
+          IMPORTING
+            ex_eban  = eban
+          EXCEPTIONS
+            failure  = 1.
+      ENDIF.
+*-- if requisition is created from prod. order                ----*
+*-- or from planned order and delivery date has not changed,  ----*
+*-- take over release date from the requisition               ----*
+      IF schedule-banfn NE space AND
+         ( eban-estkz = cl_mmpur_constants=>estkz_f OR
+           eban-estkz = cl_mmpur_constants=>estkz_u )
+         AND eban-lfdat EQ schedule-eindt.
+        e_mdpa-psttr = eban-frgdt.
+      ELSE.
+
+        CALL FUNCTION 'MEX_READ_T001W'
+          EXPORTING
+            im_werks  = item-werks
+          IMPORTING
+            ex_t001w  = t001w
+          EXCEPTIONS
+            not_found = 1
+            OTHERS    = 2.
+
+        IF sy-subrc <> 0.
+          CLEAR: e_mdpa, e_mdlb.
+          RETURN.
+        ENDIF.
+
+        CALL FUNCTION 'ME_COMP_REQUIREMENT_DATE'
+          EXPORTING
+            im_plant            = item-werks
+            im_factory_calendar = t001w-fabkl
+            im_delivery_date    = schedule-eindt
+            im_planned_del_time = item-plifz
+          IMPORTING
+            ex_requirement_date = e_mdpa-psttr.
+        IF sy-subrc <> 0.                                   "#EC *
+          CLEAR: e_mdpa, e_mdlb.
+          RETURN.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    e_mdpa-pedtr = schedule-eindt.
+    e_mdpa-knttp = item-knttp.
+    e_mdpa-sobkz = item-sobkz.
+    e_mdpa-kzvbr = item-kzvbr.
+    e_mdpa-kzbws = item-kzbws.
+    e_mdpa-revlv = item-revlv.
+    e_mdpa-sernr = schedule-sernr.
+    e_mdpa-rsnum = schedule-rsnum.
+    e_mdpa-cuobj = item-cuobj.
+
+*    e_mdpa-verid = order_handle->verid.
+
+* read material data
+    IF NOT item-werks IS INITIAL.
+      CALL FUNCTION 'ME_READ_MT06E'
+        EXPORTING
+          i_matnr = item-matnr
+          i_werks = item-werks
+        IMPORTING
+          e_mt06e = mt06e
+        EXCEPTIONS
+          OTHERS  = 1.
+    ENDIF.
+
+    e_mdpa-altsl = mt06e-altsl.
+
+    IF item-knttp NE space AND item-kzvbr NE 'U'.
+* get accounting data
+      DATA(accounts) = <item>-item->get_accountings( ).
+      IF lines( accounts ) EQ 1.
+        ASSIGN accounts[ 1 ] TO FIELD-SYMBOL(<acc>).
+        IF sy-subrc IS INITIAL AND NOT <acc> IS INITIAL.
+          accounting = <acc>-accounting->get_data( ).
+        ENDIF.
+        e_mdpa-aufpl_ord = accounting-aufpl_ord.
+        e_mdpa-aplzl_ord = accounting-aplzl_ord.
+* Account assignment data for make to order
+        IF e_mdpa-sobkz EQ cl_mmpur_constants=>sobkz_e OR
+           e_mdpa-sobkz EQ cl_mmpur_constants=>sobkz_q.
+          e_mdpa-kdauf = accounting-vbeln.
+          e_mdpa-kdpos = accounting-vbelp.
+          e_mdpa-kdein = accounting-veten.
+          e_mdpa-pspel = accounting-ps_psp_pnr.
+          e_mdlb-kdauf = accounting-vbeln.
+          e_mdlb-kdpos = accounting-vbelp.
+          e_mdlb-kdein = accounting-veten.
+          e_mdlb-pspel = accounting-ps_psp_pnr.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+  ENDMETHOD.

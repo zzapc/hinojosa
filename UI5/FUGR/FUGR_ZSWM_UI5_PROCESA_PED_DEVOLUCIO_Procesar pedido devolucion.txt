@@ -1,0 +1,236 @@
+FUNCTION zswm_ui5_procesa_ped_devolucio.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(TCODE) TYPE  TCODE OPTIONAL
+*"     VALUE(UNAME) TYPE  SY-UNAME OPTIONAL
+*"     VALUE(OPERARIO) TYPE  ZLNUM_OPER OPTIONAL
+*"     VALUE(TKNUM) TYPE  TKNUM OPTIONAL
+*"     VALUE(VERUR) TYPE  VERUR_VL OPTIONAL
+*"     VALUE(VBELN) TYPE  VBELN_VL OPTIONAL
+*"     VALUE(NO_GEN_LOG) TYPE  FLAG DEFAULT 'X'
+*"     VALUE(MODE_BI) TYPE  CHAR1 DEFAULT 'N'
+*"  EXPORTING
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_TT
+*"----------------------------------------------------------------------
+  DATA num_bultos TYPE i.
+* cambiar jtm 31.08.2022 antes se hacia picking con la cantidad de la entrega, ahora se juega con los %
+*  SELECT COUNT( * ) INTO num_bultos FROM zswm_ui5_pack WHERE vbeln EQ vbeln
+*                                                         and lvorm ne abap_true.
+  .
+  DATA t_bultos LIKE zswm_ui5_pack OCCURS 0 WITH HEADER LINE.
+    SELECT * INTO CORRESPONDING FIELDS OF TABLE t_bultos FROM zswm_ui5_pack WHERE vbeln EQ vbeln
+                                                                              AND lvorm NE abap_true.
+  SORT t_bultos.
+  LOOP AT t_bultos.
+    AT FIRST.
+      clear_bi.
+      dynpro 'SAPMV50A'   '4004'.
+      campo  'LIKP-VBELN' vbeln.
+      boton '/00'.
+    ENDAT.
+    AT NEW posnr.
+      DATA menge_pos TYPE menge_d.
+      dynpro 'SAPMV50A'   '1000'.
+      boton  '=POPO_T'.
+      dynpro 'SAPMV50A'    '0111'.
+      campo  'RV50A-POSNR' t_bultos-posnr.
+      boton  '=WEIT'.
+      CLEAR menge_pos.
+    ENDAT.
+    ADD t_bultos-menge TO menge_pos.
+    ADD 1 TO num_bultos.
+    AT END OF posnr.
+      DATA menge_c(12).
+      WRITE menge_pos TO menge_c LEFT-JUSTIFIED.
+      dynpro 'SAPMV50A'   '1000'.
+      campo  'LIPSD-G_LFIMG(01)' menge_c.
+      boton  '/00'.
+    ENDAT.
+    AT LAST.
+      dynpro 'SAPMV50A'   '1000'.
+      boton  '=VERP_T'.
+      dynpro 'SAPLV51G'   '6000'.
+      boton  '=ALL_AUTV'.
+      dynpro 'SAPLV51G'   '6000'.
+      boton  '=SICH'.
+*     Cambiar llamada BI add 20.10.2022
+      CLEAR : t_bdcmsgcoll[], t_bapiret2[].
+      CALL TRANSACTION 'VL02N' USING t_bdc MODE mode_bi MESSAGES INTO t_bdcmsgcoll.
+      IF t_bdcmsgcoll[] IS NOT INITIAL.
+        CALL FUNCTION 'CONVERT_BDCMSGCOLL_TO_BAPIRET2'
+          TABLES
+            imt_bdcmsgcoll = t_bdcmsgcoll
+            ext_return     = t_bapiret2.
+
+      ENDIF.
+*      call_bi 'VL02N' 'N'.
+*     fin de cambiar jtm 20.10.2022
+      LOOP AT t_bapiret2 WHERE type EQ  'E'
+                            OR type EQ  'A'.
+      ENDLOOP.
+      IF sy-subrc EQ 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        LOOP AT t_bapiret2.
+          PERFORM mensaje USING t_bapiret2-type t_bapiret2-id t_bapiret2-number t_bapiret2-message_v1 t_bapiret2-message_v2 t_bapiret2-message_v3 t_bapiret2-message_v4 CHANGING tt_log_global[].
+        ENDLOOP.
+        MOVE abap_true TO error.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+      ENDIF.
+
+    ENDAT.
+  ENDLOOP.
+*  clear_bi.
+*  dynpro 'SAPMV50A'   '4004'.
+*  campo  'LIKP-VBELN' vbeln.
+*  boton  '=VERP_T'.
+*  dynpro 'SAPLV51G'   '6000'.
+*  boton  '=ALL_AUTV'.
+*  dynpro 'SAPLV51G'   '6000'.
+*  boton  '=SICH'.
+*  call_bi 'VL02N' 'N'.
+*  LOOP AT t_bapiret2 WHERE type EQ  'E'
+*                        OR type EQ  'A'.
+*  ENDLOOP.
+*  IF sy-subrc EQ 0.
+*    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+*    LOOP AT t_bapiret2.
+*      PERFORM mensaje USING t_bapiret2-type t_bapiret2-id t_bapiret2-number t_bapiret2-message_v1 t_bapiret2-message_v2 t_bapiret2-message_v3 t_bapiret2-message_v4 CHANGING tt_log_global[].
+*    ENDLOOP.
+*    MOVE abap_true TO error.
+*  ELSE.
+*    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+*      EXPORTING
+*        wait = 'X'.
+*  ENDIF.
+* fin de add jtm 31.08.2022
+
+  CHECK error NE abap_true
+    AND sy-subrc EQ 0. " add jtm 31.08.2022
+* Los pedidos de devolución ya están anexados a un transporte
+*  IF tknum IS NOT INITIAL.
+*    CALL FUNCTION 'ZSWM_ADD_DELV_TO_SHIPMENT_UI5'
+*      EXPORTING
+*        tcode    = tcode
+*        uname    = uname
+*        operario = operario
+*        tknum    = tknum
+*        vbeln    = vbeln
+*      IMPORTING
+*        error    = error
+*        tt_log   = tt_log.
+*
+*  ENDIF.
+  IF error NE abap_true.
+*   add jtm 31.08.2022
+    DO 5 TIMES.
+      DATA sw_bloqueo TYPE flag.
+      CLEAR sw_bloqueo.
+      WAIT UP TO  1 SECONDS.
+      CALL FUNCTION 'ZSWM_BLOQUEOS'
+        EXPORTING
+*         GNAME   =
+*         GUNAME  =
+          vbeln   = vbeln
+*         LGNUM   =
+*         TANUM   =
+*         EXIDV   =
+        IMPORTING
+          bloqueo = sw_bloqueo
+*        TABLES
+*         T_BLOQUEOS       =
+        .
+      CHECK sw_bloqueo NE abap_true.
+      EXIT.
+    ENDDO.
+*   fin de add jtm 31.08.2022
+*   add jtm 20.10.2022
+*    data sW_cerrar_transporte type flag.
+*    move abap_true to sw_no_cerrar_transporte.
+    DATA tknum_dev TYPE tknum.
+*    select SINGLE vbtyp into @data(vbtyp) from likp where vbeln eq @vbeln.
+*    if sy-subrc eq 0 and vbtyp eq 'T'.
+    SELECT SINGLE tknum INTO tknum_dev FROM vttp WHERE vbeln EQ vbeln.
+*       select * into TABLE @data(tT_vttp) from vttp where tknum eq @tknum_dev.
+*       move abap_true to sw_cerrar_transporte.
+*       loop at tt_vttp into data(rt_vttp).
+*           select SINGLE wbstk into @data(wbstk) from vbuk where vbeln eq @rt_vttp-vbeln.
+*           check sy-subrc ne 0 or wbstk ne 'C'.
+*           move abap_false to sw_cerrar_transporte.
+*           exit.
+*       endloop.
+*    else.
+*   fin de add jtm 20.10.2022 No se para que está el MF siguiente???
+    CALL FUNCTION 'ZSWM_POST_ID_DELIVERY'
+      EXPORTING
+        tcode                = tcode
+        uname                = uname
+        vbeln                = vbeln
+        operario             = operario
+        tknum                = tknum_dev " add jtm
+        num_bultos           = num_bultos
+        no_cerrar_transporte = abap_true
+        no_gen_log           = abap_true
+      IMPORTING
+        error                = error
+        tt_log               = tt_log.
+  ENDIF.
+*    add jtm 01.09.2022
+  IF error NE abap_true.
+*   ----------------------------------------------------------------------------------
+*   add jtm 20.10.2022 esperamos a que se creen las UAS
+    DATA: sw_existe_uas.
+    DO 5 TIMES.
+      WAIT UP TO  1 SECONDS.
+      MOVE abap_true TO sw_existe_uas.
+      LOOP AT t_bultos.
+        SELECT SINGLE COUNT( * ) FROM lein WHERE lenum EQ t_bultos-exidv.
+        CHECK sy-subrc NE 0.
+        MOVE abap_false TO sw_existe_uas.
+        EXIT.
+      ENDLOOP.
+      IF sw_existe_uas EQ abap_true.
+        EXIT.
+      ENDIF.
+    ENDDO.
+*   fin de add jtm 20.10.2022
+*   ----------------------------------------------------------------------------------
+    DATA: tt_lenum TYPE zswm_print_exidv_lenum_tt,
+          rt_lenum TYPE zswm_print_exidv_lenum_scr.
+    CLEAR tt_lenum[].
+    LOOP AT t_bultos.
+      rt_lenum-lenum = t_bultos-exidv. COLLECT rt_lenum INTO tt_lenum.
+    ENDLOOP.
+    IF sy-subrc EQ 0.
+      CALL FUNCTION 'ZSWM_PRINT_EXIDV'
+        EXPORTING
+          tcode    = tcode
+          uname    = uname
+          operario = operario
+*         LENUM    =
+          tt_lenum = tt_lenum
+          mvttype  = 'D'
+        IMPORTING
+          error    = error
+          tt_log   = tt_log
+*         OK       =
+        .
+    ENDIF.
+  ENDIF.
+
+*    fin de add jtm 01.09.2022
+**    add jtm 20.10.2022
+*     if sw_cerrar_transporte eq abap_true and error ne abap_true.
+*                 PERFORM close_shipment USING tknum_dev CHANGING  tt_log error.
+*     endif.
+**    fin de add jtm 20.10.2022
+*  ENDIF.
+
+
+
+
+ENDFUNCTION.

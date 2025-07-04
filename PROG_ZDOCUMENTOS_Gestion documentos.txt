@@ -1,0 +1,565 @@
+***********************************************************************
+* APLICACION : BC
+* TIPO : LISTADO
+* TITULO : Gestion documentos
+* *
+* DESCRIPCION : Gestion documentos
+*
+*
+* AUTOR: Andres Picazo                                FECHA: 19/05/2011
+* ANALISTA: Andres Picazo
+*
+* MODIFICACIONES
+*
+***********************************************************************
+REPORT zdocumentos.
+
+*------INCLUDES--------------------------------------------------------*
+
+*------TABLAS/ESTRUCTURAS----------------------------------------------*
+TABLES: zest_documento, *zest_documento, sscrfields.
+
+
+CLASS lcl_alv DEFINITION INHERITING FROM zcl_ap_alv_check.
+  PUBLIC SECTION.
+    METHODS handle_double_click REDEFINITION.
+    METHODS handle_user_command REDEFINITION.
+ENDCLASS.
+
+
+CLASS zcl_report DEFINITION INHERITING FROM zcl_ap_dev FINAL.
+  PUBLIC SECTION.
+    TYPES: BEGIN OF t_listado,
+             check         TYPE xfeld,
+             lights        TYPE zico_estado_mensaje,
+             tcode         LIKE zest_documento-tcode,
+             nombre        LIKE zest_documento-nombre,
+             extension     LIKE zest_documento-extension,
+             comprimido    LIKE zest_documento-comprimido,
+             longitud      LIKE zest_documento-longitud,
+             fichero       LIKE zest_documento-fichero,
+             descripcion   TYPE zest_documento-descripcion,
+             clasificacion TYPE zest_documento-clasificacion,
+             permisos      TYPE zest_documento-permisos,
+             boton         TYPE zest_documento-boton,
+             obsoleto      LIKE zest_documento-obsoleto,
+             erdat         LIKE zest_documento-erdat,
+             erzet         LIKE zest_documento-erzet,
+             ernam         LIKE zest_documento-ernam,
+             aedat         LIKE zest_documento-aedat,
+             aezet         LIKE zest_documento-aezet,
+             aenam         LIKE zest_documento-aenam,
+           END OF t_listado,
+           tt_listado TYPE STANDARD TABLE OF t_listado.
+
+    DATA: i_listado TYPE tt_listado,
+          o_alv     TYPE REF TO lcl_alv ##NEEDED.
+
+    METHODS  main.
+
+    METHODS: listado,
+      seleccionar_datos,
+      importar_docs_apc,
+      insert_docs IMPORTING i_valores TYPE zcl_ap_mgraph=>tt_workbook_values.
+
+ENDCLASS.
+
+*------VARIABLES-------------------------------------------------------*
+DATA o_prog TYPE REF TO zcl_report.
+
+
+
+DATA: documento    TYPE zdocumentos,
+      l_string     TYPE string,
+      v_directorio TYPE string,
+      v_fichero    TYPE string,
+      l_return     TYPE c LENGTH 1,
+      l_sistema    TYPE char40.
+
+
+*------PARAMETER/SELECT-OPTIONS EN PANTALLA----------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK 001 WITH FRAME.
+SELECT-OPTIONS: s_tcode  FOR zest_documento-tcode,
+                s_nombre FOR zest_documento-nombre,
+                s_exten  FOR zest_documento-extension,
+                s_erdat  FOR zest_documento-erdat,
+                s_erzet  FOR zest_documento-erzet,
+                s_ernam  FOR zest_documento-ernam,
+                s_clasif FOR zest_documento-clasificacion,
+                s_obsol  FOR zest_documento-obsoleto DEFAULT ''.
+SELECTION-SCREEN SKIP 1.
+PARAMETERS p_vari LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK 001.
+SELECTION-SCREEN FUNCTION KEY 1.
+SELECTION-SCREEN FUNCTION KEY 2.
+SELECTION-SCREEN FUNCTION KEY 3.
+
+
+
+
+************************************************************************
+*
+* LOGICA DEL PROGRAMA
+*
+************************************************************************
+
+*----------------------------------------------------------------------*
+* CLASS lcl_alv IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv IMPLEMENTATION.
+  METHOD handle_double_click.
+    READ TABLE o_prog->i_listado INDEX row INTO DATA(l_listado).
+    IF sy-subrc = 0.
+      zcl_ap_documentos=>visualizar_documento( tcode = l_listado-tcode
+                                          nombre = l_listado-nombre ).
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD handle_user_command.
+    DATA: l_sistema     TYPE rfcdest,
+          l_editor      TYPE string,
+          l_xstring_ini TYPE xstring,
+          l_xstring     TYPE xstring,
+          l_mod         TYPE xfeld.
+    DATA l_tcode LIKE LINE OF s_tcode.
+    DATA: l_key  TYPE c LENGTH 120,
+          i_keys TYPE TABLE OF string.
+
+    check_ucomm_sel = 'EDITAR,BORRAR,DESCARGAR,OT,OBSOLETO'.
+
+    super->handle_user_command( e_salv_function ).
+
+    IF sy-sysid = zcl_c=>entorno_desarrollo.
+      l_sistema = zcl_c=>rfc_produccion.
+    ELSE.
+      l_sistema = zcl_c=>rfc_desarrollo.
+    ENDIF.
+
+    CASE ucomm.
+      WHEN 'EXCEL'.
+        exportar_excel( ).
+      WHEN 'NUEVO'.
+        CLEAR zest_documento.
+        READ TABLE s_tcode INTO l_tcode INDEX 1.
+        IF sy-subrc = 0.
+          zest_documento-tcode = l_tcode-low.
+          READ TABLE s_tcode INTO l_tcode INDEX 2.
+          IF sy-subrc = 0.
+            zest_documento-nombre = l_tcode-low.
+          ENDIF.
+        ENDIF.
+        zcl_ap_documentos=>popup_documento( EXPORTING operacion = 'C'
+                                CHANGING documento = zest_documento ).
+        o_prog->seleccionar_datos( ).
+        refresh( ).
+
+      WHEN 'EDITAR'.
+        get_seleccion( ).
+        LOOP AT o_prog->i_listado INTO DATA(l_listado) WHERE check = 'X'.
+          DATA(l_fichero) = zcl_ap_documentos=>grabar_documento_temporal( tcode = l_listado-tcode  nombre = l_listado-nombre ).
+          CLEAR l_editor.
+          DATA(l_extension) = zcl_ap_ficheros=>get_extension( fichero = l_fichero ).
+          l_extension = to_upper( l_extension ).
+          CASE l_extension.
+            WHEN 'DOC' OR 'DOCX'.
+              l_editor = 'winword.exe'.
+            WHEN 'XLS' OR 'XLSX'.
+              l_editor = 'excel.exe'.
+          ENDCASE.
+          IF l_editor IS INITIAL.
+            MESSAGE |No es posible editar ficheros { l_extension }| TYPE 'I'.
+          ELSE.
+            zcl_ap_ficheros=>leer_xstring( EXPORTING fichero = l_fichero
+                                           IMPORTING xstring  = l_xstring_ini ).
+            IF l_xstring_ini IS INITIAL.
+              MESSAGE 'Error recuperando fichero' TYPE 'I'.
+            ELSE.
+              DATA(l_fichero_edt) = |"{ l_fichero }"|.
+
+              cl_gui_frontend_services=>execute(
+                EXPORTING
+*                 document               =
+                  application            = l_editor
+                  parameter              = l_fichero_edt
+*                 default_directory      =
+*                 maximized              =
+*                 minimized              =
+                  synchronous            = 'X'
+*                 operation              = 'OPEN'
+                EXCEPTIONS
+                  cntl_error             = 1
+                  error_no_gui           = 2
+                  bad_parameter          = 3
+                  file_not_found         = 4
+                  path_not_found         = 5
+                  file_extension_unknown = 6
+                  error_execute_failed   = 7
+                  synchronous_failed     = 8
+                  not_supported_by_gui   = 9
+                  OTHERS                 = 10 ).
+              IF sy-subrc <> 0.
+                MESSAGE 'Error editando fichero' TYPE 'I'.
+              ELSE.
+                zcl_ap_ficheros=>leer_xstring( EXPORTING fichero = l_fichero
+                                               IMPORTING xstring  = l_xstring ).
+
+                IF NOT l_xstring IS INITIAL.
+                  IF l_xstring <> l_xstring_ini.
+                    l_mod = 'X'.
+                    DATA(l_long) = xstrlen( l_xstring ).
+                    UPDATE zdocumentos
+                       SET xstring = l_xstring
+                           longitud = l_long
+                           aenam    = sy-uname
+                           aedat    = sy-datum
+                           aezet    = sy-uzeit
+                     WHERE tcode  = l_listado-tcode
+                       AND nombre = l_listado-nombre.
+                  ENDIF.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+        IF l_mod = 'X'.
+          o_prog->seleccionar_datos( ).
+          refresh( ).
+        ENDIF.
+
+      WHEN 'ACTUALIZAR'.
+        get_seleccion( ).
+        LOOP AT o_prog->i_listado INTO l_listado WHERE check = 'X'.
+          CLEAR zest_documento.
+          MOVE-CORRESPONDING l_listado TO zest_documento.
+          zcl_ap_documentos=>popup_documento( EXPORTING operacion = 'M'
+                                  CHANGING documento = zest_documento ).
+        ENDLOOP.
+        o_prog->seleccionar_datos( ).
+        refresh( ).
+      WHEN 'BORRAR'.
+        get_seleccion( ).
+        LOOP AT o_prog->i_listado INTO l_listado WHERE check = 'X'.
+          DELETE FROM zdocumentos
+           WHERE tcode  = l_listado-tcode
+             AND nombre = l_listado-nombre.
+        ENDLOOP.
+        o_prog->seleccionar_datos( ).
+        refresh( ).
+      WHEN 'OBSOLETO'.
+        get_seleccion( ).
+        LOOP AT o_prog->i_listado ASSIGNING FIELD-SYMBOL(<listado>) WHERE check = 'X'.
+          IF <listado>-obsoleto IS INITIAL.
+            <listado>-obsoleto = 'X'.
+          ELSE.
+            <listado>-obsoleto = ''.
+          ENDIF.
+          UPDATE zdocumentos
+             SET obsoleto = <listado>-obsoleto
+           WHERE tcode  = <listado>-tcode
+             AND nombre = <listado>-nombre.
+        ENDLOOP.
+        refresh( ).
+      WHEN 'GET_DES'.
+        zcl_ap_popup=>popup_usuario( EXPORTING campo1 = 'ZEST_DOCUMENTO-TCODE'
+                                               titulo = 'Recupera datos de desarrollo'
+                                     IMPORTING return = l_return
+                                     CHANGING  valor1 =
+                                     zest_documento-tcode ).
+        IF l_return = '' AND NOT zest_documento-tcode IS INITIAL.
+          l_string = zest_documento-tcode.
+          IF sy-sysid = zcl_c=>entorno_produccion.
+            l_sistema = zcl_c=>rfc_desarrollo.
+          ELSE.
+            l_sistema = zcl_c=>rfc_produccion.
+          ENDIF.
+          CALL FUNCTION 'Z_RFC_GET_TABLA'
+            EXPORTING
+              tabla      = 'ZDOCUMENTOS'
+              clave      = l_string
+              actualizar = 'X'
+              sistema    = l_sistema.
+        ENDIF.
+
+      WHEN 'DESCARGAR'.
+
+        cl_gui_frontend_services=>directory_browse(
+          EXPORTING
+            window_title         = 'Selecciona un directorio'
+            initial_folder       = 'C:\'
+          CHANGING
+            selected_folder      = v_directorio
+          EXCEPTIONS
+            cntl_error           = 1
+            error_no_gui         = 2
+            not_supported_by_gui = 3
+            OTHERS               = 4 ).
+
+        get_seleccion( ).
+        LOOP AT o_prog->i_listado INTO l_listado WHERE check = 'X'.
+          CLEAR zest_documento.
+          MOVE-CORRESPONDING l_listado TO zest_documento.
+          SELECT SINGLE * FROM zdocumentos
+            INTO documento
+           WHERE tcode  = l_listado-tcode
+             AND nombre = l_listado-nombre.
+          IF l_listado-nombre IS INITIAL.
+            l_listado-nombre = 'noname'.
+          ENDIF.
+          v_fichero = zcl_ap_ficheros=>concat_ruta(
+                                       directorio = v_directorio
+                                       fichero    = l_listado-nombre
+                                       extension  = l_listado-extension ).
+          zcl_ap_documentos=>grabar_documento( documento = documento
+                                            fichero = v_fichero ).
+        ENDLOOP.
+
+      WHEN 'COPIAR_REM'.
+        SET PARAMETER ID 'Z_NO_VAR_DEF' FIELD 'X' ##EXISTS.
+        SUBMIT zap_comparar_tablas
+               VIA SELECTION-SCREEN
+               WITH p_target = l_sistema
+               WITH s_table = 'ZDOCUMENTOS'.
+        SET PARAMETER ID 'Z_NO_VAR_DEF' FIELD '' ##EXISTS.
+
+      WHEN 'OT'.
+        get_seleccion( ).
+        LOOP AT o_prog->i_listado INTO l_listado WHERE check = 'X'.
+          l_key(3) = sy-mandt.
+          l_key+3(20) = l_listado-tcode.
+          l_key+23(40) = l_listado-nombre.
+          APPEND l_key TO i_keys.
+        ENDLOOP.
+
+        zcl_ap_utils=>grabar_tabla_en_ot( tabla = 'ZDOCUMENTOS' i_keys = i_keys ).
+      WHEN 'IMP_APC'.
+        o_prog->importar_docs_apc( ).
+        refresh( ).
+      WHEN OTHERS.
+    ENDCASE.
+  ENDMETHOD.
+
+ENDCLASS.
+
+
+CLASS zcl_report IMPLEMENTATION.
+  METHOD main.
+    seleccionar_datos( ).
+    listado( ).
+  ENDMETHOD.                    " REPORT
+
+  METHOD seleccionar_datos.
+    CLEAR i_listado.
+    SELECT * FROM zdocumentos                 "#EC CI_ALL_FIELDS_NEEDED
+      INTO CORRESPONDING FIELDS OF TABLE i_listado
+     WHERE tcode     IN s_tcode
+       AND nombre    IN s_nombre
+       AND extension IN s_exten
+       AND erdat     IN s_erdat
+       AND erzet     IN s_erzet
+       AND ernam     IN s_ernam
+       AND obsoleto  IN s_obsol
+       AND clasificacion IN s_clasif
+     ORDER BY tcode nombre.
+  ENDMETHOD.
+
+  METHOD listado.
+    sgpi_texto( 'Generando informe'(gin) ).
+
+    o_alv->add_button( button = 'F01' text = 'Nuevo'  icon = icon_create ucomm = 'NUEVO' ).
+    o_alv->add_button( button = 'F02' text = 'Actualizar'  icon = icon_read_file ucomm = 'ACTUALIZAR' ).
+    o_alv->add_button( button = 'F03' text = 'Editar'  icon = icon_change ucomm = 'EDITAR' ).
+    o_alv->add_button( button = 'F04' text = 'Borrar'  icon = icon_delete ucomm = 'BORRAR' ).
+    o_alv->add_button( button = 'F05' text = 'Descargar'  icon = icon_write_file ucomm = 'DESCARGAR' ).
+    o_alv->add_button( button = 'F06' qinfo = 'Copiar de sistema remoto'  icon = icon_system_copy ucomm = 'COPIAR_REM' ).
+    o_alv->add_button( button = 'F07' qinfo = 'Incluir en orden de transporte'  icon = icon_transport ucomm = 'OT' ).
+    o_alv->add_button( button = 'F08' qinfo = 'Marcar como obsoleto'  icon = icon_erase ucomm = 'OBSOLETO' ).
+
+    IF sy-uname = zcl_c=>usuario_ap.
+      o_alv->add_button( button = 'M01' text = 'Importar docs.APC'  ucomm = 'IMP_APC' ).
+    ENDIF.
+
+    o_alv->set_layout( p_vari ).
+
+*    o_alv->set_top_of_page( ).
+
+    o_alv->set_field_noout( 'COMPRIMIDO,LIGHTS' ).
+    o_alv->set_field_text( 'NOMBRE,EXTENSION,LONGITUD,BOTON' ).
+    o_alv->set_field( campo = 'OBSOLETO' op = 'CHECKBOX' ).
+    o_alv->set_field( campo = 'ERZET,AEZET' op = 'NO_CERO' ).
+
+    o_alv->set_orden( 'TCODE,NOMBRE' ).
+
+    o_alv->get_datos_layout( EXPORTING reordenar_tabla = 'X' tabla_ref = 'X' CHANGING t_tabla = i_listado ).
+    o_alv->set_seleccion( CHANGING t_tabla = i_listado ).
+
+    o_alv->show( ).
+  ENDMETHOD.
+
+  METHOD importar_docs_apc.
+    DATA(o_ms) = NEW zcl_ap_mgraph( clave = '' json_parametros = 'D:\OneDrive - SAP4 Programing SL\GD_LIB\LIB\DOC\MG_SAP4.JSON' ).
+    IF NOT o_ms->message IS INITIAL.
+      MESSAGE o_ms->message TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+    CLEAR i_listado.
+
+    o_ms->get_id_worksheet(
+  EXPORTING
+    nombre          = 'GD_LIB/LIB/DOC/documentos.xlsx'
+    popup_respuesta = 'E'
+    hoja          = 'Todos'
+  IMPORTING
+    message         = DATA(l_message)
+    info_xlsx       = DATA(info_xlsx)
+    id_worksheet    = DATA(l_id) ).
+
+    IF NOT l_message IS INITIAL.
+      MESSAGE l_message TYPE 'I'.
+      RETURN.
+    ENDIF.
+    IF l_id IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    o_ms->get_rango_worksheet(
+      EXPORTING
+        id              = l_id
+        nombre          = 'GD_LIB/LIB/DOC/documentos.xlsx'
+        rango           = 'A1:I100'
+        popup_respuesta = 'E'
+      IMPORTING
+        message         = l_message
+        i_valores       = DATA(i_valores) ).
+
+    IF NOT l_message IS INITIAL.
+      MESSAGE l_message TYPE 'I'.
+      RETURN.
+    ELSE.
+      insert_docs( i_valores ).
+    ENDIF.
+
+    DATA(l_cliente) = zcl_c=>get_constante( 'CLIENTE_TASKS' ).
+    IF NOT l_cliente IS INITIAL.
+      READ TABLE info_xlsx ASSIGNING FIELD-SYMBOL(<info_xlsx>) WITH KEY name = l_cliente.
+      IF sy-subrc = 0.
+        o_ms->get_rango_worksheet(
+    EXPORTING
+      id              = <info_xlsx>-id
+      nombre          = 'GD_LIB/LIB/DOC/documentos.xlsx'
+      rango           = 'A1:I100'
+      popup_respuesta = 'E'
+    IMPORTING
+      message         = l_message
+      i_valores       = DATA(i_valores_cliente) ).
+        IF NOT l_message IS INITIAL.
+          MESSAGE l_message TYPE 'I'.
+          RETURN.
+        ELSE.
+          insert_docs( i_valores_cliente ).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD insert_docs.
+    DATA: l_listado    TYPE o_prog->t_listado,
+          l_listado_bd TYPE o_prog->t_listado,
+          l_url_larga  TYPE string.
+
+    LOOP AT i_valores ASSIGNING FIELD-SYMBOL(<val>) WHERE fila > 1 AND columna = 1 AND valor <> ''. "TCODE
+      CLEAR: l_listado, l_url_larga, l_listado_bd.
+      l_listado-tcode = <val>-valor.
+      LOOP AT i_valores ASSIGNING FIELD-SYMBOL(<val2>) WHERE fila = <val>-fila AND columna > 1 AND valor NE ''.
+        CASE <val2>-columna.
+          WHEN 2. l_listado-nombre = <val2>-valor.
+          WHEN 3. l_listado-fichero = <val2>-valor.
+          WHEN 4. l_url_larga = <val2>-valor.
+          WHEN 5. l_listado-clasificacion = <val2>-valor.
+          WHEN 6. l_listado-descripcion = <val2>-valor.
+          WHEN 7. l_listado-permisos = <val2>-valor.
+          WHEN 8. l_listado-boton = <val2>-valor.
+          WHEN 9. l_listado-extension = zcl_ap_ficheros=>get_extension( <val2>-valor ).
+        ENDCASE.
+      ENDLOOP.
+      IF l_listado-fichero IS INITIAL AND NOT l_url_larga IS INITIAL.
+        l_listado-fichero = l_url_larga.
+      ENDIF.
+
+      IF NOT l_listado-nombre IS INITIAL.
+        SELECT SINGLE * FROM zdocumentos
+          INTO CORRESPONDING FIELDS OF l_listado_bd
+         WHERE tcode = l_listado-tcode
+           AND nombre = l_listado-nombre.
+
+        DELETE o_prog->i_listado WHERE tcode = l_listado-tcode AND nombre = l_listado-nombre.
+        IF l_listado_bd-fichero NE l_listado-fichero OR
+           l_listado_bd-clasificacion NE l_listado-clasificacion OR
+           l_listado_bd-permisos NE l_listado-permisos OR
+           l_listado_bd-descripcion NE l_listado-descripcion OR
+           l_listado_bd-boton NE l_listado-boton OR
+           l_listado_bd-extension NE l_listado-extension.
+
+          CLEAR documento.
+          MOVE-CORRESPONDING l_listado TO documento.
+          IF l_listado_bd IS INITIAL.
+            documento-erdat = sy-datum.
+            documento-erzet = sy-uzeit.
+            documento-ernam = sy-uname.
+          ELSE.
+            IF documento-erdat IS INITIAL.
+              documento-erdat = sy-datum.
+              documento-erzet = sy-uzeit.
+              documento-ernam = sy-uname.
+            ENDIF.
+            documento-aedat = sy-datum.
+            documento-aezet = sy-uzeit.
+            documento-aenam = sy-uname.
+          ENDIF.
+          MODIFY zdocumentos FROM documento.
+          APPEND l_listado TO o_prog->i_listado.
+        ELSE.
+*          APPEND l_listado_bd TO o_prog->i_listado.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+
+ENDCLASS.
+
+
+*----------------------------------------------------------------------*
+* INITIALIZATION
+*----------------------------------------------------------------------*
+INITIALIZATION.
+  o_prog = NEW #( status       = 'INICIO_DYN'
+                  status_prog  = 'ZAP_STATUS'
+                  no_param     = 'X'
+                  guardar_logz = '' ).
+
+  o_prog->o_alv = NEW #( status             = 'STANDARD_ALV_DYN'
+                         status_prog        = 'ZAP_STATUS'
+                         top_of_page_auto   = 'X'
+                         top_of_page_titulo = 'X'
+                         o_dev              = o_prog ).
+
+  p_vari = o_prog->o_alv->get_default_layout( ).
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_vari.
+  p_vari = o_prog->o_alv->get_f4_layout( ).
+
+************************************************************************
+* AT SELECTION-SCREEN.
+************************************************************************
+AT SELECTION-SCREEN.
+*+*+*+*+ PLANTILLA *+*+*+*+
+  zcl_ap_dev=>at_selection_screen( ).
+*+*+*+*+ PLANTILLA *+*+*+*+
+
+*----------------------------------------------------------------------
+* START-OF-SELECTION.
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+  o_prog->main( ).

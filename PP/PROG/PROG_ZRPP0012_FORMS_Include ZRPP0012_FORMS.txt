@@ -1,0 +1,949 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0012_FORMS
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  F_REC_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_rec_datos.
+
+  DATA: lt_aufm TYPE TABLE OF aufm.
+  DATA: ls_aufm  TYPE aufm,
+        ls_datos TYPE zstpp_bob_rollo_calidad.
+  DATA: lv_error TYPE flag.
+
+
+  CLEAR: lt_aufm, ls_aufm.
+  REFRESH: lt_aufm.
+
+  " Seleccionamos los movimientos de la tabla AUFM por
+  " fecha contab., centro, movimiento, material y lote:
+  SELECT * FROM aufm
+    INTO TABLE lt_aufm
+    WHERE budat IN s_budat
+    AND werks IN s_werks
+    AND ( bwart = '101' OR bwart = '102')
+    AND matnr IN s_matnr
+    AND charg IN s_charg.
+
+  " Filtramos por cliente, grupo de artículos, tipo mat (ZPAP),
+  " ancho bobina, gramaje y tipo orden (ZI02):
+
+  LOOP AT lt_aufm INTO ls_aufm.
+    CLEAR: ls_datos, lv_error.
+    " 1) Chequeo orden de proceso = ZI02:
+    PERFORM f_tipo_orden USING ls_aufm-aufnr
+                         CHANGING lv_error.
+    CHECK lv_error <> 'X'.
+
+    " 2) Chequeos MARA: grupo artículo, ancho bobina y gramaje bobina:
+    PERFORM f_cheq_mat USING ls_aufm-matnr
+                       CHANGING lv_error
+                                ls_datos-matkl
+                                ls_datos-zzcalidad
+                                ls_datos-zzgramaje
+                                ls_datos-zzancho.
+    CHECK lv_error <> 'X'.
+
+    " 3) Chequeo AUFK por cliente:
+    PERFORM f_cheq_cliente USING ls_aufm-aufnr
+                           CHANGING lv_error
+                                    ls_datos-kunnr_ord.
+    CHECK lv_error <> 'X'.
+
+    " Datos para el listado de la AUFM:
+    ls_datos-bwart = ls_aufm-bwart.
+    ls_datos-matnr_bob = ls_aufm-matnr.
+    " Descriptivo de material bobina:
+    SELECT SINGLE maktx INTO ls_datos-maktx_bob
+      FROM makt
+      WHERE matnr = ls_aufm-matnr
+      AND spras = sy-langu.
+    ls_datos-werks = ls_aufm-werks.
+    ls_datos-budat = ls_aufm-budat.
+    ls_datos-charg_bob = ls_aufm-charg.
+    ls_datos-aufnr_bob = ls_aufm-aufnr.
+    ls_datos-menge_bob = ls_aufm-menge.
+    ls_datos-meins_bob = ls_aufm-meins.
+    " Descriptivo cliente:
+    SELECT SINGLE name1 INTO ls_datos-kunnr_des_ord
+      FROM kna1
+      WHERE kunnr = ls_datos-kunnr_ord.
+    " Obtenemos datos del rollo relacionado con la bobina:
+    PERFORM f_datos_rollo USING ls_datos-matnr_bob
+                                ls_datos-charg_bob
+                                ls_datos-menge_bob
+                                ls_datos-werks
+                          CHANGING ls_datos-matnr_rollo
+                                   ls_datos-maktx_rollo
+                                   ls_datos-charg_rollo
+                                   lv_error.
+    CHECK lv_error <> 'X'.
+
+    " Obtener datos de calidad:
+* -> RHP - 08/10/15 - Añadir campo Gota
+    PERFORM f_datos_qm CHANGING ls_datos-matnr_rollo
+                                ls_datos-charg_rollo
+                                ls_datos-werks
+                                ls_datos-maktx_rollo
+                                ls_datos-prueflos
+                                ls_datos-sct_value
+                                ls_datos-cmt_value
+                                ls_datos-humedad_value
+                                ls_datos-gramaje_value
+                                ls_datos-gota_value
+                                ls_datos-estallido_value
+                                ls_datos-cobb60_value
+                                ls_datos-cobb1800_value
+                                lv_error.
+* <- RHP
+    CHECK lv_error <> 'X'.
+
+    APPEND ls_datos TO gt_datos.
+
+  ENDLOOP.
+
+
+
+ENDFORM.                    " F_REC_DATOS
+*&---------------------------------------------------------------------*
+*&      Form  F_INICIALIZACION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_inicializacion .
+  CLEAR: gt_datos.
+  REFRESH: gt_datos.
+ENDFORM.                    " F_INICIALIZACION
+*&---------------------------------------------------------------------*
+*&      Form  F_TIPO_ORDEN
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_AUFM_AUFNR  text
+*      <--P_LV_ERROR  text
+*----------------------------------------------------------------------*
+FORM f_tipo_orden  USING    p_aufnr
+                   CHANGING p_error.
+
+  DATA: lv_sfcpf TYPE co_prodprf.
+  CLEAR lv_sfcpf.
+
+  SELECT SINGLE sfcpf INTO lv_sfcpf
+    FROM caufv
+    WHERE aufnr = p_aufnr.
+
+  IF lv_sfcpf <> 'ZI02'.
+    p_error = 'X'.
+  ELSE.
+    CLEAR p_error.
+  ENDIF.
+
+ENDFORM.                    " F_TIPO_ORDEN
+*&---------------------------------------------------------------------*
+*&      Form  F_CHEQ_MAT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_AUFM_MATNR  text
+*      <--P_LV_ERROR  text
+*      <--P_LS_DATOS_MATKL  text
+*----------------------------------------------------------------------*
+FORM f_cheq_mat  USING    p_matnr
+                 CHANGING p_error
+                          p_matkl
+                          p_calid
+                          p_grama
+                          p_ancho.
+
+  DATA: lv_matnr TYPE matnr.
+
+  CLEAR: lv_matnr, p_matkl, p_calid, p_grama, p_ancho, p_error.
+  SELECT SINGLE matnr matkl zzcalidad zzgramaje zzancho
+         INTO (lv_matnr, p_matkl, p_calid, p_grama, p_ancho)
+    FROM mara
+    WHERE matnr = p_matnr
+    AND matkl IN s_matkl
+    AND mtart = 'ZPAP'
+    AND zzcalidad IN s_calid
+    AND zzancho IN s_ancho
+    AND zzgramaje IN s_grama.
+
+  IF lv_matnr IS NOT INITIAL.
+    CLEAR p_error.
+  ELSE.
+    p_error = 'X'.
+  ENDIF.
+
+ENDFORM.                    " F_CHEQ_MAT
+*&---------------------------------------------------------------------*
+*&      Form  F_CHEQ_CLIENTE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_AUFM_AUFNR  text
+*      <--P_LV_ERROR  text
+*      <--P_LS_DATOS_KUNNR_ORD  text
+*----------------------------------------------------------------------*
+FORM f_cheq_cliente  USING    p_aufnr
+                     CHANGING p_error
+                              p_kunnr_ord.
+
+  DATA: lv_aufnr TYPE aufnr.
+
+  CLEAR: lv_aufnr, p_kunnr_ord.
+  SELECT SINGLE aufnr zzkunnr1 INTO (lv_aufnr, p_kunnr_ord)
+    FROM aufk
+    WHERE aufnr = p_aufnr
+    AND zzkunnr1 IN s_kunnr.
+
+  IF lv_aufnr IS NOT INITIAL.
+    CLEAR p_error.
+  ELSE.
+    p_error = 'X'.
+  ENDIF.
+
+ENDFORM.                    " F_CHEQ_CLIENTE
+*&---------------------------------------------------------------------*
+*&      Form  F_DATOS_ROLLO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_DATOS_MATNR_BOB  text
+*      -->P_LS_DATOS_MENGE_BOB  text
+*      -->P_LS_DATOS_WERKS  text
+*      <--P_LS_DATOS_MATNR_ROLLO  text
+*      <--P_LS_DATOS_MAKTX_ROLLO  text
+*      <--P_LS_DATOS_CHARG_ROLLO  text
+*----------------------------------------------------------------------*
+FORM f_datos_rollo  USING    p_matnr_bob
+                             p_charg_bob
+                             p_menge_bob
+                             p_werks
+                    CHANGING p_matnr_rollo
+                             p_maktx_rollo
+                             p_charg_rollo
+                             p_flag.
+
+
+  DATA:   lv_object            TYPE objnum,
+          lt_alloc_values_num  TYPE tt_bapi1003_alloc_values_num,
+          lt_alloc_values_char TYPE tt_bapi1003_alloc_values_char,
+          lt_alloc_values_curr TYPE tt_bapi1003_alloc_values_curr,
+          lt_return            TYPE bapiret2_tab,
+          ls_return            TYPE bapiret2,
+          ls_alloc_values_char TYPE bapi1003_alloc_values_char.
+
+  DATA: lv_matnr_aux TYPE matnr.
+  CLEAR: p_matnr_rollo, p_maktx_rollo, p_charg_rollo, lv_object.
+  CLEAR: p_flag.
+  CLEAR: lt_alloc_values_num, lt_alloc_values_char.
+  CLEAR: lt_alloc_values_curr, lt_return.
+  CLEAR: ls_alloc_values_char.
+  REFRESH: lt_alloc_values_num, lt_alloc_values_char.
+  REFRESH: lt_alloc_values_curr, lt_return.
+
+  CONCATENATE p_matnr_bob p_charg_bob INTO lv_object.
+
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = lv_object
+      objecttable     = 'MCH1'
+      classnum        = 'Z_BOBINA'
+      classtype       = '023'
+*     KEYDATE         = SY-DATUM
+*     UNVALUATED_CHARS       = ' '
+*     LANGUAGE        = SY-LANGU
+* IMPORTING
+*     STATUS          =
+*     STANDARDCLASS   =
+    TABLES
+      allocvaluesnum  = lt_alloc_values_num
+      allocvalueschar = lt_alloc_values_char
+      allocvaluescurr = lt_alloc_values_curr
+      return          = lt_return.
+
+  CLEAR ls_return.
+  READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+  IF ls_return-type = 'E' AND ls_return IS NOT INITIAL.
+    p_flag = 'X'.
+  ELSE.
+    " Material rollo origen:
+    CLEAR ls_alloc_values_char.
+    READ TABLE lt_alloc_values_char INTO ls_alloc_values_char
+               WITH KEY charact = 'Z_ROLLO_ORIGEN_V2'.
+    IF ls_alloc_values_char-value_neutral IS NOT INITIAL.
+      p_matnr_rollo = ls_alloc_values_char-value_neutral.
+      CONDENSE p_matnr_rollo.
+      lv_matnr_aux = p_matnr_rollo.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = lv_matnr_aux
+        IMPORTING
+          output = lv_matnr_aux.
+      p_matnr_rollo = lv_matnr_aux.
+
+      " Descriptivo material rollo:
+      SELECT SINGLE maktx INTO p_maktx_rollo
+        FROM makt
+        WHERE matnr = p_matnr_rollo
+        AND spras = sy-langu.
+
+    ELSE.
+      CLEAR p_matnr_rollo.
+    ENDIF.
+
+    " Lote rollo origen consumido:
+    CLEAR ls_alloc_values_char.
+    READ TABLE lt_alloc_values_char INTO ls_alloc_values_char
+               WITH KEY charact = 'Z_LOTE_ORIGEN'.
+    IF ls_alloc_values_char-value_neutral IS NOT INITIAL.
+      p_charg_rollo = ls_alloc_values_char-value_neutral.
+      CONDENSE p_charg_rollo.
+    ELSE.
+      CLEAR p_charg_rollo.
+    ENDIF.
+
+  ENDIF.
+
+  IF p_matnr_rollo IS INITIAL OR p_charg_rollo IS INITIAL.
+    p_flag = 'X'.
+  ENDIF.
+
+ENDFORM.                    " F_DATOS_ROLLO
+*&---------------------------------------------------------------------*
+*&      Form  F_DATOS_QM
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_DATOS_MATNR_ROLLO  text
+*      -->P_LS_DATOS_CHARG_ROLLO  text
+*      <--P_LS_DATOS_PRUEFLOS  text
+*      <--P_LS_DATOS_SCT_VALUE  text
+*      <--P_LS_DATOS_CMT_VALUE  text
+*      <--P_LS_DATOS_HUMEDAD_VALUE  text
+*      <--P_LS_DATOS_GRAMAJE_VALUE  text
+*      <--P_LS_DATOS_GOTA_VALUE text
+*----------------------------------------------------------------------*
+FORM f_datos_qm  CHANGING p_matnr
+                          p_charg
+                          p_werks
+                          p_maktx
+                          p_prueflos
+                          p_sct
+                          p_cmt
+                          p_humedad
+                          p_gramaje
+                          p_gota
+                          p_estallido
+                          p_cobb60
+                          p_cobb1800
+                          p_flag.
+
+  DATA: ls_sct     TYPE ty_dat_qpmk,
+        ls_cmt     TYPE ty_dat_qpmk,
+        ls_humedad TYPE ty_dat_qpmk,
+        ls_gramaje TYPE ty_dat_qpmk,
+        ls_return  TYPE bapireturn1,
+        ls_insoper TYPE bapi2045l2,
+        ls_req     TYPE bapi2045d1,
+        ls_res     TYPE bapi2045d2.
+
+* -> RHP - 08/10/15 - Añadir Gota,Estallido,Cobb60 y Cobb1800
+
+  DATA: ls_gota TYPE ty_dat_qpmk.
+  DATA: ls_estallido TYPE ty_dat_qpmk.
+  DATA: ls_cobb60 TYPE ty_dat_qpmk.
+  DATA: ls_cobb1800 TYPE ty_dat_qpmk.
+
+* <- RHP
+
+  DATA: lt_insoper TYPE TABLE OF bapi2045l2,
+        lt_req     TYPE          co_mes_bapi2045d1_t,
+        lt_res     TYPE          rplm_tt_bapi2045d2.
+
+* GST - 06/08/2015 ->
+  DATA: lv_rollo TYPE xflag,
+        lv_mtart TYPE mtart.
+* GST - 06/08/2015 <-
+
+  CLEAR: p_prueflos, p_sct, p_cmt, p_humedad, p_gramaje, p_maktx.
+  CLEAR: ls_return, lt_insoper.
+  REFRESH: lt_insoper.
+
+* GST - 06/08/2015 ->
+  CLEAR: lv_rollo, lv_mtart.
+  WHILE ( p_prueflos IS INITIAL AND lv_rollo <> 'X').
+* GST - 06/08/2015 <-
+
+* Lote de inspección:
+    PERFORM f_get_prueflos USING p_matnr
+                                 p_charg
+                           CHANGING p_prueflos.
+
+* GST - 06/08/2015 ->
+    IF p_matnr IS NOT INITIAL AND p_charg IS NOT INITIAL.
+      " Descriptivo material rollo:
+      SELECT SINGLE maktx INTO p_maktx
+        FROM makt
+        WHERE matnr = p_matnr
+        AND spras = sy-langu.
+
+      " Recuperar datos del rollo:
+      CLEAR lv_mtart.
+      SELECT SINGLE mtart INTO lv_mtart
+        FROM mara
+        WHERE matnr = p_matnr.
+
+      IF lv_mtart = 'ZROL'.
+        lv_rollo = 'X'.
+      ELSE.
+        CLEAR lv_rollo.
+      ENDIF.
+
+      IF p_prueflos IS INITIAL AND lv_rollo <> 'X'.
+        PERFORM buscar_rollo CHANGING p_matnr
+                                      p_charg.
+
+        IF p_matnr IS INITIAL OR  p_charg IS INITIAL.
+          lv_rollo = 'X'.
+        ENDIF.
+
+      ENDIF.
+
+    ELSE.
+      lv_rollo = 'X'.
+
+    ENDIF.
+
+  ENDWHILE.
+* GST - 06/08/2015 <-
+
+
+  IF p_prueflos IS NOT INITIAL.
+
+* Obtenemos las operaciones por lote de inspección:
+
+    CALL FUNCTION 'BAPI_INSPLOT_GETOPERATIONS'
+      EXPORTING
+        number        = p_prueflos
+*      IMPORTING
+*       return        = ls_return
+      TABLES
+        inspoper_list = lt_insoper.
+
+* Recuperamos centro, característica y versión:
+
+* -> RHP - 08/10/15 - Añadir campo Gota
+    PERFORM f_get_data_qpmk CHANGING ls_sct
+                                     ls_cmt
+                                     ls_humedad
+                                     ls_gramaje
+                                     ls_gota
+                                     ls_estallido
+                                     ls_cobb60
+                                     ls_cobb1800.
+* <- RHP
+
+* Intentamos encontrar el valor de las características
+* en cada operación:
+    LOOP AT lt_insoper INTO ls_insoper.
+
+      CLEAR: lt_req, lt_res.
+      REFRESH: lt_req, lt_res.
+
+      IF p_sct IS NOT INITIAL AND p_cmt IS NOT INITIAL AND
+        p_humedad IS NOT INITIAL AND p_gramaje IS NOT INITIAL
+        AND p_gota IS NOT INITIAL AND p_estallido IS NOT INITIAL
+        AND p_cobb60 IS NOT INITIAL AND p_cobb1800 IS NOT INITIAL.
+        EXIT.
+      ENDIF.
+
+      CALL FUNCTION 'BAPI_INSPOPER_GETDETAIL'
+        EXPORTING
+          insplot                = ls_insoper-insplot
+          inspoper               = ls_insoper-inspoper
+*         READ_INSPPOINTS        = ' '
+          read_char_requirements = 'X'
+          read_char_results      = 'X'
+*         READ_SAMPLE_RESULTS    = ' '
+*         READ_SINGLE_RESULTS    = ' '
+*         READ_CHARS_WITH_CLASSES            = ' '
+*         READ_CHARS_WITHOUT_RECORDING       = ' '
+*         RES_ORG                = ' '
+*         CHAR_FILTER_NO         = '1   '
+*         CHAR_FILTER_TCODE      = 'QE11'
+*         MAX_INSPPOINTS         = 100
+*         INSPPOINT_FROM         = 0
+*         HANDHELD_APPLICATION   = ' '
+*         RESULT_COPY            = ' '
+*       IMPORTING
+*         OPERATION              =
+*         INSPPOINT_REQUIREMENTS =
+*         RETURN                 =
+        TABLES
+*         INSPPOINTS             =
+          char_requirements      = lt_req
+          char_results           = lt_res
+*         SAMPLE_RESULTS         =
+*         SINGLE_RESULTS         =
+        .
+
+
+      " SCT:
+      IF p_sct IS INITIAL AND ls_sct IS NOT INITIAL.
+        CLEAR ls_req.
+        READ TABLE lt_req INTO ls_req
+                   WITH KEY mstr_char = ls_sct-mkmnr
+                            pmstr_char = ls_sct-zaehler
+                            vmstr_char = ls_sct-version.
+        IF ls_req IS NOT INITIAL.
+          CLEAR ls_res.
+          READ TABLE lt_res INTO ls_res
+                     WITH KEY insplot = ls_req-insplot
+                              inspoper = ls_req-inspoper
+                              inspchar = ls_req-inspchar.
+          IF ls_res-mean_value IS NOT INITIAL.
+            p_sct = ls_res-mean_value.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      " CMT:
+
+      IF p_cmt IS INITIAL AND ls_cmt IS NOT INITIAL.
+        CLEAR ls_req.
+        READ TABLE lt_req INTO ls_req
+                   WITH KEY mstr_char = ls_cmt-mkmnr
+                            pmstr_char = ls_cmt-zaehler
+                            vmstr_char = ls_cmt-version.
+        IF ls_req IS NOT INITIAL.
+          CLEAR ls_res.
+          READ TABLE lt_res INTO ls_res
+                     WITH KEY insplot = ls_req-insplot
+                              inspoper = ls_req-inspoper
+                              inspchar = ls_req-inspchar.
+          IF ls_res-mean_value IS NOT INITIAL.
+            p_cmt = ls_res-mean_value.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      " HUMEDAD:
+      IF p_humedad IS INITIAL AND ls_humedad IS NOT INITIAL.
+        CLEAR ls_req.
+        READ TABLE lt_req INTO ls_req
+                   WITH KEY mstr_char = ls_humedad-mkmnr
+                            pmstr_char = ls_humedad-zaehler
+                            vmstr_char = ls_humedad-version.
+        IF ls_req IS NOT INITIAL.
+          CLEAR ls_res.
+          READ TABLE lt_res INTO ls_res
+                     WITH KEY insplot = ls_req-insplot
+                              inspoper = ls_req-inspoper
+                              inspchar = ls_req-inspchar.
+          IF ls_res-mean_value IS NOT INITIAL.
+            p_humedad = ls_res-mean_value.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      " GRAMAJE:
+      IF p_gramaje IS INITIAL AND ls_gramaje IS NOT INITIAL.
+        CLEAR ls_req.
+        READ TABLE lt_req INTO ls_req
+                   WITH KEY mstr_char = ls_gramaje-mkmnr
+                            pmstr_char = ls_gramaje-zaehler
+                            vmstr_char = ls_gramaje-version.
+        IF ls_req IS NOT INITIAL.
+          CLEAR ls_res.
+          READ TABLE lt_res INTO ls_res
+                     WITH KEY insplot = ls_req-insplot
+                              inspoper = ls_req-inspoper
+                              inspchar = ls_req-inspchar.
+          IF ls_res-mean_value IS NOT INITIAL.
+            p_gramaje = ls_res-mean_value.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+* -> RHP - 08/10/15 - Añadir campo Gota
+      " GOTA:
+      IF p_gota IS INITIAL AND ls_gota IS NOT INITIAL.
+        CLEAR ls_req.
+        READ TABLE lt_req INTO ls_req
+                   WITH KEY mstr_char = ls_gota-mkmnr
+                            pmstr_char = ls_gota-zaehler
+                            vmstr_char = ls_gota-version.
+        IF ls_req IS NOT INITIAL.
+          CLEAR ls_res.
+          READ TABLE lt_res INTO ls_res
+                     WITH KEY insplot = ls_req-insplot
+                              inspoper = ls_req-inspoper
+                              inspchar = ls_req-inspchar.
+          IF ls_res-mean_value IS NOT INITIAL.
+            p_gota = ls_res-mean_value.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      " ESTALLIDO:
+      IF p_estallido IS INITIAL AND ls_estallido IS NOT INITIAL.
+        CLEAR ls_req.
+        READ TABLE lt_req INTO ls_req
+                   WITH KEY mstr_char = ls_estallido-mkmnr
+                            pmstr_char = ls_estallido-zaehler
+                            vmstr_char = ls_estallido-version.
+        IF ls_req IS NOT INITIAL.
+          CLEAR ls_res.
+          READ TABLE lt_res INTO ls_res
+                     WITH KEY insplot = ls_req-insplot
+                              inspoper = ls_req-inspoper
+                              inspchar = ls_req-inspchar.
+          IF ls_res-mean_value IS NOT INITIAL.
+            p_estallido = ls_res-mean_value.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      " COBB60:
+      IF p_cobb60 IS INITIAL AND ls_cobb60 IS NOT INITIAL.
+        CLEAR ls_req.
+        READ TABLE lt_req INTO ls_req
+                   WITH KEY mstr_char = ls_cobb60-mkmnr
+                            pmstr_char = ls_cobb60-zaehler
+                            vmstr_char = ls_cobb60-version.
+        IF ls_req IS NOT INITIAL.
+          CLEAR ls_res.
+          READ TABLE lt_res INTO ls_res
+                     WITH KEY insplot = ls_req-insplot
+                              inspoper = ls_req-inspoper
+                              inspchar = ls_req-inspchar.
+          IF ls_res-mean_value IS NOT INITIAL.
+            p_cobb60 = ls_res-mean_value.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      " COBB1800:
+      IF p_cobb1800 IS INITIAL AND ls_cobb1800 IS NOT INITIAL.
+        CLEAR ls_req.
+        READ TABLE lt_req INTO ls_req
+                   WITH KEY mstr_char = ls_cobb1800-mkmnr
+                            pmstr_char = ls_cobb1800-zaehler
+                            vmstr_char = ls_cobb1800-version.
+        IF ls_req IS NOT INITIAL.
+          CLEAR ls_res.
+          READ TABLE lt_res INTO ls_res
+                     WITH KEY insplot = ls_req-insplot
+                              inspoper = ls_req-inspoper
+                              inspchar = ls_req-inspchar.
+          IF ls_res-mean_value IS NOT INITIAL.
+            p_cobb1800 = ls_res-mean_value.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+* <- RHP
+
+  ELSE.
+    p_flag = 'X'.
+  ENDIF.
+
+ENDFORM.                    " F_DATOS_QM
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_DATA_QPMK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_SCT  text
+*      <--P_LS_CMT  text
+*      <--P_LS_HUMEDAD  text
+*      <--P_LS_GRAMAJE  text
+*      <--P_LS_GOTA text
+*----------------------------------------------------------------------*
+FORM f_get_data_qpmk  CHANGING ps_sct     TYPE ty_dat_qpmk
+                               ps_cmt     TYPE ty_dat_qpmk
+                               ps_humedad TYPE ty_dat_qpmk
+                               ps_gramaje TYPE ty_dat_qpmk
+                               ps_gota    TYPE ty_dat_qpmk
+                               ps_estallido TYPE ty_dat_qpmk
+                               ps_cobb60 TYPE ty_dat_qpmk
+                               ps_cobb1800 TYPE ty_dat_qpmk.
+
+  DATA: lt_qpmk TYPE STANDARD TABLE OF ty_dat_qpmk.
+
+  REFRESH: lt_qpmk.
+  CLEAR: ps_sct, ps_cmt, ps_humedad, ps_gramaje, lt_qpmk.
+
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE lt_qpmk
+    FROM qpmk
+    WHERE ( dummy40 = 'ZRPP0012-SCT' OR dummy40 = 'ZRPP0012-CTM'
+            OR dummy40 = 'ZRPP0012-HUM' OR dummy40 = 'ZRPP0012-GRA'
+            OR dummy40 = 'ZRPP0012-GOT' OR dummy40 = 'ZRPP0012-EST'
+            OR dummy40 = 'ZRPP0012-COBB60' OR dummy40 = 'ZRPP0012-COBB1800').
+
+  " Característica SCT:
+  READ TABLE lt_qpmk INTO ps_sct WITH KEY dummy40 = 'ZRPP0012-SCT'.
+
+  " Característica CMT:
+  READ TABLE lt_qpmk INTO ps_cmt WITH KEY dummy40 = 'ZRPP0012-CTM'.
+
+  " Característica Humedad:
+  READ TABLE lt_qpmk INTO ps_humedad WITH KEY dummy40 = 'ZRPP0012-HUM'.
+
+  " Característica Gramaje:
+  READ TABLE lt_qpmk INTO ps_gramaje WITH KEY dummy40 = 'ZRPP0012-GRA'.
+
+  " Característica Gota:
+  READ TABLE lt_qpmk INTO ps_gota WITH KEY dummy40 = 'ZRPP0012-GOT'.
+
+  " Característica Estallido:
+  READ TABLE lt_qpmk INTO ps_estallido
+                          WITH KEY dummy40 = 'ZRPP0012-EST'.
+
+  " Característica Cobb60:
+  READ TABLE lt_qpmk INTO ps_cobb60
+                          WITH KEY dummy40 = 'ZRPP0012-COBB60'.
+
+  " Característica Cobb1800:
+  READ TABLE lt_qpmk INTO ps_cobb1800
+                          WITH KEY dummy40 = 'ZRPP0012-COBB1800'.
+
+ENDFORM.                    " F_GET_DATA_QPMK
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_PRUEFLOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_MATNR  text
+*      -->P_P_CHARG  text
+*      <--P_P_PRUEFLOS  text
+*----------------------------------------------------------------------*
+FORM f_get_prueflos  USING    p_matnr
+                              p_charg
+                     CHANGING p_prueflos.
+
+  DATA: lt_prueflos TYPE STANDARD TABLE OF ty_prueflos,
+        ls_prueflos TYPE                   ty_prueflos.
+
+  CLEAR: lt_prueflos, ls_prueflos.
+  REFRESH: lt_prueflos.
+
+  SELECT a~matnr a~charg a~prueflos b~vdatum
+    INTO TABLE lt_prueflos
+    FROM qals AS a
+    INNER JOIN qave AS b ON b~prueflos = a~prueflos
+    WHERE a~matnr = p_matnr
+    AND a~charg = p_charg.
+
+  IF lt_prueflos[] IS NOT INITIAL.
+    SORT lt_prueflos BY vdatum DESCENDING.
+    CLEAR ls_prueflos.
+    READ TABLE lt_prueflos INTO ls_prueflos INDEX 1.
+    IF ls_prueflos IS NOT INITIAL.
+      p_prueflos = ls_prueflos-prueflos.
+    ELSE.
+      CLEAR p_prueflos.
+    ENDIF.
+  ELSE.
+    CLEAR p_prueflos.
+  ENDIF.
+
+ENDFORM.                    " F_GET_PRUEFLOS
+*&---------------------------------------------------------------------*
+*&      Form  BUSCAR_ROLLO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_P_MATNR  text
+*      <--P_P_CHARG  text
+*----------------------------------------------------------------------*
+FORM buscar_rollo  CHANGING p_matnr
+                            p_charg.
+
+  DATA: lv_matnr TYPE matnr,
+        lv_charg TYPE charg_d.
+
+  DATA:   lv_object            TYPE objnum,
+          lt_alloc_values_num  TYPE tt_bapi1003_alloc_values_num,
+          lt_alloc_values_char TYPE tt_bapi1003_alloc_values_char,
+          lt_alloc_values_curr TYPE tt_bapi1003_alloc_values_curr,
+          lt_return            TYPE bapiret2_tab,
+          ls_alloc_values_num  TYPE bapi1003_alloc_values_num,
+          ls_alloc_values_char TYPE bapi1003_alloc_values_char.
+
+  DATA: BEGIN OF lt_materiales OCCURS 0,
+          matnr TYPE matnr,
+          charg TYPE charg_d,
+          mtart TYPE mtart,
+        END OF lt_materiales.
+  DATA: ls_materiales LIKE LINE OF lt_materiales.
+
+  CLEAR: lt_materiales, ls_materiales.
+  REFRESH: lt_materiales.
+
+  CLEAR: lv_object, ls_alloc_values_num, ls_alloc_values_num.
+  CLEAR: lt_alloc_values_num, lt_alloc_values_char,
+         lt_alloc_values_curr, lt_return.
+  REFRESH: lt_alloc_values_num, lt_alloc_values_char,
+           lt_alloc_values_curr, lt_return.
+
+
+  CLEAR: lv_matnr, lv_charg.
+  CONCATENATE p_matnr p_charg INTO lv_object.
+
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = lv_object
+      objecttable     = 'MCH1'
+      classnum        = 'Z_BOBINA'
+      classtype       = '023'
+*     KEYDATE         = SY-DATUM
+*     UNVALUATED_CHARS       = ' '
+*     LANGUAGE        = SY-LANGU
+* IMPORTING
+*     STATUS          =
+*     STANDARDCLASS   =
+    TABLES
+      allocvaluesnum  = lt_alloc_values_num
+      allocvalueschar = lt_alloc_values_char
+      allocvaluescurr = lt_alloc_values_curr
+      return          = lt_return.
+
+  " Valores char de las características:
+  LOOP AT lt_alloc_values_char INTO ls_alloc_values_char.
+    CASE ls_alloc_values_char-charact.
+        " Lote rollo origen:
+      WHEN 'Z_LOTE_ORIGEN'.
+        CONDENSE ls_alloc_values_char-value_char.
+        lv_charg = ls_alloc_values_char-value_char.
+
+        " Material rollo origen:
+      WHEN 'Z_ROLLO_ORIGEN_V2'.
+        CONDENSE ls_alloc_values_char-value_char.
+        lv_matnr = ls_alloc_values_char-value_char.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = lv_matnr
+          IMPORTING
+            output = lv_matnr.
+    ENDCASE.
+  ENDLOOP.
+
+  IF lv_matnr IS INITIAL AND lv_charg IS NOT INITIAL.
+
+    SELECT a~matnr a~charg b~mtart
+      INTO CORRESPONDING FIELDS OF TABLE lt_materiales
+      FROM mch1 AS a
+      INNER JOIN mara AS b ON b~matnr = a~matnr
+      WHERE a~charg = lv_charg.
+
+    IF lt_materiales[] IS NOT INITIAL.
+      CLEAR ls_materiales.
+      READ TABLE lt_materiales INTO ls_materiales INDEX 1.
+      lv_matnr = ls_materiales-matnr.
+    ENDIF.
+
+  ENDIF.
+
+  IF lv_matnr IS INITIAL OR lv_charg IS INITIAL.
+
+    CLEAR: lv_matnr, lv_charg.
+    CONCATENATE p_matnr p_charg INTO lv_object.
+
+    CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+      EXPORTING
+        objectkey       = lv_object
+        objecttable     = 'MCH1'
+        classnum        = 'Z_BOBINA_REP'
+        classtype       = '023'
+*       KEYDATE         = SY-DATUM
+*       UNVALUATED_CHARS       = ' '
+*       LANGUAGE        = SY-LANGU
+* IMPORTING
+*       STATUS          =
+*       STANDARDCLASS   =
+      TABLES
+        allocvaluesnum  = lt_alloc_values_num
+        allocvalueschar = lt_alloc_values_char
+        allocvaluescurr = lt_alloc_values_curr
+        return          = lt_return.
+
+    " Valores char de las características:
+    LOOP AT lt_alloc_values_char INTO ls_alloc_values_char.
+      CASE ls_alloc_values_char-charact.
+          " Lote rollo origen:
+        WHEN 'Z_LOTE_ORIGEN'.
+          CONDENSE ls_alloc_values_char-value_char.
+          lv_charg = ls_alloc_values_char-value_char.
+
+          " Material rollo origen:
+        WHEN 'Z_ROLLO_ORIGEN_V2'.
+          CONDENSE ls_alloc_values_char-value_char.
+          lv_matnr = ls_alloc_values_char-value_char.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING
+              input  = lv_matnr
+            IMPORTING
+              output = lv_matnr.
+      ENDCASE.
+    ENDLOOP.
+
+    IF lv_matnr IS INITIAL AND lv_charg IS NOT INITIAL.
+
+      SELECT a~matnr a~charg b~mtart
+        INTO CORRESPONDING FIELDS OF TABLE lt_materiales
+        FROM mch1 AS a
+        INNER JOIN mara AS b ON b~matnr = a~matnr
+        WHERE a~charg = lv_charg.
+
+      IF lt_materiales[] IS NOT INITIAL.
+        CLEAR ls_materiales.
+        READ TABLE lt_materiales INTO ls_materiales INDEX 1.
+        lv_matnr = ls_materiales-matnr.
+      ENDIF.
+
+    ENDIF.
+
+  ENDIF.
+
+  p_matnr = lv_matnr.
+  p_charg = lv_charg.
+
+ENDFORM.                    " BUSCAR_ROLLO
+*&---------------------------------------------------------------------*
+*&      Form  F_INICIALIZACION_SEL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_inicializacion_sel .
+
+  DATA: lv_werks TYPE werks_d,
+        ls_werks LIKE LINE OF s_werks.
+
+  CLEAR: lv_werks, ls_werks.
+  SELECT SINGLE parva FROM usr05
+      INTO lv_werks
+      WHERE bname = sy-uname AND
+      parid = 'WRK'.
+
+  IF lv_werks IS NOT INITIAL.
+    ls_werks-sign = 'I'.
+    ls_werks-option = 'EQ'.
+    ls_werks-low = lv_werks.
+    APPEND ls_werks TO s_werks.
+  ENDIF.
+
+ENDFORM.                    " F_INICIALIZACION_SEL

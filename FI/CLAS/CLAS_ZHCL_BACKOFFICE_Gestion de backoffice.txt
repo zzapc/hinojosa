@@ -1,0 +1,168 @@
+
+CLASS zhcl_backoffice DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC .
+
+  PUBLIC SECTION.
+
+    TYPES:
+      BEGIN OF t_asig_entrega,
+        kunnr   TYPE kunag,
+        parvw   TYPE parvw,
+        lifnr   TYPE lifnr,
+        email   TYPE string,
+        posnr   TYPE lips-posnr,
+        matnr   TYPE lips-matnr,
+        lfimg   TYPE lips-lfimg,
+        vrkme   TYPE lips-vrkme,
+        ebeln   TYPE ebeln,
+        ebelp   TYPE ebelp,
+        vbeln   TYPE vbeln,
+        message TYPE bapi_msg,
+      END OF t_asig_entrega .
+    TYPES:
+      tt_asig_entrega TYPE STANDARD TABLE OF t_asig_entrega WITH KEY posnr .
+
+    CLASS-METHODS get_asignacion_entrega
+      IMPORTING
+        !vbeln        TYPE vbeln_vl
+      EXPORTING
+        VALUE(i_asig) TYPE tt_asig_entrega
+        !message      TYPE bapi_msg .
+protected section.
+private section.
+endclass. "ZHCL_BACKOFFICE definition
+class ZHCL_BACKOFFICE implementation.
+  METHOD get_asignacion_entrega.
+    TYPES: BEGIN OF t_interlocutores,
+             kunnr           TYPE kunnr,
+             parvw           TYPE parvw,
+             lifnr           TYPE lifnr,
+             no_mail_albaran TYPE ztsd0012-no_mail_albaran,
+             email           TYPE string,
+             message         TYPE bapi_msg,
+           END OF t_interlocutores.
+
+    DATA: i_kunnr          TYPE TABLE OF kunnr,
+          r_kunnr          TYPE RANGE OF kunnr,
+          l_clientes       TYPE string,
+          i_interlocutores TYPE TABLE OF t_interlocutores.
+
+    CLEAR: i_asig, message.
+
+    SELECT SINGLE kunag FROM likp
+      INTO @DATA(l_kunag)
+     WHERE vbeln = @vbeln.
+    IF sy-subrc NE 0.
+      message = 'No existe la entrega'.
+      RETURN.
+    ELSEIF NOT l_kunag IS INITIAL.
+      APPEND l_kunag TO i_kunnr.
+      SELECT * FROM lips
+        INTO CORRESPONDING FIELDS OF TABLE i_asig
+       WHERE vbeln = vbeln.
+      LOOP AT i_asig ASSIGNING FIELD-SYMBOL(<asig>).
+        <asig>-kunnr = l_kunag.
+      ENDLOOP.
+    ENDIF.
+
+    IF i_kunnr IS INITIAL.
+      SELECT posnr, matnr, lfimg, vrkme, ebeln, ebelp, vbak~vbeln, vbak~kunnr FROM ekkn JOIN lips ON lips~vgbel = ekkn~ebeln
+                                                                          JOIN vbak ON vbak~vbeln = ekkn~vbeln
+        INTO CORRESPONDING FIELDS OF TABLE @i_asig
+       WHERE lips~vbeln = @vbeln
+         AND ekkn~vbeln NE ''.
+      LOOP AT i_asig ASSIGNING <asig> WHERE NOT kunnr IS INITIAL.
+        COLLECT <asig>-kunnr INTO i_kunnr.
+      ENDLOOP.
+    ENDIF.
+
+    IF i_kunnr IS INITIAL.
+      SELECT posnr, lips~matnr, lfimg, vrkme, ebeln, ebelp, zzcliente AS kunnr FROM ekpo JOIN lips ON lips~vgbel = ekpo~ebeln
+        INTO CORRESPONDING FIELDS OF TABLE @i_asig
+       WHERE vbeln = @vbeln
+         AND zzcliente NE ''
+         AND loekz = ''.
+
+      LOOP AT i_asig ASSIGNING <asig> WHERE NOT kunnr IS INITIAL.
+        COLLECT <asig>-kunnr INTO i_kunnr.
+      ENDLOOP.
+    ENDIF.
+
+    IF i_kunnr IS INITIAL.
+      message = |No se ha conseguido encontrar solicitante|.
+      RETURN.
+    ENDIF.
+
+    LOOP AT i_kunnr ASSIGNING FIELD-SYMBOL(<kunnr>).
+      __add_lista_no0 l_clientes <kunnr>.
+      APPEND VALUE #( option = 'EQ' sign = 'I' low = <kunnr> ) TO r_kunnr.
+    ENDLOOP.
+
+* Buscamos backoffice y comercial de ese cliente
+    SELECT DISTINCT knvp~kunnr, knvp~lifnr, knvp~parvw
+      FROM knvp JOIN likp ON likp~vkorg = knvp~vkorg
+                JOIN lips ON lips~vbeln = likp~vbeln
+                 AND lips~vtweg = knvp~vtweg
+                 AND lips~spart = knvp~spart
+      INTO CORRESPONDING FIELDS OF TABLE @i_interlocutores
+     WHERE likp~vbeln = @vbeln
+       AND knvp~kunnr IN @r_kunnr
+       AND parvw IN ( 'A1', 'Y0' ).
+
+* Buscamos si alguno tiene mandado el flag de no enviar
+    LOOP AT i_interlocutores ASSIGNING FIELD-SYMBOL(<inter>) WHERE email IS INITIAL.
+      SELECT SINGLE no_mail_albaran FROM ztsd0012
+        INTO <inter>-no_mail_albaran
+       WHERE lifnr = <inter>-lifnr
+         AND parvw = <inter>-parvw
+         AND no_mail_albaran = 'X'.
+      IF sy-subrc = 0.
+        <inter>-message = 'Marcado para no recibir albarán'.
+      ELSE.
+        SELECT smtp_addr FROM adr6 JOIN lfa1 ON adr6~addrnumber = lfa1~adrnr
+          INTO TABLE @DATA(i_adr6)
+         WHERE lifnr = @<inter>-lifnr.
+        IF sy-subrc NE 0.
+          <inter>-message = 'Interlocutor sin mail'.
+        ELSE.
+          LOOP AT i_adr6 ASSIGNING FIELD-SYMBOL(<adr6>).
+            IF sy-tabix = 1.
+              DATA(l_inter) = <inter>.
+              <inter>-email = <adr6>-smtp_addr.
+            ELSE.
+              l_inter-email = <adr6>-smtp_addr..
+              APPEND l_inter TO i_interlocutores.
+            ENDIF.
+          ENDLOOP.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+    SORT i_interlocutores.
+
+    LOOP AT i_asig ASSIGNING <asig> where lifnr = ''.
+      DATA(l_cont) = 0.
+      LOOP AT i_interlocutores ASSIGNING <inter> WHERE kunnr = <asig>-kunnr.
+        IF l_cont IS INITIAL.
+          DATA(l_asig) = <asig>.
+          <asig>-parvw = <inter>-parvw.
+          <asig>-lifnr = <inter>-lifnr.
+          <asig>-email = <inter>-email.
+          <asig>-message = <inter>-message.
+        ELSE.
+          l_asig-parvw = <inter>-parvw.
+          l_asig-lifnr = <inter>-lifnr.
+          l_asig-email = <inter>-email.
+          l_asig-message = <inter>-message.
+          APPEND l_asig TO i_asig.
+        ENDIF.
+        ADD 1 TO l_cont.
+      ENDLOOP.
+      IF sy-subrc NE 0.
+        <asig>-message = 'Cliente sin interlocutores'.
+      ENDIF.
+    ENDLOOP.
+    SORT i_asig.
+
+  ENDMETHOD.

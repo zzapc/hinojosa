@@ -1,0 +1,2583 @@
+FUNCTION zspp_if_omp_fb_pln.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(INPUT_METHOD) LIKE  BDWFAP_PAR-INPUTMETHD
+*"     VALUE(MASS_PROCESSING) LIKE  BDWFAP_PAR-MASS_PROC
+*"     REFERENCE(I_SCHED_TYPE) TYPE  ETTYP OPTIONAL
+*"  EXPORTING
+*"     VALUE(WORKFLOW_RESULT) LIKE  BDWF_PARAM-RESULT
+*"     VALUE(APPLICATION_VARIABLE) LIKE  BDWF_PARAM-APPL_VAR
+*"     VALUE(IN_UPDATE_TASK) LIKE  BDWFAP_PAR-UPDATETASK
+*"     VALUE(CALL_TRANSACTION_DONE) LIKE  BDWFAP_PAR-CALLTRANS
+*"  TABLES
+*"      IDOC_CONTRL STRUCTURE  EDIDC
+*"      IDOC_DATA STRUCTURE  EDIDD
+*"      IDOC_STATUS STRUCTURE  BDIDOCSTAT
+*"      RETURN_VARIABLES STRUCTURE  BDWFRETVAR
+*"      SERIALIZATION_INFO STRUCTURE  BDI_SER
+*"  EXCEPTIONS
+*"      WRONG_FUNCTION_CALLED
+*"----------------------------------------------------------------------
+
+  DATA(lo_log) =  NEW zcl_seidor_guardar_log( ).
+  lo_log->refresh( ).
+  IF go_log IS NOT INITIAL.
+    go_log->refresh( ).
+    CLEAR go_log.
+  ENDIF.
+
+  DATA lv_reintentos TYPE i.
+
+  lv_reintentos = 4.
+
+  CONSTANTS: c_processed_idocs(15) VALUE 'Processed_IDOCs',
+             c_appl_objects(12)    VALUE 'Appl_Objects'.
+
+  DATA: wa_head           TYPE zspp_order_head,
+        wa_oper           TYPE zspp_order_oper,
+        it_oper           TYPE TABLE OF zspp_order_oper,
+        wa_comp           TYPE zspp_order_compo,
+        it_comp           TYPE TABLE OF zspp_order_compo,
+        lv_cantidad_modif TYPE menge_d.
+  DATA num_heads TYPE i.
+  CLEAR num_heads.
+
+  TRY .
+      DATA(lv_mensaje) = idoc_contrl[ 1 ]-mestyp.
+    CATCH cx_root.
+  ENDTRY.
+  SELECT SINGLE waitsec INTO @DATA(lv_waitsec) FROM zsppt_wait WHERE funcion EQ 'ZSPP_IF_OMP_FB_PLN'.
+  "Por la forma en que nos enviará la información OMP puede venir en varios STEPS que corresponden a la misma operación
+  "y por tanto tener varios CI_NUMBER para las OF y operaciones de la misma, así como distintas fechas para los pasos de
+  "máquina, de modo que debemos recorrer la infomración y quedarnos con las fechas que corresponan de más temprana
+  "y más tardía
+*  LOOP AT idoc_data INTO DATA(wa_data_head) WHERE segnam EQ 'ZSPP_ORDER_HEAD'.
+  LOOP AT idoc_data ASSIGNING FIELD-SYMBOL(<wa_data_head>) WHERE segnam EQ 'ZSPP_ORDER_HEAD'.
+    wa_head = <wa_data_head>-sdata.
+
+    CLEAR: wa_head-ffin_prog, wa_head-fini_prog.
+
+    LOOP AT idoc_data INTO DATA(wa_data) WHERE segnam EQ 'ZSPP_ORDER_OPER' AND docnum EQ <wa_data_head>-docnum.
+      wa_oper = wa_data-sdata.
+
+      DATA lv_aufn_aux1 TYPE aufnr.
+      DATA lv_aufn_aux2 TYPE aufnr.
+      lv_aufn_aux1 = wa_oper-secuencia.
+      lv_aufn_aux2 = wa_head-orden.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = lv_aufn_aux1
+        IMPORTING
+          output = lv_aufn_aux1.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = lv_aufn_aux2
+        IMPORTING
+          output = lv_aufn_aux2.
+
+      IF lv_aufn_aux1 <> lv_aufn_aux2 AND ( lv_mensaje EQ 'ZIF_OMP_FB_PLANNINGVIEW' OR lv_mensaje EQ 'ZIF_OMP_FB_PLN' ).
+        DATA(lv_error_datos_pi) = 'X'.
+        EXIT.
+      ENDIF.
+
+      CLEAR: lv_aufn_aux1, lv_aufn_aux2.
+
+      wa_oper-operacion = |{ wa_oper-operacion ALPHA = IN }|.
+      IF wa_head-fini_prog > wa_oper-fini_oper.
+        wa_head-fini_prog = wa_oper-fini_oper.
+      ENDIF.
+      IF wa_head-ffin_prog < wa_oper-ffin_oper.
+        wa_head-ffin_prog = wa_oper-ffin_oper.
+      ENDIF.
+
+      APPEND wa_oper TO it_oper.
+    ENDLOOP.
+    LOOP AT idoc_data INTO wa_data WHERE segnam EQ 'ZSPP_ORDER_COMPO' AND docnum EQ <wa_data_head>-docnum.
+      wa_comp = wa_data-sdata.
+      AT FIRST.
+        wa_head-fini_prog = wa_oper-fini_oper.
+      ENDAT.
+      lv_aufn_aux1 = wa_comp-reserva.
+      lv_aufn_aux2 = wa_head-orden.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = lv_aufn_aux1
+        IMPORTING
+          output = lv_aufn_aux1.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = lv_aufn_aux2
+        IMPORTING
+          output = lv_aufn_aux2.
+
+*      IF lv_aufn_aux1 <> lv_aufn_aux2 AND lv_mensaje EQ 'ZIF_OMP_FB_PLANNINGVIEW'.
+      DATA(lv_error_datos_pi2) = ' '.
+*        EXIT.
+*      ENDIF.
+
+      CLEAR: lv_aufn_aux1, lv_aufn_aux2.
+
+      REPLACE ALL OCCURRENCES OF '/' IN wa_comp-material WITH ''.
+      CONDENSE wa_comp-material NO-GAPS.
+      CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+        EXPORTING
+          input        = wa_comp-material
+        IMPORTING
+          output       = wa_comp-material
+        EXCEPTIONS
+          length_error = 1
+          OTHERS       = 2.
+      IF sy-subrc <> 0.
+* Implement suitable error handling here
+      ENDIF.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wa_comp-posicion
+        IMPORTING
+          output = wa_comp-posicion.
+      IF sy-subrc <> 0.
+* Implement suitable error handling here
+      ENDIF.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wa_comp-asig_oper
+        IMPORTING
+          output = wa_comp-asig_oper.
+      IF sy-subrc <> 0.
+* Implement suitable error handling here
+      ENDIF.
+      APPEND wa_comp TO it_comp.
+    ENDLOOP.
+    num_heads = num_heads + 1.
+  ENDLOOP.
+  DATA(it_cinumbers) = it_oper[].
+  SORT it_oper BY operacion ASCENDING.
+  DATA(it_auxiliar) = it_oper[].
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = wa_head-orden
+    IMPORTING
+      output = wa_head-orden.
+
+  SELECT SINGLE aufnr INTO @DATA(lv_aufnr) FROM aufk WHERE aufnr EQ @wa_head-orden.
+  IF sy-subrc = 0.
+
+
+    REFRESH it_auxiliar.
+    LOOP AT it_oper INTO DATA(w01).
+      DATA(lv_cuenta) = 1.
+      LOOP AT it_oper INTO DATA(w02) WHERE operacion = w01-operacion.
+        IF lv_cuenta = 1.
+          APPEND INITIAL LINE TO it_auxiliar ASSIGNING FIELD-SYMBOL(<fs03>).
+          MOVE-CORRESPONDING w02 TO <fs03>.
+          <fs03>-operacion = |{ <fs03>-operacion ALPHA = IN }|.
+        ELSE.
+          "sumamos los tiempos de los distintos steps y además las cantidades de la operación
+          <fs03>-tiempo_prep = <fs03>-tiempo_prep + w02-tiempo_prep.
+          <fs03>-tiempo_ejec = <fs03>-tiempo_ejec + w02-tiempo_ejec.
+          <fs03>-cant_base_op = <fs03>-cant_base_op + w02-cant_base_op.
+
+          IF <fs03>-fini_ejec > w02-fini_ejec.
+            <fs03>-fini_ejec = w02-fini_ejec.
+            <fs03>-hini_ejec = w02-hini_ejec.
+          ENDIF.
+          IF <fs03>-hini_ejec > w02-hini_ejec AND <fs03>-fini_ejec >= w02-fini_ejec .
+            <fs03>-hini_ejec = w02-hini_ejec.
+          ENDIF.
+
+          IF <fs03>-fini_desmont < w02-fini_desmont.
+            <fs03>-fini_desmont = w02-fini_desmont.
+            <fs03>-hini_desmont = w02-hini_desmont.
+          ENDIF.
+          IF <fs03>-hini_desmont < w02-hini_desmont AND <fs03>-fini_desmont <= w02-fini_desmont.
+            <fs03>-hini_desmont = w02-hini_desmont.
+          ENDIF.
+          IF <fs03>-ffin_oper < w02-ffin_oper.
+            <fs03>-ffin_oper = w02-ffin_oper.
+            <fs03>-hfin_oper = w02-hfin_oper.
+          ENDIF.
+          IF <fs03>-hfin_oper < w02-hfin_oper AND <fs03>-ffin_oper <= w02-hfin_oper.
+            <fs03>-hfin_oper = w02-hfin_oper.
+          ENDIF.
+
+        ENDIF.
+        lv_cuenta = lv_cuenta + 1.
+      ENDLOOP.
+    ENDLOOP.
+
+    SORT it_auxiliar BY operacion ASCENDING.
+    DELETE ADJACENT DUPLICATES FROM it_auxiliar COMPARING operacion.
+
+    it_oper[] = it_auxiliar[].
+
+    IF lv_mensaje CS 'FB_UNPLN' .
+      "Para desplanificar veremos si vienen varios RUN pues si vienen varios RUNs los informamos en los campos
+*  <USERFIELD01>000100000768/5</USERFIELD01>
+*  <USERFIELD02>000100000768</USERFIELD02>
+*  <USERFIELD03>unplanned</USERFIELD03>
+      "de los distintos segmentos COMPO, de modo que tenemos que casarlos con los RUNNIDs que nos hemos guardado
+      "en la tabla CINUMBERS para eliminar aquellos que no apliquen ya pues estarán desplanificados
+      "Dado que vienen en orden los iremos casando en una tabla interna con sus respectivas operaciones o STEPs
+      TYPES: BEGIN OF ty_runs,
+               processid TYPE zspp_processid,
+               status    TYPE text20,
+               runnr     TYPE i,
+               aufnr     TYPE aufnr,
+             END OF ty_runs.
+      DATA it_runs TYPE TABLE OF ty_runs.
+      DATA lv_run TYPE i.
+      CLEAR: it_runs[], it_runs, lv_run.
+      LOOP AT it_cinumbers ASSIGNING FIELD-SYMBOL(<fs_op>) GROUP BY ( userfield06 = <fs_op>-userfield06 ).
+        LOOP AT GROUP <fs_op> ASSIGNING FIELD-SYMBOL(<fs_op2>).
+          APPEND INITIAL LINE TO it_runs ASSIGNING FIELD-SYMBOL(<run>).
+          <run>-aufnr = <fs_op2>-secuencia.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING
+              input  = <run>-aufnr
+            IMPORTING
+              output = <run>-aufnr.
+          <run>-runnr = lv_run = lv_run + 1.
+          <run>-processid = <fs_op2>-userfield06.
+          EXIT.
+        ENDLOOP.
+      ENDLOOP.
+
+      "Con la tabla IT_RUNS rellena, casamos con los RUNS que nos han llegado en el segmento COMPO
+      "para saber su status de PLANIFICADO o UNPLANNED
+      LOOP AT it_comp ASSIGNING FIELD-SYMBOL(<fs_com>).
+        SPLIT <fs_com>-userfield01 AT '/' INTO DATA(lv_orden) DATA(lv_runnr).
+        READ TABLE it_runs ASSIGNING <run> WITH KEY runnr = lv_runnr.
+        IF sy-subrc = 0.
+          <run>-status = <fs_com>-userfield03.
+        ELSE.
+          APPEND INITIAL LINE TO it_runs ASSIGNING <run>.
+          <run>-aufnr = lv_orden.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING
+              input  = <run>-aufnr
+            IMPORTING
+              output = <run>-aufnr.
+          <run>-runnr = lv_runnr.
+          <run>-processid = ''.
+          <run>-status = <fs_com>-userfield03.
+        ENDIF.
+      ENDLOOP.
+
+    ELSE.
+
+      DATA(it_compoaux) = it_comp[].
+      REFRESH it_compoaux.
+      SORT it_comp BY posicion ASCENDING.
+      LOOP AT it_comp ASSIGNING FIELD-SYMBOL(<fs_aux1>) GROUP BY ( posicion = <fs_aux1>-posicion
+                                                                   material = <fs_aux1>-material
+                                                                   concept_clas = <fs_aux1>-concept_clas ).
+        lv_cuenta = 1.
+        LOOP AT GROUP <fs_aux1> ASSIGNING FIELD-SYMBOL(<fs_aux2>).
+          IF lv_cuenta = 1.
+            APPEND INITIAL LINE TO it_compoaux ASSIGNING FIELD-SYMBOL(<compoaux>).
+            MOVE-CORRESPONDING <fs_aux2> TO <compoaux>.
+          ELSE.
+            DATA: lv_menge2 TYPE menge_d,
+                  lv_menge1 TYPE menge_d.
+            lv_menge1 = <compoaux>-cantidad_kg.
+            lv_menge2 = <fs_aux2>-cantidad_kg.
+            <compoaux>-cantidad_kg = lv_menge1 + lv_menge2.
+
+            lv_menge1 = <compoaux>-cantidad_m.
+            lv_menge2 = <fs_aux2>-cantidad_m.
+            <compoaux>-cantidad_m = lv_menge1 + lv_menge2.
+          ENDIF.
+          lv_cuenta = lv_cuenta + 1.
+        ENDLOOP.
+      ENDLOOP.
+
+      DATA(it_cinumbers_compo) = it_comp[].
+
+      it_comp[] = it_compoaux[].
+      SORT it_comp.
+      DELETE ADJACENT DUPLICATES FROM it_comp.
+
+    ENDIF.
+
+    IF num_heads > 1.
+      workflow_result = '99999'.
+      CLEAR idoc_status.
+      idoc_status-msgty    = 'E'.
+      idoc_status-msgid    = '00'.
+      idoc_status-msgno    = '398'.
+      idoc_status-msgv1    = 'Se ha enviado más de una cabecera'.
+      idoc_status-msgv2    = ''.
+      idoc_status-msgv3    = ''.
+      idoc_status-msgv4    = ''.
+      idoc_status-status   = '51'.
+      idoc_status-repid    = sy-repid.
+      CLEAR return_variables.
+      return_variables-wf_param = 'Error_IDOCs'.
+      LOOP AT idoc_contrl.
+        idoc_status-docnum = idoc_contrl-docnum.
+        APPEND idoc_status.
+        return_variables-doc_number = idoc_contrl-docnum.
+        APPEND return_variables.
+      ENDLOOP.
+
+      DATA(lv_error) = 'X'.
+    ELSEIF num_heads = 0.
+      workflow_result = '99999'.
+      CLEAR idoc_status.
+      idoc_status-msgty    = 'E'.
+      idoc_status-msgid    = '00'.
+      idoc_status-msgno    = '398'.
+      idoc_status-msgv1    = 'No se ha enviado ninguna cabecera'.
+      idoc_status-msgv2    = ''.
+      idoc_status-msgv3    = ''.
+      idoc_status-msgv4    = ''.
+      idoc_status-status   = '51'.
+      idoc_status-repid    = sy-repid.
+      CLEAR return_variables.
+      return_variables-wf_param = 'Error_IDOCs'.
+      LOOP AT idoc_contrl.
+        idoc_status-docnum = idoc_contrl-docnum.
+        APPEND idoc_status.
+        return_variables-doc_number = idoc_contrl-docnum.
+        APPEND return_variables.
+      ENDLOOP.
+
+      lv_error = 'X'.
+    ELSE.
+      lv_error = space.
+    ENDIF.
+
+    IF  lv_error_datos_pi2 EQ 'X' OR lv_error_datos_pi EQ 'X'.
+      lv_error = 'X'.
+
+      workflow_result = '99999'.
+      CLEAR idoc_status.
+      idoc_status-msgty    = 'E'.
+      idoc_status-msgid    = '00'.
+      idoc_status-msgno    = '398'.
+      idoc_status-msgv1    = 'Error de mapeos en PI'.
+      idoc_status-msgv2    = ''.
+      idoc_status-msgv3    = ''.
+      idoc_status-msgv4    = ''.
+      idoc_status-status   = '51'.
+      idoc_status-repid    = sy-repid.
+      CLEAR return_variables.
+      return_variables-wf_param = 'Error_IDOCs'.
+      LOOP AT idoc_contrl.
+        idoc_status-docnum = idoc_contrl-docnum.
+        APPEND idoc_status.
+        return_variables-doc_number = idoc_contrl-docnum.
+        APPEND return_variables.
+      ENDLOOP.
+
+    ENDIF.
+
+    DATA: lv_hora_fin TYPE syuzeit,
+          lv_hora_ini TYPE syuzeit.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = wa_head-orden
+      IMPORTING
+        output = wa_head-orden.
+
+    SELECT SINGLE werks INTO @DATA(lv_werks) FROM aufk WHERE aufnr EQ @wa_head-orden.
+
+    IF lv_error EQ space.
+      SELECT SINGLE aufpl INTO @DATA(lv_aufpl) FROM afko WHERE aufnr EQ @wa_head-orden.
+
+      SELECT * INTO TABLE @DATA(it_totoper) FROM afvc WHERE aufpl EQ @lv_aufpl AND loekz EQ @space.
+      SORT it_totoper BY vornr ASCENDING.
+      DESCRIBE TABLE it_totoper LINES DATA(totales).
+      DESCRIBE TABLE it_oper LINES DATA(enviadas).
+      SORT it_oper BY operacion ASCENDING.
+      IF totales <> enviadas.
+        "Deberemos actualizar la operación no enviada, que normalmente será la de paletizado
+        LOOP AT it_totoper INTO DATA(wa_totales2).
+          SELECT SINGLE * INTO @DATA(wa_totales) FROM afvv WHERE aufpl EQ @wa_totales2-aufpl AND aplzl EQ @wa_totales2-aplzl.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING
+              input  = wa_totales2-vornr
+            IMPORTING
+              output = wa_totales2-vornr.
+          READ TABLE it_oper WITH KEY operacion = wa_totales2-vornr TRANSPORTING NO FIELDS.
+          IF sy-subrc <> 0.
+            "Debemos calcular en base a la
+            DATA(total_duracion_oper) = wa_totales-vgw01 + wa_totales-vgw02 + wa_totales-vgw03.
+            "Encontramos la operación anterior
+            LOOP AT it_oper INTO DATA(operacion_aux) WHERE operacion < wa_totales2-vornr.
+            ENDLOOP.
+            IF sy-subrc = 0.
+              APPEND INITIAL LINE TO it_oper ASSIGNING FIELD-SYMBOL(<oper>).
+              <oper>-operacion = wa_totales2-vornr.
+              <oper>-fini_prep = operacion_aux-fini_ejec.
+              <oper>-hini_prep = operacion_aux-hini_ejec.
+              "calculamos el inicio de la operación en base a la duración de la operación anterior
+              DATA lv_auxiliar TYPE ad_tstamp.
+              CONVERT DATE <oper>-fini_prep TIME <oper>-hini_prep INTO TIME STAMP DATA(lv_auxiliar_ts) TIME ZONE sy-zonlo.
+              lv_auxiliar = lv_auxiliar_ts.
+              DATA duracion TYPE i.
+              duracion = operacion_aux-tiempo_ejec. "Vendrá en segundos
+              CALL FUNCTION 'ADDR_ADD_TO_TIMESTAMP'
+                EXPORTING
+                  iv_seconds   = duracion
+                CHANGING
+                  cv_timestamp = lv_auxiliar.
+              lv_auxiliar_ts = lv_auxiliar.
+              CONVERT TIME STAMP lv_auxiliar_ts TIME ZONE sy-zonlo INTO DATE <oper>-fini_prep TIME <oper>-hini_prep.
+              "Ahora sumamos la duración de preparación, pasandolo a segundos
+              IF wa_totales-vge01 EQ 'MIN'.
+                wa_totales-vgw01 = wa_totales-vgw01 * 60.
+              ELSEIF wa_totales-vge01 EQ 'H'.
+                wa_totales-vgw01 = wa_totales-vgw01 * 60 * 60.
+              ENDIF.
+              duracion = wa_totales-vgw01.
+              CLEAR lv_auxiliar_ts.
+              <oper>-fini_ejec = <oper>-fini_prep.
+              <oper>-hini_ejec = <oper>-hini_prep.
+              CONVERT DATE <oper>-fini_ejec TIME <oper>-hini_ejec INTO TIME STAMP lv_auxiliar_ts TIME ZONE sy-zonlo.
+              lv_auxiliar = lv_auxiliar_ts.
+              CALL FUNCTION 'ADDR_ADD_TO_TIMESTAMP'
+                EXPORTING
+                  iv_seconds   = duracion
+                CHANGING
+                  cv_timestamp = lv_auxiliar.
+              lv_auxiliar_ts = lv_auxiliar.
+              CONVERT TIME STAMP lv_auxiliar_ts TIME ZONE sy-zonlo INTO DATE <oper>-fini_ejec TIME <oper>-hini_ejec.
+
+              IF wa_totales-vge02 EQ 'MIN'.
+                wa_totales-vgw02 = wa_totales-vgw02 * 60.
+              ELSEIF wa_totales-vge02 EQ 'H'.
+                wa_totales-vgw02 = wa_totales-vgw02 * 60 * 60.
+              ENDIF.
+              duracion = wa_totales-vgw02.
+              CLEAR lv_auxiliar_ts.
+              <oper>-fini_desmont = <oper>-fini_ejec.
+              <oper>-hini_desmont = <oper>-hini_ejec.
+              CONVERT DATE <oper>-fini_desmont TIME <oper>-hini_desmont INTO TIME STAMP lv_auxiliar_ts TIME ZONE sy-zonlo.
+              lv_auxiliar = lv_auxiliar_ts.
+              CALL FUNCTION 'ADDR_ADD_TO_TIMESTAMP'
+                EXPORTING
+                  iv_seconds   = duracion
+                CHANGING
+                  cv_timestamp = lv_auxiliar.
+              lv_auxiliar_ts = lv_auxiliar.
+              CONVERT TIME STAMP lv_auxiliar_ts TIME ZONE sy-zonlo INTO DATE <oper>-fini_desmont TIME <oper>-hini_desmont.
+
+              <oper>-fini_oper = <oper>-fini_prep.
+              <oper>-hini_oper = <oper>-hini_prep.
+
+              IF wa_totales-vge03 EQ 'MIN'.
+                wa_totales-vgw03 = wa_totales-vgw03 * 60.
+              ELSEIF wa_totales-vge03 EQ 'H'.
+                wa_totales-vgw03 = wa_totales-vgw03 * 60 * 60.
+              ENDIF.
+              duracion = wa_totales-vgw03.
+              CLEAR lv_auxiliar.
+              <oper>-ffin_oper = <oper>-fini_desmont.
+              <oper>-hfin_oper = <oper>-hini_desmont.
+              CONVERT DATE <oper>-ffin_oper TIME <oper>-hfin_oper INTO TIME STAMP lv_auxiliar_ts TIME ZONE sy-zonlo.
+              lv_auxiliar = lv_auxiliar_ts.
+              CALL FUNCTION 'ADDR_ADD_TO_TIMESTAMP'
+                EXPORTING
+                  iv_seconds   = duracion
+                CHANGING
+                  cv_timestamp = lv_auxiliar.
+              lv_auxiliar_ts = lv_auxiliar.
+              CONVERT TIME STAMP lv_auxiliar_ts TIME ZONE sy-zonlo INTO DATE <oper>-ffin_oper TIME <oper>-hfin_oper.
+              wa_head-hfin_prog = <oper>-hfin_oper.
+              wa_head-ffin_prog = <oper>-ffin_oper.
+
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+
+      CLEAR: lv_hora_fin, lv_hora_ini.
+
+      "Ordenamos por operacion/fecha/hora y ajustamos
+      SORT it_oper BY operacion fini_oper hini_oper ASCENDING.
+
+      LOOP AT it_oper ASSIGNING FIELD-SYMBOL(<fs_oper>).
+        LOOP AT it_oper ASSIGNING FIELD-SYMBOL(<fs_oper2>) WHERE operacion = <fs_oper>-operacion.
+          "La fecha inicio operacion siempre será la más baja
+          <fs_oper2>-fini_oper = <fs_oper>-fini_oper.
+          <fs_oper2>-hini_oper = <fs_oper>-hini_oper.
+          "La fecha inicio preparacion siempre será la más baja
+          <fs_oper2>-fini_prep = <fs_oper>-fini_oper.
+          <fs_oper2>-hini_prep = <fs_oper>-hini_oper.
+          "La fecha inicio ejecución siempre será la más baja
+          <fs_oper2>-fini_ejec = <fs_oper>-fini_ejec.
+          <fs_oper2>-hini_ejec = <fs_oper>-hini_ejec.
+
+          "La fecha inicio desmontaje será la más alta
+          IF ( ( <fs_oper2>-fini_desmont < <fs_oper>-ffin_oper ) OR
+          ( <fs_oper2>-fini_desmont = <fs_oper>-ffin_oper AND <fs_oper2>-hini_desmont < <fs_oper>-hfin_oper ) ).
+            <fs_oper2>-fini_desmont = <fs_oper>-ffin_oper.
+            <fs_oper2>-hini_desmont = <fs_oper>-hfin_oper.
+          ENDIF.
+          IF <fs_oper2>-ffin_oper < <fs_oper>-ffin_oper OR
+          ( <fs_oper2>-ffin_oper = <fs_oper>-ffin_oper AND <fs_oper2>-hfin_oper < <fs_oper>-hfin_oper ).
+            <fs_oper2>-ffin_oper = <fs_oper>-ffin_oper.
+            <fs_oper2>-hfin_oper = <fs_oper>-hfin_oper.
+          ENDIF.
+
+          lv_hora_fin = <fs_oper2>-hfin_oper.
+
+          IF lv_hora_ini IS INITIAL.
+
+            lv_hora_ini = <fs_oper2>-hini_oper.
+
+          ENDIF.
+
+
+        ENDLOOP.
+      ENDLOOP.
+
+
+      DATA: lv_number        LIKE  bapi_order_key-order_number,
+            lv_order_objects LIKE  bapi_pp_order_objects,
+            wa_return        LIKE  bapiret2,
+            it_header        TYPE TABLE OF bapi_order_header1,
+            it_position      TYPE TABLE OF  bapi_order_item,
+            it_sequence      TYPE TABLE OF  bapi_order_sequence,
+            it_operation     TYPE TABLE OF  bapi_order_operation1,
+            it_trigger_point TYPE TABLE OF  bapi_order_trigger_point,
+            it_component     TYPE TABLE OF  bapi_order_component,
+            it_prod_rel_tool TYPE TABLE OF  bapi_order_prod_rel_tools.
+
+      lv_number = wa_head-orden.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = lv_number
+        IMPORTING
+          output = lv_number.
+      lv_order_objects = 'XXXXXXXX'.
+      CLEAR wa_return.
+
+      CALL FUNCTION 'BAPI_PRODORD_GET_DETAIL'
+        EXPORTING
+          number        = lv_number
+*         COLLECTIVE_ORDER       =
+          order_objects = lv_order_objects
+        IMPORTING
+          return        = wa_return
+        TABLES
+          header        = it_header
+          position      = it_position
+          sequence      = it_sequence
+          operation     = it_operation
+          trigger_point = it_trigger_point
+          component     = it_component
+          prod_rel_tool = it_prod_rel_tool.
+
+      CASE wa_return-type.
+        WHEN 'E' OR 'A' OR 'X'.
+          workflow_result = '99999'.
+          CLEAR idoc_status.
+          idoc_status-msgty    = wa_return-type.
+          idoc_status-msgid    = wa_return-id.
+          idoc_status-msgno    = wa_return-number.
+          idoc_status-msgv1    = wa_return-message_v1.
+          idoc_status-msgv2    = wa_return-message_v2.
+          idoc_status-msgv3    = wa_return-message_v3.
+          idoc_status-msgv4    = wa_return-message_v4.
+          idoc_status-status   = '51'.
+          idoc_status-repid    = sy-repid.
+          CLEAR return_variables.
+          return_variables-wf_param = 'Error_IDOCs'.
+          LOOP AT idoc_contrl.
+            idoc_status-docnum = idoc_contrl-docnum.
+            APPEND idoc_status.
+            return_variables-doc_number = idoc_contrl-docnum.
+            APPEND return_variables.
+          ENDLOOP.
+
+          lv_error = 'X'.
+      ENDCASE.
+
+      DATA lv_objnr TYPE jsto-objnr.
+      SELECT SINGLE objnr INTO @lv_objnr FROM aufk WHERE aufnr EQ @wa_head-orden.
+
+      IF lv_error = space.
+
+        "Si se envía el FB_UNPLN o el STATUS UNPLANNED (al final es lo mismo indistintamente) debemos desliberar la
+        "orden si estuviese liberada y desmarcar el status PLAN si estuviese activo
+        "Comprobamos si TODOS los RUNS que vienen en el fichero vienen con status UNPLANNED, sino no hay que releer datos maestros
+        "sino que se deberá comportar como un FB_PLN sin tener en cuenta la operación desplanificada, la cual deberemos
+        "eliminar de la tabla CI_NUMBERS
+        DATA lv_desplanificar TYPE xfeld.
+        CLEAR lv_desplanificar.
+        LOOP AT it_runs TRANSPORTING NO FIELDS WHERE status <> 'unplanned' AND status <> 'UNPLANNED'.
+          EXIT.
+        ENDLOOP.
+        IF sy-subrc <> 0.
+          "Todos los RUNS son UNPLANNED, por tanto desplanificamos y releemos datos maestros
+          lv_desplanificar = abap_true.
+        ENDIF.
+        IF " ( wa_head-status EQ 'UNPLANNED' OR wa_head-status EQ 'unplanned' ) OR
+        lv_mensaje EQ 'ZIF_OMP_FB_UNPLN' AND lv_desplanificar = abap_true.
+          DATA(lv_desplanificada) = 'X'.
+
+          DATA: lv_lgnum TYPE lgnum,
+                rg_tbnum TYPE RANGE OF ltbk-tbnum,
+                rg_statu TYPE RANGE OF ltbk-statu,
+                rg_benum TYPE RANGE OF ltbk-benum,
+                rg_bdatu TYPE RANGE OF ltbk-bdatu,
+                rg_bwlvs TYPE RANGE OF ltbk-bwlvs,
+                r_del    TYPE xfeld,
+                p_test   TYPE flag,
+                p_modo   TYPE c.
+
+          CLEAR:lv_lgnum, rg_tbnum, rg_statu, rg_benum, rg_bdatu, rg_bwlvs.
+          REFRESH: rg_tbnum, rg_statu, rg_benum, rg_bdatu, rg_bwlvs.
+          "JVM - 11/05/2023 - Adaptaciones para centro
+*          CASE lv_werks.
+*            WHEN '2001'.
+*              lv_lgnum = '201'.
+*            WHEN '2003'.
+*              lv_lgnum = '203'.
+*            WHEN OTHERS.
+*          ENDCASE.
+          SELECT SINGLE lgnum INTO lv_lgnum FROM t320 WHERE werks = lv_werks.
+          "FJVM - 11/05/2023
+*      •  Número de almacén 201 para werks de la OF 2001 y 203 para werks dela OF 2003
+*      •  Nº NT indicamos desde 1 hasta 999999999999
+*      •  Número de necesidad = AUFNR
+*      •  Staatus cabecera <> E
+*      •  Marcar flag Borrar necesidad
+*      •  Desmarcar ejectuar modo test
+          APPEND INITIAL LINE TO rg_tbnum ASSIGNING FIELD-SYMBOL(<tbnum>).
+          <tbnum>-sign = 'I'.
+          <tbnum>-option = 'BT'.
+          <tbnum>-low = 1.
+          <tbnum>-high = 999999999999.
+          APPEND INITIAL LINE TO rg_statu ASSIGNING FIELD-SYMBOL(<statu>).
+          <statu>-sign = 'I'.
+          <statu>-option = 'NE'.
+          <statu>-low = 'E'.
+          APPEND INITIAL LINE TO rg_benum ASSIGNING FIELD-SYMBOL(<benum>).
+          <benum>-sign = 'I'.
+          <benum>-option = 'EQ'.
+          <benum>-low = |{ lv_number ALPHA = OUT }|.
+          "INI JVM - Grafos al replanificar no se están borrando sus NTs
+          zspp_utils=>get_ofs_grafo(
+            EXPORTING
+              i_aufnr    = lv_number
+            IMPORTING
+              o_tt_aufnr = DATA(lt_ofs_grafo)
+          ).
+          LOOP AT lt_ofs_grafo ASSIGNING FIELD-SYMBOL(<grafos>).
+            APPEND INITIAL LINE TO rg_benum ASSIGNING <benum>.
+            <benum>-sign = 'I'.
+            <benum>-option = 'EQ'.
+            <benum>-low = |{ <grafos> ALPHA = OUT }|.
+          ENDLOOP.
+          SORT rg_benum ASCENDING BY low.
+          DELETE ADJACENT DUPLICATES FROM rg_benum COMPARING low.
+          "FJVM - Grafos al replanificar no se están borrando sus NTs
+          SUBMIT zswm_utilidades1 WITH p_lgnum = lv_lgnum
+                                  WITH s_tbnum IN rg_tbnum[]
+                                  WITH s_statu IN rg_statu[]
+                                  WITH s_benum IN rg_benum[]
+                                  WITH s_bdatu IN rg_bdatu[]
+                                  WITH s_bwlvs IN rg_bwlvs[]
+                                  WITH r_del = 'X'
+                                  WITH r_fin = space
+                                  WITH p_test = space
+                                  WITH p_modo = 'N' EXPORTING LIST TO MEMORY AND RETURN.
+
+          DATA rg_aufnr TYPE RANGE OF aufnr.
+          APPEND INITIAL LINE TO rg_aufnr ASSIGNING FIELD-SYMBOL(<aufnr>).
+          <aufnr>-sign = 'I'.
+          <aufnr>-option = 'EQ'.
+          <aufnr>-low = lv_number.
+
+          "INI JVM - Grafos al replanificar no se están borrando sus NTs
+          LOOP AT lt_ofs_grafo ASSIGNING <grafos>.
+            APPEND INITIAL LINE TO rg_aufnr ASSIGNING <aufnr>.
+            <aufnr>-sign = 'I'.
+            <aufnr>-option = 'EQ'.
+            <aufnr>-low = <grafos>.
+          ENDLOOP.
+          SORT rg_aufnr ASCENDING BY low.
+          DELETE ADJACENT DUPLICATES FROM rg_aufnr COMPARING low.
+          "FJVM - Grafos al replanificar no se están borrando sus NTs
+
+
+          DATA: jobname LIKE tbtcjob-jobname VALUE
+                'ZBORRA_NTS'.
+          DATA: jobcount LIKE tbtcjob-jobcount,
+                host     LIKE msxxlist-host.
+          DATA: BEGIN OF starttime.
+                  INCLUDE STRUCTURE tbtcstrt.
+                DATA: END OF starttime.
+          DATA: starttimeimmediate LIKE btch0000-char1 VALUE 'X'.
+
+* Job open
+          CALL FUNCTION 'JOB_OPEN'
+            EXPORTING
+              delanfrep        = ' '
+              jobgroup         = ' '
+              jobname          = jobname
+              sdlstrtdt        = sy-datum
+              sdlstrttm        = sy-uzeit
+            IMPORTING
+              jobcount         = jobcount
+            EXCEPTIONS
+              cant_create_job  = 01
+              invalid_job_data = 02
+              jobname_missing  = 03.
+          IF sy-subrc NE 0.
+            "error processing
+          ENDIF.
+
+* Insert process into job
+          SUBMIT zpsfc243b WITH r_aufnr IN rg_aufnr[]
+          WITH testmode = space
+          WITH update = abap_true
+          USER sy-uname
+          VIA JOB jobname
+          NUMBER jobcount AND RETURN.
+          IF sy-subrc > 0.
+            "error processing
+          ENDIF.
+
+* Close job
+          starttime-sdlstrtdt = sy-datum + 1.
+          starttime-sdlstrttm = '220000'.
+          CALL FUNCTION 'JOB_CLOSE'
+            EXPORTING
+              "            event_id             = starttime-eventid
+              "            event_param          = starttime-eventparm
+              "            event_periodic       = starttime-periodic
+              jobcount             = jobcount
+              jobname              = jobname
+  "           laststrtdt           = starttime-laststrtdt
+  "           laststrttm           = starttime-laststrttm
+  "           prddays              = 1
+  "           prdhours             = 0
+  "           prdmins              = 0
+  "           prdmonths            = 0
+  "           prdweeks             = 0
+  "           sdlstrtdt            = starttime-sdlstrtdt
+  "           sdlstrttm            = starttime-sdlstrttm
+              strtimmed            = starttimeimmediate
+  "           targetsystem         = host
+            EXCEPTIONS
+              cant_start_immediate = 01
+              invalid_startdate    = 02
+              jobname_missing      = 03
+              job_close_failed     = 04
+              job_nosteps          = 05
+              job_notex            = 06
+              lock_failed          = 07
+              OTHERS               = 99.
+          IF sy-subrc EQ 0.
+            "error processing
+          ENDIF.
+
+          DATA v_fin TYPE tbtcv-fin.
+
+          DO.
+            CALL FUNCTION 'SHOW_JOBSTATE'
+              EXPORTING
+                jobcount         = jobcount
+                jobname          = jobname
+              IMPORTING
+                finished         = v_fin
+              EXCEPTIONS
+                jobcount_missing = 1
+                jobname_missing  = 2
+                job_notex        = 3
+                OTHERS           = 4.
+            IF sy-subrc = 0.
+              CHECK v_fin IS NOT INITIAL.
+              EXIT.
+            ELSE.
+              EXIT.
+            ENDIF.
+          ENDDO.
+
+          PERFORM wait_aufnr USING lv_number.
+
+          DATA: wa_orderdata_lib  LIKE  bapi_pp_order_change,
+                wa_orderdatax_lib LIKE  bapi_pp_order_changex,
+                wa_return_unplan  TYPE bapiret2,
+                master_data_read  TYPE bapiflag-bapiflag.
+
+
+          IF lv_waitsec IS INITIAL.
+            WAIT UP TO '2' SECONDS.
+          ELSE.
+            WAIT UP TO lv_waitsec SECONDS.
+          ENDIF.
+
+*        DATA lv_reintentos TYPE i.
+*
+*        lv_reintentos = 4.
+
+          DO lv_reintentos TIMES.
+
+            wa_orderdata_lib-explode_new = abap_true.
+*        wa_orderdatax_lib-explode_new = abap_true.
+            CALL FUNCTION 'BAPI_PRODORD_CHANGE'
+              EXPORTING
+                number           = lv_number
+                orderdata        = wa_orderdata_lib
+                orderdatax       = wa_orderdatax_lib
+              IMPORTING
+                return           = wa_return_unplan
+*               order_type       =
+*               order_status     =
+                master_data_read = master_data_read.
+
+*        LOOP AT lt_return_unplan INTO DATA(wa_unplan) WHERE type <> space.
+            CLEAR idoc_status.
+            IF wa_return_unplan-type IS INITIAL.
+              wa_return_unplan-type = 'S'.
+              wa_return_unplan-number = 398.
+              wa_return_unplan-id = '00'.
+              wa_return_unplan-message_v1 = 'Se han leído datos maestros'.
+            ENDIF.
+            idoc_status-msgty    = wa_return_unplan-type.
+            idoc_status-msgid    = wa_return_unplan-id.
+            idoc_status-msgno    = wa_return_unplan-number.
+            idoc_status-msgv1    = wa_return_unplan-message_v1.
+            idoc_status-msgv2    = wa_return_unplan-message_v2.
+            idoc_status-msgv3    = wa_return_unplan-message_v3.
+            idoc_status-msgv4    = wa_return_unplan-message_v4.
+            CLEAR return_variables.
+            return_variables-wf_param = 'Log IDOCs'.
+            LOOP AT idoc_contrl.
+              idoc_status-docnum = idoc_contrl-docnum.
+              APPEND idoc_status.
+              return_variables-doc_number = idoc_contrl-docnum.
+              APPEND return_variables.
+            ENDLOOP.
+
+            CASE wa_return_unplan-type.
+              WHEN 'A' OR 'X' OR 'E'.
+                DATA(var_error_unplan) = 'X'.
+                WAIT UP TO 2 SECONDS.
+              WHEN OTHERS.
+                CLEAR var_error_unplan.
+                EXIT.
+            ENDCASE.
+          ENDDO.
+*        ENDLOOP.
+
+          COMMIT WORK AND WAIT.
+
+*        SELECT SINGLE waitsec INTO @DATA(lv_waitsec) FROM zsppt_wait WHERE funcion EQ 'ZSPP_IF_OMP_FB_PLN'.
+          IF lv_waitsec IS INITIAL.
+            WAIT UP TO '2' SECONDS.
+          ELSE.
+            WAIT UP TO lv_waitsec SECONDS.
+          ENDIF.
+
+          IF ( it_header[ 1 ]-system_status CS 'PLAN' ) AND var_error_unplan = space.
+*unplanned
+            DATA it_stat TYPE TABLE OF jstat.
+            REFRESH it_stat.
+            APPEND INITIAL LINE TO it_stat ASSIGNING FIELD-SYMBOL(<stat>).
+            <stat>-inact = 'X'.
+            <stat>-stat = 'I0513'.
+
+            CALL FUNCTION 'STATUS_CHANGE_INTERN'
+              EXPORTING
+*               CHECK_ONLY          = ' '
+*               CLIENT              = SY-MANDT
+                objnr               = lv_objnr
+*               ZEILE               = ' '
+*               SET_CHGKZ           =
+*    IMPORTING
+*               ERROR_OCCURRED      =
+*               OBJECT_NOT_FOUND    =
+*               STATUS_INCONSISTENT =
+*               STATUS_NOT_ALLOWED  =
+              TABLES
+                status              = it_stat
+              EXCEPTIONS
+                object_not_found    = 1
+                status_inconsistent = 2
+                status_not_allowed  = 3
+                OTHERS              = 4.
+            IF sy-subrc <> 0.
+* Implement suitable error handling here
+              CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+*      IMPORTING
+*        return =     " Return Messages
+                .
+
+              CLEAR idoc_status.
+              idoc_status-msgty    = 'E'.
+              idoc_status-msgid    = '00'.
+              idoc_status-msgno    = '398'.
+              idoc_status-msgv1    = |Error al desactivar status PLAN|.
+              idoc_status-msgv2    = |para la orden { wa_head-orden ALPHA = OUT }|.
+              idoc_status-msgv3    = ''.
+              idoc_status-msgv4    = ''.
+              idoc_status-status   = '62'.
+              idoc_status-repid    = sy-repid.
+              CLEAR return_variables.
+              return_variables-wf_param = 'Log IDOCs'.
+              LOOP AT idoc_contrl.
+                idoc_status-docnum = idoc_contrl-docnum.
+                APPEND idoc_status.
+                return_variables-doc_number = idoc_contrl-docnum.
+                APPEND return_variables.
+              ENDLOOP.
+
+            ELSE.
+              COMMIT WORK AND WAIT.
+
+*            SELECT SINGLE waitsec INTO @lv_waitsec FROM zsppt_wait WHERE funcion EQ 'ZSPP_IF_OMP_FB_PLN'.
+              IF lv_waitsec IS INITIAL.
+                WAIT UP TO '2' SECONDS.
+              ELSE.
+                WAIT UP TO lv_waitsec SECONDS.
+              ENDIF.
+
+
+              CLEAR idoc_status.
+              idoc_status-msgty    = 'S'.
+              idoc_status-msgid    = '00'.
+              idoc_status-msgno    = '398'.
+              idoc_status-msgv1    = |Se ha desactivado status PLAN|.
+              idoc_status-msgv2    = |para la orden { wa_head-orden ALPHA = OUT }|.
+              idoc_status-msgv3    = ''.
+              idoc_status-msgv4    = ''.
+              idoc_status-status   = '62'.
+              idoc_status-repid    = sy-repid.
+              CLEAR return_variables.
+              return_variables-wf_param = 'Log IDOCs'.
+              LOOP AT idoc_contrl.
+                idoc_status-docnum = idoc_contrl-docnum.
+                APPEND idoc_status.
+                return_variables-doc_number = idoc_contrl-docnum.
+                APPEND return_variables.
+              ENDLOOP.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+
+      IF lv_error = space AND lv_desplanificada EQ space.
+
+        "Revisamos si los puestos de trabajo enviados coinciden con los de la OF
+        DATA: wa_return_change    TYPE bapiret2,
+              it_operation_change TYPE cose_t_operation.
+        DATA(it_operation_aux)  = it_operation[].
+
+
+        "INI JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+        CALL METHOD zspp_utils=>get_of_status "JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+          EXPORTING "JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+            i_aufnr   = lv_aufnr "JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+          IMPORTING "JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+            ot_status = DATA(status). "JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+
+        IF line_exists( status[ istat = 'I0001' ] )"JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+          AND NOT line_exists( status[ istat = 'I0002' ] )"JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+          AND NOT line_exists( status[ istat = 'I0045' ] )"JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+          AND NOT line_exists( status[ istat = 'I0076' ] )."JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+
+          LOOP AT it_operation_aux INTO DATA(wa_puesto).
+            READ TABLE it_oper WITH KEY operacion = wa_puesto-operation_number INTO DATA(wa_puesto2).
+            IF wa_puesto-work_center <> wa_puesto2-puesto_trab AND wa_puesto2-puesto_trab IS NOT INITIAL.
+              REFRESH it_operation_change.
+              CLEAR wa_return_change.
+              APPEND INITIAL LINE TO it_operation_change ASSIGNING FIELD-SYMBOL(<change>).
+              <change>-operation = wa_puesto-operation_number.
+              <change>-work_center = wa_puesto2-puesto_trab.
+              <change>-work_center_x = abap_true.
+              DATA num_intentos TYPE i.
+              CLEAR num_intentos.
+              DO lv_reintentos TIMES.
+                CALL FUNCTION 'CO_SE_PRODORD_CHANGE'
+                  EXPORTING
+                    iv_order_number = lv_number
+*                   IS_HEADER       =
+*                   IT_HDR_USER_STATUS       =
+*                   IT_SEQUENCE     =
+                    it_operation    = it_operation_change
+*                   IT_OPR_USER_STATUS       =
+*                   IT_PRT          =
+                    iv_commit       = 'X'
+                  IMPORTING
+                    es_return       = wa_return_change.
+                IF wa_return_change EQ 'E' OR wa_return_change EQ 'A' OR wa_return_change EQ 'X'.
+                  num_intentos = num_intentos + 1.
+                  IF num_intentos = lv_reintentos.
+                    ROLLBACK WORK.
+                    idoc_status-msgty    = wa_return_change-type.
+                    idoc_status-msgid    = wa_return_change-id.
+                    idoc_status-msgno    = wa_return_change-number.
+                    idoc_status-msgv1    = wa_return_change-message_v1.
+                    idoc_status-msgv2    = wa_return_change-message_v2.
+                    idoc_status-msgv3    = wa_return_change-message_v3.
+                    idoc_status-msgv4    = wa_return_change-message_v4.
+                    idoc_status-status   = '51'.
+                    idoc_status-repid    = sy-repid.
+                    CLEAR return_variables.
+                    return_variables-wf_param = 'Error_IDOCs'.
+                    LOOP AT idoc_contrl.
+                      idoc_status-docnum = idoc_contrl-docnum.
+                      APPEND idoc_status.
+                      return_variables-doc_number = idoc_contrl-docnum.
+                      APPEND return_variables.
+                    ENDLOOP.
+                  ELSE.
+                    WAIT UP TO 3 SECONDS.
+                    CONTINUE.
+                  ENDIF.
+
+                ELSE.
+                  COMMIT WORK AND WAIT.
+
+                  IF lv_waitsec IS INITIAL.
+                    WAIT UP TO '2' SECONDS.
+                  ELSE.
+                    WAIT UP TO lv_waitsec SECONDS.
+                  ENDIF.
+
+
+
+                  idoc_status-msgty    = 'S'.
+                  idoc_status-msgid    = '00'.
+                  idoc_status-msgno    = 398.
+                  idoc_status-msgv1    = 'Modificado puesto trabajo, operación:'.
+                  idoc_status-msgv2    = |{ wa_puesto-operation_number ALPHA = OUT }|.
+                  idoc_status-msgv3    = 'nuevo puesto:'.
+                  idoc_status-msgv4    = |{ wa_puesto2-puesto_trab }|.
+                  idoc_status-status   = '62'.
+                  idoc_status-repid    = sy-repid.
+                  CLEAR return_variables.
+                  return_variables-wf_param = 'Modificación'.
+                  LOOP AT idoc_contrl.
+                    idoc_status-docnum = idoc_contrl-docnum.
+                    APPEND idoc_status.
+                    return_variables-doc_number = idoc_contrl-docnum.
+                    APPEND return_variables.
+                  ENDLOOP.
+
+                  PERFORM wait_aufnr USING lv_number.
+                  EXIT.
+                ENDIF.
+              ENDDO.
+            ENDIF.
+          ENDLOOP.
+
+        ENDIF."JVM(SEI)-Dato erroneo puesto de trabajo cambio tras RELEASE
+
+        "Si se envía el status PLANNED lo activamos.
+*      DATA lv_objnr TYPE jsto-objnr.
+*      DATA it_stat TYPE TABLE OF jstat.
+        REFRESH it_stat.
+*      SELECT SINGLE objnr INTO @lv_objnr FROM aufk WHERE aufnr EQ @wa_head-orden.
+        LOOP AT it_oper TRANSPORTING NO FIELDS WHERE status_oper EQ 'PLANNED' OR status_oper EQ 'planned'.
+          DATA(lv_plan) = 'X'.
+          EXIT.
+        ENDLOOP.
+        LOOP AT it_oper TRANSPORTING NO FIELDS WHERE status_oper NE 'UNPLANNED' AND status_oper NE 'unplanned'.
+          EXIT.
+        ENDLOOP.
+        IF sy-subrc <> 0.
+          DATA(lv_unplan) = 'X'.
+        ENDIF.
+        "Con que un run o step está planificado, la OF está planificada y lista para liberar
+        IF ( ( wa_head-status EQ 'PLANNED' OR wa_head-status EQ 'planned' OR lv_plan = 'X' ) AND NOT ( it_header[ 1 ]-system_status CS 'PLAN' ) ).
+          "Comprobamos si la OF está con status PLANNED
+          APPEND INITIAL LINE TO it_stat ASSIGNING <stat>.
+          <stat>-inact = ' '.
+          <stat>-stat = 'I0513'.
+
+          CALL FUNCTION 'STATUS_CHANGE_INTERN'
+            EXPORTING
+*             CHECK_ONLY          = ' '
+*             CLIENT              = SY-MANDT
+              objnr               = lv_objnr
+*             ZEILE               = ' '
+*             SET_CHGKZ           =
+*    IMPORTING
+*             ERROR_OCCURRED      =
+*             OBJECT_NOT_FOUND    =
+*             STATUS_INCONSISTENT =
+*             STATUS_NOT_ALLOWED  =
+            TABLES
+              status              = it_stat
+            EXCEPTIONS
+              object_not_found    = 1
+              status_inconsistent = 2
+              status_not_allowed  = 3
+              OTHERS              = 4.
+          IF sy-subrc <> 0.
+* Implement suitable error handling here
+            CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+*      IMPORTING
+*        return =     " Return Messages
+              .
+
+            CLEAR idoc_status.
+            idoc_status-msgty    = 'E'.
+            idoc_status-msgid    = '00'.
+            idoc_status-msgno    = '398'.
+            idoc_status-msgv1    = |Error al activar status PLAN|.
+            idoc_status-msgv2    = |para la orden { wa_head-orden ALPHA = OUT }|.
+            idoc_status-msgv3    = ''.
+            idoc_status-msgv4    = ''.
+            idoc_status-status   = '62'.
+            idoc_status-repid    = sy-repid.
+            CLEAR return_variables.
+            return_variables-wf_param = 'Log IDOCs'.
+            LOOP AT idoc_contrl.
+              idoc_status-docnum = idoc_contrl-docnum.
+              APPEND idoc_status.
+              return_variables-doc_number = idoc_contrl-docnum.
+              APPEND return_variables.
+            ENDLOOP.
+
+          ELSE.
+*
+*    IF sy-tcode EQ 'SE37'.
+            COMMIT WORK AND WAIT.
+
+            DATA(lv_status_plan_act) = 'X'.
+
+            IF lv_waitsec IS INITIAL.
+              WAIT UP TO '2' SECONDS.
+            ELSE.
+              WAIT UP TO lv_waitsec SECONDS.
+            ENDIF.
+
+*    ENDIF.
+
+*    workflow_result = '99999'.
+            CLEAR idoc_status.
+            idoc_status-msgty    = 'S'.
+            idoc_status-msgid    = '00'.
+            idoc_status-msgno    = '398'.
+            idoc_status-msgv1    = |Se ha activado status PLAN|.
+            idoc_status-msgv2    = |para la orden { wa_head-orden ALPHA = OUT }|.
+            idoc_status-msgv3    = ''.
+            idoc_status-msgv4    = ''.
+            idoc_status-status   = '62'.
+            idoc_status-repid    = sy-repid.
+            CLEAR return_variables.
+            return_variables-wf_param = 'Log IDOCs'.
+            LOOP AT idoc_contrl.
+              idoc_status-docnum = idoc_contrl-docnum.
+              APPEND idoc_status.
+              return_variables-doc_number = idoc_contrl-docnum.
+              APPEND return_variables.
+            ENDLOOP.
+
+          ENDIF.
+
+
+        ELSEIF " ( wa_head-status EQ 'UNPLANNED' OR wa_head-status EQ 'unplanned' or
+          "Todos los RUNS y STEPS deben estar desplanificados
+          ( lv_unplan EQ 'X' ) AND ( it_header[ 1 ]-system_status CS 'PLAN' ).
+*unplanned
+          APPEND INITIAL LINE TO it_stat ASSIGNING <stat>.
+          <stat>-inact = 'X'.
+          <stat>-stat = 'I0513'.
+
+          CALL FUNCTION 'STATUS_CHANGE_INTERN'
+            EXPORTING
+*             CHECK_ONLY          = ' '
+*             CLIENT              = SY-MANDT
+              objnr               = lv_objnr
+*             ZEILE               = ' '
+*             SET_CHGKZ           =
+*    IMPORTING
+*             ERROR_OCCURRED      =
+*             OBJECT_NOT_FOUND    =
+*             STATUS_INCONSISTENT =
+*             STATUS_NOT_ALLOWED  =
+            TABLES
+              status              = it_stat
+            EXCEPTIONS
+              object_not_found    = 1
+              status_inconsistent = 2
+              status_not_allowed  = 3
+              OTHERS              = 4.
+          IF sy-subrc <> 0.
+* Implement suitable error handling here
+            CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+*      IMPORTING
+*        return =     " Return Messages
+              .
+
+            CLEAR idoc_status.
+            idoc_status-msgty    = 'E'.
+            idoc_status-msgid    = '00'.
+            idoc_status-msgno    = '398'.
+            idoc_status-msgv1    = |Error al desactivar status PLAN|.
+            idoc_status-msgv2    = |para la orden { wa_head-orden ALPHA = OUT }|.
+            idoc_status-msgv3    = ''.
+            idoc_status-msgv4    = ''.
+            idoc_status-status   = '62'.
+            idoc_status-repid    = sy-repid.
+            CLEAR return_variables.
+            return_variables-wf_param = 'Log IDOCs'.
+            LOOP AT idoc_contrl.
+              idoc_status-docnum = idoc_contrl-docnum.
+              APPEND idoc_status.
+              return_variables-doc_number = idoc_contrl-docnum.
+              APPEND return_variables.
+            ENDLOOP.
+
+          ELSE.
+            COMMIT WORK AND WAIT.
+
+            IF lv_waitsec IS INITIAL.
+              WAIT UP TO '2' SECONDS.
+            ELSE.
+              WAIT UP TO lv_waitsec SECONDS.
+            ENDIF.
+
+
+            CLEAR idoc_status.
+            idoc_status-msgty    = 'S'.
+            idoc_status-msgid    = '00'.
+            idoc_status-msgno    = '398'.
+            idoc_status-msgv1    = |Se ha desactivado status PLAN|.
+            idoc_status-msgv2    = |para la orden { wa_head-orden ALPHA = OUT }|.
+            idoc_status-msgv3    = ''.
+            idoc_status-msgv4    = ''.
+            idoc_status-status   = '62'.
+            idoc_status-repid    = sy-repid.
+            CLEAR return_variables.
+            return_variables-wf_param = 'Log IDOCs'.
+            LOOP AT idoc_contrl.
+              idoc_status-docnum = idoc_contrl-docnum.
+              APPEND idoc_status.
+              return_variables-doc_number = idoc_contrl-docnum.
+              APPEND return_variables.
+            ENDLOOP.
+          ENDIF.
+        ENDIF.
+
+        CLEAR lv_cantidad_modif.
+
+        "Debemos modificar la cantidad con la que se envía en la última operación, pues es la que tendrá
+        "la cantidad final correcta que va a ir a paletizar en Unidades (cajas)
+        LOOP AT it_auxiliar INTO DATA(wa_comp_modif).
+          lv_cantidad_modif = wa_comp_modif-cant_base_op.
+        ENDLOOP.
+
+        "JVM MODIF 26/09/2022
+        "•  Cuando llegue el campo Openquantity (fb_pln) con valor, la cantidad de la OF no se modifica. Si llega con valor 0 sí.
+        "vendrá en el campo USERFIELD02 del segmento ZSPP_ORDER_HEAD
+        DATA lv_cant_open TYPE menge_d.
+        CLEAR lv_cant_open.
+        TRY.
+            lv_cant_open = wa_head-userfield02.
+            IF lv_cant_open > 0.
+              CLEAR lv_cantidad_modif.
+            ENDIF.
+          CATCH cx_root.
+        ENDTRY.
+
+        "INI JVM - Modif 07/06/2024 - Si está liberada, independientemente de donde venga, no se modifica cantidad NUNCA
+        IF NOT it_header[ 1 ]-system_status CS 'LIB'.
+          "JVM - modif 15/12/2022 - si es un planningview y la cantidad es inferior a la de la cabecera de la OF no modificamos la cantidad
+          IF lv_mensaje  EQ 'ZIF_OMP_FB_PLANNINGVIEW'.
+            IF lv_cantidad_modif < it_header[ 1 ]-target_quantity.
+              CLEAR lv_cantidad_modif.
+            ENDIF.
+          ENDIF.
+        ELSEIF it_header[ 1 ]-system_status CS 'LIB'.
+          CLEAR lv_cantidad_modif.
+        ENDIF.
+        "FJVM
+        "FIN JVM - Modif 07/06/2024 - Si está liberada, independientemente de donde venga, no se modifica cantidad NUNCA
+        "Modificamos las fechas de cabecera de la OF, pueden verse afectadas posteriormente por las fechas de operaciones
+        IF ( it_header[ 1 ]-sched_fin_time <> wa_head-hfin_prog OR
+        it_header[ 1 ]-sched_start_time <> wa_head-hini_prog OR
+        it_header[ 1 ]-production_finish_date <> wa_head-ffin_prog OR
+        it_header[ 1 ]-production_start_date <> wa_head-fini_prog  OR
+        ( it_header[ 1 ]-target_quantity <> lv_cantidad_modif AND lv_cantidad_modif > 0 ) ) AND
+        NOT ( it_header[ 1 ]-system_status CS 'NOTI' OR it_header[ 1 ]-system_status CS 'CTEC' OR it_header[ 1 ]-system_status CS 'CERR' ).
+
+          DATA: wa_orderdata  LIKE  bapi_pp_order_change,
+                wa_orderdatax LIKE  bapi_pp_order_changex.
+
+          "INI REPLACE JVM; - 07/06/2024
+*          IF wa_head-ffin_prog IS NOT INITIAL AND it_header[ 1 ]-production_finish_date <> wa_head-ffin_prog AND wa_head-ffin_prog >= sy-datum.
+*            wa_orderdata-basic_end_date = wa_head-ffin_prog.
+*            wa_orderdatax-basic_end_date = 'X'.
+*          ENDIF.
+*          IF wa_head-hfin_prog IS NOT INITIAL AND it_header[ 1 ]-sched_fin_time <> wa_head-hfin_prog AND wa_head-ffin_prog >= sy-datum.
+*            wa_orderdata-basic_end_date = wa_head-ffin_prog.
+*            wa_orderdata-basic_end_time = wa_head-hfin_prog.
+*            wa_orderdatax-basic_end_date = abap_true.
+*          ENDIF.
+*          IF wa_head-fini_prog IS NOT INITIAL AND it_header[ 1 ]-production_start_date <> wa_head-fini_prog AND wa_head-fini_prog >= sy-datum.
+*
+*            wa_orderdata-basic_start_date = wa_head-fini_prog.
+*            wa_orderdatax-basic_start_date = 'X'.
+*          ENDIF.
+*
+*          IF wa_head-hini_prog IS NOT INITIAL AND it_header[ 1 ]-sched_start_time <> wa_head-hini_prog AND wa_head-fini_prog >= sy-datum.
+*            wa_orderdata-basic_start_time = wa_head-hini_prog.
+*            wa_orderdata-basic_start_date = wa_head-fini_prog.
+*            wa_orderdatax-basic_start_date = 'X'.
+*          ENDIF.
+
+          "ADD
+*          comportamiento correcto: la fecha fin de omp, la que llega al idoc, se debe informar en la fecha inicio extrema de sap, que será igual
+*          que la fecha fin programada. la fecha fin extrema se calcula añadiendo los días de holgura por la clave de horizonte.
+*          en el idoc la fecha que informa el fin de la of es la ffin_oper de la última operación. esta fecha debe trasladarse a la fecha inicio extrema.
+*          revisar si en la cabecera del idoc (zspp_order_head) también debería aparecer esta fecha, lo lógico es que así
+*          sea.
+*          SELECT SINGLE sichz FROM caufv INTO @DATA(lv_dias) WHERE aufnr = @lv_number.
+          DATA lv_fecha TYPE datum.
+          CONDENSE wa_oper-ffin_oper NO-GAPS.
+          lv_fecha = wa_head-ffin_prog.
+*          lv_fecha = lv_fecha + lv_dias.
+          zspp_utils=>determina_fecha_fin_sichz(
+            EXPORTING
+              i_fecha_fin =  lv_fecha
+              i_aufnr     = lv_number
+            RECEIVING
+              o_fecha     = lv_fecha
+          ).
+          IF wa_oper-ffin_oper IS NOT INITIAL.
+*          wa_orderdata-basic_end_date = wa_orderdata-basic_start_date  = wa_oper-ffin_oper. "JVM - MODIF 06/06/2024
+            wa_orderdata-basic_end_date = lv_fecha. "wa_oper-ffin_oper. "JVM - MODIF 06/06/2024
+            wa_orderdata-basic_start_date  = wa_head-ffin_prog. "JVM - MODIF 06/06/2024
+            IF lv_hora_fin IS NOT INITIAL.
+*            wa_orderdata-basic_end_time = wa_orderdata-basic_start_time = '240000'."wa_oper-hfin_oper."JVM - MODIF 06/06/2024
+
+              wa_orderdata-basic_end_time = lv_hora_fin.
+              wa_orderdata-basic_start_time = lv_hora_ini.
+
+              IF wa_orderdata-basic_end_date = wa_orderdata-basic_start_date
+                AND lv_hora_fin <= lv_hora_ini.
+
+                wa_orderdata-basic_end_time = lv_hora_fin.
+                wa_orderdata-basic_start_time = lv_hora_fin - 60.
+
+              ENDIF.
+
+              IF lv_mensaje CS 'PLANNINGVIEW'.
+                wa_orderdata-basic_end_time = wa_orderdata-basic_start_time = lv_hora_fin.
+              ENDIF.
+
+            ENDIF.
+            wa_orderdatax-basic_end_date = wa_orderdatax-basic_start_date = 'X'.
+          ENDIF.
+
+          "FJVM - REPLACE 07/06/2024
+
+*        IF wa_head-cantidad IS NOT INITIAL AND wa_head-cantidad <> it_header[ 1 ]-target_quantity.
+          IF NOT lv_mensaje CS 'PLANNINGVIEW'.
+            IF lv_cantidad_modif IS NOT INITIAL AND lv_cantidad_modif <> it_header[ 1 ]-target_quantity.
+              wa_orderdata-quantity = lv_cantidad_modif."wa_head-cantidad.
+              wa_orderdatax-quantity = 'X'.
+            ENDIF.
+          ENDIF.
+
+          IF wa_orderdatax IS NOT INITIAL.
+            CLEAR num_intentos.
+
+****            IF sy-sysid EQ 'HED' AND sy-uname EQ 'PARTNERSAP'.
+*****1  Hacia adelante
+*****2  Hacia atrás
+*****3  Sólo necesidades de capacidad
+*****4  Fecha del día
+*****5  Progresivo con hora
+*****6  Resgresivo con hora
+*****Z  programacion bapi
+****              DATA: it_det_sched TYPE TABLE OF bapi_order_return,
+****                    it_ofs_sched TYPE TABLE OF bapi_order_key,
+****                    lv_schdtyp   TYPE bapi_order_func_cntrl-sched_type.
+****
+****              DATA: lv_begin  TYPE datum,
+****                    lv_end    TYPE datum,
+****                    lv_timbeg TYPE syuzeit,
+****                    lv_timfin TYPE syuzeit.
+****              lv_schdtyp = 6.
+****              FREE: it_det_sched, it_ofs_sched.
+****              APPEND INITIAL LINE TO it_ofs_sched ASSIGNING FIELD-SYMBOL(<schedule>).
+****              <schedule>-order_number = 60001788.
+****              lv_end = '20240605'. lv_begin = '20240603'. lv_timbeg = '110100'. lv_timfin = '120200'.
+****              CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+****                EXPORTING
+****                  input  = <schedule>-order_number
+****                IMPORTING
+****                  output = <schedule>-order_number.
+****
+****              CALL FUNCTION 'BAPI_PRODORD_SCHEDULE'
+****                EXPORTING
+****                  sched_type    = lv_schdtyp
+*****                 fwd_dlv_origin =
+****                  fwd_dlv_date  = lv_end
+****                  fwd_dlv_time  = lv_timfin
+*****                 fwd_dlv_offset =
+*****                 fwd_dlv_unit  =
+*****                 fwd_beg_origin =
+****                  fwd_beg_date  = lv_begin
+****                  fwd_beg_time  = lv_timbeg
+*****                 fwd_beg_offset =
+*****                 fwd_beg_unit  =
+*****                 bck_dlv_origin = '1'
+*****                 bck_dlv_date  = lv_end
+*****                 bck_dlv_time  = lv_timfin
+*****                 bck_dlv_offset =
+*****                 bck_dlv_unit  =
+*****                 bck_beg_origin = '1'
+*****                 bck_beg_date  = lv_begin
+*****                 bck_beg_time  = lv_timbeg
+*****                 bck_beg_offset =
+*****                 bck_beg_unit  =
+*****                 work_process_group = 'COWORK_BAPI'
+*****                 work_process_max   = 99
+*****                IMPORTING
+*****                 return        =
+****                TABLES
+****                  orders        = it_ofs_sched[]
+****                  detail_return = it_det_sched[]
+*****                 application_log    =
+****                .
+****              UPDATE afko SET nauterm = 'X' WHERE aufnr = <schedule>-order_number.
+****              COMMIT WORK AND WAIT.
+****
+****            ENDIF.
+
+            DO lv_reintentos TIMES.
+
+              CLEAR wa_return.
+              CALL FUNCTION 'BAPI_PRODORD_CHANGE'
+                EXPORTING
+                  number     = lv_number
+                  orderdata  = wa_orderdata
+                  orderdatax = wa_orderdatax
+                IMPORTING
+                  return     = wa_return
+*                 ORDER_TYPE =
+*                 ORDER_STATUS           =
+*                 MASTER_DATA_READ       =
+                .
+
+*          WAIT UP TO 1 SECONDS.
+
+              num_intentos = num_intentos + 1.
+
+              CASE wa_return-type.
+                WHEN 'A' OR 'E' OR 'X'.
+
+                  IF num_intentos = lv_reintentos.
+                    workflow_result = '99999'.
+                    CLEAR idoc_status.
+                    idoc_status-msgty    = wa_return-type.
+                    idoc_status-msgid    = wa_return-id.
+                    idoc_status-msgno    = wa_return-number.
+                    idoc_status-msgv1    = wa_return-message_v1.
+                    idoc_status-msgv2    = wa_return-message_v2.
+                    idoc_status-msgv3    = wa_return-message_v3.
+                    idoc_status-msgv4    = wa_return-message_v4.
+                    idoc_status-status   = '51'.
+                    idoc_status-repid    = sy-repid.
+                    CLEAR return_variables.
+                    return_variables-wf_param = 'Error_IDOCs'.
+                    LOOP AT idoc_contrl.
+                      idoc_status-docnum = idoc_contrl-docnum.
+                      APPEND idoc_status.
+                      return_variables-doc_number = idoc_contrl-docnum.
+                      APPEND return_variables.
+                    ENDLOOP.
+
+                  ELSE.
+                    WAIT UP TO 3 SECONDS.
+                    COMMIT WORK AND WAIT.
+                    CONTINUE.
+                  ENDIF.
+                WHEN OTHERS.
+                  EXIT.
+                  IF wa_return-type IS NOT INITIAL.
+                    CLEAR idoc_status.
+                    idoc_status-msgty    = wa_return-type.
+                    idoc_status-msgid    = wa_return-id.
+                    idoc_status-msgno    = wa_return-number.
+                    idoc_status-msgv1    = wa_return-message_v1.
+                    idoc_status-msgv2    = wa_return-message_v2.
+                    idoc_status-msgv3    = wa_return-message_v3.
+                    idoc_status-msgv4    = wa_return-message_v4.
+                    idoc_status-status   = '62'.
+                    idoc_status-repid    = sy-repid.
+                    CLEAR return_variables.
+                    return_variables-wf_param = 'Log IDOCs'.
+                    LOOP AT idoc_contrl.
+                      idoc_status-docnum = idoc_contrl-docnum.
+                      APPEND idoc_status.
+                      return_variables-doc_number = idoc_contrl-docnum.
+                      APPEND return_variables.
+                    ENDLOOP.
+                  ENDIF.
+              ENDCASE.
+
+
+
+              COMMIT WORK AND WAIT.
+            ENDDO.
+            IF lv_waitsec IS INITIAL.
+              WAIT UP TO '2' SECONDS.
+            ELSE.
+              WAIT UP TO lv_waitsec SECONDS.
+            ENDIF.
+
+
+*        wait UP TO 2 SECONDS.
+
+            PERFORM wait_aufnr USING lv_number.
+          ENDIF.
+        ENDIF.
+
+
+        IF lv_mensaje CS 'FB_PLN'.
+          IF it_header[ 1 ]-system_status CS 'PLAN' OR it_header[ 1 ]-system_status CS 'ABIE'.
+            "Modificamos los CI_NUMBERS
+            DATA wa_cinums TYPE zsppt_cinumbers.
+            DATA it_cinums TYPE TABLE OF zsppt_cinumbers.
+*        AUFNR
+*        VORNR
+*        MATNR
+*        CI_NUMBER
+*        STEPNR
+*        ESTACION
+*        CANT_STEP
+*        FECHA_INI
+*        HORA_INI
+*        FECHA_FIN
+*        HORA_FIN
+*        CANAL
+*        CALIDAD
+*        LGNUM
+*        TBNUM
+*        RSNUM
+*        RSPOS
+*        ERDAT
+*        ERZEIT
+*        ERNAM
+*        AEDAT
+            LOOP AT it_cinumbers INTO DATA(cinumbers) WHERE operacion EQ '0010'.
+              DELETE FROM zsppt_cinumbers WHERE aufnr EQ lv_number AND vornr EQ cinumbers-operacion.
+              LOOP AT it_cinumbers_compo INTO DATA(cinumbers_compo) WHERE posicion EQ cinumbers-operacion AND userfield01 = cinumbers-userfield06.
+                COMMIT WORK AND WAIT.
+
+                IF lv_waitsec IS INITIAL.
+                  WAIT UP TO '2' SECONDS.
+                ELSE.
+                  WAIT UP TO lv_waitsec SECONDS.
+                ENDIF.
+
+                wa_cinums-processid = cinumbers-userfield06.
+                wa_cinums-aufnr = lv_number.
+                wa_cinums-vornr = cinumbers-operacion.
+*            CONDENSE cinumbers-userfield01 NO-GAPS.
+                wa_cinums-ci_number = cinumbers-userfield01.
+                CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+                  EXPORTING
+                    input        = cinumbers_compo-material
+                  IMPORTING
+                    output       = cinumbers_compo-material
+                  EXCEPTIONS
+                    length_error = 1
+                    OTHERS       = 2.
+                IF sy-subrc <> 0.
+* Implement suitable error handling here
+                ENDIF.
+
+                wa_cinums-matnr = cinumbers_compo-material.
+                CONDENSE cinumbers-userfield02 NO-GAPS.
+                wa_cinums-stepnr = cinumbers-userfield02.
+                CONDENSE cinumbers_compo-concept_clas NO-GAPS.
+                "Recuperamos el concepto de clasificación correcto en base a lo que hay en tabla
+                SELECT DISTINCT low INTO TABLE @DATA(it_concepto)
+                      FROM t320 INNER JOIN lagp ON t320~lgnum EQ lagp~lgnum AND lagp~lgtyp EQ '100'
+                      INNER JOIN tvarvc AS tvar ON lagp~lgpla EQ tvar~low AND name EQ 'ZWM_NOMBRE_MAQUINA'
+                      WHERE werks EQ @lv_werks
+                      AND lptyp EQ 'ON'.
+
+                "ADD JVM - 31/01/2025 - Anyadir lógica para los puestos de trabajo de Xátiva
+                IF lv_werks = c_xativa.
+                  IF it_oper[ 1 ]-puesto_trab CS '105'.
+                    CONDENSE cinumbers_compo-concept_clas NO-GAPS.
+                    CONCATENATE 'EST' cinumbers_compo-concept_clas INTO cinumbers_compo-concept_clas.
+                  ELSEIF it_oper[ 1 ]-puesto_trab CS '104'.
+                    CONDENSE cinumbers_compo-concept_clas NO-GAPS.
+                    CONCATENATE 'BHS' cinumbers_compo-concept_clas INTO cinumbers_compo-concept_clas.
+                  ENDIF.
+                ENDIF.
+                "FIN JVM - 31/01/2025 - Anyadir lógica para los puestos de trabajo de Xátiva
+                LOOP AT it_concepto INTO DATA(lv_concepto) WHERE low CS cinumbers_compo-concept_clas .
+                  EXIT.
+                ENDLOOP.
+                IF sy-subrc = 0.
+                  cinumbers_compo-concept_clas = lv_concepto.
+                ELSE.
+                  CLEAR cinumbers_compo-concept_clas.
+                ENDIF.
+                CONDENSE cinumbers_compo-concept_clas NO-GAPS.
+                wa_cinums-estacion = cinumbers_compo-concept_clas."cinumbers-userfield03.
+
+                CONDENSE cinumbers_compo-cantidad_kg NO-GAPS.
+                CONDENSE cinumbers_compo-cantidad_m NO-GAPS.
+                IF cinumbers_compo-cantidad_kg IS NOT INITIAL.
+                  wa_cinums-cant_step = cinumbers_compo-cantidad_kg.
+                  wa_cinums-um_step = 'KG'.
+                ELSE.
+                  wa_cinums-cant_step = cinumbers_compo-cantidad_m.
+                  wa_cinums-um_step = 'M'.
+                ENDIF.
+                wa_cinums-fecha_ini = cinumbers-fini_oper.
+                wa_cinums-hora_ini = cinumbers-hini_oper.
+                wa_cinums-fecha_fin = cinumbers-ffin_oper.
+                wa_cinums-hora_fin = cinumbers-hfin_oper.
+                CONDENSE cinumbers_compo-lote NO-GAPS.
+                wa_cinums-canal = cinumbers_compo-lote.
+                CONDENSE cinumbers-userfield04 NO-GAPS.
+                wa_cinums-calidad = cinumbers-userfield04.
+                CONDENSE wa_cinums-ci_number NO-GAPS.
+                wa_cinums-erdat  = wa_cinums-aedat  = sy-datum.
+                wa_cinums-erzeit = wa_cinums-aezeit = sy-uzeit.
+                wa_cinums-ernam  = wa_cinums-aenam  = sy-uname.
+                wa_cinums-stepcontribution = cinumbers-userfield03.
+                wa_cinums-plannedtrim = cinumbers-userfield05.
+                APPEND wa_cinums TO it_cinums.
+              ENDLOOP.
+            ENDLOOP.
+            IF it_cinums[] IS NOT INITIAL.
+              MODIFY zsppt_cinumbers FROM TABLE it_cinums.
+              COMMIT WORK AND WAIT.
+
+              IF lv_waitsec IS INITIAL.
+                WAIT UP TO '2' SECONDS.
+              ELSE.
+                WAIT UP TO lv_waitsec SECONDS.
+              ENDIF.
+
+
+            ENDIF.
+          ENDIF.
+        ELSEIF lv_mensaje EQ 'ZIF_OMP_FB_UNPLN'.
+          "Vemos si tenemos que borrar algún CINUMBER de la tabla Z
+          "Seleccionamos todos los registros de la tabla Z
+          DATA it_tab_ci_del TYPE TABLE OF zsppt_cinumbers.
+          CLEAR: it_tab_ci_del, it_tab_ci_del[].
+          SELECT * INTO TABLE @DATA(it_tab_ci) FROM zsppt_cinumbers WHERE aufnr EQ @lv_number.
+          LOOP AT it_tab_ci INTO DATA(wa_tab_ci).
+            LOOP AT it_runs TRANSPORTING NO FIELDS WHERE ( status <> 'UNPLANNED' AND status <> 'unplanned' ) AND processid = wa_tab_ci-processid.
+              EXIT.
+            ENDLOOP.
+            IF sy-subrc <> 0.
+              DELETE zsppt_cinumbers FROM wa_tab_ci.
+              APPEND wa_tab_ci TO it_tab_ci_del.
+              COMMIT WORK AND WAIT.
+
+              IF lv_waitsec IS INITIAL.
+                WAIT UP TO '2' SECONDS.
+              ELSE.
+                WAIT UP TO lv_waitsec SECONDS.
+              ENDIF.
+
+              DATA(lv_actualiza_cant) = abap_true.
+            ENDIF.
+          ENDLOOP.
+*        LOOP AT it_runs ASSIGNING <run> WHERE status EQ 'UNPLANNED' OR status EQ 'unplanned'.
+*          DELETE FROM zsppt_cinumbers WHERE aufnr = <run>-aufnr
+*                                        AND processid = <run>-processid.
+*          COMMIT WORK AND WAIT.
+*          DATA(lv_actualiza_cant) = abap_true.
+*        ENDLOOP.
+
+          IF lv_actualiza_cant = 'X'.
+            SELECT * INTO TABLE @DATA(it_cantidad_cinums) FROM zsppt_cinumbers WHERE aufnr EQ @lv_number.
+
+            TYPES: BEGIN OF ty_cantidades,
+                     matnr TYPE matnr,
+                     menge TYPE menge_d,
+                     sortf TYPE sortp,
+                   END OF ty_cantidades.
+            DATA: wa_cantidades TYPE ty_cantidades,
+                  it_cantidades TYPE TABLE OF ty_cantidades.
+            LOOP AT it_cantidad_cinums INTO DATA(wa_cant_cinum).
+              wa_cantidades-matnr = wa_cant_cinum-matnr.
+              wa_cantidades-menge = wa_cant_cinum-cant_step.
+              wa_cantidades-sortf = wa_cant_cinum-estacion.
+              COLLECT wa_cantidades INTO it_cantidades.
+              CLEAR wa_cantidades.
+            ENDLOOP.
+
+            SELECT * INTO TABLE @DATA(it_resb_upd)
+              FROM resb
+              FOR ALL ENTRIES IN @it_tab_ci_del
+              WHERE matnr EQ @it_tab_ci_del-matnr
+              AND xloek EQ @space
+                AND aufnr EQ @lv_number.
+
+            LOOP AT it_tab_ci_del INTO DATA(wa_delete).
+              READ TABLE it_resb_upd WITH KEY matnr = wa_delete-matnr sortf = wa_delete-estacion ASSIGNING FIELD-SYMBOL(<resb_upd>).
+              IF sy-subrc = 0.
+                DATA(lv_bdmng) = <resb_upd>-bdmng.
+                "Actualizamos la cantidad necesaria del papel por la estación, habremos eliminado
+                "la cantidad del step desplanificado
+                IF ( lv_bdmng - wa_delete-cant_step ) <= 0.
+                  <resb_upd>-xloek = 'X'.
+                ELSEIF ( lv_bdmng - wa_delete-cant_step ) > 0.
+                  <resb_upd>-bdmng = <resb_upd>-bdmng - wa_delete-cant_step.
+*              ELSE.
+*                READ TABLE it_cantidades WITH KEY matnr = <resb_upd>-matnr sortf = <resb_upd>-sortf INTO wa_cantidades.
+*                IF sy-subrc = 0.
+*                  <resb_upd>-bdmng = wa_cantidades-menge.
+*                ENDIF.
+                ENDIF.
+              ENDIF.
+            ENDLOOP.
+
+            READ TABLE it_cantidades WITH KEY matnr = <resb_upd>-matnr sortf = <resb_upd>-sortf INTO wa_cantidades.
+            IF sy-subrc = 0.
+              <resb_upd>-bdmng = wa_cantidades-menge.
+            ENDIF.
+            LOOP AT it_cantidades INTO wa_cantidades.
+              READ TABLE it_resb_upd WITH KEY matnr = wa_cantidades-matnr sortf = wa_cantidades-sortf ASSIGNING <resb_upd>.
+              IF sy-subrc = 0.
+                <resb_upd>-bdmng = wa_cantidades-menge.
+                <resb_upd>-xloek = space.
+              ENDIF.
+            ENDLOOP.
+
+
+          ENDIF.
+          "INI ADD JVM - 27/01/2023 actualizar fechas de operación en tabla CI_NUMBERS
+        ELSEIF lv_mensaje CS 'PLANNINGVIEW'.
+          "Debemos actualizar las fechas de inicio y fin de la operación de onduladora
+          IF it_header[ 1 ]-system_status CS 'PLAN' OR it_header[ 1 ]-system_status CS 'ABIE'.
+            "Modificamos las fechas de operacion
+            FREE it_cinums.
+            LOOP AT it_cinumbers INTO cinumbers WHERE operacion EQ '0010'.
+              DATA lv_aux_cinums TYPE zsppt_cinumbers.
+              CLEAR lv_aux_cinums.
+
+              CONDENSE cinumbers-userfield02 NO-GAPS.
+
+              lv_aux_cinums-aufnr = lv_number.
+              lv_aux_cinums-vornr = cinumbers-operacion.
+              lv_aux_cinums-ci_number = cinumbers-userfield01.
+              CONDENSE lv_aux_cinums-ci_number NO-GAPS.
+              lv_aux_cinums-stepnr = cinumbers-userfield02.
+              lv_aux_cinums-processid = cinumbers-userfield06.
+
+              SELECT * INTO TABLE @DATA(it_upd_cinums) FROM zsppt_cinumbers
+                WHERE aufnr EQ @lv_aux_cinums-aufnr
+                AND vornr EQ @lv_aux_cinums-vornr
+                AND ci_number EQ @lv_aux_cinums-ci_number
+                AND stepnr EQ @lv_aux_cinums-stepnr
+                AND processid = @lv_aux_cinums-processid.
+
+              LOOP AT it_upd_cinums ASSIGNING FIELD-SYMBOL(<udp_cinums>).
+                <udp_cinums>-fecha_ini = cinumbers-fini_oper.
+                <udp_cinums>-hora_ini = cinumbers-hini_oper.
+                <udp_cinums>-fecha_fin = cinumbers-ffin_oper.
+                <udp_cinums>-hora_fin = cinumbers-hfin_oper.
+              ENDLOOP.
+
+              APPEND LINES OF it_upd_cinums TO it_cinums.
+              FREE it_upd_cinums.
+
+            ENDLOOP.
+            IF it_cinums[] IS NOT INITIAL.
+
+              MODIFY zsppt_cinumbers FROM TABLE it_cinums.
+              COMMIT WORK AND WAIT.
+
+              IF lv_waitsec IS INITIAL.
+                WAIT UP TO '2' SECONDS.
+              ELSE.
+                WAIT UP TO lv_waitsec SECONDS.
+              ENDIF.
+
+
+            ENDIF.
+          ENDIF.
+
+        ENDIF.
+        "FIN ADD JVM - 27/01/2023 actualizar fechas de operación en tabla CI_NUMBERS
+        "Si no está NOTI ni CTEC ni CERR, se puede hacer cambios de fechas
+        IF NOT ( it_header[ 1 ]-system_status CS 'NOTI' OR it_header[ 1 ]-system_status CS 'CTEC' OR it_header[ 1 ]-system_status CS 'CERR' ).
+
+          DATA lv_update TYPE xfeld.
+          CLEAR lv_update.
+          SELECT SINGLE aufpl INTO @lv_aufpl FROM afko WHERE aufnr EQ @lv_number.
+
+          LOOP AT it_oper ASSIGNING <oper>.
+            SELECT * INTO TABLE @DATA(it_afvc) FROM afvc WHERE aufpl EQ @lv_aufpl AND loekz EQ @space AND vornr EQ @<oper>-operacion.
+            IF sy-subrc = 0.
+              SELECT * INTO TABLE @DATA(it_afvv) FROM afvv FOR ALL ENTRIES IN @it_afvc WHERE aufpl EQ @lv_aufpl AND aplzl EQ @it_afvc-aplzl.
+
+              LOOP AT it_afvv ASSIGNING FIELD-SYMBOL(<afvv>).
+                IF <oper>-cant_base_op IS NOT INITIAL.
+*                <afvv>-bmsch = <oper>-cant_base_op.
+                  <afvv>-mgvrg = <oper>-cant_base_op.
+                ENDIF.
+                IF <oper>-fini_prep IS NOT INITIAL.
+                  <afvv>-ssavd =  <afvv>-fsavd = <oper>-fini_prep."Finiprep
+                  <afvv>-ssavz = <afvv>-fsavz = <oper>-hini_prep."hiniprep
+*              IF <oper>-operacion EQ '0010'.
+                  IF <oper>-tiempo_prep IS NOT INITIAL.
+                    <afvv>-ruest = <oper>-tiempo_prep / 60. "viene en segundos, convertimos a minutos
+                  ENDIF.
+                  DATA(lv_modif) = 'X'.
+                ENDIF.
+                IF <oper>-fini_ejec IS NOT INITIAL.
+*         FSSLD FSELD
+                  <afvv>-sssbd = <afvv>-fssbd = <oper>-fini_ejec. "finiejec
+                  <afvv>-sssbz = <afvv>-fssbz = <oper>-hini_ejec."hiniejec
+*              IF <oper>-operacion EQ '0010'.
+                  IF <oper>-tiempo_ejec IS NOT INITIAL.
+                    <afvv>-bearz = <oper>-tiempo_ejec / 60. "viene en segundos, convertimos a minutos
+
+                  ENDIF.
+                  lv_modif = 'X'.
+                ENDIF.
+                IF <oper>-fini_desmont IS NOT INITIAL.
+                  <afvv>-ssedd = <afvv>-sseld = <afvv>-sssad = <afvv>-fssad = <oper>-fini_desmont."Finidesmont
+                  <afvv>-sssld = <afvv>-ssedd = <afvv>-fsedd = <oper>-fini_desmont."Ffindesmont
+                  <afvv>-sssaz = <afvv>-fssaz = <oper>-hini_desmont."hinidesmont
+                  <afvv>-ssedz = <afvv>-fsedz = <oper>-hini_desmont."hfindesmont
+                  lv_modif = 'X'.
+                  <afvv>-fssld = <afvv>-fseld = <afvv>-sssld = <afvv>-sseld = <oper>-fini_desmont.
+                  <afvv>-fsslz = <afvv>-fselz = <afvv>-ssslz = <afvv>-sselz = <oper>-hini_desmont.
+                ENDIF.
+
+                IF <afvv>-epanf IS NOT INITIAL.
+                  <afvv>-epanf = <oper>-fini_oper.
+                  <afvv>-epanz = <oper>-hini_oper.
+                  lv_modif = 'X'.
+                ENDIF.
+                IF <afvv>-epend IS NOT INITIAL.
+                  <afvv>-epend = <oper>-ffin_oper.
+                  <afvv>-epenz = <oper>-hfin_oper.
+                  lv_modif = 'X'.
+                ENDIF.
+
+                IF lv_modif = 'X'.
+*                  DATA lv_fecha_conf TYPE datum.
+                  SELECT SINGLE prodnet, maufnr FROM caufv WHERE aufnr = @lv_number
+                     AND kdauf <> @space INTO (@DATA(es_grafo), @DATA(of_superior) ).
+                  IF sy-subrc = 0 AND es_grafo EQ abap_true AND of_superior EQ space .
+                    "Hay que modificar la fecha MARCO en la OF
+                    SELECT SINGLE * INTO @DATA(wa_afko) FROM afko WHERE aufnr = @lv_number.
+                    wa_afko-pnetendd = <afvv>-ssedd.
+                    MODIFY afko FROM wa_afko.
+                    COMMIT WORK AND WAIT.
+                  ENDIF.
+
+                  MODIFY afvv FROM <afvv>.
+                  lv_update = 'X'.
+                ENDIF.
+                CLEAR lv_modif.
+
+                "JVM - 22/12/2022 - Modificamos la AFVU pasándole las fechas
+                SELECT SINGLE * INTO @DATA(wa_afvu) FROM afvu WHERE aufpl EQ @lv_aufpl AND aplzl EQ @<afvv>-aplzl.
+                IF sy-subrc = 0.
+                  wa_afvu-slwid = 'Z000001'.
+                  wa_afvu-usr02 = <oper>-hini_oper.
+                  wa_afvu-usr08 = <oper>-fini_oper.
+                  MODIFY afvu FROM wa_afvu.
+                ENDIF.
+                "FJVM - 22/12/2022 - Modificamos la AFVU pasándole las fechas
+
+              ENDLOOP.
+
+            ENDIF.
+          ENDLOOP.
+
+          IF lv_update = 'X'.
+
+            "Comprobamos si el status de la primera operación al menos, está PLANIFICADA, sino no cambiará bien las fechas
+            SELECT aplzl INTO TABLE @DATA(it_aplzl) FROM afvc WHERE aufpl EQ @lv_aufpl AND loekz EQ @space." AND vornr EQ '0010'.
+*        IF sy-subrc = 0 AND lv_objnr IS NOT INITIAL.
+            LOOP AT it_aplzl INTO DATA(lv_aplzl).
+              DATA wa_op_key    TYPE  coxt_s_ord_opr_key.
+*        APPEND INITIAL LINE TO wa_op_key ASSIGNING FIELD-SYMBOL(<key>).
+              wa_op_key-aufnr = lv_number.
+              wa_op_key-aplzl = lv_aplzl.
+              DATA scheddate TYPE coxt_s_date_pairx.
+              scheddate-start_time = 'X'.
+
+              CLEAR num_intentos.
+
+*******************              DO lv_reintentos TIMES.
+*******************                num_intentos = num_intentos + 1.
+*******************                DATA: we_ret        TYPE coxt_bapireturn,
+*******************                      lv_error_oper TYPE  c.
+*******************                CLEAR: we_ret, lv_error_oper.
+*******************                CALL FUNCTION 'CO_XT_OPERATION_CHANGE'
+*******************                  EXPORTING
+*******************                    is_order_operation_key = wa_op_key
+********************                   I_WORK_CENTER_ID       =
+********************                   I_WORK_CENTER_IDX      =
+********************                   IS_SCHEDULED_DATES     =
+*******************                    is_scheduled_datesx    = scheddate
+*******************                    i_date_fixed           = space
+*******************                    i_dispatch             = 'X'
+*******************                    i_dispatchx            = 'X'
+********************                   I_ORDER_CATEGORY       =
+********************                   IS_DATES_PROC          =
+********************                   IS_DATES_PROCX         =
+********************                   IS_DATES_TEARDOWN      =
+********************                   IS_DATES_TEARDOWNX     =
+********************                   IS_DATES_SETUP         =
+********************                   IS_DATES_SETUPX        =
+********************                   IS_OPR_SEG_DATES_TIMES =
+********************                   IS_OPR_SEG_DATES_TIMESX       =
+********************                   IS_OPR_SCHED_DATES     =
+********************                   IS_OPR_SCHED_DATESX    =
+********************                   I_OPR_SEG_DATES_TIMES  =
+*******************                  IMPORTING
+*******************                    es_bapireturn          = we_ret
+*******************                    e_error_occurred       = lv_error_oper.
+*******************
+*******************                COMMIT WORK.
+*******************
+*******************                IF lv_waitsec IS INITIAL.
+*******************                  WAIT UP TO '2' SECONDS.
+*******************                ELSE.
+*******************                  WAIT UP TO lv_waitsec SECONDS.
+*******************                ENDIF.
+*******************
+*******************
+*******************                IF we_ret-type IS NOT INITIAL.
+*******************                  IF lv_reintentos = num_intentos.
+*******************                    CLEAR idoc_status.
+*******************                    idoc_status-msgty    = we_ret-type.
+*******************                    idoc_status-msgid    = we_ret-id.
+*******************                    idoc_status-msgno    = we_ret-number.
+*******************                    idoc_status-msgv1    = we_ret-message_v1.
+*******************                    idoc_status-msgv2    = we_ret-message_v2.
+*******************                    idoc_status-msgv3    = we_ret-message_v3.
+*******************                    idoc_status-msgv4    = we_ret-message_v4.
+*******************                    idoc_status-status   = '62'.
+*******************                    idoc_status-repid    = sy-repid.
+*******************                    CLEAR return_variables.
+*******************                    return_variables-wf_param = 'Log IDOCs'.
+*******************                    LOOP AT idoc_contrl.
+*******************                      idoc_status-docnum = idoc_contrl-docnum.
+*******************                      APPEND idoc_status.
+*******************                      return_variables-doc_number = idoc_contrl-docnum.
+*******************                      APPEND return_variables.
+*******************                    ENDLOOP.
+*******************                  ENDIF.
+*******************                ENDIF.
+*******************
+********************              COMMIT WORK AND WAIT .
+********************
+********************              IF lv_waitsec IS INITIAL.
+********************                WAIT UP TO '2' SECONDS.
+********************              ELSE.
+********************                WAIT UP TO lv_waitsec SECONDS.
+********************              ENDIF.
+*******************
+********************            WAIT UP TO 2 SECONDS.
+*******************
+*******************                PERFORM wait_aufnr USING lv_number.
+*******************                IF we_ret-type IS INITIAL AND lv_error_oper IS INITIAL.
+*******************                  EXIT.
+*******************                ENDIF.
+*******************              ENDDO.
+            ENDLOOP.
+*        ENDIF.
+
+*          COMMIT WORK AND WAIT.
+*
+*          IF lv_waitsec IS INITIAL.
+*            WAIT UP TO '2' SECONDS.
+*          ELSE.
+*            WAIT UP TO lv_waitsec SECONDS.
+*          ENDIF.
+
+            DATA it_aufnr TYPE TABLE OF bapi_order_key.
+            DATA it_return TYPE TABLE OF bapi_order_return.
+            CLEAR: it_aufnr, it_aufnr[], it_return[], it_return.
+            APPEND INITIAL LINE TO it_aufnr ASSIGNING FIELD-SYMBOL(<orden>).
+            <orden>-order_number = lv_number.
+
+            CLEAR num_intentos.
+
+            DO lv_reintentos TIMES.
+              num_intentos = num_intentos + 1.
+
+              REFRESH it_return.
+*
+              CALL FUNCTION 'BAPI_PRODORD_SCHEDULE'
+* EXPORTING
+*   SCHED_TYPE               =
+*   FWD_DLV_ORIGIN           =
+*   FWD_DLV_DATE             =
+*   FWD_DLV_TIME             =
+*   FWD_DLV_OFFSET           =
+*   FWD_DLV_UNIT             =
+*   FWD_BEG_ORIGIN           =
+*   FWD_BEG_DATE             =
+*   FWD_BEG_TIME             =
+*   FWD_BEG_OFFSET           =
+*   FWD_BEG_UNIT             =
+*   BCK_DLV_ORIGIN           =
+*   BCK_DLV_DATE             =
+*   BCK_DLV_TIME             =
+*   BCK_DLV_OFFSET           =
+*   BCK_DLV_UNIT             =
+*   BCK_BEG_ORIGIN           =
+*   BCK_BEG_DATE             =
+*   BCK_BEG_TIME             =
+*   BCK_BEG_OFFSET           =
+*   BCK_BEG_UNIT             =
+*   WORK_PROCESS_GROUP       = 'COWORK_BAPI'
+*   WORK_PROCESS_MAX         = 99
+* IMPORTING
+*   RETURN                   =
+                TABLES
+                  orders        = it_aufnr
+                  detail_return = it_return
+*                 APPLICATION_LOG          =
+                .
+              COMMIT WORK AND WAIT.
+              IF lv_waitsec IS INITIAL.
+                WAIT UP TO '2' SECONDS.
+              ELSE.
+                WAIT UP TO lv_waitsec SECONDS.
+              ENDIF.
+              IF lv_reintentos = num_intentos.
+                EXIT.
+              ENDIF.
+              LOOP AT it_return TRANSPORTING NO FIELDS WHERE type EQ 'A' OR type EQ 'E' OR type EQ 'X'.
+                EXIT.
+              ENDLOOP.
+              IF sy-subrc = 0.
+                WAIT UP TO 2 SECONDS.
+                CONTINUE.
+              ELSE.
+                "No hay errores
+                EXIT.
+              ENDIF.
+            ENDDO.
+
+            LOOP AT it_return INTO DATA(wa_ret_sched).
+              IF wa_ret_sched-type IS NOT INITIAL.
+                CLEAR idoc_status.
+                idoc_status-msgty    = wa_ret_sched-type.
+                idoc_status-msgid    = wa_ret_sched-id.
+                idoc_status-msgno    = wa_ret_sched-number.
+                idoc_status-msgv1    = wa_ret_sched-message_v1.
+                idoc_status-msgv2    = wa_ret_sched-message_v2.
+                idoc_status-msgv3    = wa_ret_sched-message_v3.
+                idoc_status-msgv4    = wa_ret_sched-message_v4.
+                idoc_status-status   = '62'.
+                idoc_status-repid    = sy-repid.
+                CLEAR return_variables.
+                return_variables-wf_param = 'Log IDOCs'.
+                LOOP AT idoc_contrl.
+                  idoc_status-docnum = idoc_contrl-docnum.
+                  APPEND idoc_status.
+                  return_variables-doc_number = idoc_contrl-docnum.
+                  APPEND return_variables.
+                ENDLOOP.
+              ENDIF.
+            ENDLOOP.
+            COMMIT WORK AND WAIT.
+*
+*          IF lv_waitsec IS INITIAL.
+*            WAIT UP TO '2' SECONDS.
+*          ELSE.
+*            WAIT UP TO lv_waitsec SECONDS.
+*          ENDIF.
+
+*          WAIT UP TO 2 SECONDS.
+            PERFORM wait_aufnr USING lv_number.
+          ENDIF.
+        ENDIF.
+
+        "Si el mensaje es de UNPLN no modificamos nada de componentes en base al segmento,
+        "sino que deberemos tener en cuenta la cantidad
+        IF lv_mensaje EQ 'ZIF_OMP_FB_UNPLN' AND lv_actualiza_cant EQ abap_true.
+          WAIT UP TO 2 SECONDS.
+          MODIFY resb FROM TABLE it_resb_upd.
+          COMMIT WORK AND WAIT.
+
+          IF lv_waitsec IS INITIAL.
+            WAIT UP TO '2' SECONDS.
+          ELSE.
+            WAIT UP TO lv_waitsec SECONDS.
+          ENDIF.
+
+        ELSE.
+          IF lv_mensaje EQ 'ZIF_OMP_FB_PLN'.
+*APC20250220 Como se van a añadir posiciones de reserva, si detectamos que tiene más de 9900 posiciones damos un error.
+            SELECT MAX( posnr ) FROM resb
+              INTO @DATA(l_posnr)
+             WHERE aufnr = @lv_number.
+            IF l_posnr > '9900'.
+              workflow_result = '99999'.
+              DATA(lv_err_idoc) = 'X'.
+              CLEAR idoc_status.
+              idoc_status-msgty    = 'E'.
+              idoc_status-msgid    = '00'.
+              idoc_status-msgno    = '398'.
+              idoc_status-msgv1    = 'Posición reserva supera posición 9900'.
+              idoc_status-msgv2    = ''.
+              idoc_status-msgv3    = ''.
+              idoc_status-msgv4    = ''.
+              idoc_status-status   = '64'.
+              idoc_status-repid    = sy-repid.
+              CLEAR return_variables.
+              return_variables-wf_param = 'Error_IDOCs'.
+              LOOP AT idoc_contrl.
+                idoc_status-docnum = idoc_contrl-docnum.
+                APPEND idoc_status.
+                return_variables-doc_number = idoc_contrl-docnum.
+                APPEND return_variables.
+              ENDLOOP.
+            ELSE.
+*APC20250220 Fin
+
+              IF it_comp[] IS NOT INITIAL.
+
+                DATA lv_lgort TYPE lgort_d.
+
+                SELECT t1~* INTO TABLE @DATA(it_resb)
+                      FROM resb AS t1 INNER JOIN mara AS t2 ON t1~matnr EQ t2~matnr
+                      WHERE aufnr EQ @lv_number AND mtart EQ 'ZPAP' AND xloek EQ @space.
+                LOOP AT it_resb INTO DATA(wa_resb).
+                  wa_resb-xloek = 'X'.
+                  MODIFY resb FROM wa_resb.
+                  lv_lgort = wa_resb-lgort.
+                ENDLOOP.
+                COMMIT WORK AND WAIT.
+
+                IF lv_waitsec IS INITIAL.
+                  WAIT UP TO '2' SECONDS.
+                ELSE.
+                  WAIT UP TO lv_waitsec SECONDS.
+                ENDIF.
+
+              ENDIF.
+
+              DATA lv_meins TYPE meins.
+              DATA lv_menge TYPE menge_d.
+
+              LOOP AT it_comp INTO DATA(wa_compo).
+
+                CLEAR: lv_meins, lv_menge.
+
+                CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+                  EXPORTING
+                    input  = wa_compo-material
+                  IMPORTING
+                    output = wa_compo-material
+*     EXCEPTIONS
+*                   LENGTH_ERROR       = 1
+*                   OTHERS = 2
+                  .
+                IF sy-subrc <> 0.
+* Implement suitable error handling here
+                ENDIF.
+                CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+                  EXPORTING
+                    input  = wa_compo-asig_oper
+                  IMPORTING
+                    output = wa_compo-asig_oper.
+
+                SELECT SINGLE meins INTO lv_meins FROM mara WHERE matnr EQ wa_compo-material.
+                IF lv_meins EQ 'KG'.
+                  lv_menge = wa_compo-cantidad_kg.
+                ELSE.
+                  lv_menge = wa_compo-cantidad_m.
+                ENDIF.
+
+                "Recuperamos el concepto de clasificación correcto en base a lo que hay en tabla
+                SELECT DISTINCT low INTO TABLE @it_concepto
+                  FROM t320 INNER JOIN lagp ON t320~lgnum EQ lagp~lgnum AND lagp~lgtyp EQ '100'
+                  INNER JOIN tvarvc AS tvar ON lagp~lgpla EQ tvar~low AND name EQ 'ZWM_NOMBRE_MAQUINA'
+                  WHERE werks EQ @lv_werks
+                  AND lptyp EQ 'ON'.
+
+                "ADD JVM - 31/01/2025 - Anyadir lógica para los puestos de trabajo de Xátiva
+                IF lv_werks = c_xativa.
+                  IF it_oper[ 1 ]-puesto_trab CS '105'.
+                    CONDENSE wa_compo-concept_clas NO-GAPS.
+                    CONCATENATE 'EST' wa_compo-concept_clas INTO wa_compo-concept_clas.
+                  ELSEIF it_oper[ 1 ]-puesto_trab CS '104'.
+                    CONDENSE cinumbers_compo-concept_clas NO-GAPS.
+                    CONCATENATE 'BHS' wa_compo-concept_clas INTO wa_compo-concept_clas.
+                  ENDIF.
+                ENDIF.
+                "FIN JVM - 31/01/2025 - Anyadir lógica para los puestos de trabajo de Xátiva
+
+                LOOP AT it_concepto INTO lv_concepto WHERE low CS wa_compo-concept_clas .
+                  EXIT.
+                ENDLOOP.
+                IF sy-subrc = 0.
+                  wa_compo-concept_clas = lv_concepto.
+                ELSE.
+                  CLEAR wa_compo-concept_clas.
+                ENDIF.
+
+                DATA lt_return TYPE  bapiret2_tab.
+                REFRESH lt_return.
+                CLEAR gr_wait.
+                IF go_log IS INITIAL.
+                  go_log ?= lo_log.
+                ENDIF.
+                CALL FUNCTION 'ZSPP_ADD_RESB' STARTING NEW TASK 'T1' DESTINATION 'NONE' PERFORMING read_result ON END OF TASK
+                  EXPORTING
+                    i_aufnr         = lv_number
+                    i_matnr         = wa_compo-material
+                    i_werks         = lv_werks
+                    i_lgort         = lv_lgort
+                    i_menge         = lv_menge
+                    i_meins         = lv_meins
+                    i_charg         = ''
+                    i_vornr         = wa_compo-asig_oper
+                    i_concepto_clas = wa_compo-concept_clas
+                    i_cinumber      = wa_compo-userfield01.
+*      IMPORTING
+*        o_return        = lt_return.
+
+                WAIT UNTIL gr_wait = 'X'.
+
+*        WAIT UP TO 2 SECONDS.
+
+                PERFORM wait_aufnr USING lv_number.
+                IF wa_resb-rsnum IS NOT INITIAL.
+                  PERFORM wait_rsnum USING wa_resb-rsnum.
+                ENDIF.
+
+              ENDLOOP.
+
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+      ENDIF.
+    ENDIF.
+
+    IF lv_desplanificada EQ space AND lv_error EQ space.
+*    LOOP AT it_oper TRANSPORTING NO FIELDS WHERE status_oper EQ 'PLANNED' OR status_oper EQ 'planned'.
+*      DATA(lv_liberar) = 'X'.
+*      EXIT.
+*    ENDLOOP.
+      IF lv_mensaje CS 'FB_PLN'."AND lv_liberar = 'X'. "( wa_head-status EQ 'PLANNED' OR wa_head-status EQ 'planned' ).
+        DATA: it_return_release TYPE TABLE OF bapi_order_return,
+              it_order          TYPE TABLE OF bapi_order_key.
+
+
+        WAIT UP TO 3 SECONDS.
+
+        CLEAR: it_order[], it_return_release[],
+        it_order, it_return_release.
+
+        APPEND INITIAL LINE TO it_order ASSIGNING FIELD-SYMBOL(<order>).
+        <order>-order_number = lv_number.
+
+        CALL FUNCTION 'BAPI_PRODORD_RELEASE'
+*     EXPORTING
+*       RELEASE_CONTROL          = '1'
+*       WORK_PROCESS_GROUP       = 'COWORK_BAPI'
+*       WORK_PROCESS_MAX         = 99
+*     IMPORTING
+*       RETURN                   =
+          TABLES
+            orders        = it_order
+            detail_return = it_return_release
+*           APPLICATION_LOG          =
+          .
+
+        LOOP AT it_return_release INTO DATA(release).
+          IF release-type IS NOT INITIAL.
+            CLEAR idoc_status.
+            IF release-type EQ 'A' OR release-type EQ 'E' OR release-type EQ 'X'.
+              DATA(lv_release_err)  = 'X'.
+            ENDIF.
+            idoc_status-msgty    = release-type.
+            idoc_status-msgid    = release-id.
+            idoc_status-msgno    = release-number.
+            idoc_status-msgv1    = release-message_v1.
+            idoc_status-msgv2    = release-message_v2.
+            idoc_status-msgv3    = release-message_v3.
+            idoc_status-msgv4    = release-message_v4.
+            idoc_status-status   = '62'.
+            idoc_status-repid    = sy-repid.
+            CLEAR return_variables.
+            return_variables-wf_param = 'Log IDOCs'.
+            LOOP AT idoc_contrl.
+              idoc_status-docnum = idoc_contrl-docnum.
+              APPEND idoc_status.
+              return_variables-doc_number = idoc_contrl-docnum.
+              APPEND return_variables.
+            ENDLOOP.
+          ENDIF.
+        ENDLOOP.
+        IF lv_release_err = 'X'.
+          ROLLBACK WORK.
+        ELSE.
+          COMMIT WORK.
+
+*          IF lv_waitsec IS INITIAL.
+*            WAIT UP TO '2' SECONDS.
+*          ELSE.
+*            WAIT UP TO lv_waitsec SECONDS.
+*          ENDIF.
+
+*          "INI JVM -GAPSD032 - Se mueve a la fucnión ENDDATES
+*
+*          "fecha confirmada de la OF + el tiempo en tránsito.
+*          DATA lv_fecha_conf TYPE datum.
+*          SELECT SINGLE kdauf, kdpos, gltrp FROM caufv WHERE aufnr = @lv_number AND kdauf <> @space INTO (@DATA(lv_vbeln), @DATA(lv_posnr), @lv_fecha_conf ).
+*          IF sy-subrc = 0.
+**            SELECT SINGLE
+*            SELECT SINGLE traztd FROM tvro AS t1 INNER JOIN vbap AS t2 ON t1~route EQ t2~route WHERE vbeln = @lv_vbeln AND posnr = @lv_posnr
+*              INTO @DATA(lv_transito).
+*            IF lv_transito <> 0.
+*              DATA lv_dias TYPE char10.
+*              CALL FUNCTION 'CONVERSION_EXIT_TSTRG_OUTPUT'
+*                EXPORTING
+*                  input  = lv_transito
+*                IMPORTING
+*                  output = lv_dias.
+*
+*              DATA lv_dias2 TYPE char10.
+*              DATA lv_descarte TYPE char10.
+*              SPLIT lv_dias at ',' INTO lv_dias2 lv_descarte.
+*              REPLACE all OCCURRENCES OF ',' in lv_dias2 WITH ''.
+*              CONDENSE lv_dias2.
+*              DATA lv_dias3 TYPE i.
+*              lv_dias3 = lv_dias2.
+*
+*              lv_fecha_conf = lv_fecha_conf + lv_dias3.
+*            ENDIF.
+*            CALL FUNCTION 'ZSSD_UPD_FSERV'
+*              EXPORTING
+*                i_fconfs = lv_fecha_conf
+*                i_vbeln  = lv_vbeln
+*                i_posnr  = lv_posnr.
+*          ENDIF.
+*          "FIN JVM -GAPSD032 - Se mueve a la fucnión ENDDATES
+
+        ENDIF.
+
+      ENDIF.
+*    CLEAR lv_liberar.
+    ENDIF.
+
+    "INI JVM -GAPSD032 - Se mueve a la fucnión ENDDATES
+
+    "fecha confirmada de la OF + el tiempo en tránsito.
+    CALL FUNCTION 'ZSPP_UPD_FSERV_IDOCS'
+      EXPORTING
+        i_aufnr = lv_aufnr.
+
+*    DATA lv_fecha_conf TYPE datum.
+*    SELECT SINGLE kdauf, kdpos, gltrp FROM caufv WHERE aufnr = @wa_head-orden
+*       AND kdauf <> @space INTO (@DATA(lv_vbeln), @DATA(lv_posnr), @lv_fecha_conf ).
+*    IF sy-subrc = 0 AND lv_status_plan_act EQ abap_true.
+*
+*      SELECT SINGLE traztd FROM tvro AS t1 INNER JOIN vbap AS t2 ON t1~route EQ t2~route
+*        WHERE vbeln = @lv_vbeln AND posnr = @lv_posnr
+*        INTO @DATA(lv_transito).
+*      IF lv_transito <> 0.
+*        DATA lv_dias TYPE char10.
+*        CALL FUNCTION 'CONVERSION_EXIT_TSTRG_OUTPUT'
+*          EXPORTING
+*            input  = lv_transito
+*          IMPORTING
+*            output = lv_dias.
+*
+*        DATA lv_dias2 TYPE char10.
+*        DATA lv_descarte TYPE char10.
+*        SPLIT lv_dias AT ',' INTO lv_dias2 lv_descarte.
+*        REPLACE ALL OCCURRENCES OF ',' IN lv_dias2 WITH ''.
+*        CONDENSE lv_dias2.
+*        DATA lv_dias3 TYPE i.
+*        lv_dias3 = lv_dias2.
+*
+*        lv_fecha_conf = lv_fecha_conf + lv_dias3.
+*      ENDIF.
+*      CALL FUNCTION 'ZSSD_UPD_FSERV'
+*        EXPORTING
+*          i_fconfs = lv_fecha_conf
+*          i_vbeln  = lv_vbeln
+*          i_posnr  = lv_posnr.
+*    ENDIF.
+    "FIN JVM -GAPSD032 - Se mueve a la fucnión ENDDATES
+
+
+  ELSE.
+
+    DATA(lv_of_no_existe) = 'X'.
+
+    CLEAR idoc_status.
+    idoc_status-msgty    = 'E'.
+    idoc_status-msgid    = '00'.
+    idoc_status-msgno    = '398'.
+    idoc_status-msgv1    = 'La orden indicada'.
+    idoc_status-msgv2    = wa_head-orden.
+    idoc_status-msgv3    = 'no existe en el sistema'.
+    idoc_status-msgv4    = ''.
+    idoc_status-status   = '62'.
+    idoc_status-repid    = sy-repid.
+    CLEAR return_variables.
+    return_variables-wf_param = 'Log IDOCs'.
+    LOOP AT idoc_contrl.
+      idoc_status-docnum = idoc_contrl-docnum.
+      APPEND idoc_status.
+      return_variables-doc_number = idoc_contrl-docnum.
+      APPEND return_variables.
+    ENDLOOP.
+
+
+  ENDIF.
+
+  DATA: i_type       TYPE bapi_mtype,
+        i_id         TYPE symsgid,
+        i_number     TYPE symsgno,
+        i_message_v1 TYPE symsgv,
+        i_message_v2 TYPE symsgv,
+        i_message_v3 TYPE symsgv,
+        i_message_v4 TYPE symsgv.
+
+  LOOP AT idoc_status INTO DATA(wa_status).
+    i_type = wa_status-msgty.
+    i_id = wa_status-msgid.
+    i_number = wa_status-msgno.
+    i_message_v1 = wa_status-msgv1.
+    i_message_v2 = wa_status-msgv2.
+    i_message_v3 = wa_status-msgv3.
+    i_message_v4 = wa_status-msgv4.
+    lo_log->guardar_mensaje(
+    EXPORTING
+      i_type       = i_type
+      i_id         = i_id
+      i_number     = i_number
+      i_message_v1 = i_message_v1
+      i_message_v2 = i_message_v2
+      i_message_v3 = i_message_v3
+      i_message_v4 = i_message_v4
+      ).
+  ENDLOOP.
+  IF sy-subrc = 0.
+    DATA lv_subobjeto TYPE balsubobj.
+
+    CASE lv_mensaje.
+      WHEN 'ZIF_OMP_FB_ORDER_ENDDATES'.
+        lv_subobjeto = 'ZENDDAT'.
+
+      WHEN 'ZIF_OMP_FB_PLN'.
+        lv_subobjeto = 'ZFBPLN'.
+
+      WHEN 'ZIF_OMP_FB_UNPLN'.
+        lv_subobjeto = 'ZFBUNPLN'.
+
+      WHEN 'ZIF_OMP_FB_PLANNINGVIEW'.
+        lv_subobjeto = 'ZPLANV'.
+
+      WHEN OTHERS.
+        lv_subobjeto = 'ZEDI_OMP'.
+
+    ENDCASE.
+
+    lo_log->guardar_log(
+    EXPORTING
+      objeto    = 'ZEDI_OMP'    " Log aplicación: Nombre objeto (sigla de aplicación)
+*      subobjeto = 'ZEDI_OMP'    " Log aplicación: Objeto inferior
+      subobjeto = lv_subobjeto "'ZEDI_OMP'    " Log aplicación: Objeto inferior
+*    extnumber =     " Log aplicación: Identificación externa
+    IMPORTING
+    lognumber = DATA(lv_lognum)    " Número de LOG
+          ).
+  ENDIF.
+  DATA it_logtab TYPE bapiret2_tab.
+  lo_log->get_bapiret_tab(
+    IMPORTING
+    gt_bapiret = it_logtab
+  ).
+  LOOP AT it_logtab TRANSPORTING NO FIELDS WHERE type EQ 'E' OR type EQ 'A' OR type EQ 'X'.
+    lv_err_idoc = 'X'.
+    EXIT.
+  ENDLOOP.
+  LOOP AT idoc_status TRANSPORTING NO FIELDS WHERE msgty EQ 'E' OR msgty EQ 'A' OR msgty EQ 'X'.
+    lv_err_idoc = 'X'.
+    EXIT.
+  ENDLOOP.
+  REFRESH idoc_status.
+  CLEAR idoc_status.
+
+  workflow_result = '99999'.
+  CLEAR idoc_status.
+
+  IF lv_err_idoc = 'X'.
+    idoc_status-msgty    = 'E'.
+    idoc_status-status   = '63'.
+  ELSE.
+    idoc_status-msgty    = 'S'.
+    idoc_status-status   = '53'.
+  ENDIF.
+  IF lv_of_no_existe IS INITIAL AND NOT ( lv_error_datos_pi2 EQ 'X' OR lv_error_datos_pi EQ 'X' ).
+
+    idoc_status-msgid    = '00'.
+    idoc_status-msgno    = '398'.
+    idoc_status-msgv1    = 'Revisar LOG de Aplicación'.
+    idoc_status-msgv2    = ''.
+    idoc_status-msgv3    = ''.
+    idoc_status-msgv4    = ''.
+
+  ELSEIF lv_error_datos_pi2 EQ 'X' OR lv_error_datos_pi EQ 'X'.
+
+    idoc_status-msgid    = '00'.
+    idoc_status-msgno    = '398'.
+    idoc_status-msgv1    = 'Error de mapeos en PI'.
+    idoc_status-msgv2    = ''.
+    idoc_status-msgv3    = ''.
+    idoc_status-msgv4    = ''.
+
+  ELSE.
+
+    idoc_status-msgid    = '00'.
+    idoc_status-msgno    = '398'.
+    idoc_status-msgv1    = 'La orden indicada'.
+    idoc_status-msgv2    = wa_head-orden.
+    idoc_status-msgv3    = 'no existe en el sistema'.
+    idoc_status-msgv4    = ''.
+
+  ENDIF.
+  idoc_status-repid    = sy-repid.
+  idoc_status-appl_log = lv_lognum.
+  CLEAR return_variables.
+  return_variables-wf_param = 'PROCESS_IDOCs'.
+  LOOP AT idoc_contrl.
+    idoc_status-docnum = idoc_contrl-docnum.
+    APPEND idoc_status.
+    return_variables-doc_number = idoc_contrl-docnum.
+    APPEND return_variables.
+  ENDLOOP.
+
+  SORT return_variables.
+  DELETE ADJACENT DUPLICATES FROM return_variables.
+
+
+  CALL FUNCTION 'DB_COMMIT'.
+  CALL FUNCTION 'DEQUEUE_ALL'.
+  COMMIT WORK.
+
+ENDFUNCTION.

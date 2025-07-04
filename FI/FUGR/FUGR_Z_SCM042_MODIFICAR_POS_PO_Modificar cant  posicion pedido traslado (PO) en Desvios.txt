@@ -1,0 +1,117 @@
+FUNCTION z_scm042_modificar_pos_po.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IT_PO_POS_MOD) TYPE  FRE_EKPO_TTY
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_TT
+*"----------------------------------------------------------------------
+* JGM 02.2024 GAPCM042 Aplicativo Gestión de Desvíos:
+* Modificar posiciones (cantidades) de pedido traslado (PO).
+*--------------------------------------------------------------------*
+  DATA: lt_po_pos     TYPE fre_ekpo_tty,
+        lt_po_pos_aux TYPE fre_ekpo_tty,
+        lt_return     TYPE bapiret2_tt.
+  DATA: lt_poitem  TYPE TABLE OF bapimepoitem,
+        lt_poitemx TYPE TABLE OF bapimepoitemx.
+
+  DATA: ls_poheader  TYPE bapimepoheader,
+        ls_poheaderx TYPE bapimepoheaderx,
+        ls_poitem    TYPE bapimepoitem,
+        ls_poitemx   TYPE bapimepoitemx.
+
+  DATA: lv_purchaseorder TYPE bapimepoheader-po_number,
+        lv_ebelp         TYPE ekpo-ebelp,
+        lv_menge_new     TYPE ekpo-menge.
+
+  DATA: lr_type_error TYPE RANGE OF bapi_mtype.
+
+
+  lr_type_error = VALUE #( sign = 'I' option = 'EQ' ( low = 'E' ) ( low = 'A' ) ).
+
+*  lt_po_pos = it_po_pos_mod.
+*  SORT lt_po_pos BY ebeln ebelp.
+
+  ">Puede haber partición de lotes, agrupar por PO-pos de procedencia.
+  lt_po_pos_aux = it_po_pos_mod.
+  SORT lt_po_pos_aux BY ebeln ebelp.
+
+  LOOP AT lt_po_pos_aux INTO DATA(wa_aux).
+    COLLECT wa_aux INTO lt_po_pos.
+  ENDLOOP.
+  "<
+
+  LOOP AT lt_po_pos ASSIGNING FIELD-SYMBOL(<fs_po_pos>).
+
+    AT NEW ebeln.
+      lv_purchaseorder = <fs_po_pos>-ebeln.
+
+      SELECT ebeln, ebelp, loekz, menge, meins
+        INTO TABLE @DATA(lt_ekpo)
+        FROM ekpo
+        WHERE ebeln EQ @lv_purchaseorder.
+
+      "Cabecera:
+      CLEAR: ls_poheader,
+             ls_poheaderx.
+    ENDAT.
+
+    "Posiciones:
+    lv_ebelp = <fs_po_pos>-ebelp.
+
+    TRY .
+        DATA(ls_ekpo) = lt_ekpo[ ebelp = lv_ebelp ].
+      CATCH cx_root.
+    ENDTRY.
+    IF ls_ekpo IS NOT INITIAL.
+      lv_menge_new = ls_ekpo-menge - <fs_po_pos>-menge. "Reducir cantidad.
+    ENDIF.
+
+    ls_poitem-po_item   = lv_ebelp.
+    ls_poitem-quantity  = lv_menge_new.
+    ls_poitem-po_unit   = <fs_po_pos>-meins.
+    APPEND ls_poitem TO lt_poitem.
+    CLEAR ls_poitem.
+
+    ls_poitemx-po_item  = lv_ebelp.
+    ls_poitemx-quantity = 'X'.
+    ls_poitemx-po_unit  = 'X'.
+    APPEND ls_poitemx TO lt_poitemx.
+    CLEAR ls_poitemx.
+
+    AT END OF ebeln.
+      CALL FUNCTION 'BAPI_PO_CHANGE'
+        EXPORTING
+          purchaseorder = lv_purchaseorder
+*         POHEADER      =
+*         POHEADERX     =
+        TABLES
+          return        = lt_return
+          poitem        = lt_poitem
+          poitemx       = lt_poitemx.
+
+      LOOP AT lt_return TRANSPORTING NO FIELDS WHERE type IN lr_type_error.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc EQ 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+
+        "Modificadas cantidades pedido traslado".
+        PERFORM fill_return USING 'S' 'ZSCM042' '047' lv_purchaseorder space space space CHANGING et_return.
+      ENDIF.
+
+      "Mensajes de error de la bapi.
+      DELETE lt_return WHERE type NOT IN lr_type_error.
+      APPEND LINES OF lt_return TO et_return.
+
+      FREE: lt_return,
+            lt_poitem,
+            lt_poitemx.
+    ENDAT.
+  ENDLOOP.
+
+ENDFUNCTION.

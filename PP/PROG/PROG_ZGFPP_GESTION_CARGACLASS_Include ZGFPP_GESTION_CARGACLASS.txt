@@ -1,0 +1,226 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZGFPP_GESTION_CARGACLASS
+*&---------------------------------------------------------------------*
+CLASS lcl_handle_popup DEFINITION.
+  PUBLIC SECTION.
+    METHODS:
+      on_user_command FOR EVENT added_function OF cl_salv_events
+        IMPORTING e_salv_function.
+
+*    METHODS: on_link_click   FOR EVENT link_click OF
+*                  cl_salv_events_table
+*      IMPORTING row column.
+
+ENDCLASS.                    "lcl_handle_events DEFINITION
+
+*---------------------------------------------------------------------*
+* #5.2 implement the events for handling the events of cl_salv_table
+*---------------------------------------------------------------------*
+CLASS lcl_handle_popup IMPLEMENTATION.
+  METHOD on_user_command.
+    DATA:
+      lr_selections TYPE REF TO cl_salv_selections,
+      lt_rows       TYPE salv_t_row,
+      lt_enq        TYPE TABLE OF seqg3, "DTM
+      l_kunnr       TYPE kunnr,
+      lv_garg       TYPE eqegraarg.      "DTM
+
+    g_rc = '00'.
+*   execute function
+    CASE e_salv_function.
+      WHEN 'CONTINUE'
+        OR 'CONT'.                     "pressing ENTER behaves different, means RS_CUA_GET_STATUS returns UCOMM only 4 digts long
+*       get selected line
+        lr_selections = go_alv->get_selections( ).
+        lt_rows = lr_selections->get_selected_rows( ).
+
+        IF lines( lt_rows ) = 0.
+          MESSAGE |Seleccione una o mas entregas para continuar| TYPE 'I' DISPLAY LIKE 'E'. " i323(zpp). "Seleccione una receta para continuar.
+          EXIT.
+        ELSE.
+          CLEAR: g_kg_totales , l_kunnr, gt_entregas_selec.
+
+          LOOP AT lt_rows INTO DATA(l_row).
+            CHECK g_rc <> '11'.
+
+            TRY.
+                DATA(ls_entrega) = gt_entregas_totales[ l_row ].
+                APPEND INITIAL LINE TO gt_entregas_selec ASSIGNING FIELD-SYMBOL(<fs_entrega>).
+                <fs_entrega>-vbeln = ls_entrega-vbeln.
+                <fs_entrega>-kostk = ls_entrega-kostk.
+*                g_kg_totales = g_kg_totales + ls_entrega-menge.
+                g_kg_totales = g_kg_totales + ls_entrega-cant_pick.
+
+* Validar que todos los registros seleccionados son del mismo cliente.
+                IF l_kunnr IS INITIAL.
+                  l_kunnr = ls_entrega-kunnr.
+                ELSE.
+                  IF l_kunnr <> ls_entrega-kunnr.
+                    g_rc = '11'.
+                    MESSAGE |Las entregas seleccionadas no pertenecen al mismo cliente.| TYPE 'E'. " i323(zpp). "Seleccione una receta para continuar.
+                    EXIT.
+                  ENDIF.
+                ENDIF.
+
+              CATCH cx_root .
+            ENDTRY.
+
+          ENDLOOP.
+
+*DTM - Se comprueba si las entregas seleccionadas están bloqueadas
+
+          LOOP AT lt_rows ASSIGNING FIELD-SYMBOL(<lfs_rows>).
+
+            TRY.
+                DATA(ls_entregas) = gt_entregas_totales[ <lfs_rows> ].
+
+                CLEAR: lv_garg, lt_enq[].
+                lv_garg = sy-mandt && ls_entregas-vbeln.
+
+                CALL FUNCTION 'ENQUEUE_READ'
+                  EXPORTING
+                    gclient               = sy-mandt
+                    gname                 = 'LIKP'
+                    garg                  = lv_garg
+                  TABLES
+                    enq                   = lt_enq
+                  EXCEPTIONS
+                    communication_failure = 1
+                    system_failure        = 2
+                    OTHERS                = 3.
+
+                IF lt_enq IS NOT INITIAL.
+
+                  READ TABLE lt_enq ASSIGNING FIELD-SYMBOL(<lfs_enq>) INDEX 1.
+
+                  ls_entregas-vbeln = |{ ls_entregas-vbeln ALPHA = OUT }|. "Se quitan los ceros de la izquierda
+
+                  g_rc = '11'.
+                  MESSAGE |La entrega { ls_entregas-vbeln } está bloqueada por el usuario { <lfs_enq>-guname } . Por favor, inténtelo más tarde. | TYPE 'I' DISPLAY LIKE 'E'.
+                  EXIT.
+
+                ELSE. " Se comprueba que la entrega no tenga realizada la SM (status SM <> C)
+
+                  SELECT SINGLE wbstk FROM vbuk
+                      WHERE vbeln EQ @ls_entregas-vbeln
+                  INTO @DATA(lv_status).
+
+                  IF lv_status EQ 'C'.
+
+                    ls_entregas-vbeln = |{ ls_entregas-vbeln ALPHA = OUT }|. "Se quitan los ceros de la izquierda
+
+                    g_rc = '11'.
+                    MESSAGE |Entrega { ls_entregas-vbeln } con salida de mercancía ya realizada. | TYPE 'I' DISPLAY LIKE 'E'.
+                    EXIT.
+
+                  ENDIF.
+
+                ENDIF.
+
+              CATCH cx_root .
+            ENDTRY.
+
+          ENDLOOP.
+
+* DTM
+
+          CHECK g_rc <> '11'.
+
+* validar los kg.máximos con o sin remolque.
+          IF gw_2o_remolque = 'X'.
+
+            " DTM - gv_carga_max tiene los Kg máximos permitidos menos la tara o taras
+            IF g_kg_totales > gv_carga_max. "zclpp_gestion_cargas_picking=>gc_kg_max_con_remolque.
+              g_rc = '11'. "DTM
+              MESSAGE |Suma de kg. de entregas superior al máximo permitido.| TYPE 'E'.
+**              EXIT.
+            ENDIF.
+
+          ELSE.
+
+            IF g_kg_totales > gv_carga_max. "zclpp_gestion_cargas_picking=>gc_kg_max_sin_remolque.
+              g_rc = '11'. "DTM
+              MESSAGE |Suma de kg. de entregas superior al máximo permitido.| TYPE 'E'.
+**              EXIT.
+            ENDIF.
+
+          ENDIF.
+
+          CHECK g_rc <> '11'. "DTM
+
+          DATA: lv_answer(1) TYPE c,
+                l_msg        TYPE string.
+
+          l_msg = |Se procederá a la creación del transporte. ¿Desea continuar?|.
+
+
+          CALL FUNCTION 'POPUP_TO_CONFIRM'
+            EXPORTING
+              titlebar              = 'Creación de transporte'
+              text_question         = l_msg
+              text_button_1         = 'Crear transporte' "
+              icon_button_1         = 'ICON_OKAY' "
+              text_button_2         = 'Cancelar' " 'Cancelar'
+              icon_button_2         = 'ICON_CANCEL' " 'Cancelar'
+              default_button        = '1'
+              display_cancel_button = ' '
+            IMPORTING
+              answer                = lv_answer
+            EXCEPTIONS
+              text_not_found        = 1
+              OTHERS                = 2.
+*              text_button_1         = 'Cancelar' "
+*              icon_button_1         = 'ICON_CANCEL' "
+*              text_button_2         = 'Crear transporte' " 'Cancelar'
+*              icon_button_2         = 'ICON_OKAY' " 'Cancelar'
+
+          IF lv_answer = '2'.
+*    p_tipo = 'E'.
+            EXIT.
+          ENDIF.
+
+
+          go_alv->close_screen( ).
+          g_rc = '00'.
+*            TRY.
+*                g_id_receta = g_datos_rec_mp[ lv_row ]-id_receta.
+*              CATCH cx_root .
+*                MESSAGE e324(zpp). "Receta no encontrada
+*            ENDTRY.
+*          ENDIF.
+        ENDIF.
+
+      WHEN 'CANC'.
+        g_rc = '03'.
+*       leave popup
+*       - (currently) not supported via code &AC1
+        go_alv->close_screen( ).
+*      WHEN 'CONS'.
+*        lr_selections = go_alv->get_selections( ).
+*        lt_rows = lr_selections->get_selected_rows( ).
+*        DESCRIBE TABLE lt_rows LINES lv_no_selected.
+*
+*        IF lv_no_selected IS INITIAL.
+**         no selection made
+*          MESSAGE i323(zpp). "Seleccione una receta para continuar.
+*        ELSE.
+*          LOOP AT lt_rows INTO lv_row.
+**            PERFORM invocar_consulta_receta_mp USING lv_row.
+*          ENDLOOP.
+**         only valid lines
+**          READ TABLE lt_rows INTO lv_row INDEX 1.
+**          IF lv_row IS NOT INITIAL.
+**            PERFORM invocar_consulta_receta_std USING lv_row.
+**          ENDIF.
+*        ENDIF.
+
+      WHEN OTHERS.
+*       currently no further commands supported
+
+    ENDCASE.
+
+
+
+
+  ENDMETHOD.
+ENDCLASS.

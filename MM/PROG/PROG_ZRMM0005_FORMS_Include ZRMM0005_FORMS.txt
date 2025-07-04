@@ -1,0 +1,926 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRMM0005_FORMS
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  RECUPERAR_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM recuperar_datos .
+
+* Obtenemos movimientos y periodos a tratar:
+  PERFORM obtener_mov.
+
+* Obtenemos previsiones año:
+  PERFORM obtener_prev.
+
+* Con todos los datos, rellenamos la tabla dinámica del ALV:
+  PERFORM cargar_alv.
+
+ENDFORM.                    " RECUPERAR_DATOS
+*&---------------------------------------------------------------------*
+*&      Form  CARGAR_COLUMNAS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM cargar_columnas .
+
+  DATA: ls_columna TYPE ty_clientes.
+
+  DATA: lv_conta TYPE zcolumna,
+        lv_ind   TYPE i.
+
+* Inicializamos:
+  CLEAR: ls_columna, gti_columnas.
+  REFRESH: gti_columnas.
+
+* Sacamos todas las columnas que se van a pintar
+* a partir de la selección:
+
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE gti_columnas
+    FROM ztmm0010
+    WHERE kunnr IN so_kunnr.
+
+* Añadir las columnas que no tienen especificado cliente:
+  SELECT * APPENDING CORRESPONDING FIELDS OF TABLE gti_columnas
+    FROM ztmm0010
+    WHERE kunnr = ' '.
+
+* Ordenamos por número de columna y nombre de cliente.
+* Quitamos posibles duplicados.
+  SORT gti_columnas BY columna ASCENDING
+                       ncolumna ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM gti_columnas.
+
+* Recorremos los clientes poniendo el contador real
+* que van a tener en el listado:
+  LOOP AT gti_columnas INTO ls_columna.
+    lv_ind = sy-tabix.
+    lv_conta = lv_conta + '001'.
+    ls_columna-cont =  lv_conta.
+*   Modificamos la línea
+    MODIFY gti_columnas FROM ls_columna INDEX lv_ind.
+  ENDLOOP.
+
+ENDFORM.                    " CARGAR_COLUMNAS
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_MOV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM obtener_mov.
+
+  DATA: lt_movimientos       TYPE TABLE OF ty_movimientos,
+        ls_mov               TYPE          ty_movimientos,
+        ls_mov_per           TYPE          ty_mov_per,
+        ls_periodos          TYPE          ty_periodos,
+        ls_columnas          TYPE          ty_clientes,
+        lv_object            TYPE          objnum,
+        lt_alloc_values_num  TYPE          tt_bapi1003_alloc_values_num,
+        lt_alloc_values_char TYPE          tt_bapi1003_alloc_values_char,
+        lt_alloc_values_curr TYPE          tt_bapi1003_alloc_values_curr,
+        lt_return            TYPE          bapiret2_tab,
+        ls_alloc_values_char TYPE          bapi1003_alloc_values_char,
+        lv_atwrt             TYPE          ausp-atwrt,
+        lv_cuobj_bm          TYPE          mch1-cuobj_bm,
+        lv_objek             TYPE          ausp-objek,
+        lv_atinn             TYPE          ausp-atinn,
+        lv_klart             TYPE          ausp-klart  VALUE '023',
+        lv_clint             TYPE          kssk-clint,
+        lv_class             TYPE          klah-class.
+
+
+  CLEAR: lt_movimientos.
+  REFRESH: lt_movimientos, gti_mov_per, gti_periodos.
+
+* Buscamos valor interno de caracteristica Z_CLIENTE
+  CLEAR lv_atinn.
+  SELECT SINGLE atinn INTO lv_atinn
+    FROM cabn
+    WHERE atnam = 'Z_CLIENTE'.
+
+* Seleccionamos todos los movimientos según datos de selección:
+  SELECT a~budat b~matnr b~charg b~werks b~lgort b~bwart b~menge
+         b~meins
+    INTO TABLE lt_movimientos
+    FROM mkpf AS a
+    INNER JOIN mseg AS b ON ( b~mblnr = a~mblnr AND b~mjahr = a~mjahr )
+    INNER JOIN mara AS c ON ( c~matnr = b~matnr )
+    WHERE a~budat IN so_budat
+    AND b~matnr IN so_matnr
+    AND b~werks IN so_werks
+    AND b~lgort IN so_lgort
+    AND ( b~bwart = '101' OR b~bwart = '102' OR
+          b~bwart = '701' OR b~bwart = '702' OR b~bwart = '309')
+    AND c~mtart IN so_mtart.
+
+* Recuperamos cliente y periodos:
+  LOOP AT lt_movimientos INTO ls_mov.
+    CLEAR ls_mov_per.
+    MOVE-CORRESPONDING ls_mov TO ls_mov_per.
+* Periodo:
+    ls_mov_per-period = ls_mov-budat+0(6).
+    " Añadir periodo tratado a tabla global:
+    CLEAR ls_periodos.
+    READ TABLE gti_periodos INTO ls_periodos WITH KEY period = ls_mov_per-period.
+    IF ls_periodos IS INITIAL.
+      ls_periodos-period = ls_mov_per-period.
+      CALL FUNCTION 'FKK_LAST_DAY_OF_MONTH'
+        EXPORTING
+          day_in            = ls_mov_per-budat
+        IMPORTING
+          last_day_of_month = ls_periodos-ffperio
+        EXCEPTIONS
+          day_in_no_date    = 1
+          OTHERS            = 2.
+      IF sy-subrc <> 0.
+* Implement suitable error handling here
+      ELSE.
+        IF so_budat-high IS NOT INITIAL AND ls_periodos-ffperio > so_budat-high.
+          ls_periodos-ffperio = so_budat-high.
+        ELSEIF ( so_budat-low IS NOT INITIAL AND so_budat-high IS INITIAL ) AND ls_periodos-ffperio > so_budat-low.
+          ls_periodos-ffperio = so_budat-low.
+        ENDIF.
+      ENDIF.
+      APPEND ls_periodos TO gti_periodos.
+    ENDIF.
+
+* Cliente: Leer el cliente del material/lote
+*--> INICIO 7000012433 - DUMP por timeout - Leemos caracteristica en AUSP
+    CLEAR: lv_cuobj_bm, lv_objek, lv_atwrt.
+    SELECT SINGLE cuobj_bm INTO lv_cuobj_bm
+      FROM mch1
+      WHERE matnr = ls_mov_per-matnr
+      AND   charg = ls_mov_per-charg.
+    IF sy-subrc = 0.
+      lv_objek = lv_cuobj_bm.
+      SELECT SINGLE atwrt INTO lv_atwrt
+        FROM ausp
+        WHERE objek = lv_objek
+        AND   atinn = lv_atinn
+        AND   klart = lv_klart.
+    ENDIF.
+    IF lv_atwrt IS NOT INITIAL.
+      CONDENSE lv_atwrt.
+      CLEAR ls_columnas.
+      READ TABLE gti_columnas INTO ls_columnas
+                 WITH KEY kunnr = lv_atwrt.
+      IF ls_columnas IS NOT INITIAL.
+        ls_mov_per-kunnr = lv_atwrt.
+        CONDENSE ls_mov_per-kunnr.
+      ELSE.
+        CLEAR ls_mov_per-kunnr.
+      ENDIF.
+    ELSE.
+      CLEAR ls_mov_per-kunnr.
+    ENDIF.
+
+*--> INI SAT 7000014855 08/05/2017
+    IF so_dec-low IS NOT INITIAL.
+      DATA: lv_dec TYPE char20.
+      CLEAR lv_object.
+      CONCATENATE ls_mov_per-matnr ls_mov_per-charg INTO lv_object.
+
+      REFRESH: lt_alloc_values_num, lt_alloc_values_char.
+      REFRESH: lt_alloc_values_curr, lt_return.
+
+      CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+        EXPORTING
+          objectkey       = lv_object
+          objecttable     = 'MCH1'
+          classnum        = 'Z_BOBINA'
+          classtype       = '023'
+*         KEYDATE         = SY-DATUM
+*         UNVALUATED_CHARS       = ' '
+*         LANGUAGE        = SY-LANGU
+* IMPORTING
+*         STATUS          =
+*         STANDARDCLASS   =
+        TABLES
+          allocvaluesnum  = lt_alloc_values_num
+          allocvalueschar = lt_alloc_values_char
+          allocvaluescurr = lt_alloc_values_curr
+          return          = lt_return.
+
+      CLEAR ls_alloc_values_char.
+      TRANSLATE so_dec-low TO UPPER CASE.
+
+      IF so_dec-low NE 'A' AND so_dec-low NE 'P' AND so_dec-low NE 'R'
+        AND so_dec-low NE 'DE       A' AND so_dec-low NE 'DE       R' AND so_dec-low NE 'DE       P'.
+        MESSAGE i119(zmm) DISPLAY LIKE 'W'.
+        CLEAR: so_dec[], lv_dec, ls_mov_per-dec_empleo.
+        CALL SELECTION-SCREEN 1000.
+      ELSEIF so_dec-low EQ 'A' OR so_dec-low EQ 'P' OR so_dec-low EQ 'R'.
+        CONCATENATE 'DE       ' so_dec-low INTO lv_dec RESPECTING BLANKS.
+      ELSE.
+        lv_dec = so_dec-low.
+      ENDIF.
+
+      READ TABLE lt_alloc_values_char INTO ls_alloc_values_char
+                 WITH KEY charact = 'LOBM_UDCODE'.
+      IF ls_alloc_values_char-value_neutral IS NOT INITIAL AND ls_alloc_values_char-value_neutral EQ lv_dec.
+        CONDENSE ls_alloc_values_char-value_neutral.
+        ls_mov_per-dec_empleo = ls_alloc_values_char-value_neutral.
+        CONDENSE ls_mov_per-dec_empleo.
+      ELSE.
+        CLEAR ls_mov_per.
+      ENDIF.
+    ENDIF.
+
+*--> FIN SAT 7000014855 08/05/2017
+
+*    CLEAR lv_object.
+*    CONCATENATE ls_mov_per-matnr ls_mov_per-charg INTO lv_object.
+*
+*    REFRESH: lt_alloc_values_num, lt_alloc_values_char.
+*    REFRESH: lt_alloc_values_curr, lt_return.
+*
+*    CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+*      EXPORTING
+*        objectkey       = lv_object
+*        objecttable     = 'MCH1'
+*        classnum        = 'Z_BOBINA'
+*        classtype       = '023'
+**       KEYDATE         = SY-DATUM
+**       UNVALUATED_CHARS       = ' '
+**       LANGUAGE        = SY-LANGU
+** IMPORTING
+**       STATUS          =
+**       STANDARDCLASS   =
+*      TABLES
+*        allocvaluesnum  = lt_alloc_values_num
+*        allocvalueschar = lt_alloc_values_char
+*        allocvaluescurr = lt_alloc_values_curr
+*        return          = lt_return.
+*
+*    CLEAR ls_alloc_values_char.
+*    READ TABLE lt_alloc_values_char INTO ls_alloc_values_char
+*               WITH KEY charact = 'Z_CLIENTE'.
+*    IF ls_alloc_values_char-value_neutral IS NOT INITIAL.
+*      CONDENSE ls_alloc_values_char-value_neutral.
+*      CLEAR ls_columnas.
+*      READ TABLE gti_columnas INTO ls_columnas
+*                 WITH KEY kunnr = ls_alloc_values_char-value_neutral.
+*      IF ls_columnas IS NOT INITIAL.
+*        ls_mov_per-kunnr = ls_alloc_values_char-value_neutral.
+*        CONDENSE ls_mov_per-kunnr.
+*      ELSE.
+*        CLEAR ls_mov_per-kunnr.
+*      ENDIF.
+*    ELSE.
+*      CLEAR ls_mov_per-kunnr.
+*    ENDIF.
+*<-- FIN    7000012433 - DUMP por timeout - Leemos caracteristica en AUSP
+
+    APPEND ls_mov_per TO gti_mov_per.
+  ENDLOOP.
+ENDFORM.                    " OBTENER_MOV
+*&---------------------------------------------------------------------*
+*&      Form  CARGAR_ALV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM cargar_alv .
+
+  DATA: lv_field     TYPE char20,
+        lv_fecha(10),
+        lv_tot_per   TYPE zmenge_cli,
+        lv_tot       TYPE zmenge_cli,
+        ls_periodos  TYPE ty_periodos,
+        ls_columnas  TYPE ty_clientes,
+        ls_mov_per   TYPE ty_mov_per,
+        ls_prev      TYPE ztmm0011,
+        lv_porc_tot  TYPE zmenge_cli,
+        lv_desv_tot  TYPE zmenge_cli,
+        lv_desv_aux  TYPE zmenge_cli.
+
+  FIELD-SYMBOLS: <fs_periodo>      TYPE zperiodo,
+                 <fs_periodo_aux>  TYPE zperiodo,
+                 <fs_periodo_aux2> TYPE zperiodo,
+                 <fs_periodo_aux3> TYPE zperiodo,
+                 <fs_periodo_tot>  TYPE zperiodo,
+                 <fs_menge>        TYPE zmenge_cli,
+                 <fs_menge_aux>    TYPE zmenge_cli,
+                 <fs_menge_desv>   TYPE zmenge_cli,
+                 <fs_menge_tot>    TYPE zmenge_cli,
+                 <fs_total>        TYPE ztot_per,
+                 <fs_tab_total>    TYPE ztot_per,
+                 <fs_meins>        TYPE meins,
+                 <fs_meins_tot>    TYPE meins,
+                 <fs_tab_meins>    TYPE meins,
+                 <fs_porc_meins>   TYPE meins,
+                 <fs_desv_meins>   TYPE meins,
+                 <fs_porc>         TYPE zmenge_cli,
+                 <fs_porc_desv>    TYPE zmenge_cli,
+                 <fs_tab_porc>     TYPE zmenge_cli,
+                 <fs_tot_desv>     TYPE zmenge_cli,
+                 <fs_color>        TYPE zcolor.
+
+* Inicializamos la tabla del ALV
+  REFRESH <gti_datos>.
+*---------------------------------------------------------------------*
+* Datos por periodos en el listado:
+*---------------------------------------------------------------------*
+  SORT gti_periodos BY period ASCENDING.
+  LOOP AT gti_periodos INTO ls_periodos.
+    CLEAR lv_tot_per.
+*   Inicializamos la estructura dinámica con los datos básicos
+    CLEAR <gs_dato>.
+*   Periodo:
+    CLEAR lv_field.
+    lv_field = 'PERIODO'.
+    ASSIGN COMPONENT lv_field OF STRUCTURE <gs_dato> TO <fs_periodo>.
+    CHECK sy-subrc = 0.
+    CLEAR lv_fecha.
+    CONCATENATE ls_periodos-ffperio+4(2) ls_periodos-ffperio+0(4)
+                INTO lv_fecha SEPARATED BY '.'.
+    <fs_periodo> = lv_fecha.
+
+*   Cantidades por cliente:
+    LOOP AT gti_columnas INTO ls_columnas.
+*     Sacamos el campo dinámico que vamos a rellenar
+      CLEAR lv_field.
+      CONCATENATE 'ZMENGE_CLI' ls_columnas-cont INTO lv_field.
+      ASSIGN COMPONENT lv_field OF STRUCTURE <gs_dato> TO <fs_menge>.
+      CHECK sy-subrc = 0.
+*     Sacamos las cantidades para los clientes:
+      LOOP AT gti_mov_per INTO ls_mov_per WHERE period = ls_periodos-period
+                                          AND   kunnr = ls_columnas-kunnr.
+* Cantidad:
+        CASE ls_mov_per-bwart.
+          WHEN '101' OR '701'.
+*        IF ls_mov_per-bwart = '101'.
+            <fs_menge> = <fs_menge> + ls_mov_per-menge.
+            lv_tot_per = lv_tot_per + ls_mov_per-menge.
+*        ELSE.
+          WHEN '102' OR '702'.
+            <fs_menge> = <fs_menge> - ls_mov_per-menge.
+            lv_tot_per = lv_tot_per - ls_mov_per-menge.
+*        ENDIF.
+        ENDCASE.
+* Unidad:
+        CLEAR lv_field.
+        lv_field = 'MEINS'.
+        ASSIGN COMPONENT lv_field OF STRUCTURE <gs_dato> TO <fs_meins>.
+        CHECK sy-subrc = 0.
+        <fs_meins> = ls_mov_per-meins.
+
+      ENDLOOP.
+
+    ENDLOOP.
+*   Total:
+    CLEAR lv_field.
+    lv_field = 'ZTOT_PER'.
+    ASSIGN COMPONENT lv_field OF STRUCTURE <gs_dato> TO <fs_total>.
+    CHECK sy-subrc = 0.
+    <fs_total> = lv_tot_per.
+
+*   Añadimos la línea al ALV
+    APPEND <gs_dato> TO <gti_datos>.
+
+  ENDLOOP.
+*-------------------------------------------------------------------*
+* Fin datos por periodos en el listado                              *
+*-------------------------------------------------------------------*
+
+*-------------------------------------------------------------------*
+* Totalizados fabricado:
+*-------------------------------------------------------------------*
+  CLEAR: <gs_dato>, <gs_tot>, lv_tot.
+
+*   Descripción totalizado:
+  CLEAR lv_field.
+  lv_field = 'PERIODO'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_tot> TO <fs_periodo>.
+  CHECK sy-subrc = 0.
+  <fs_periodo> = text-003. "'TOTALES'.
+
+  LOOP AT <gti_datos> ASSIGNING <gs_dato>.
+    LOOP AT gti_columnas INTO ls_columnas.
+* Cálculo total cantidad:
+      CLEAR lv_field.
+      CONCATENATE 'ZMENGE_CLI' ls_columnas-cont INTO lv_field.
+      ASSIGN COMPONENT lv_field OF STRUCTURE <gs_dato> TO <fs_menge>.
+      CHECK sy-subrc = 0.
+      ASSIGN COMPONENT lv_field OF STRUCTURE <gs_tot> TO <fs_menge_tot>.
+      CHECK sy-subrc = 0.
+      <fs_menge_tot> = <fs_menge_tot> + <fs_menge>.
+      lv_tot = lv_tot + <fs_menge>.
+      CLEAR lv_field.
+      lv_field = 'MEINS'.
+      ASSIGN COMPONENT lv_field OF STRUCTURE <gs_dato> TO <fs_meins>.
+      CHECK sy-subrc = 0.
+* Unidad:
+      CLEAR lv_field.
+      lv_field = 'MEINS'.
+      ASSIGN COMPONENT lv_field OF STRUCTURE <gs_tot> TO <fs_meins_tot>.
+      CHECK sy-subrc = 0.
+      <fs_meins_tot> = <fs_meins>.
+    ENDLOOP.
+  ENDLOOP.
+* Total:
+  CLEAR lv_field.
+  lv_field = 'ZTOT_PER'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_tot> TO <fs_total>.
+  CHECK sy-subrc = 0.
+  <fs_total> = lv_tot.
+
+  CLEAR lv_field.
+  lv_field = 'COLOR'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_tot> TO <fs_color>.
+  CHECK sy-subrc = 0.
+  <fs_color> = 'C311'.
+
+* Añadimos la línea al ALV:
+  APPEND <gs_tot> TO <gti_datos>.
+
+*-------------------------------------------------------------------*
+* Fin de totalizados fabricado                                      *
+*-------------------------------------------------------------------*
+
+*-------------------------------------------------------------------*
+* Totalizados tabla: Cantidad
+*-------------------------------------------------------------------*
+  DATA: lv_porc_cli   TYPE zporc_cuotas,
+        lv_cant_cli   TYPE menge_d,
+        lv_porc_stock TYPE zporc_cuotas,
+        lv_cant_stock TYPE menge_d.
+  CLEAR: <gs_tot_tab>, <gs_porc_tab>.
+  CLEAR: lv_porc_cli, lv_cant_cli, lv_porc_stock, lv_porc_stock.
+  CLEAR lv_field.
+  lv_field = 'PERIODO'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_tot_tab> TO <fs_periodo>.
+  CHECK sy-subrc = 0.
+  <fs_periodo> = text-004. "'TOTALES PREV.'.
+
+  LOOP AT gti_columnas INTO ls_columnas.
+    CLEAR: lv_field. ", <fs_menge>, <fs_porc>.
+    CONCATENATE 'ZMENGE_CLI' ls_columnas-cont INTO lv_field.
+    ASSIGN COMPONENT lv_field OF STRUCTURE <gs_tot_tab> TO <fs_menge>.
+    CHECK sy-subrc = 0.
+    CLEAR <fs_menge>.
+    CLEAR ls_prev.
+    READ TABLE gti_prev INTO ls_prev
+               WITH KEY ncolumna = ls_columnas-ncolumna.
+
+    IF ls_prev IS NOT INITIAL.
+      IF ls_columnas-kunnr IS NOT INITIAL.
+        <fs_menge> = ls_prev-menge.
+        lv_cant_cli = lv_cant_cli + ls_prev-menge.
+      ELSE.
+        lv_cant_stock = gv_cant_prev - lv_cant_cli.
+        <fs_menge> = lv_cant_stock.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Totales y unidades: Totales tabla
+  CLEAR lv_field.
+  lv_field = 'ZTOT_PER'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_tot_tab> TO <fs_tab_total>.
+  CHECK sy-subrc = 0.
+  <fs_tab_total> = gv_cant_prev.
+
+  CLEAR lv_field.
+  lv_field = 'MEINS'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_tot_tab> TO <fs_tab_meins>.
+  CHECK sy-subrc = 0.
+  <fs_tab_meins> = gv_meins_prev.
+
+  CLEAR lv_field.
+  lv_field = 'COLOR'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_tot_tab> TO <fs_color>.
+  CHECK sy-subrc = 0.
+  <fs_color> = 'C311'.
+
+  APPEND <gs_tot_tab> TO <gti_datos>.
+
+*-------------------------------------------------------------------*
+* Fin Totalizados tabla: Cantidad
+*-------------------------------------------------------------------*
+
+*-------------------------------------------------------------------*
+* Porcentajes en base a lo fabricado
+*-------------------------------------------------------------------*
+
+  CLEAR: <gs_porc>, <gs_desv>.
+
+  CLEAR lv_field.
+  lv_field = 'PERIODO'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_porc> TO <fs_periodo_aux2>.
+  CHECK sy-subrc = 0.
+  <fs_periodo_aux2> = text-006. " PORCENTAJE FABRICADO.
+
+  LOOP AT gti_columnas INTO ls_columnas.
+    CLEAR: lv_field.
+
+    " Cantidad:
+    CONCATENATE 'ZMENGE_CLI' ls_columnas-cont INTO lv_field.
+    ASSIGN COMPONENT lv_field OF STRUCTURE <gs_porc> TO <fs_menge>.
+    CHECK sy-subrc = 0.
+    LOOP AT <gti_datos> ASSIGNING <gs_dato>.
+      ASSIGN COMPONENT 'PERIODO' OF STRUCTURE <gs_dato> TO <fs_periodo>.
+      CHECK sy-subrc = 0.
+      IF <fs_periodo> = text-003.
+        ASSIGN COMPONENT lv_field OF STRUCTURE <gs_dato> TO <fs_menge_aux>.
+        CHECK sy-subrc = 0.
+        <fs_menge> = ( <fs_menge_aux> / lv_tot ) * 100.
+        lv_porc_tot = lv_porc_tot + <fs_menge>.
+      ENDIF.
+    ENDLOOP.
+
+  ENDLOOP.
+
+* Quitar picos:
+  CLEAR lv_desv_aux.
+  lv_desv_aux = 100 - lv_porc_tot.
+  IF lv_desv_aux <> 0.
+    <fs_menge> = <fs_menge> +  lv_desv_aux.
+  ENDIF.
+
+
+*
+* Total y unidades:
+  CLEAR lv_field.
+  lv_field = 'ZTOT_PER'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_porc> TO <fs_menge>.
+  CHECK sy-subrc = 0.
+  <fs_menge> = 100.
+
+  CLEAR lv_field.
+  lv_field = 'MEINS'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_porc> TO <fs_porc_meins>.
+  CHECK sy-subrc = 0.
+  <fs_porc_meins> = '%'.
+
+  CLEAR lv_field.
+  lv_field = 'COLOR'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_porc> TO <fs_color>.
+  CHECK sy-subrc = 0.
+  <fs_color> = 'C311'.
+
+
+**-------------------------------------------------------------------*
+** Fin Porcentajes en base a lo fabricado
+**-------------------------------------------------------------------*
+
+  APPEND <gs_porc> TO <gti_datos>.
+
+*-------------------------------------------------------------------*
+* Totalizados tabla: Porcentaje
+*-------------------------------------------------------------------*
+
+  CLEAR: <gs_tot_tab>, <gs_porc_tab>.
+
+  CLEAR lv_field.
+  lv_field = 'PERIODO'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_porc_tab> TO <fs_periodo_aux>.
+  CHECK sy-subrc = 0.
+  <fs_periodo_aux> = text-005. "'PORC. PREV.'.
+
+  LOOP AT gti_columnas INTO ls_columnas.
+    CLEAR: lv_field. ", <fs_menge>, <fs_porc>.
+    CONCATENATE 'ZMENGE_CLI' ls_columnas-cont INTO lv_field.
+    ASSIGN COMPONENT lv_field OF STRUCTURE <gs_porc_tab> TO <fs_menge>.
+    CHECK sy-subrc = 0.
+    CLEAR <fs_menge>.
+    CLEAR ls_prev.
+    READ TABLE gti_prev INTO ls_prev
+               WITH KEY ncolumna = ls_columnas-ncolumna.
+
+    IF ls_prev IS NOT INITIAL.
+      IF ls_columnas-kunnr IS NOT INITIAL.
+        <fs_menge> = ls_prev-porcentaje.
+        lv_porc_cli = lv_porc_cli + ls_prev-porcentaje.
+      ELSE.
+        lv_porc_stock = gv_porc_prev - lv_porc_cli.
+        <fs_menge> = lv_porc_stock.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Totales y unidades: Totales porcentaje tabla
+  CLEAR lv_field.
+  lv_field = 'ZTOT_PER'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_porc_tab> TO <fs_tab_porc>.
+  CHECK sy-subrc = 0.
+  <fs_tab_porc> = gv_porc_prev.
+
+  CLEAR lv_field.
+  lv_field = 'MEINS'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_porc_tab> TO <fs_tab_meins>.
+  CHECK sy-subrc = 0.
+  <fs_tab_meins> = '%'.
+
+  CLEAR lv_field.
+  lv_field = 'COLOR'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_porc_tab> TO <fs_color>.
+  CHECK sy-subrc = 0.
+  <fs_color> = 'C311'.
+
+  APPEND <gs_porc_tab> TO <gti_datos>.
+
+*-------------------------------------------------------------------*
+* Fin Totalizados tabla: Porcentaje
+*-------------------------------------------------------------------*
+
+*---------------------------------------------------------------------*
+*  Desviaciones                                                       *
+*---------------------------------------------------------------------*
+
+  CLEAR: <gs_porc>, <gs_desv>.
+
+  CLEAR: lv_field, lv_desv_tot.
+  lv_field = 'PERIODO'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_desv> TO <fs_periodo_aux3>.
+  CHECK sy-subrc = 0.
+  <fs_periodo_aux3> = text-007. " DESVIACIÓN
+*
+  LOOP AT gti_columnas INTO ls_columnas.
+    CLEAR: lv_field.
+
+    " Cantidad:
+    CONCATENATE 'ZMENGE_CLI' ls_columnas-cont INTO lv_field.
+    ASSIGN COMPONENT lv_field OF STRUCTURE <gs_desv> TO <fs_menge>.
+    CHECK sy-subrc = 0.
+    LOOP AT <gti_datos> ASSIGNING <gs_dato>.
+      ASSIGN COMPONENT 'PERIODO' OF STRUCTURE <gs_dato> TO <fs_periodo>.
+      CHECK sy-subrc = 0.
+      IF <fs_periodo> = text-003.
+        ASSIGN COMPONENT lv_field OF STRUCTURE <gs_dato> TO <fs_menge_aux>.
+        CHECK sy-subrc = 0.
+        CLEAR ls_prev.
+        READ TABLE gti_prev INTO ls_prev
+                   WITH KEY ncolumna = ls_columnas-ncolumna.
+        IF ls_prev IS NOT INITIAL.
+          <fs_menge> = ls_prev-menge - <fs_menge_aux>.
+          lv_desv_tot = lv_desv_tot + <fs_menge>.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+  ENDLOOP.
+*
+* Total y unidades:
+  CLEAR lv_field.
+  lv_field = 'ZTOT_PER'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_desv> TO <fs_menge>.
+  CHECK sy-subrc = 0.
+  <fs_menge> = lv_desv_tot.
+
+  CLEAR lv_field.
+  lv_field = 'MEINS'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_desv> TO <fs_desv_meins>.
+  CHECK sy-subrc = 0.
+  <fs_desv_meins> = gv_meins_prev.
+
+  CLEAR lv_field.
+  lv_field = 'COLOR'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_desv> TO <fs_color>.
+  CHECK sy-subrc = 0.
+  <fs_color> = 'C311'.
+
+  APPEND <gs_desv> TO <gti_datos>.
+
+*---------------------------------------------------------------------*
+*  Fin Desviaciones                                                   *
+*---------------------------------------------------------------------*
+
+*---------------------------------------------------------------------*
+* Desviaciones (%)
+*---------------------------------------------------------------------*
+
+  CLEAR: <gs_desv>.
+
+  CLEAR: lv_field, lv_desv_tot.
+  lv_field = 'PERIODO'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_desv> TO <fs_periodo_aux3>.
+  CHECK sy-subrc = 0.
+  <fs_periodo_aux3> = text-008. " DESVIACIÓN (%)
+*
+  LOOP AT gti_columnas INTO ls_columnas.
+    CLEAR: lv_field.
+
+    " Cantidad:
+    CONCATENATE 'ZMENGE_CLI' ls_columnas-cont INTO lv_field.
+    ASSIGN COMPONENT lv_field OF STRUCTURE <gs_desv> TO <fs_menge>.
+    CHECK sy-subrc = 0.
+    LOOP AT <gti_datos> ASSIGNING <gs_dato>.
+      ASSIGN COMPONENT 'PERIODO' OF STRUCTURE <gs_dato> TO <fs_periodo>.
+      CHECK sy-subrc = 0.
+      IF <fs_periodo> = text-006.
+        ASSIGN COMPONENT lv_field OF STRUCTURE <gs_dato> TO <fs_menge_aux>.
+        CHECK sy-subrc = 0.
+        CLEAR ls_prev.
+        READ TABLE gti_prev INTO ls_prev
+                   WITH KEY ncolumna = ls_columnas-ncolumna.
+        IF ls_prev IS NOT INITIAL.
+          <fs_menge> = ls_prev-porcentaje - <fs_menge_aux>.
+          lv_desv_tot = lv_desv_tot + <fs_menge>.
+*        ELSE.
+*          <fs_menge> = 0 - <fs_menge_aux>.
+*          lv_desv_tot = lv_desv_tot + <fs_menge>.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+  ENDLOOP.
+
+*
+* Total y unidades:
+  CLEAR lv_field.
+  lv_field = 'ZTOT_PER'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_desv> TO <fs_menge>.
+  CHECK sy-subrc = 0.
+  <fs_menge> = lv_desv_tot.
+
+  CLEAR lv_field.
+  lv_field = 'MEINS'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_desv> TO <fs_desv_meins>.
+  CHECK sy-subrc = 0.
+  <fs_desv_meins> = '%'.
+
+  CLEAR lv_field.
+  lv_field = 'COLOR'.
+  ASSIGN COMPONENT lv_field OF STRUCTURE <gs_desv> TO <fs_color>.
+  CHECK sy-subrc = 0.
+  <fs_color> = 'C311'.
+
+  APPEND <gs_desv> TO <gti_datos>.
+
+
+*---------------------------------------------------------------------*
+* Fin Desviaciones (%)
+*---------------------------------------------------------------------*
+
+
+ENDFORM.                    " CARGAR_ALV
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_PREV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM obtener_prev .
+
+  DATA: lv_gjahr TYPE gjahr,
+        ls_prev  TYPE ztmm0011.
+  CLEAR: gti_prev, lv_gjahr.
+  CLEAR: gv_porc_prev, gv_cant_prev, gv_meins_prev.
+  REFRESH: gti_prev.
+
+* Año para el que estamos haciendo la previsión:
+  IF so_budat-high IS NOT INITIAL.
+    lv_gjahr = so_budat-high+0(4).
+  ELSEIF ( so_budat-low IS NOT INITIAL AND so_budat-high IS INITIAL ).
+    lv_gjahr = so_budat-low+0(4).
+  ENDIF.
+
+
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE gti_prev
+    FROM ztmm0011
+    WHERE gjahr = lv_gjahr AND
+          werks IN  so_werks.
+
+  READ TABLE gti_mov_per INDEX 1 TRANSPORTING NO FIELDS.
+
+  LOOP AT gti_prev INTO ls_prev.
+    gv_porc_prev = gv_porc_prev + ls_prev-porcentaje.
+    gv_cant_prev = gv_cant_prev + ls_prev-menge.
+    gv_meins_prev = ls_prev-meins.
+  ENDLOOP.
+ENDFORM.                    " OBTENER_PREV
+
+FORM f4_atwrt.
+
+  DATA: BEGIN OF lt_match OCCURS 0,
+          shlpname  LIKE ddshretval-shlpname,
+          fieldname LIKE ddshretval-fieldname,
+          recordpos LIKE ddshretval-recordpos,
+          fieldval  LIKE ddshretval-fieldval,
+          retfield  LIKE ddshretval-retfield,
+        END OF lt_match.
+
+  DATA: BEGIN OF lt_values OCCURS 0,
+          atwrt TYPE ausp-atwrt,
+          atwtb TYPE atwtb,
+        END OF lt_values.
+
+  DATA:  lv_clint   TYPE          kssk-clint,
+         gt_klah    TYPE TABLE OF klah,
+         ls_klah    TYPE          klah,
+         lt_feature TYPE TABLE OF kldat,
+         ls_feature TYPE          kldat.
+
+  DATA: dynfields TYPE TABLE OF dynpread WITH HEADER LINE.
+
+
+  CLEAR: so_dec[].
+  dynfields-fieldname = 'SO_DEC'.
+  APPEND dynfields.
+
+* Read the Values of the SCREEN FIELDs
+  CALL FUNCTION 'DYNP_VALUES_READ'
+    EXPORTING
+      dyname               = sy-cprog
+      dynumb               = sy-dynnr
+      translate_to_upper   = 'X'
+    TABLES
+      dynpfields           = dynfields
+    EXCEPTIONS
+      invalid_abapworkarea = 1
+      invalid_dynprofield  = 2
+      invalid_dynproname   = 3
+      invalid_dynpronummer = 4
+      invalid_request      = 5
+      no_fielddescription  = 6
+      invalid_parameter    = 7
+      undefind_error       = 8
+      double_conversion    = 9
+      stepl_not_found      = 10
+      OTHERS               = 11.
+
+* Find out the Value of P_DEC
+  READ TABLE dynfields WITH KEY fieldname = 'SO_DEC'.
+
+  SELECT SINGLE clint FROM kssk INTO lv_clint
+    WHERE mafid = 'O'
+    AND   klart = '023'.
+
+  SELECT * INTO TABLE gt_klah FROM klah
+     WHERE clint EQ lv_clint.
+
+  LOOP AT gt_klah INTO ls_klah WHERE clint = lv_clint.
+
+    CALL FUNCTION 'CLAS_READ_FEATURE_INFO'
+      EXPORTING
+        class           = ls_klah-class
+        classtype       = '023'
+        language        = sy-langu
+        key_date        = sy-datum
+      TABLES
+        feature_info    = lt_feature
+      EXCEPTIONS
+        class_not_exist = 1
+        OTHERS          = 2.
+
+    LOOP AT lt_feature INTO ls_feature WHERE atinn = '9999999414'.
+* Valor de la característica
+      SELECT atwrt FROM ausp INTO TABLE lt_values
+        WHERE klart = '023'
+        AND atinn = ls_feature-atinn.
+
+      SORT lt_values.
+      DELETE ADJACENT DUPLICATES FROM lt_values COMPARING atwrt.
+      DELETE lt_values WHERE atwrt = '03       R'.
+      LOOP AT lt_values.
+* Denominacio de la caracteristica
+        IF lt_values = 'DE       A'.
+          lt_values-atwtb = 'Aceptación'.
+        ENDIF.
+        IF lt_values = 'DE       P'.
+          lt_values-atwtb = 'Rollo a Pulper'.
+        ENDIF.
+        IF lt_values = 'DE       R'.
+          lt_values-atwtb = 'Rechazo'.
+        ENDIF.
+        IF lt_values-atwtb IS NOT INITIAL.
+          MODIFY lt_values.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+  ENDLOOP.
+
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      retfield        = 'ATWRT'
+      window_title    = text-t02
+      value_org       = 'S'
+    TABLES
+      value_tab       = lt_values
+      return_tab      = lt_match
+    EXCEPTIONS
+      parameter_error = 1
+      no_values_found = 2
+      OTHERS          = 3.
+
+  IF sy-subrc EQ 0.
+    READ TABLE lt_match INDEX 1.
+    MOVE lt_match-fieldval TO so_dec-low.
+  ENDIF.
+
+ENDFORM.

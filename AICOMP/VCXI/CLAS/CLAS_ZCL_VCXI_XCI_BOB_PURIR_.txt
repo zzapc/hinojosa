@@ -1,0 +1,414 @@
+
+class ZCL_VCXI_XCI_BOB_PURIR definition
+  public
+  create public .
+
+public section.
+
+  constants C_ESOKZ_STANDARD type ESOKZ value '0' ##NO_TEXT.
+  data F_LIFNR type LIFNR read-only .
+  data F_ESOKZ type ESOKZ read-only .
+
+  methods GET_RECORD
+    importing
+      !IF_MATNR type MATNR
+      !IF_EKORG type EKORG optional
+      !IF_WERKS type WERKS_D optional
+    exporting
+      !ES_GENERAL type BAPIEINA
+      !ES_PURCHORG type BAPIEINE
+    raising
+      /VCXI/CX_CKX .
+  methods CONSTRUCTOR
+    importing
+      !IF_LIFNR type LIFNR
+      !IF_ESOKZ type ESOKZ default C_ESOKZ_STANDARD
+    raising
+      /VCXI/CX_CKX .
+  methods CREATE_FOR_MATNR
+    importing
+      !IF_MATNR type MATNR
+      !IF_EKORG type EKORG optional
+      !IF_WERKS type WERKS_D optional
+      !IF_EKGRP type EKGRP optional
+      !IF_IDNLF type IDNLF optional
+      !IF_BSTME type BSTME optional
+      !IF_UMBSZ type UMBSZ optional
+      !IF_UMBSN type UMBSN optional
+      !IF_KONWA type KONWA optional
+      !IF_KPEIN type KPEIN optional
+      !IF_KMEIN type KMEIN optional
+      !IF_AUTO_SOURCE type AUT_SOURCE optional
+      !IF_KODATAB type KODATAB default SY-DATUM
+      !IT_CONDSCALE type ZVCXI_XCI_TT_CONDSCALE optional
+    exporting
+      !ET_BAPIRET2 type BAPIRETTAB
+    returning
+      value(RF_INFNR) type INFNR
+    raising
+      /VCXI/CX_CKX .
+protected section.
+
+  class-methods CONV_KBETR_TO_BAPI
+    importing
+      !IF_KBETR type KBETR
+      !IF_KONWA type KONWA
+    returning
+      value(RF_AMOUNT) type BAPICURR_D
+    raising
+      /VCXI/CX_CKX .
+  class-methods GET_LFM1
+    importing
+      !IF_LIFNR type LIFNR
+      !IF_EKORG type EKORG
+    returning
+      value(RS_LFM1) type LFM1
+    raising
+      /VCXI/CX_CKX .
+  class-methods GET_MARA
+    importing
+      !IF_MATNR type MATNR
+    exporting
+      !ES_MARM type MARM
+    returning
+      value(RS_MARA) type MARA
+    raising
+      /VCXI/CX_CKX .
+  class-methods GET_MARM
+    importing
+      !IF_MATNR type MATNR
+      !IF_MEINH type MEINH
+    returning
+      value(RS_MARM) type MARM
+    raising
+      /VCXI/CX_CKX .
+  class-methods GET_T405
+    importing
+      !IF_EKWSL type EKWSL
+    returning
+      value(RS_T405) type T405
+    raising
+      /VCXI/CX_CKX .
+private section.
+endclass. "ZCL_VCXI_XCI_BOB_PURIR definition
+class ZCL_VCXI_XCI_BOB_PURIR implementation.
+  method CONSTRUCTOR.
+
+    ME->F_LIFNR = IF_LIFNR.
+    ME->F_ESOKZ = IF_ESOKZ.
+
+  endmethod.
+  method CONV_KBETR_TO_BAPI.
+
+*** Convert as SAP stores amounts of currencies w/o decimals differently (e.g. 400 HUF are stored as 4.00 HUF)
+    call function 'CURRENCY_AMOUNT_SAP_TO_BAPI'
+      exporting
+        CURRENCY    = IF_KONWA
+        SAP_AMOUNT  = conv BAPICURR_D( IF_KBETR )
+      importing
+        BAPI_AMOUNT = RF_AMOUNT.
+
+  endmethod.
+  method CREATE_FOR_MATNR.
+
+    data: LS_MARA       type MARA,
+          LS_MARM_BSTME type MARM,
+          LS_T405       type T405,
+          LS_LFM1       type LFM1,
+          LS_GENERAL    type BAPIEINA,
+          LS_PURCHORG   type BAPIEINE,
+          LS_MEWIEINA   type MEWIEINA,
+          LS_MEWIEINAX  type MEWIEINAX,
+          LS_MEWIEINE   type MEWIEINE,
+          LS_MEWIEINEX  type MEWIEINEX,
+          LS_CONDSCALE  type ZVCXI_XCI_S_CONDSCALE,
+          LS_RETURN     type BAPIRETURN,
+          LS_BAPIRET2   type BAPIRET2.
+    data: LT_COND_VALID type table of MEWIVALIDITY,
+          LT_CONDITION  type table of MEWICONDITION,
+          LT_SCALE_QUAN type table of MEWISCALEQUAN,
+          LT_RETURN     type          MEWI_T_RETURN.
+
+
+    clear ET_BAPIRET2.
+
+    if IF_WERKS is not initial and
+       IF_EKORG is     initial.
+***   Please also enter a purchasing organization
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                            IF_MSGID = '06'
+                                            IF_MSGNO = '301' ).
+    endif.
+
+*** Load Interface Work Areas for Condition Mainenance to avoid issues regarding syncronization
+    call function 'COND_MNT_LOAD'.
+
+***--------------------------------------------------------------------------------------
+*** Get Material Master Data
+    LS_MARA = ZCL_VCXI_XCI_BOB_PURIR=>GET_MARA( IF_MATNR = IF_MATNR ).
+
+    if IF_BSTME is not initial.
+      LS_MARA-BSTME = IF_BSTME.
+    endif.
+
+*** Get Purchase Order UoM
+    LS_MARM_BSTME = ZCL_VCXI_XCI_BOB_PURIR=>GET_MARM( IF_MATNR = IF_MATNR
+                                                      IF_MEINH = switch #( LS_MARA-BSTME when SPACE then LS_MARA-MEINS
+                                                                                                    else LS_MARA-BSTME ) ).
+*** Get Purchasing Data based on Purchasing Value Key
+    if LS_MARA-EKWSL is not initial.
+      LS_T405 = GET_T405( IF_EKWSL = LS_MARA-EKWSL ).
+    endif.
+
+*** Get Vendor Data
+    if IF_EKORG is supplied.
+      LS_LFM1 = GET_LFM1( IF_LIFNR = ME->F_LIFNR
+                          IF_EKORG = IF_EKORG ).
+    endif.
+
+***--------------------------------------------------------------------------------------
+*** Get existing Record
+    ME->GET_RECORD( exporting IF_MATNR    = IF_MATNR
+                              IF_EKORG    = IF_EKORG
+                              IF_WERKS    = IF_WERKS
+                    importing ES_GENERAL  = LS_GENERAL
+                              ES_PURCHORG = LS_PURCHORG ).
+
+*** Check that the Record doesn't already exists
+    if ( IF_EKORG is     initial and LS_GENERAL  is not initial ) or
+       ( IF_EKORG is not initial and LS_PURCHORG is not initial ).
+      raise exception type /VCXI/CX_CKX.
+    endif.
+
+***--------------------------------------------------------------------------------------
+*** Purchasing Info Record: General Data
+    if LS_GENERAL is initial.
+      LS_MEWIEINA = value #( VENDOR     = ME->F_LIFNR
+                             MATERIAL   = IF_MATNR
+                             BASE_UOM   = LS_MARA-MEINS
+                             VAR_ORD_UN = LS_MARA-VABME
+                             PO_UNIT    = cond #( when IF_BSTME is not initial then IF_BSTME else LS_MARM_BSTME-MEINH )
+                             CONV_NUM1  = cond #( when IF_UMBSZ is not initial then IF_UMBSZ else LS_MARM_BSTME-UMREZ )
+                             CONV_DEN1  = cond #( when IF_UMBSN is not initial then IF_UMBSN else LS_MARM_BSTME-UMREN )
+                             REMINDER1  = LS_T405-MAHN1
+                             REMINDER2  = LS_T405-MAHN2
+                             REMINDER3  = LS_T405-MAHN3
+                             VEND_MAT   = IF_IDNLF
+                             SALES_PERS = LS_LFM1-VERKF
+                             TELEPHONE  = LS_LFM1-TELF1
+                            ).
+      /VCXI/CL_CKX_SERVICE=>FILL_X_STRUCT( exporting IS_DATA    = LS_MEWIEINA
+                                           changing  CS_X_STRUC = LS_MEWIEINAX ).
+    endif.
+
+***--------------------------------------------------------------------------------------
+    if IF_EKORG is not initial.
+***   Purchasing Info Record: Purchasing Organization Data
+      LS_MEWIEINE = value #( PURCH_ORG   = IF_EKORG
+                             PLANT       = IF_WERKS
+                             PUR_GROUP   = IF_EKGRP
+                             NRM_PO_QTY  = '1'
+                             INFO_TYPE   = ME->F_ESOKZ
+                             PLND_DELRY  = switch #( LS_LFM1-PLIFZ when 0 then 1
+                                                                          else LS_LFM1-PLIFZ )
+                             UNDER_TOL   = LS_T405-UNTTO
+                             OVERDELTOL  = LS_T405-UEBTO
+                             UNLIMITED   = LS_T405-UEBTK
+                             CONF_CTRL   = LS_LFM1-BSTAE
+                             ACKN_REQD   = cond #( when LS_T405-KZABS eq ABAP_TRUE then ABAP_TRUE
+                                                   when LS_LFM1-KZABS eq ABAP_TRUE then ABAP_TRUE )
+                             AUTO_SOURCE = IF_AUTO_SOURCE
+                           ).
+      /VCXI/CL_CKX_SERVICE=>FILL_X_STRUCT( exporting IS_DATA    = LS_MEWIEINE
+                                           changing  CS_X_STRUC = LS_MEWIEINEX ).
+
+***   Condition Validity
+      LT_COND_VALID  = value #( ( VALID_FROM = IF_KODATAB
+                                  VALID_TO   = '99991231' ) ).
+
+***   Prepare Condition
+      LT_CONDITION = value #( ( COND_COUNT = '01'
+                                COND_TYPE  = 'PB00'
+                                COND_VALUE = CONV_KBETR_TO_BAPI( IF_KBETR = value #( IT_CONDSCALE[ 1 ]-KBETR optional )  " Currency amount
+                                                                 IF_KONWA = IF_KONWA )
+                                CURRENCY   = IF_KONWA                                                 " Condition unit (currency or percentage)
+                                COND_UNIT  = IF_KMEIN                                                 " Condition Unit
+                                COND_P_UNT = IF_KPEIN                                                 " Condition Pricing Unit
+                                BASE_UOM   = LS_MARA-MEINS                                            " Base Unit
+                                SCALE_UNIT = IF_KMEIN                                                 " Use Condition Unit as Price Unit
+                                SCALE_CURR = IF_KONWA ) ).                                            " Use Condition Currency for Scales
+
+***   Prepare Price Scales
+      if LINES( IT_CONDSCALE ) gt 1 or
+         IT_CONDSCALE[ 1 ]-KSTBM ne 0.
+        loop at IT_CONDSCALE into LS_CONDSCALE.
+          append value #( COND_COUNT     = '01'
+                          LINE_NO        = SY-TABIX
+                          SCALE_BASE_QTY = LS_CONDSCALE-KSTBM
+                          COND_VALUE     = CONV_KBETR_TO_BAPI( IF_KBETR = LS_CONDSCALE-KBETR
+                                                               IF_KONWA = IF_KONWA )
+                        ) to LT_SCALE_QUAN.
+        endloop.
+      endif.
+    endif.
+
+
+***--------------------------------------------------------------------------------------
+*** Create Info Record
+    refresh LT_RETURN.
+    call function 'ME_INFORECORD_MAINTAIN'
+      exporting
+        I_EINA          = LS_MEWIEINA
+        I_EINAX         = LS_MEWIEINAX
+        I_EINE          = LS_MEWIEINE
+        I_EINEX         = LS_MEWIEINEX
+        TESTRUN         = SPACE
+      importing
+        E_EINA          = LS_MEWIEINA
+        E_EINE          = LS_MEWIEINE
+      tables
+*       TXT_LINES       = LT_TEXTS
+        COND_VALIDITY   = LT_COND_VALID
+        CONDITION       = LT_CONDITION
+        COND_SCALE_QUAN = LT_SCALE_QUAN
+        RETURN          = LT_RETURN.
+
+*** Convert Return Messages
+    loop at LT_RETURN into LS_RETURN.
+      call function 'BALW_RETURN_TO_RET2'
+        exporting
+          RETURN_IN = LS_RETURN
+        importing
+          RETURN_OU = LS_BAPIRET2.
+
+      if LS_BAPIRET2-ID is initial.
+        LS_BAPIRET2-ID = LS_BAPIRET2-LOG_NO.
+      endif.
+
+      append LS_BAPIRET2 to ET_BAPIRET2.
+    endloop.
+
+*** Return Info Recored Number
+    RF_INFNR = LS_MEWIEINA-INFO_REC.
+
+  endmethod.
+  method GET_LFM1.
+
+    call function 'LFM1_SINGLE_READ'
+      exporting
+        I_LIFNR   = IF_LIFNR
+        I_EKORG   = IF_EKORG
+      importing
+        O_LFM1    = RS_LFM1
+      exceptions
+        NOT_FOUND = 1
+        others    = 2.
+    if SY-SUBRC ne 0.
+      /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+    endif.
+
+  endmethod.
+  method GET_MARA.
+
+*** Get General Material Data
+    call function 'MARA_SINGLE_READ'
+      exporting
+        MATNR             = IF_MATNR
+      importing
+        WMARA             = RS_MARA
+      exceptions
+        LOCK_ON_MATERIAL  = 1
+        LOCK_SYSTEM_ERROR = 2
+        WRONG_CALL        = 3
+        NOT_FOUND         = 4
+        others            = 5.
+    if SY-SUBRC ne 0.
+      /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+    endif.
+
+    if ES_MARM is requested.
+      call function 'MARM_SINGLE_READ'
+        exporting
+          MATNR  = IF_MATNR
+          MEINH  = RS_MARA-MEINS
+        importing
+          WMARM  = ES_MARM
+        exceptions
+          others = 0.
+    endif.
+
+  endmethod.
+  method GET_MARM.
+
+    call function 'MARM_SINGLE_READ'
+      exporting
+        MATNR  = IF_MATNR
+        MEINH  = IF_MEINH
+      importing
+        WMARM  = RS_MARM
+      exceptions
+        others = 0.
+
+  endmethod.
+  method GET_RECORD.
+
+    data: LT_GENERAL  type table of BAPIEINA,
+          LT_PURCHORG type table of BAPIEINE.
+
+
+    clear: ES_GENERAL,
+           ES_PURCHORG.
+
+    if IF_WERKS is not initial and
+       IF_EKORG is     initial.
+***   Please also enter a purchasing organization
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                            IF_MSGID = '06'
+                                            IF_MSGNO = '301' ).
+    endif.
+
+*** Check if Record already exists
+    call function 'BAPI_INFORECORD_GETLIST'
+      exporting
+        VENDOR              = ME->F_LIFNR
+        MATERIAL_LONG       = IF_MATNR
+        PURCH_ORG           = IF_EKORG
+        PLANT               = IF_WERKS
+        INFO_TYPE           = ME->F_ESOKZ
+      tables
+        INFORECORD_GENERAL  = LT_GENERAL
+        INFORECORD_PURCHORG = LT_PURCHORG.
+
+*** Return Values
+    ES_GENERAL = value #( LT_GENERAL[ 1 ] optional ).
+
+    if IF_EKORG is not initial.
+      ES_PURCHORG = value #( LT_PURCHORG[ PURCH_ORG = IF_EKORG ] optional ).
+    endif.
+
+    if IF_WERKS is not initial.
+      ES_PURCHORG = value #( LT_PURCHORG[ PURCH_ORG = IF_EKORG
+                                          PLANT     = IF_WERKS ]
+                             default value #( LT_PURCHORG[ PURCH_ORG = IF_EKORG
+                                                           PLANT     = SPACE ] optional ) ).
+    endif.
+
+  endmethod.
+  method GET_T405.
+
+    check IF_EKWSL is not initial.
+
+*** Get Purchasing Data
+    call function 'T405_SINGLE_READ'
+      exporting
+        T405_EKWSL = IF_EKWSL
+      importing
+        WT405      = RS_T405
+      exceptions
+        NOT_FOUND  = 1
+        others     = 2.
+    if SY-SUBRC ne 0.
+      /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+    endif.
+
+  endmethod.

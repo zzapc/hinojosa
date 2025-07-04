@@ -1,0 +1,846 @@
+
+class ZCL_SI_NOTRO_M2S_INB definition
+  public
+  create public .
+
+public section.
+
+  interfaces ZII_SI_NOTRO_M2S_INB .
+protected section.
+private section.
+endclass. "ZCL_SI_NOTRO_M2S_INB definition
+class ZCL_SI_NOTRO_M2S_INB implementation.
+  METHOD zii_si_notro_m2s_inb~si_notro_m2s_inb.
+*------------------------------------------------------------------------------------------
+*  INPUT  Importing Type  ZMT_NOTRO
+*  OUTPUT Exporting Type  ZMT_NORLO_RESPONSE
+*------------------------------------------------------------------------------------------
+* •	Operación A, alta de rollo.
+*     Se realizará un alta de lote del material contra la orden de
+*    fabricación (movimiento 101) por la cantidad informada, siempre que
+*    no sea 0, se clasificará el lote y se notificará tiempos contra la
+*    orden de fabricación (ver notificación de rollos)
+
+* •	Operación B, baja de rollo.
+*     Se buscará el rollo SAP correspondiente al rollo MES informado y:
+*       o	se anulará el lote de rollo contra la orden de fabricación (movimiento 102),
+*         en el texto de la cabecera del documento de material grabar el literal
+*         “Notificación MES”
+*       o	se anularán los correspondientes consumos (automático)
+*       o	se anulará la notificación de tiempos contra la orden de fabricación
+*       o	se anulará la clasificación del lote (características en blanco)
+*       o	se borrarán los registros de defectos (ZTPP0030) y todos los registros de
+*         observaciones de defectos (ZTPP0031) correspondientes al lote SAP
+
+* •	Operación P, rollo a pulper.
+*     Se buscará el rollo SAP correspondiente al rollo MES informado y:
+*      o  se convertirá el material y lote de rollo a material (2001764) y lote pulper
+*         (movimiento 309), en el texto de la cabecera del documento de material grabar el
+*         literal “Notificación MES”
+*      o  se clasificará el lote de bobina pulper con el motivo recibido.
+*      o  se traspasará (movimiento 311) el material y lote pulper al almacén pulper (4002)
+
+*•  Operación F, finalización MES de orden de fabricación.
+*   Se buscará el registro correspondiente al centro, orden de fabricación y número
+*   de fabricación en la tabla del secuenciador (ZTPP0009) y se marcará el indicador
+*   de fabricación finalizada (IND_FIN = X)
+
+*•  Operación R, reapertura MES de orden de fabricación.
+*     Se buscará el registro correspondiente al centro, orden de fabricación y número de
+*     fabricación en la tabla del secuenciador (ZTPP0009) y se desmarcará el indicador de
+*     fabricación finalizada (IND_FIN = blanco)
+*------------------------------------------------------------------------------------------
+
+    DATA: lv_aufnr TYPE aufnr.
+
+    DATA: wa_row          TYPE zdt_notro_l,
+          lv_mblnr        TYPE  mblnr,
+          lv_mjahr        TYPE  mjahr,
+          lv_matnr        TYPE matnr,
+          lv_charg_new    TYPE  charg_d,
+          lv_charg_origen TYPE charg_d,
+          lv_error        TYPE  xfeld.
+
+    DATA: t_messages TYPE TABLE OF bapiret2.
+
+    DATA: wa_row_out TYPE zdt_norlo_l_response.
+
+*   variables envio mail.
+    DATA: lt_addr            TYPE bcsy_smtpa,
+          lo_send_email      TYPE REF TO cl_bcs,
+          lo_document        TYPE REF TO cl_document_bcs,
+          lo_recipient       TYPE REF TO if_recipient_bcs,
+          lv_sent_to_all     TYPE os_boolean,
+          lo_sender          TYPE REF TO cl_cam_address_bcs,
+          lv_sender          TYPE adr6-smtp_addr,
+          lv_subject         TYPE so_obj_des,
+          lt_message         TYPE STANDARD TABLE OF soli,
+          lt_message_anyadir TYPE STANDARD TABLE OF soli,
+          ls_message         TYPE soli,
+          l_err_alta         TYPE char01,
+          lt_return          TYPE TABLE OF bapiret2,
+          wa_return          TYPE bapiret2.
+    DATA: lv_extnumber TYPE balnrext.
+
+    DATA(l_msgguid) = zcl_ap_proxy=>get_msgguid( ).
+    SET PARAMETER ID 'MSGGUID' FIELD l_msgguid.
+    DATA(o_log) = NEW zcl_ap_log( object = 'MES_NOTRO'
+                                  report = 'ZCL_SI_NOTRO_M2S_INB'
+                                  clave  = l_msgguid ).
+
+*------------------------------------------------------------------------------------------
+
+
+*   recuperamos los destinatios del mail en caso de que la interface genere errores.
+    SELECT * FROM ztmes_mail
+      INTO TABLE @DATA(t_mail)
+      WHERE interface = 'PROD'.
+
+    LOOP AT input-mt_notro-row INTO wa_row.
+
+      o_log->log( message  = 'Inicio proceso'
+                  msgv1    = wa_row-centro
+                  msgv2    = wa_row-ord_fab
+                  msgv3    = wa_row-num_fab
+                  msgv4    = wa_row-id_rollo_mes
+                  msgty    = 'I' ).
+
+*      CHECK wa_row-peso IS NOT INITIAL AND wa_row-peso <> '0' AND wa_row-peso(1) <> '-'.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wa_row-ord_fab
+        IMPORTING
+          output = lv_aufnr.
+
+      CASE wa_row-operacion.
+
+        WHEN 'A'. "alta de rollo
+
+***** 65397 - 20/07/2021 - CMS - Proyecto de actualización de costes.
+***** Exit provisional para evitar la alta/notificación de rollo
+*****          exit.
+
+          CHECK wa_row-peso IS NOT INITIAL AND wa_row-peso <> '0' AND wa_row-peso(1) <> '-'.
+
+*         1.- ALTA STOCK CONTRA ORDEN Y CREACION LOTE
+          CALL FUNCTION 'ZALTA_STOCK'
+            EXPORTING
+              i_input    = wa_row
+            IMPORTING
+              e_mblnr    = lv_mblnr
+              e_mjahr    = lv_mjahr
+              e_charg    = lv_charg_new
+              e_error    = lv_error
+            TABLES
+              t_messages = t_messages.
+
+          IF lv_error <> 'X'.
+*           2.- CLASIFICAR LOTE
+            CALL FUNCTION 'ZCLASIFICAR_LOTE'
+              EXPORTING
+                i_input    = wa_row
+                i_charg    = lv_charg_new
+              IMPORTING
+                e_error    = lv_error
+              TABLES
+                t_messages = t_messages.
+
+            IF lv_error <> 'X'.
+
+*             3.- NOTICAR
+              CALL FUNCTION 'ZNOTIFICAR_ORDEN'
+                IMPORTING
+                  e_error    = lv_error
+                TABLES
+                  t_messages = t_messages
+                CHANGING
+                  datos      = wa_row.
+
+              IF lv_error = 'X'.
+*               Anular clasificacion del lote y alta de stock
+                CALL FUNCTION 'ZANULAR_DOC'
+                  EXPORTING
+                    i_mblnr    = lv_mblnr
+                    i_mjahr    = lv_mjahr
+                  IMPORTING
+                    e_error    = lv_error
+                  TABLES
+                    t_messages = t_messages.
+
+                CALL FUNCTION 'ZANULAR_CLASIFICACION_LOTE'
+                  EXPORTING
+                    i_row      = wa_row
+                    i_charg    = lv_charg_new
+                  IMPORTING
+                    e_error    = lv_error
+                  TABLES
+                    t_messages = t_messages.
+
+*                  IF lv_.
+*
+*                  ENDIF.
+              ENDIF.
+            ELSE.
+*             Anular alta de stock
+              CALL FUNCTION 'ZANULAR_DOC'
+                EXPORTING
+                  i_mblnr    = lv_mblnr
+                  i_mjahr    = lv_mjahr
+                IMPORTING
+                  e_error    = lv_error
+                TABLES
+                  t_messages = t_messages.
+
+            ENDIF.
+          ENDIF.
+
+*         si todo ha ido bien, entonces devolvemos el lote SAP
+          IF lv_error <> 'X'.
+            wa_row_out-centro =  wa_row-centro.
+            wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+            wa_row_out-lote_sap = lv_charg_new.
+            wa_row_out-fecha_insercion = sy-datum.
+            wa_row_out-hora_insercion = sy-uzeit.
+            wa_row_out-operacion = wa_row-operacion.
+*           wa_row_out-flag = wa_row-flag.
+
+            APPEND wa_row_out TO output-mt_norlo_response-row.
+          ELSE.
+            wa_row_out-centro =  wa_row-centro.
+            wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+            wa_row_out-lote_sap = ''.
+            wa_row_out-fecha_insercion = sy-datum.
+            wa_row_out-hora_insercion = sy-uzeit.
+            wa_row_out-operacion = '9'. "wa_row-operacion. -> pasamos un 9 porque las operaciones son caracteres. Asi, si amplian la funcionalidad
+            "no colisionará con ninguna futura operacion.
+*           wa_row_out-flag = wa_row-flag.
+
+            APPEND wa_row_out TO output-mt_norlo_response-row.
+
+*            CASE l_err_alta.
+*              WHEN 'S'.
+*              WHEN 'C'.
+*              WHEN 'O'.
+*              WHEN 'C'.
+*              WHEN .
+*              WHEN OTHERS.
+*            ENDCASE.
+
+          ENDIF.
+
+
+        WHEN 'B'. "baja de rollo
+          SELECT SINGLE * FROM mseg
+            INTO @DATA(wa_mseg)
+            WHERE werks = @wa_row-centro AND
+                  aufnr = @lv_aufnr AND
+                  kzbew = 'F' AND
+                  bwart = '101' AND
+                  sgtxt = @wa_row-id_rollo_mes.
+
+          IF sy-subrc = 0.
+*            Anular alta de stock
+            CALL FUNCTION 'ZANULAR_DOC'
+              EXPORTING
+                i_mblnr    = wa_mseg-mblnr
+                i_mjahr    = wa_mseg-mjahr
+              IMPORTING
+                e_error    = lv_error
+              TABLES
+                t_messages = t_messages.
+
+            IF lv_error <> 'X'.
+
+              CALL FUNCTION 'ZANULAR_TIEMPOS'
+                EXPORTING
+                  i_aufnr    = lv_aufnr
+                  i_peso     = wa_mseg-menge
+                IMPORTING
+                  e_error    = lv_error
+                TABLES
+                  t_messages = t_messages.
+
+
+              IF lv_error <> 'X'.
+
+                DELETE FROM ztpp0030 WHERE aufnr = @lv_aufnr AND
+                                           werks = @wa_row-centro AND
+                                           matnr = @wa_mseg-matnr AND
+                                           charg = @wa_mseg-charg.
+                IF sy-subrc = 0.
+                  COMMIT WORK.
+                ENDIF.
+
+                DELETE FROM ztpp0031 WHERE aufnr = @lv_aufnr AND
+                                           matnr = @wa_mseg-matnr AND
+                                           charg = @wa_mseg-charg.
+                IF sy-subrc = 0.
+                  COMMIT WORK.
+                ENDIF.
+
+                CALL FUNCTION 'ZANULAR_CLASIFICACION_LOTE'
+                  EXPORTING
+                    i_row      = wa_row
+                    i_charg    = wa_mseg-charg
+                  IMPORTING
+                    e_error    = lv_error
+                  TABLES
+                    t_messages = t_messages.
+              ENDIF.
+
+            ENDIF.
+          ENDIF.
+
+*         si hay algún error, informamos a MES con la estructura de salida.
+          IF lv_error = 'X'.
+            wa_row_out-centro =  wa_row-centro.
+            wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+*           wa_row_out-lote_sap = lv_charg_new.
+            wa_row_out-fecha_insercion = sy-datum.
+            wa_row_out-hora_insercion = sy-uzeit.
+            wa_row_out-operacion = '9'.  "wa_row-operacion. -> pasamos un 9 porque las operaciones son caracteres. Asi, si amplian la funcionalidad
+            "no colisionará con ninguna futura operacion.
+            wa_row_out-flag = 'X'.
+
+            APPEND wa_row_out TO output-mt_norlo_response-row.
+
+          ELSE.
+            wa_row_out-centro =  wa_row-centro.
+            wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+            wa_row_out-lote_sap = ''.
+            wa_row_out-fecha_insercion = sy-datum.
+            wa_row_out-hora_insercion = sy-uzeit.
+            wa_row_out-operacion = wa_row-operacion.
+            wa_row_out-flag = 'X'.
+
+            APPEND wa_row_out TO output-mt_norlo_response-row.
+
+          ENDIF.
+
+        WHEN 'F'. "finalización MES de orden de fabricación.
+          DATA: l_werks    TYPE werks_d,
+                l_num_fabr TYPE znum_fabr.
+
+          l_werks     = CONV #( wa_row-centro ).
+          l_num_fabr  = CONV #( wa_row-num_fab ).
+
+          CALL METHOD zcl_secuenciador=>upd_direct_o_difer_ztpp0009
+            EXPORTING
+              i_werks     = l_werks
+              i_aufnr     = lv_aufnr
+              i_num_fabr  = l_num_fabr
+              i_ind_fin_x = 'X' " Se quiere actualizar valor de IND_FIN
+              i_ind_fin   = 'X'
+*             i_ind_obs_pope_x =
+*             i_observ_pope    =
+*            IMPORTING
+*             o_upd_diferido   =
+            .
+          COMMIT WORK.
+          wa_row_out-centro =  wa_row-centro.
+          wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+          wa_row_out-lote_sap = ''.
+          wa_row_out-fecha_insercion = sy-datum.
+          wa_row_out-hora_insercion = sy-uzeit.
+          wa_row_out-operacion = wa_row-operacion.
+*           wa_row_out-flag = wa_row-flag.
+          APPEND wa_row_out TO output-mt_norlo_response-row.
+
+        WHEN 'R'. "reapertura MES de orden de fabricación.
+          l_werks     = CONV #( wa_row-centro ).
+          l_num_fabr  = CONV #( wa_row-num_fab ).
+
+          CALL METHOD zcl_secuenciador=>upd_direct_o_difer_ztpp0009
+            EXPORTING
+              i_werks     = l_werks
+              i_aufnr     = lv_aufnr
+              i_num_fabr  = l_num_fabr
+              i_ind_fin_x = 'X' " Se quiere actualizar valor de IND_FIN
+              i_ind_fin   = ' '.
+
+          wa_row_out-centro           = wa_row-centro.
+          wa_row_out-id_rollo         = wa_row-id_rollo_mes.
+          wa_row_out-lote_sap         = ''.
+          wa_row_out-fecha_insercion  = sy-datum.
+          wa_row_out-hora_insercion   = sy-uzeit.
+          wa_row_out-operacion        = wa_row-operacion.
+*           wa_row_out-flag = wa_row-flag.
+          APPEND wa_row_out TO output-mt_norlo_response-row.
+
+        WHEN 'P'. "rollo a pulper
+          CHECK wa_row-peso IS NOT INITIAL AND wa_row-peso <> '0' AND wa_row-peso(1) <> '-'.
+
+          CALL FUNCTION 'ZOPERACION_ROLLO' "309
+            EXPORTING
+              i_input        = wa_row
+            IMPORTING
+              e_mblnr        = lv_mblnr
+              e_mjahr        = lv_mjahr
+              e_charg_pulper = lv_charg_new
+              e_charg_origen = lv_charg_origen
+              e_error        = lv_error
+            TABLES
+              t_messages     = t_messages.
+
+          IF lv_error <> 'X'.
+            CALL FUNCTION 'ZTRASPASO' "311
+              EXPORTING
+                i_input    = wa_row
+                i_charg    = lv_charg_new
+              IMPORTING
+                e_mblnr    = lv_mblnr
+                e_mjahr    = lv_mjahr
+                e_error    = lv_error
+              TABLES
+                t_messages = t_messages.
+
+            IF lv_error <> 'X'.
+*            clasifimamos el lote de bobina pulper con el motivo recibido.
+              CALL FUNCTION 'ZCLASIFICAR_LOTE_BOBINA_PULPER'
+                EXPORTING
+                  i_input        = wa_row
+                  i_charg_pulper = lv_charg_new
+                  i_charg_origen = lv_charg_origen
+                IMPORTING
+                  e_error        = lv_error
+                TABLES
+                  t_messages     = t_messages.
+            ENDIF.
+          ELSE.
+            CALL FUNCTION 'ZANULAR_DOC'
+              EXPORTING
+                i_mblnr    = lv_mblnr
+                i_mjahr    = lv_mjahr
+              IMPORTING
+                e_error    = lv_error
+              TABLES
+                t_messages = t_messages.
+          ENDIF.
+
+          IF lv_error = 'X'.
+            wa_row_out-centro =  wa_row-centro.
+            wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+*           wa_row_out-lote_sap = lv_charg_new.
+            wa_row_out-fecha_insercion = sy-datum.
+            wa_row_out-hora_insercion = sy-uzeit.
+            wa_row_out-operacion = '9'. "wa_row-operacion. -> pasamos un 9 porque las operaciones son caracteres. Asi, si amplian la funcionalidad
+            "no colisionará con ninguna futura operacion.
+            wa_row_out-flag = 'X'.
+
+            lv_extnumber = |Error en la notificación de rollo pulper: { wa_row-id_rollo_mes }|.
+            CLEAR wa_return.
+            wa_return-type = 'E'.
+            wa_return-id = 'ZQM'.
+            wa_return-number = '008'.
+            wa_return-message_v1 = wa_row-id_rollo_mes.
+            APPEND wa_return TO lt_return .
+
+            CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+              EXPORTING
+                objeto    = 'ZSAP_MES'
+                subobjeto = 'ZLOTE_INSPECCION'
+                mensajes  = lt_return[]
+                extnumber = lv_extnumber.
+
+
+            APPEND wa_row_out TO output-mt_norlo_response-row.
+          ELSE.
+            wa_row_out-centro =  wa_row-centro.
+            wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+            wa_row_out-lote_sap = ''.
+            wa_row_out-fecha_insercion = sy-datum.
+            wa_row_out-hora_insercion = sy-uzeit.
+            wa_row_out-operacion = wa_row-operacion.
+            wa_row_out-flag = 'X'.
+
+            APPEND wa_row_out TO output-mt_norlo_response-row.
+          ENDIF.
+
+
+        WHEN 'I'.
+          DATA: l_charg TYPE charg_d.
+
+* Se usa DO 1 times para evitar tantos IFS como validaciones.
+          DO 1 TIMES.
+
+            l_charg = CONV #( wa_row-id_rollo_mes ).
+
+* Obtenemos datos del lote.
+            SELECT SINGLE werks , aufnr
+              INTO @DATA(ls_datos_lote)
+              FROM aufm
+              WHERE charg = @l_charg  AND
+                    bwart = '101'.
+            IF sy-subrc <> 0. "Orden no encontrada.
+              APPEND INITIAL LINE TO lt_message_anyadir ASSIGNING FIELD-SYMBOL(<fs_msg_anyadir>).
+              <fs_msg_anyadir>-line = |Orden no encontrada para el lote: { l_charg }|.
+              lv_extnumber = |Orden no encontrada para el lote: { l_charg }|.
+              CLEAR wa_return.
+              wa_return-type = 'E'.
+              wa_return-id = 'ZQM'.
+              wa_return-number = '005'.
+              wa_return-message_v1 = l_charg.
+              APPEND wa_return TO lt_return .
+
+              CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+                EXPORTING
+                  objeto    = 'ZSAP_MES'
+                  subobjeto = 'ZLOTE_INSPECCION'
+                  mensajes  = lt_return[]
+                  extnumber = lv_extnumber.
+
+
+              lv_error = 'X'.
+              wa_row_out-centro   =  wa_row-centro.
+              wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+              wa_row_out-fecha_insercion = sy-datum.
+              wa_row_out-hora_insercion = sy-uzeit.
+              wa_row_out-operacion = '9'.
+              wa_row_out-flag = 'X'.
+              APPEND wa_row_out TO output-mt_norlo_response-row.
+
+              EXIT.
+            ENDIF.
+
+* Si hemos encontrado el '101', miramos el estado de la orden, debe ser LIBERADA
+            SELECT SINGLE stat
+              FROM jest AS j
+              INNER JOIN aufk AS a ON a~objnr = j~objnr
+              INTO @DATA(l_stat)
+              WHERE aufnr = @ls_datos_lote-aufnr AND
+                    stat  = @zcl_secuenciador=>gc_i0002_liberada AND
+                    inact = ' '.
+
+            IF sy-subrc <> 0. "Lote erróneo.
+              APPEND INITIAL LINE TO lt_message_anyadir ASSIGNING <fs_msg_anyadir>.
+              <fs_msg_anyadir>-line = |Orden { ls_datos_lote-aufnr } no está en estado LIB. No se permite el cambio de peso del lote { l_charg }|.
+
+              lv_extnumber = |Orden { ls_datos_lote-aufnr } no está en estado LIB. No se permite el cambio de peso del lote { l_charg }|.
+              CLEAR wa_return.
+              wa_return-type = 'E'.
+              wa_return-id = 'ZQM'.
+              wa_return-number = '006'.
+              wa_return-message_v1 = ls_datos_lote-aufnr.
+              wa_return-message_v2 = l_charg.
+              APPEND wa_return TO lt_return .
+
+              CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+                EXPORTING
+                  objeto    = 'ZSAP_MES'
+                  subobjeto = 'ZLOTE_INSPECCION'
+                  mensajes  = lt_return[]
+                  extnumber = lv_extnumber.
+
+              lv_error = 'X'.
+              wa_row_out-centro   =  wa_row-centro.
+              wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+              wa_row_out-fecha_insercion = sy-datum.
+              wa_row_out-hora_insercion = sy-uzeit.
+              wa_row_out-operacion = '9'.
+              wa_row_out-flag = 'X'.
+              APPEND wa_row_out TO output-mt_norlo_response-row.
+              EXIT.
+            ENDIF.
+
+            CALL FUNCTION 'ZMES_ANYADIR_QUITAR_PESO'
+              EXPORTING
+                i_aufnr          = ls_datos_lote-aufnr
+                i_werks          = ls_datos_lote-werks
+                i_charg          = l_charg
+                i_peso           = wa_row-peso
+*               i_id_rollo_mes   =
+                iw_increm_decrem = 'I'
+              IMPORTING
+*               E_MBLNR          =
+*               E_MJAHR          =
+                e_error          = lv_error.
+            IF lv_error = 'X'. "Lote erróneo.
+              APPEND INITIAL LINE TO lt_message_anyadir ASSIGNING <fs_msg_anyadir>.
+              <fs_msg_anyadir>-line = |Error al generar mov.101 para añadir peso. Lote: { l_charg }|.
+
+              lv_extnumber = |Error al generar mov.101 para añadir peso. Lote: { l_charg }|.
+              CLEAR wa_return.
+              wa_return-type = 'E'.
+              wa_return-id = 'ZQM'.
+              wa_return-number = '007'.
+              wa_return-message_v1 = l_charg.
+              APPEND wa_return TO lt_return .
+
+              CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+                EXPORTING
+                  objeto    = 'ZSAP_MES'
+                  subobjeto = 'ZLOTE_INSPECCION'
+                  mensajes  = lt_return[]
+                  extnumber = lv_extnumber.
+
+
+              lv_error = 'X'.
+              wa_row_out-centro   =  wa_row-centro.
+              wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+              wa_row_out-fecha_insercion = sy-datum.
+              wa_row_out-hora_insercion = sy-uzeit.
+              wa_row_out-operacion = '9'.
+              wa_row_out-flag = 'X'.
+              APPEND wa_row_out TO output-mt_norlo_response-row.
+              EXIT.
+
+            ELSE.
+              wa_row_out-lote_sap = l_charg.
+              APPEND wa_row_out TO output-mt_norlo_response-row.
+
+            ENDIF.
+
+          ENDDO.
+
+        WHEN 'D'.
+
+* Se usa DO 1 times para evitar tantos IFS como validaciones.
+          DO 1 TIMES.
+
+            l_charg = CONV #( wa_row-id_rollo_mes ).
+
+* Obtenemos datos del lote.
+            SELECT SINGLE werks , aufnr
+              INTO @ls_datos_lote
+              FROM aufm
+              WHERE charg = @l_charg  AND
+                    bwart = '101'.
+            IF sy-subrc <> 0. "Orden no encontrada.
+              APPEND INITIAL LINE TO lt_message_anyadir ASSIGNING <fs_msg_anyadir>.
+              <fs_msg_anyadir>-line = |Orden no encontrada para el lote: { l_charg }|.
+              lv_error = 'X'.
+              wa_row_out-centro   =  wa_row-centro.
+              wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+              wa_row_out-fecha_insercion = sy-datum.
+              wa_row_out-hora_insercion = sy-uzeit.
+              wa_row_out-operacion = '9'.
+              wa_row_out-flag = 'X'.
+              APPEND wa_row_out TO output-mt_norlo_response-row.
+
+              EXIT.
+            ENDIF.
+
+* Si hemos encontrado el '101', miramos el estado de la orden, debe ser LIBERADA
+            SELECT SINGLE  stat
+              FROM jest AS j
+              INNER JOIN aufk AS a ON a~objnr = j~objnr
+              INTO @l_stat
+              WHERE aufnr = @ls_datos_lote-aufnr AND
+                    stat  = @zcl_secuenciador=>gc_i0002_liberada AND
+                    inact = ' '.
+
+            IF sy-subrc <> 0. "Lote erróneo.
+              APPEND INITIAL LINE TO lt_message_anyadir ASSIGNING <fs_msg_anyadir>.
+              <fs_msg_anyadir>-line = |Orden { ls_datos_lote-aufnr } no está en estado LIB. No se permite el cambio de peso del lote { l_charg }|.
+
+              lv_extnumber = |Error al generar mov.101 para añadir peso. Lote: { l_charg }|.
+              CLEAR wa_return.
+              wa_return-type = 'E'.
+              wa_return-id = 'ZQM'.
+              wa_return-number = '006'.
+              wa_return-message_v1 = ls_datos_lote-aufnr.
+              wa_return-message_v2 = l_charg.
+              APPEND wa_return TO lt_return .
+
+              CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+                EXPORTING
+                  objeto    = 'ZSAP_MES'
+                  subobjeto = 'ZLOTE_INSPECCION'
+                  mensajes  = lt_return[]
+                  extnumber = lv_extnumber.
+
+
+              lv_error = 'X'.
+              wa_row_out-centro   =  wa_row-centro.
+              wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+              wa_row_out-fecha_insercion = sy-datum.
+              wa_row_out-hora_insercion = sy-uzeit.
+              wa_row_out-operacion = '9'.
+              wa_row_out-flag = 'X'.
+              APPEND wa_row_out TO output-mt_norlo_response-row.
+              EXIT.
+            ENDIF.
+
+            CALL FUNCTION 'ZMES_ANYADIR_QUITAR_PESO'
+              EXPORTING
+                i_aufnr          = ls_datos_lote-aufnr
+                i_werks          = ls_datos_lote-werks
+                i_charg          = l_charg
+                i_peso           = wa_row-peso
+                iw_increm_decrem = 'D'
+              IMPORTING
+                e_error          = lv_error.
+            IF lv_error = 'X'. "Lote erróneo.
+              APPEND INITIAL LINE TO lt_message_anyadir ASSIGNING <fs_msg_anyadir>.
+              <fs_msg_anyadir>-line = |Error al generar mov.102 para quitar peso. Lote: { l_charg }|.
+
+              lv_extnumber = |Orden no encontrada para el lote: { l_charg }|.
+              CLEAR wa_return.
+              wa_return-type = 'E'.
+              wa_return-id = 'ZQM'.
+              wa_return-number = '005'.
+              wa_return-message_v1 = l_charg.
+              APPEND wa_return TO lt_return .
+
+              CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+                EXPORTING
+                  objeto    = 'ZSAP_MES'
+                  subobjeto = 'ZLOTE_INSPECCION'
+                  mensajes  = lt_return[]
+                  extnumber = lv_extnumber.
+
+
+              lv_error = 'X'.
+              wa_row_out-centro   =  wa_row-centro.
+              wa_row_out-id_rollo =  wa_row-id_rollo_mes.
+              wa_row_out-fecha_insercion = sy-datum.
+              wa_row_out-hora_insercion = sy-uzeit.
+              wa_row_out-operacion = '9'.
+              wa_row_out-flag = 'X'.
+              APPEND wa_row_out TO output-mt_norlo_response-row.
+              EXIT.
+            ELSE.
+              wa_row_out-lote_sap = l_charg.
+              APPEND wa_row_out TO output-mt_norlo_response-row.
+
+            ENDIF.
+
+          ENDDO.
+
+      ENDCASE.
+
+
+      DATA(l_log_msg) = ''.
+      LOOP AT t_messages ASSIGNING FIELD-SYMBOL(<msg>).
+        l_log_msg = 'X'.
+        IF <msg>-message IS INITIAL.
+          MESSAGE ID <msg>-id TYPE 'S' NUMBER <msg>-number
+                  WITH <msg>-message_v1 <msg>-message_v2 <msg>-message_v3 <msg>-message_v4
+                  INTO <msg>-message.
+        ENDIF.
+        o_log->log( msgid    = <msg>-id
+                    msgty    = <msg>-type
+                    msgno    = <msg>-number
+                    message  = <msg>-message
+                    msgv1    = wa_row-centro
+                    msgv2    = wa_row-ord_fab
+                    msgv3    = wa_row-num_fab
+                    msgv4    = wa_row-id_rollo_mes ).
+      ENDLOOP.
+      LOOP AT lt_return ASSIGNING <msg>.
+        l_log_msg = 'X'.
+        IF <msg>-message IS INITIAL.
+          MESSAGE ID <msg>-id TYPE 'S' NUMBER <msg>-number
+                  WITH <msg>-message_v1 <msg>-message_v2 <msg>-message_v3 <msg>-message_v4
+                  INTO <msg>-message.
+        ENDIF.
+        o_log->log( msgid    = <msg>-id
+                   msgty    = <msg>-type
+                   msgno    = <msg>-number
+                   message  = <msg>-message
+                   msgv1    = wa_row-centro
+                   msgv2    = wa_row-ord_fab
+                   msgv3    = wa_row-num_fab
+                   msgv4    = wa_row-id_rollo_mes ).
+      ENDLOOP.
+
+      IF lv_error = 'X'.
+        IF l_log_msg IS INITIAL.
+          o_log->log( message  = 'Se ha producido algún error'
+                      msgv1    = wa_row-centro
+                      msgv2    = wa_row-ord_fab
+                      msgv3    = wa_row-num_fab
+                      msgv4    = wa_row-id_rollo_mes
+                      msgty    = 'E' ).
+        ENDIF.
+        READ TABLE t_mail INTO DATA(ls_mails) WITH KEY werks = wa_row-centro.
+        IF sy-subrc = 0.
+          IF ls_mails-mail_1 NE space.
+            APPEND ls_mails-mail_1 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_2 NE space.
+            APPEND ls_mails-mail_2 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_3 NE space.
+            APPEND ls_mails-mail_3 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_4 NE space.
+            APPEND ls_mails-mail_4 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_5 NE space.
+            APPEND ls_mails-mail_5 TO lt_addr.
+          ENDIF.
+
+*         Inicialización de la clase
+          lo_send_email = cl_bcs=>create_persistent( ).
+
+
+*         cuerpo del mail
+          CLEAR: lt_message.
+          REFRESH: lt_message.
+          CONCATENATE 'Se ha producido un error en la interface MES – SAP (PROD) a las' sy-uzeit 'del' sy-datum
+            INTO ls_message SEPARATED BY space.
+          APPEND ls_message TO lt_message.
+
+
+*         Crear documento
+          lv_subject = 'Error integración MES – SAP (PROD)'.
+
+          lo_document =  cl_document_bcs=>create_document( i_type    =  'HTM'
+                                                           i_subject =  lv_subject
+                                                           i_text    =  lt_message ).
+*         Enviar documento al email
+          lo_send_email->set_document( lo_document ).
+
+*         Añadir remitente
+*          SELECT SINGLE * FROM usr21
+*            INTO @DATA(wa_usr21)
+*            WHERE bname = @sy-uname.
+*
+*          IF sy-subrc = 0.
+*            SELECT SINGLE smtp_addr FROM adr6
+*              INTO  lv_sender
+*              WHERE addrnumber = wa_usr21-addrnumber AND
+*              persnumber = wa_usr21-persnumber.
+*          ENDIF.
+          lv_sender = 'sap@hinojosa.es'.
+
+          lo_sender = cl_cam_address_bcs=>create_internet_address( lv_sender  ).
+          lo_send_email->set_sender( i_sender = lo_sender ).
+
+*         Añadir destinatarios al email
+          DATA l_emails TYPE string.
+          LOOP AT lt_addr ASSIGNING FIELD-SYMBOL(<fs_addr>).
+            lo_recipient = cl_cam_address_bcs=>create_internet_address( <fs_addr> ).
+            lo_send_email->add_recipient( i_recipient = lo_recipient ).
+            __add_lista l_emails <fs_addr>.
+          ENDLOOP.
+
+
+*         Enviar email
+          TRY.
+              lv_sent_to_all = lo_send_email->send( i_with_error_screen = 'X' ).
+            CATCH cx_send_req_bcs .
+          ENDTRY.
+
+          o_log->log( p1 = 'Se ha enviado mail a ' p2 = l_emails msgty = 'I' ).
+
+          COMMIT WORK.
+        ELSE.
+          o_log->log( p1 = 'No se envian errores por mail porque no se encuentran destinatarios' msgty = 'E' ).
+        ENDIF.
+      ELSE.
+        o_log->log( message  = 'Proceso ok'
+                    msgv1    = wa_row-centro
+                    msgv2    = wa_row-ord_fab
+                    msgv3    = wa_row-num_fab
+                    msgv4    = wa_row-id_rollo_mes
+                    msgty    = 'I' ).
+      ENDIF.
+
+    ENDLOOP.
+
+  ENDMETHOD.
+endclass. "ZCL_SI_NOTRO_M2S_INB definition
+endclass. "ZCL_SI_NOTRO_M2S_INB implementation

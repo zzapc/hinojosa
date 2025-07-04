@@ -1,0 +1,205 @@
+FUNCTION zmfpp_form_receta_mp.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_WERKS) TYPE  WERKS_D
+*"     REFERENCE(I_ID_RECETA) TYPE  ZID_RECETA
+*"     VALUE(I_NODIALOG) TYPE  FPNODIALOG OPTIONAL
+*"     REFERENCE(GET_PDF) TYPE  ABAP_BOOL DEFAULT ''
+*"  EXPORTING
+*"     REFERENCE(O_PRINTPARMS) TYPE  SFPOUTPUTPARAMS
+*"     REFERENCE(O_RC) TYPE  CHAR2
+*"     REFERENCE(PDF) TYPE  FPCONTENT
+*"----------------------------------------------------------------------
+
+  DATA: lf_formname     TYPE fpname VALUE 'ZESPPF_FORM_RECETAS',
+        lf_fm_name      TYPE rs38l_fnam,
+        ls_doc_param    TYPE sfpdocparams,
+        gs_output_param TYPE sfpoutputparams,
+        ls_formoutput   TYPE fpformoutput.
+
+  DATA: lv_padest TYPE rspopname.
+
+  DATA: lt_materiales     TYPE ztpp_form_datos_materiales_mp,
+        lr_materiales     TYPE range_t_matnr,
+        lv_temp_value(15) TYPE p DECIMALS 3,                "N1628336
+        lv_temp_mod(15)   TYPE p DECIMALS 3,                "N1628336
+        lv_mtd_c(1)       TYPE c.                           "N1628336
+
+
+* Obtener datos de la Receta
+  CALL METHOD zclpp_recetas_mp=>obtener_datos_form_receta_mp
+    EXPORTING
+      i_werks                 = i_werks
+      i_id_receta             = i_id_receta
+    IMPORTING
+      os_datos_form_receta_mp = DATA(ls_datos_form_rec)
+      o_rc                    = o_rc.
+
+* Si ha habido error al obtener datos de receta, Salir.
+  IF o_rc <> '00'.
+    EXIT.
+  ENDIF.
+
+  CLEAR lr_materiales.
+
+  lt_materiales = CORRESPONDING #( ls_datos_form_rec-t_materiales_mp ).
+  LOOP AT lt_materiales INTO DATA(ls_mat).
+    APPEND VALUE #( sign = 'I' option = 'EQ' low = ls_mat-matnr ) TO lr_materiales.
+  ENDLOOP.
+
+  CALL METHOD zclpp_consumo_recetas_mp=>calcular_peso_balas_de_almacen
+    EXPORTING
+      i_werks            = i_werks
+      it_matnr           = lr_materiales
+    IMPORTING
+      ot_datos_mat_campa = DATA(lt_datos_balas).
+
+  LOOP AT lt_materiales ASSIGNING FIELD-SYMBOL(<fs>).
+    TRY.
+        CLEAR lv_temp_value.
+        lv_temp_value = <fs>-kg_ciclo / lt_datos_balas[ matnr = <fs>-matnr ]-menge_bala.
+        lv_temp_mod = <fs>-kg_ciclo MOD lt_datos_balas[ matnr = <fs>-matnr ]-menge_bala.
+        IF lv_temp_mod > ( lt_datos_balas[ matnr = <fs>-matnr ]-menge_bala / 2 ).
+          lv_mtd_c = '+'.
+        ELSE.
+          lv_mtd_c = '-'.
+        ENDIF.
+      CATCH cx_root .
+        CLEAR <fs>-num_balas.
+    ENDTRY.
+
+
+    CALL FUNCTION 'ROUND'
+      EXPORTING
+        decimals      = 0
+        input         = lv_temp_value
+        sign          = lv_mtd_c
+      IMPORTING
+        output        = <fs>-num_balas
+      EXCEPTIONS
+        input_invalid = 1
+        overflow      = 2
+        type_invalid  = 3
+        OTHERS        = 4.
+
+    IF sy-subrc = 0.
+      <fs>-balas = <fs>-num_balas.
+    ENDIF.
+
+  ENDLOOP.
+
+  CLEAR lv_padest.
+
+  lv_padest = zcl_utils_hpap_pp=>determinar_disp_impresion( ).
+
+
+*  SELECT SINGLE padest INTO lv_padest
+*    FROM ztpp0007
+*    WHERE werks = I_WERKS
+*    AND auart = ' '
+*    AND uname = sy-uname.
+*
+*  IF lv_padest IS INITIAL.
+*
+*    SELECT SINGLE padest INTO lv_padest
+*      FROM ztpp0007
+*      WHERE werks = I_WERKS
+*      AND auart = ' '
+*      AND uname = ' '.
+*  ENDIF.
+
+  IF lv_padest IS NOT INITIAL.
+
+    CLEAR gs_output_param.
+    gs_output_param-dest = lv_padest.
+    gs_output_param-reqimm = 'X'.
+    gs_output_param-nodialog = ' '. "p_nodialog. " No diálogo
+    gs_output_param-reqnew = 'X'.
+    gs_output_param-copies    = 1.
+
+  ELSE.
+
+    CLEAR gs_output_param.
+    gs_output_param-dest = 'LOCA'.
+    gs_output_param-reqimm = 'X'.
+    gs_output_param-nodialog = ' '. "p_nodialog. " No diálogo
+    gs_output_param-reqnew = 'X'.
+    gs_output_param-copies    = 1.
+
+  ENDIF.
+
+  IF get_pdf = 'X'.
+    gs_output_param-getpdf = 'X'.
+    gs_output_param-nodialog = ''.
+  ENDIF.
+
+* ---
+* IMPRESIÓN ETIQUETA:
+  CALL FUNCTION 'FP_JOB_OPEN'
+    CHANGING
+      ie_outputparams = gs_output_param
+    EXCEPTIONS
+      cancel          = 1
+      usage_error     = 2
+      system_error    = 3
+      internal_error  = 4
+      OTHERS          = 5.
+
+  IF sy-subrc <> 0.
+    o_rc = sy-subrc.
+    RETURN.
+  ENDIF.
+
+  CLEAR o_printparms.
+  o_printparms = gs_output_param.
+
+*&---- Get the name of the generated function module
+  CALL FUNCTION 'FP_FUNCTION_MODULE_NAME'           "& Form Processing Generation
+    EXPORTING
+      i_name     = lf_formname
+    IMPORTING
+      e_funcname = lf_fm_name.
+
+  IF sy-langu = 'S'.
+    ls_doc_param-langu = 'S'.
+    ls_doc_param-country = 'ES'.
+  ELSE.
+    ls_doc_param-langu = 'E'.
+    ls_doc_param-country = 'US'.
+  ENDIF.
+
+
+
+  CALL FUNCTION lf_fm_name
+    EXPORTING
+      /1bcdwb/docparams  = ls_doc_param
+*     observaciones      = lt_obsv
+*     defectos           = ls_zpp0030
+      ls_recetas         = ls_datos_form_rec
+*     lt_materias_primas = ls_datos_form_rec-t_materiales_mp
+      lt_materias_primas = lt_materiales
+    IMPORTING
+      /1bcdwb/formoutput = ls_formoutput
+    EXCEPTIONS
+      usage_error        = 1
+      system_error       = 2
+      internal_error     = 3
+      OTHERS             = 4.
+
+* Close spool job
+  CALL FUNCTION 'FP_JOB_CLOSE'
+*   IMPORTING
+*     E_RESULT             = result
+    EXCEPTIONS
+      usage_error    = 1
+      system_error   = 2
+      internal_error = 3
+      OTHERS         = 4.
+
+  IF get_pdf = 'X'.
+    pdf = ls_formoutput-pdf.
+  ENDIF.
+*
+
+ENDFUNCTION.

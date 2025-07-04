@@ -1,0 +1,139 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRWM0001
+*&
+*&---------------------------------------------------------------------*
+*& Autor: Carlos Vivó Jiménez
+*& Fecha: 05.09.2018
+*& Proyecto: Implantación WM Xàtiva
+*&
+*& Comentarios: Programa para validar que todos los materiales con vistas
+*&    de WM tienen ubicación propuesta especificada
+*&
+*&---------------------------------------------------------------------*
+REPORT zrwm0001.
+
+INCLUDE zrwm0001_top.
+
+SELECTION-SCREEN BEGIN OF BLOCK 1.
+SELECT-OPTIONS: s_lgnum FOR lagp-lgnum,
+                s_mtart FOR mara-mtart.
+SELECTION-SCREEN END OF BLOCK 1.
+
+START-OF-SELECTION.
+
+  SELECT * FROM t320
+    INTO TABLE t_t320
+    WHERE lgnum IN s_lgnum.
+
+  SELECT * FROM ztmm0025
+    INTO TABLE t_ztmm0025
+    FOR ALL ENTRIES IN t_t320
+    WHERE werks EQ t_t320-werks
+      AND proceso EQ '2'.
+
+  CHECK sy-subrc EQ 0. " de todas todas hay que finalizarlo si no hay receptores de correo
+
+  SELECT * FROM mlgn
+    INNER JOIN mara ON mlgn~matnr EQ mara~matnr
+    INNER JOIN lqua ON mlgn~matnr EQ lqua~matnr " sólo lo que esté en stock
+    INTO CORRESPONDING FIELDS OF TABLE t_mlgn
+    WHERE mlgn~lgnum IN s_lgnum
+      AND lqua~lgnum IN s_lgnum
+      AND mara~mtart IN s_mtart.
+
+  CHECK sy-subrc EQ 0.
+
+  SELECT * FROM zwm_rf_ubic_prop
+    INTO TABLE t_zwm_rf_ubic_prop
+    FOR ALL ENTRIES IN t_mlgn
+    WHERE lgnum EQ t_mlgn-lgnum
+      AND matnr EQ t_mlgn-matnr.
+
+  LOOP AT t_zwm_rf_ubic_prop.
+    DELETE t_mlgn WHERE matnr EQ t_zwm_rf_ubic_prop-matnr
+                    AND lgnum EQ t_zwm_rf_ubic_prop-lgnum.
+  ENDLOOP.
+
+  CHECK t_mlgn[] IS NOT INITIAL.
+
+  SORT t_mlgn BY matnr lgnum.
+  DELETE ADJACENT DUPLICATES FROM t_mlgn COMPARING matnr lgnum.
+
+  LOOP AT t_t320.
+    REFRESH: t_addr, t_message.
+    CLEAR: t_ztmm0025, o_send_email, g_subject, o_document, g_sender, o_sender, o_recipient, g_sent_to_all.
+
+    READ TABLE t_ztmm0025 WITH KEY werks = t_t320-werks.
+
+    CHECK sy-subrc EQ 0.
+
+    IF t_ztmm0025-email1 NE space.
+      APPEND t_ztmm0025-email1 TO t_addr.
+    ENDIF.
+    IF t_ztmm0025-email2 NE space.
+      APPEND t_ztmm0025-email2 TO t_addr.
+    ENDIF.
+    IF t_ztmm0025-email3 NE space.
+      APPEND t_ztmm0025-email3 TO t_addr.
+    ENDIF.
+    IF t_ztmm0025-email4 NE space.
+      APPEND t_ztmm0025-email4 TO t_addr.
+    ENDIF.
+
+*   Inicialización de la clase
+    o_send_email = cl_bcs=>create_persistent( ).
+
+*   Cuerpo del email
+    CONCATENATE 'Los siguientes materiales no tienen ubicación de propuesta informada para el número de almacén WM' t_t320-lgnum
+      INTO message SEPARATED BY space.
+    APPEND message TO t_message. CLEAR message.
+
+    message = ', por favor acceda a la transacción ZWM_UBICACION_PROP y cree nuevas entradas para estos materiales especificando la ubicación correspondiente:<br>'.
+    APPEND message TO t_message. CLEAR message.
+
+    LOOP AT t_mlgn WHERE lgnum EQ t_t320-lgnum.
+      SELECT SINGLE maktx FROM makt
+        INTO g_maktx
+        WHERE matnr EQ t_mlgn-matnr.
+      WRITE t_mlgn-matnr TO message NO-ZERO.
+      CONCATENATE '<br>' message '<i>' g_maktx '</i>' INTO message SEPARATED BY space.
+      APPEND message TO t_message. CLEAR message.
+
+      WRITE: / 'Material ', t_mlgn-matnr, ' núm. almacén ', t_mlgn-lgnum.
+    ENDLOOP.
+
+*   Crear documento
+    g_subject = 'Materiales sin ubicación WM propuesta'.
+    o_document =  cl_document_bcs=>create_document( i_type    =  'HTM'
+                                                    i_subject =  g_subject
+                                                    i_text    =  t_message ).
+
+*   Enviar documento al email
+    o_send_email->set_document( o_document ).
+
+*   Añadir remitente
+    g_sender = 'sap@hinojosa.es'.
+    o_sender = cl_cam_address_bcs=>create_internet_address( g_sender  ).
+    o_send_email->set_sender( i_sender = o_sender ).
+
+* Añadir destinatarios al email
+    LOOP AT t_addr ASSIGNING FIELD-SYMBOL(<fs_addr>).
+      o_recipient = cl_cam_address_bcs=>create_internet_address( <fs_addr> ).
+      o_send_email->add_recipient( i_recipient = o_recipient ).
+    ENDLOOP.
+    IF t_ztmm0025-lista NE space. " 58445 - Envío a listas de distribución
+      o_recipient = cl_distributionlist_bcs=>getu_persistent( i_dliname = t_ztmm0025-lista i_private = space ).
+      o_send_email->add_recipient( i_recipient = o_recipient i_express = 'X' ).
+    ENDIF.
+
+* Enviar email
+    g_sent_to_all = o_send_email->send( i_with_error_screen = 'X' ).
+    COMMIT WORK AND WAIT.
+
+    IF g_sent_to_all EQ 'X'.
+*   Enviado Correctamente
+    ELSE.
+*   Error al enviar
+    ENDIF.
+
+  ENDLOOP.

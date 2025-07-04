@@ -1,0 +1,224 @@
+
+CLASS zcl_wm_rlab_dao DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PROTECTED .
+
+  PUBLIC SECTION.
+    CONSTANTS: gc_y TYPE string VALUE 'Sí',
+               gc_n TYPE string VALUE 'No'.
+    TYPES: gtty_rlab_log TYPE STANDARD TABLE OF zwm_rf_rlab_log WITH DEFAULT KEY.
+    TYPES: gtty_rlab TYPE STANDARD TABLE OF zwm_rf_riesg_lab WITH DEFAULT KEY.
+    CLASS-METHODS: get_instance IMPORTING
+                                          iv_lgnum      TYPE t300-lgnum OPTIONAL
+                                          iv_vbeln      TYPE likp-vbeln OPTIONAL
+                                          iv_usnam      TYPE zwm_rf_rlab_log-usuario OPTIONAL
+                                          iv_noper      TYPE zwm_rf_rlab_log-operario OPTIONAL
+                                RETURNING VALUE(rr_ref) TYPE REF TO zcl_wm_rlab_dao
+                                RAISING   zcx_wm_exception.
+    CLASS-METHODS init.
+    METHODS: get_lgnum RETURNING VALUE(rv_lgnum) TYPE t300-lgnum.
+    METHODS: get_vbeln RETURNING VALUE(rv_vbeln) TYPE likp-vbeln.
+    METHODS is_answered RETURNING VALUE(rv_ans) TYPE boolean.
+
+    METHODS: get_noper RETURNING VALUE(rv_noper) TYPE zwm_rf_rlab_log-operario.
+    METHODS: get_usnam RETURNING VALUE(rv_usnam) TYPE zwm_rf_rlab_log-usuario.
+    METHODS: start_query,
+      create_log_entry IMPORTING is_data   TYPE zwm_rf_rlab_log
+                                 iv_commit TYPE boolean DEFAULT abap_true,
+      get_last_log_entry RETURNING VALUE(rs_data) TYPE zwm_rf_rlab_log,
+      get_curr_query_id RETURNING VALUE(rv_id) TYPE zwm_rf_riesg_lab-id,
+
+      fetch_query_log
+        RETURNING VALUE(rt_data) TYPE gtty_rlab_log,
+      get_next_query RETURNING VALUE(rs_data) TYPE zwm_rf_riesg_lab
+                     RAISING   zcx_wm_exception,
+      has_next_query RETURNING VALUE(rv_exists) TYPE boolean.
+  PROTECTED SECTION.
+    METHODS check_answered
+      RETURNING VALUE(rv_ans) TYPE boolean.
+    METHODS: constructor IMPORTING iv_lgnum TYPE t300-lgnum
+                                   iv_vbeln TYPE likp-vbeln
+                                   iv_usnam TYPE zwm_rf_rlab_log-usuario
+                                   iv_noper TYPE zwm_rf_rlab_log-operario
+                         RAISING   zcx_wm_exception.
+    METHODS: fetch_entries RAISING zcx_wm_exception,
+      set_curr_query_id IMPORTING iv_id TYPE zwm_rf_riesg_lab-id,
+      get_next_query_id RETURNING VALUE(rv_id) TYPE zwm_rf_riesg_lab-id.
+    CLASS-DATA: gr_ref TYPE REF TO zcl_wm_rlab_dao.
+    DATA: gv_lgnum TYPE t300-lgnum.
+    DATA gv_answered TYPE boolean.
+    DATA gv_vbeln TYPE likp-vbeln.
+    DATA gv_usnam TYPE zwm_rf_rlab_log-usuario.
+    DATA gv_noper TYPE zwm_rf_rlab_log-operario.
+    DATA gt_rlab TYPE gtty_rlab.
+    DATA gv_exec_id TYPE sysuuid_c22.
+    DATA gt_rlab_log TYPE gtty_rlab_log.
+    DATA gv_curr_query_id TYPE zwm_rf_riesg_lab-id.
+  PRIVATE SECTION.
+endclass. "ZCL_WM_RLAB_DAO definition
+class ZCL_WM_RLAB_DAO implementation.
+  METHOD check_answered.
+    rv_ans = abap_false.
+    DATA(lt_data) = me->fetch_query_log(
+                    ).
+    CHECK lines( lt_data ) > 0.
+
+    " delete all records older than 24 hrs
+    DATA(lv_uzeit) = sy-uzeit.
+    DATA(lv_datum) = sy-datum - 1.
+
+    DELETE lt_data WHERE fecha < lv_datum OR ( fecha = lv_datum AND hora <= lv_uzeit ) .
+
+    CHECK lines( lt_data ) > 0.
+
+    SORT lt_data BY id fecha DESCENDING hora DESCENDING .
+    DELETE ADJACENT DUPLICATES FROM lt_data COMPARING id. " keep only most recent ones
+    " check if all questions are answered and the answer = gc_y
+    rv_ans = xsdbool(
+    lines( lt_data ) = lines( me->gt_rlab )
+    AND NOT line_exists( lt_data[ respuesta = gc_n ] )
+    ).
+
+    CHECK rv_ans = abap_true.
+
+    " and that all records are for same exec id
+    SORT lt_data BY exec_id.
+    DELETE ADJACENT DUPLICATES FROM lt_data COMPARING exec_id.
+
+    rv_ans = xsdbool( lines( lt_data ) = 1 ).
+
+
+  ENDMETHOD.
+  METHOD constructor.
+    me->gv_lgnum = iv_lgnum.
+    me->gv_vbeln = iv_vbeln.
+    me->gv_usnam = iv_usnam.
+    me->gv_noper = iv_noper.
+    TRY.
+        me->gv_exec_id = cl_system_uuid=>create_uuid_c22_static( ).
+      CATCH cx_uuid_error.    "
+    ENDTRY.
+    me->fetch_entries( ).
+    me->gv_answered = me->check_answered( ).
+  ENDMETHOD.
+  METHOD create_log_entry.
+    CHECK is_data IS NOT INITIAL.
+    DATA(ls_data) = is_data.
+    ls_data-vbeln = me->gv_vbeln.
+    ls_data-exec_id = me->gv_exec_id.
+    MODIFY zwm_rf_rlab_log FROM ls_data.
+    APPEND ls_data TO gt_rlab_log.
+    CHECK iv_commit = abap_true.
+    COMMIT WORK AND WAIT.
+
+  ENDMETHOD.
+  METHOD fetch_entries.
+    SELECT * FROM zwm_rf_riesg_lab
+      INTO CORRESPONDING FIELDS OF TABLE me->gt_rlab
+      WHERE lgnum = me->gv_lgnum
+      ORDER BY id ASCENDING.
+    CHECK sy-subrc NE 0.
+
+    RAISE EXCEPTION TYPE zcx_wm_exception
+      EXPORTING
+        textid = VALUE #( msgid = 'ZWM' msgno = '088' attr1 = me->get_lgnum( ) )
+*       previous =
+      .
+
+
+  ENDMETHOD.
+  METHOD fetch_query_log.
+
+    SELECT * FROM zwm_rf_rlab_log
+      INTO CORRESPONDING FIELDS OF TABLE rt_data
+      WHERE lgnum = me->gv_lgnum
+      AND usuario = me->gv_usnam
+      AND vbeln = me->gv_vbeln
+      AND operario = me->gv_noper.
+
+
+  ENDMETHOD.
+  METHOD get_curr_query_id.
+    rv_id = me->gv_curr_query_id.
+  ENDMETHOD.
+  METHOD get_instance.
+    rr_ref = COND #( WHEN gr_ref IS NOT BOUND OR
+    ( iv_lgnum IS SUPPLIED AND gr_ref->get_lgnum( ) NE iv_lgnum ) OR
+    ( iv_vbeln IS SUPPLIED AND gr_ref->get_vbeln( ) NE iv_lgnum ) OR
+    ( iv_usnam IS SUPPLIED AND gr_ref->get_usnam( ) NE iv_lgnum ) OR
+    ( iv_noper IS SUPPLIED AND gr_ref->get_noper( ) NE iv_lgnum )
+    THEN NEW #(
+    iv_lgnum = iv_lgnum
+    iv_vbeln = iv_vbeln
+    iv_usnam = iv_usnam
+    iv_noper = iv_noper
+    ) ELSE gr_ref ).
+
+    gr_ref = rr_ref.
+  ENDMETHOD.
+  METHOD get_last_log_entry.
+    CLEAR rs_data.
+    TRY.
+        rs_data = gt_rlab_log[ id = me->get_curr_query_id( ) ].
+      CATCH cx_root.
+    ENDTRY.
+
+  ENDMETHOD.
+  METHOD get_lgnum.
+    rv_lgnum = me->gv_lgnum.
+  ENDMETHOD.
+  METHOD get_next_query.
+    CLEAR rs_data.
+    TRY.
+        rs_data = me->gt_rlab[ id = me->get_next_query_id( ) ].
+        me->set_curr_query_id( me->get_next_query_id( ) ).
+      CATCH cx_root.
+        RAISE EXCEPTION TYPE zcx_wm_exception
+          EXPORTING
+            textid = VALUE #( msgid = 'ZWM' msgno = '089' attr1 = me->get_lgnum( ) )
+*           previous =
+          .
+    ENDTRY.
+  ENDMETHOD.
+  METHOD get_next_query_id.
+
+    CLEAR rv_id.
+    IF me->get_curr_query_id( ) IS INITIAL.
+      rv_id = me->gt_rlab[ 1 ]-id.
+      RETURN.
+    ENDIF.
+    LOOP AT me->gt_rlab TRANSPORTING NO FIELDS
+      WHERE id = me->get_curr_query_id( ).
+      TRY.
+          rv_id = me->gt_rlab[ sy-tabix + 1 ]-id.
+        CATCH cx_root.
+      ENDTRY.
+    ENDLOOP.
+
+  ENDMETHOD.
+  METHOD get_noper.
+    rv_noper = me->gv_noper.
+  ENDMETHOD.
+  METHOD get_usnam.
+    rv_usnam = me->gv_usnam.
+  ENDMETHOD.
+  METHOD get_vbeln.
+    rv_vbeln = me->gv_vbeln.
+  ENDMETHOD.
+  METHOD has_next_query.
+    rv_exists = xsdbool( ( NOT me->is_answered( ) ) AND me->get_next_query_id( ) IS NOT INITIAL ).
+  ENDMETHOD.
+  METHOD init.
+    CLEAR gr_ref.
+  ENDMETHOD.
+  METHOD is_answered.
+    rv_ans = me->gv_answered.
+  ENDMETHOD.
+  METHOD set_curr_query_id.
+    me->gv_curr_query_id = iv_id.
+  ENDMETHOD.
+  METHOD start_query.
+    me->set_curr_query_id( 0 ).
+    CLEAR gt_rlab_log.
+  ENDMETHOD.

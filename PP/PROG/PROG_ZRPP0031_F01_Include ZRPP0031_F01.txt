@@ -1,0 +1,473 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0031_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_UTILLAJES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_GV_AUFNR  text
+*----------------------------------------------------------------------*
+FORM obtener_utillajes.
+  DATA: lv_no_valid  TYPE flag,
+        lt_utillajes TYPE zttpp0013,
+        lv_index     TYPE i.
+
+* Limpiamos tabla de utillajes
+  CLEAR gt_utillajes.
+
+* Controlamos si venimos de transacción
+  IF sy-tcode EQ 'ZPP0042' OR ( sy-cprog EQ 'ZRPP0031' and sy-tcode ne 'COR2' and sy-tcode ne 'COR1' and sy-tcode ne 'COHVPI').
+*   Obtenemos utillajes
+    SELECT * FROM ztpp0013
+      INTO TABLE lt_utillajes
+      WHERE werks   = p_werks
+        AND aufnr   = p_aufnr
+        AND zzptbo  = ''.
+
+*   Controlamos que este relleno. Sino debemos cogerlo de memoria
+    IF sy-subrc NE 0.
+      MESSAGE e260(zpp) WITH p_aufnr.
+*     La orden & no contiene utillajes.
+    ENDIF.
+
+*   Obtenemos datos de cabecera
+    SELECT SINGLE * FROM afko INTO CORRESPONDING FIELDS OF gs_header
+      WHERE aufnr = p_aufnr.
+
+*   Controlamos que los datos de cabecera estén rellenos
+    IF sy-subrc NE 0.
+      MESSAGE e260(zpp) WITH p_aufnr.
+*     La orden & no contiene utillajes.
+    ENDIF.
+  ELSE.
+*   Pasamos datos de la badi al ALV
+    PERFORM pass_alv_bbdd CHANGING lt_utillajes.
+  ENDIF.
+
+* Guardamos tabla con todos los elementos
+  gt_utillajes_aux = lt_utillajes.
+
+
+* Inicializamos contador
+  lv_index = 1.
+
+* Iteramos sobre todas los equipos comprobando cuales están activos
+  LOOP AT lt_utillajes INTO DATA(ls_row).
+*   Limpiamos variable
+    CLEAR lv_no_valid.
+
+*   Comprobamos si el equipo está activo
+    CALL FUNCTION 'ZPP_CHECK_EQUNR_ACTIVE'
+      EXPORTING
+        e_equnr    = ls_row-equnr
+      IMPORTING
+        e_no_valid = lv_no_valid.
+
+*   Si hay alguna que no es initial salimos
+    IF lv_no_valid IS NOT INITIAL.
+*     Añadimos a la tabla de utilles inactivos
+      APPEND ls_row TO gt_utillajes.
+
+*     Borramos línea de utillajes AUX para poder luego juntarlas al venir por COR* o COHVPI
+      DELETE gt_utillajes_aux INDEX lv_index.
+    ELSE.
+*     Incrementamos contador
+      ADD 1 TO lv_index.
+    ENDIF.
+  ENDLOOP.
+
+* Guardamos tabla de bloqueados por si se modifica informar en BBDD
+  gt_utillajes_ori = gt_utillajes.
+ENDFORM.                    " OBTENER_UTILLAJES
+*&---------------------------------------------------------------------*
+*&      Form  MOSTRAR_ALV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM mostrar_alv .
+
+  DATA: lti_fieldcat TYPE lvc_t_fcat,
+        lti_exctool  TYPE ui_functions.
+  DATA: ls_layout  TYPE lvc_s_layo,
+        ls_variant TYPE disvariant.
+  DATA: lv_repid     TYPE syrepid.
+
+* Variante
+  lv_repid          = sy-repid.
+  ls_variant-report = lv_repid.
+
+* Preparamos el catálogo de campos
+  PERFORM prepare_fielcat CHANGING lti_fieldcat.
+
+* Preparamos la tabla para excluir botones
+  PERFORM prepare_toolbar CHANGING lti_exctool.
+
+* Layout
+  ls_layout-cwidth_opt = 'X'.
+  ls_layout-sel_mode   = 'A'.
+** Si queremos que se puedan añadir y quitar lineas
+*  ls_layout-edit       = 'X'.
+
+
+* Mostramos el ALV
+  CALL METHOD g_grid->set_table_for_first_display
+    EXPORTING
+      i_buffer_active      = ' '
+      i_bypassing_buffer   = 'X'
+      is_layout            = ls_layout
+      is_variant           = ls_variant
+      i_save               = 'A'
+      it_toolbar_excluding = lti_exctool
+    CHANGING
+      it_outtab            = gt_utillajes
+      it_fieldcatalog      = lti_fieldcat.
+
+
+* Con esto hacemos que se puedan borrar lineas. Luego hay que capturar el evento
+* Set editable cells to ready for input initially
+  CALL METHOD g_grid->set_ready_for_input
+    EXPORTING
+      i_ready_for_input = 1.
+
+* Volvemos a ajustar el ancho de las columnas
+  PERFORM refrescar_alv .
+
+ENDFORM.                    " MOSTRAR_ALV
+
+
+*&---------------------------------------------------------------------*
+*&      Form  PREPARE_FIELCAT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--CTI_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM  prepare_fielcat  CHANGING cti_fieldcat TYPE lvc_t_fcat.
+  DATA: ls_fcat TYPE lvc_s_fcat,
+        lv_ind  TYPE i.
+
+* Recuperamos el catálogo de campos
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name = 'ZTPP0013'
+    CHANGING
+      ct_fieldcat      = cti_fieldcat.
+
+* Recorremos el catálogo de campos modificandolo
+  LOOP AT cti_fieldcat INTO ls_fcat.
+    lv_ind = sy-tabix.
+*   Dependiendo del campo ponemos unas propiedades u otras
+    CASE ls_fcat-fieldname.
+*     Campos que no salen en el listado
+      WHEN  'CONT' OR 'ZZFECHAS' OR 'ZZHORAAS' OR 'ZZFECHAPTBO' OR 'ZZHORAPTBO' OR 'AUFNR' OR
+            'WERKS' OR 'COPIATRO' OR 'JUEGOCLI' OR 'ZZPTBO'.
+        ls_fcat-no_out = 'X'.
+*     Campos editables
+      WHEN 'VORNR'.
+        ls_fcat-edit = 'X'.
+        ls_fcat-drdn_hndl = '1'. " Así informamos que es DROPDOWN
+        ls_fcat-outputlen = 5.
+
+*       Añadimos DROPDOWN al campo del campo
+        PERFORM set_dropdown USING '1' 'VORNR'.
+      WHEN 'EQUNR'.
+        ls_fcat-edit = 'X'.
+    ENDCASE.
+    MODIFY cti_fieldcat FROM ls_fcat INDEX lv_ind.
+  ENDLOOP.
+
+ENDFORM.                    " PREPARE_FIELCAT
+
+
+*&---------------------------------------------------------------------*
+*&      Form  PREPARE_TOOLBAR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--CTI_EXCTOOL  text
+*----------------------------------------------------------------------*
+FORM prepare_toolbar  CHANGING cti_exctool TYPE ui_functions.
+
+* Quitamos la botonera del ALV editable EXCEPTO el botón ELIMINAR
+  APPEND cl_gui_alv_grid=>mc_fc_detail    TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_find      TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_find      TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_find_more TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_filter    TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_sum      TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_print     TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_views     TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_refresh   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_undo  TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_copy  TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_cut   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_insert_row   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_delete_row   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_copy_row   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_help TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_load_variant TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_graph TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_subtot   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_subtot   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_sort_asc   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_sort_dsc   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_sort_dsc   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_mb_sum   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_mb_export   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_mb_variant   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_mb_paste   TO cti_exctool.
+  APPEND cl_gui_alv_grid=>mc_fc_info   TO cti_exctool.
+
+ENDFORM.                    " PREPARE_TOOLBAR
+
+
+*&---------------------------------------------------------------------*
+*&      Form  REFRESCAR_ALV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM refrescar_alv .
+
+  DATA: ls_layout TYPE lvc_s_layo,
+        ls_stable TYPE lvc_s_stbl.
+
+* Sacamos el layout del ALV
+  CALL METHOD g_grid->get_frontend_layout
+    IMPORTING
+      es_layout = ls_layout.
+
+* Ponemos de nuevo que optimice las columnas
+  ls_layout-cwidth_opt = 'X'.
+
+* Cargamos de nuevo el layout
+  CALL METHOD g_grid->set_frontend_layout
+    EXPORTING
+      is_layout = ls_layout.
+
+* Refrescamos el ALV
+  ls_stable-row = 'X'.
+  ls_stable-col = 'X'.
+  CALL METHOD g_grid->refresh_table_display
+    EXPORTING
+      is_stable = ls_stable.
+
+ENDFORM.                    " REFRESCAR_ALV
+*&---------------------------------------------------------------------*
+*&      Form  SET_DROPDOWN
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_1      text
+*      -->P_0599   text
+*----------------------------------------------------------------------*
+FORM set_dropdown  USING p_handle TYPE char1
+                         p_field  TYPE char10.
+
+  DATA: it_dropdown TYPE lvc_t_drop,
+        wa_dropdown TYPE lvc_s_drop,
+        lv_no_valid TYPE flag,
+        lv_equnr    TYPE equnr.
+
+* Vemos que datos tenemos que coger
+  CASE p_field.
+    WHEN 'VORNR'.
+*     Obtenemos los elementos del DROPDOWN
+      SELECT b~vornr, b~phseq, b~steus FROM   plas AS a
+                       INNER JOIN   plpo AS b ON  a~plnty = b~plnty AND
+                                                  a~plnnr = b~plnnr AND
+                                                  a~plnkn = b~plnkn AND
+                                                  a~zaehl = b~zaehl
+        INTO TABLE @DATA(lt_vornr)
+        WHERE a~plnty = @gs_header-plnty
+          AND a~plnnr = @gs_header-plnnr
+          AND a~plnal = @gs_header-plnal
+          AND ( b~phseq EQ 'Z4' OR b~phseq EQ 'Z5' )
+          AND b~phseq NE ''
+          AND a~loekz EQ ''.
+
+*       Ordenamos y borramos duplicados
+      SORT lt_vornr BY vornr.
+      DELETE ADJACENT DUPLICATES FROM lt_vornr COMPARING vornr.
+
+*     Iteramos sobre las entradas encontradas
+      LOOP AT lt_vornr INTO DATA(ls_vornr) WHERE steus NE 'ZP05'.
+        wa_dropdown-handle  = p_handle.
+        wa_dropdown-value   = ls_vornr-vornr.
+        APPEND wa_dropdown TO it_dropdown.
+        CLEAR wa_dropdown.
+      ENDLOOP.
+    WHEN OTHERS.
+  ENDCASE.
+
+* method to display the dropdown in ALV
+  CALL METHOD g_grid->set_drop_down_table
+    EXPORTING
+      it_drop_down = it_dropdown.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  SAVE_UTILLAES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM save_utillajes .
+  DATA: ls_bbdd     TYPE ztpp0013.
+
+* Montamos tabla para pasar a BBDD juntando con líneas borradas
+  LOOP AT gt_borradas INTO DATA(ls_dato).
+*   Añadimos a tabla de borrados
+    APPEND ls_dato TO gt_utillajes.
+  ENDLOOP.
+
+* Borramos lineas vacias
+  DELETE gt_utillajes WHERE equnr IS INITIAL.
+
+* Ordenamos lineas duplicadas para luego borrar
+  SORT gt_utillajes BY aufnr werks vornr equnr zzptbo ASCENDING.
+
+* Borramos duplicados
+  DELETE ADJACENT DUPLICATES FROM gt_utillajes COMPARING aufnr werks vornr equnr.
+
+* Informamos campos faltantes
+  LOOP AT gt_utillajes ASSIGNING FIELD-SYMBOL(<fs_row>).
+*   Controlamos sociedad
+    IF <fs_row>-werks IS INITIAL.
+      <fs_row>-werks = p_werks.
+    ENDIF.
+
+*   Controlamos si es borrado o no
+    IF <fs_row>-zzptbo IS INITIAL.
+      IF <fs_row>-zzfechas IS INITIAL.
+        <fs_row>-zzfechas = sy-datum.
+        <fs_row>-zzhoraas = sy-uzeit.
+      ENDIF.
+    ELSE.
+      IF <fs_row>-zzfechaptbo IS INITIAL.
+        <fs_row>-zzfechaptbo  = sy-datum.
+        <fs_row>-zzhoraptbo   = sy-uzeit.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Controlamos que tengamos la orden informada y que estemos en la transacción
+  IF gs_header-aufnr CN '%' AND ( sy-tcode EQ 'ZPP0042' OR sy-tcode eq 'SE38' ).
+*   Iteramos sobre la tabla comprobando si hay diferencias con la BBDD para updatear
+    LOOP AT gt_utillajes INTO DATA(ls_ztpp0013).
+*     Miramos en la BBDD a ver si hay un registro igual
+      SELECT SINGLE * FROM ztpp0013 INTO ls_bbdd
+        WHERE aufnr   = ls_ztpp0013-aufnr
+          AND vornr   = ls_ztpp0013-vornr
+          AND equnr   = ls_ztpp0013-equnr.
+*          AND zzptbo  = ls_ztpp0013-zzptbo.
+        IF sy-subrc NE 0.
+*         Insertamos lineas en tabla Z
+          INSERT ztpp0013 FROM ls_ztpp0013.
+        ELSE.
+*         Modificamos lineas en tabla Z
+          MODIFY ztpp0013 FROM ls_ztpp0013.
+        ENDIF.
+    ENDLOOP.
+  ELSE.
+*   Juntamos líneas borradas
+    APPEND LINES OF gt_utillajes_aux TO gt_utillajes.
+
+*   Ordenamos por vornr
+    SORT gt_utillajes BY vornr equnr.
+
+*   Borramos duplicados
+    DELETE ADJACENT DUPLICATES FROM gt_utillajes.
+
+*   Informamos que queremos liberar en memoria
+    EXPORT release FROM 'X' TO SHARED BUFFER indx(st) ID 'RELEASE'.
+
+*   Exportamos tabla a memoria para poder leerla desde el report
+    EXPORT utillajes FROM gt_utillajes TO SHARED BUFFER indx(st) ID 'UTILLAJES'.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PASS_ALV_BBDD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LT_UTILLAJES  text
+*----------------------------------------------------------------------*
+FORM pass_alv_bbdd  CHANGING pt_utillajes TYPE zttpp0013.
+  DATA: lt_utillajes TYPE zttpm0007,
+        ls_header    TYPE caufvd,
+        ls_row       TYPE zspm0007,
+        ls_bbdd      TYPE ztpp0013.
+
+* Exportamos tabla a memoria para poder leerla desde el report
+  IMPORT header TO ls_header FROM SHARED BUFFER indx(st) ID 'HEADER'.
+  MOVE-CORRESPONDING ls_header TO gs_header.
+
+* Exportamos tabla a memoria para poder leerla desde el report
+  IMPORT utillajes TO lt_utillajes FROM SHARED BUFFER indx(st) ID 'UTILLAJES'.
+
+* Iteramos sobre la tabla ALV de la COR1. Esto ocurrirá cuando se libera sin guardar
+  LOOP AT lt_utillajes INTO ls_row. "INTO DATA(ls_row).
+    CLEAR ls_bbdd.
+    MOVE-CORRESPONDING ls_row TO ls_bbdd.
+    ls_bbdd-mandt = sy-mandt.
+    ls_bbdd-werks = '4000'.
+    ls_bbdd-aufnr = gs_header-aufnr.
+    APPEND ls_bbdd TO pt_utillajes.
+  ENDLOOP.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  HIDE_COLUMNS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_SALV  text
+*----------------------------------------------------------------------*
+FORM hide_columns  USING p_salv TYPE REF TO cl_salv_table.
+  DATA : lr_columns TYPE REF TO cl_salv_columns_table,
+         lr_column  TYPE REF TO cl_salv_column_table.
+
+* Obtenemos columnas
+  lr_columns = p_salv->get_columns( ).
+
+* Cont
+  lr_column ?= lr_columns->get_column( columnname = 'CONT' ).
+  lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+* ZZPTBO
+  lr_column ?= lr_columns->get_column( columnname = 'ZZPTBO' ).
+  lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+* ZZFECHAS
+  lr_column ?= lr_columns->get_column( columnname = 'ZZFECHAS' ).
+  lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+* ZZHORAAS
+  lr_column ?= lr_columns->get_column( columnname = 'ZZHORAAS' ).
+  lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+* ZZFECHAPTBO
+  lr_column ?= lr_columns->get_column( columnname = 'ZZFECHAPTBO' ).
+  lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+* ZZHORAPTBO
+  lr_column ?= lr_columns->get_column( columnname = 'ZZHORAPTBO' ).
+  lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+* COPIATRO
+  lr_column ?= lr_columns->get_column( columnname = 'COPIATRO' ).
+  lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+* JUEGOCLI
+  lr_column ?= lr_columns->get_column( columnname = 'JUEGOCLI' ).
+  lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+ENDFORM.

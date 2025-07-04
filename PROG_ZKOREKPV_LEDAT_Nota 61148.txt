@@ -1,0 +1,335 @@
+*&--------------------------------------------------------------------*
+*&--------------------------------------------------------------------*
+*& Object          REPS ZKOREKPV_LEDAT
+*& Object Header   PROG ZKOREKPV_LEDAT
+*&--------------------------------------------------------------------*
+*& PROGRAM ZKOREKPV_LEDAT
+*&--------------------------------------------------------------------*
+...
+*&---------------------------------------------------------------------*
+*& Report  ZKOREKPV_LEDAT
+*&---------------------------------------------------------------------*
+*& This is a consolidated report to correct inconsistencies in EKPV
+*                                                               *
+*& (LEDAT) and VETVG tables.
+*                        *
+*&---------------------------------------------------------------------*
+* correct ekpv-ledat which should be '0' because MRP deleted schedule *
+* line (note 378564)
+REPORT  zkorekpv_ledat
+               .
+TABLES: ekpo, ekpv, eket, ekko, vetvg.
+DATA: i_ekpv LIKE ekpv OCCURS 0 WITH HEADER LINE.
+DATA: BEGIN OF xvetvg OCCURS 10.
+        INCLUDE STRUCTURE vetvg.
+DATA:   ledatn LIKE vetvg-ledat,
+      END OF xvetvg.
+DATA: BEGIN OF yvetvg OCCURS 10.
+        INCLUDE STRUCTURE vetvg.
+DATA:   ledatn LIKE vetvg-ledat,
+      END OF yvetvg.
+DATA: BEGIN OF tvetvg OCCURS 10.
+        INCLUDE STRUCTURE vetvg.
+DATA: END OF tvetvg.
+DATA: BEGIN OF vetvgkey,
+        mandt LIKE vetvg-mandt,
+        vstel LIKE vetvg-vstel,
+        ledat LIKE vetvg-ledat,
+        lprio LIKE vetvg-lprio,
+        route LIKE vetvg-route,
+        spdnr LIKE vetvg-spdnr,
+        wadat LIKE vetvg-wadat,
+        kunwe LIKE vetvg-kunwe,
+        vbeln LIKE vetvg-vbeln,
+      END OF vetvgkey.
+
+
+DATA: n_ekpv  LIKE sy-tfill,
+      n_vetvg_ins  LIKE sy-tfill,
+      n_vetvg_del  LIKE sy-tfill,
+      h-ledat   LIKE ekpv-ledat.
+
+SELECT-OPTIONS: doc_num FOR ekpv-ebeln,
+                p_vstel FOR ekpv-vstel OBLIGATORY,
+                p_loekz FOR ekpo-loekz DEFAULT ' ',
+                p_eglkz FOR ekpo-eglkz DEFAULT ' ',
+                p_elikz FOR ekpo-elikz DEFAULT ' ',
+                p_novet FOR ekpo-novet DEFAULT ' ',
+                p_stapo FOR ekpo-stapo DEFAULT ' '.
+
+PARAMETERS: p_all  AS CHECKBOX,
+            db_ekpv AS CHECKBOX,
+            db_vetvg AS CHECKBOX.
+
+REFRESH i_ekpv.
+CLEAR: i_ekpv.
+CLEAR: n_ekpv, n_vetvg_ins, n_vetvg_del.
+SELECT * FROM ekpv INTO CORRESPONDING FIELDS OF i_ekpv
+         WHERE ebeln IN doc_num
+           AND vstel IN p_vstel
+         ORDER BY ebeln ebelp.
+  APPEND i_ekpv.
+ENDSELECT.
+
+CHECK sy-subrc EQ 0.
+
+SKIP 2.
+WRITE:
+/ 'existing records of table EKPV (OK=consitent - NOK=inconsistent)'.
+ULINE.
+* verify LEDAT consistency
+LOOP AT i_ekpv.
+  SELECT * FROM ekko WHERE ebeln = i_ekpv-ebeln
+                       AND memory NE 'X'
+                       AND frgrl  NE 'X'.
+    SELECT * FROM ekpo WHERE ebeln = i_ekpv-ebeln
+                         AND ebelp = i_ekpv-ebelp
+                         AND loekz IN p_loekz
+                         AND eglkz IN p_eglkz
+                         AND elikz IN p_elikz
+                         AND novet IN p_novet
+                         AND stapo IN p_stapo.
+* calculate delivery date from open schedule lines
+      CLEAR h-ledat.
+      SELECT * FROM eket WHERE ebeln = i_ekpv-ebeln AND
+                               ebelp = ekpo-ebelp AND
+                               menge > 0.
+*                             ( menge > 0 or mng02 > 0 ).
+        IF eket-menge > eket-glmng.
+          CALL FUNCTION 'ME_CALCULATE_LEDAT'
+            EXPORTING
+              i_eindt  = eket-eindt
+              i_plifz  = ekpo-plifz
+              i_tddat  = eket-tddat
+              i_mbdat  = eket-mbdat
+              i_loekz  = ekpo-loekz
+              i_novet  = ekpo-novet
+              i_eglkz  = ekpo-eglkz
+              i_elikz  = ekpo-elikz
+              i_frgrl  = ekko-frgrl
+              i_memory = ekko-memory
+              i_reswk  = ekko-reswk
+              i_glmng  = eket-glmng
+              i_menge  = eket-menge
+              i_mng02  = eket-mng02
+              i_retpo  = ekpo-retpo
+              i_werks  = ekpo-werks
+              i_stapo  = ekpo-stapo
+            IMPORTING
+              e_ledat  = h-ledat.
+        ENDIF.
+      ENDSELECT.
+* Compare result with current value ekpv-ledat
+      IF h-ledat = i_ekpv-ledat.
+        IF p_all EQ 'X'.
+          WRITE: / 'EKPV-OK :', i_ekpv-ebeln, ekpo-ebelp, i_ekpv-ledat,
+h-ledat.
+        ENDIF.
+      ELSE.
+        WRITE: / 'EKPV-NOK:',i_ekpv-ebeln, ekpo-ebelp, i_ekpv-ledat,
+h-ledat.
+        IF NOT db_ekpv IS INITIAL.
+          UPDATE ekpv
+             SET ledat = h-ledat
+           WHERE ebeln = i_ekpv-ebeln
+             AND ebelp = ekpo-ebelp.
+          IF sy-subrc EQ 0.
+            ADD 1 TO n_ekpv.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDSELECT.
+  ENDSELECT.
+ENDLOOP.
+WRITE: / n_ekpv, 'EKPV entries updated'.
+
+* verify VETVG entry existence -> code from ZKORVETV
+*- aufbauen index vetvg
+LOOP AT i_ekpv.
+  CHECK i_ekpv-ledat GT 0.
+  SELECT SINGLE * FROM ekko WHERE ebeln EQ i_ekpv-ebeln.
+  CHECK sy-subrc EQ 0.
+
+  SELECT SINGLE * FROM ekpo WHERE ebeln EQ i_ekpv-ebeln
+                            AND   ebelp EQ i_ekpv-ebelp.
+  CHECK sy-subrc EQ 0.
+  CHECK ekpo-loekz NE 'L'.
+  CHECK ekpo-elikz EQ space.
+
+  MOVE-CORRESPONDING i_ekpv TO vetvgkey.
+  vetvgkey-vbeln = i_ekpv-ebeln.
+  vetvgkey-kunwe = i_ekpv-kunnr.
+  CLEAR vetvgkey-ledat.
+
+*- prüfen, ob eintrag mit gleichem datenteil bereits vorhanden
+  READ TABLE xvetvg WITH KEY vetvgkey BINARY SEARCH.
+
+  CASE sy-subrc.
+**- eintrag vorhanden
+    WHEN 0.
+**- ledat neu versorgen, wenn kleiner
+      IF i_ekpv-ledat LT xvetvg-ledatn.
+        xvetvg-ledatn = i_ekpv-ledat.
+        MODIFY xvetvg INDEX sy-tabix.
+      ENDIF.
+
+**   eintrag noch nicht vorhanden
+    WHEN 4.
+      MOVE-CORRESPONDING i_ekpv TO xvetvg.
+      xvetvg-vbeln  = i_ekpv-ebeln.
+      xvetvg-kunwe  = i_ekpv-kunnr.
+      xvetvg-kunnr  = i_ekpv-kunag.
+      xvetvg-ledatn = i_ekpv-ledat.
+      xvetvg-auart  = ekko-bsart.
+      xvetvg-reswk  = ekko-reswk.
+      CLEAR xvetvg-ledat.
+      INSERT xvetvg INDEX sy-tabix.
+
+    WHEN 8.
+      MOVE-CORRESPONDING i_ekpv TO xvetvg.
+      xvetvg-vbeln  = i_ekpv-ebeln.
+      xvetvg-kunwe  = i_ekpv-kunnr.
+      xvetvg-kunnr  = i_ekpv-kunag.
+      xvetvg-ledatn = i_ekpv-ledat.
+      xvetvg-auart  = ekko-bsart.
+      xvetvg-reswk  = ekko-reswk.
+      CLEAR xvetvg-ledat.
+      APPEND xvetvg.
+  ENDCASE.
+
+ENDLOOP.
+
+* Verify which entries already exist in VETVG
+* xvetvg -> entries to be inserted
+* yvetvg -> entries to be deleted
+* select moved upfront to avoid problems with newly created STO's
+SELECT * FROM vetvg INTO TABLE yvetvg
+                    FOR ALL ENTRIES IN i_ekpv
+                    WHERE vbeln = i_ekpv-ebeln
+                      AND vstel = i_ekpv-vstel.
+* existing entries but only entries also within i_ekpv are considered
+
+SORT yvetvg BY vstel vbeln.
+DELETE ADJACENT DUPLICATES FROM yvetvg.
+SKIP 2.
+WRITE: / 'existing records of table VETVG'.
+ULINE.
+IF p_all EQ 'X'.
+  LOOP AT yvetvg.
+    WRITE: / 'VETVG :',
+           yvetvg-vstel,
+           yvetvg-ledat,
+           yvetvg-lprio,
+           yvetvg-route,
+           yvetvg-spdnr,
+           yvetvg-wadat,
+           yvetvg-kunwe,
+           yvetvg-vbeln,
+           yvetvg-vkorg,
+           yvetvg-vtweg,
+           yvetvg-spart,
+           yvetvg-auart,
+           yvetvg-reswk.
+  ENDLOOP.
+ENDIF.
+SORT xvetvg BY vstel vbeln.
+LOOP AT xvetvg.
+  LOOP AT yvetvg
+         WHERE  vstel  = xvetvg-vstel
+         AND    ledat  = xvetvg-ledatn " new date !!!
+         AND    lprio  = xvetvg-lprio
+         AND    route  = xvetvg-route
+         AND    spdnr  = xvetvg-spdnr
+         AND    wadat  = xvetvg-wadat
+         AND    kunwe  = xvetvg-kunwe
+         AND    vbeln  = xvetvg-vbeln.
+    EXIT.
+  ENDLOOP.
+
+  IF sy-subrc = 0.
+* No record to be inserted, exists already
+    DELETE xvetvg
+         WHERE  vstel  = xvetvg-vstel
+         AND    ledat  = xvetvg-ledat
+         AND    lprio  = xvetvg-lprio
+         AND    route  = xvetvg-route
+         AND    spdnr  = xvetvg-spdnr
+         AND    wadat  = xvetvg-wadat
+         AND    kunwe  = xvetvg-kunwe
+         AND    vbeln  = xvetvg-vbeln.
+* No record to be deleted, exists already
+    DELETE yvetvg
+         WHERE  vstel  = xvetvg-vstel
+         AND    ledat  = xvetvg-ledatn "new date !!!!
+         AND    lprio  = xvetvg-lprio
+         AND    route  = xvetvg-route
+         AND    spdnr  = xvetvg-spdnr
+         AND    wadat  = xvetvg-wadat
+         AND    kunwe  = xvetvg-kunwe
+         AND    vbeln  = xvetvg-vbeln.
+  ENDIF.
+ENDLOOP.
+
+SKIP 2.
+WRITE: / 'records of table VETVG to be deleted'.
+ULINE.
+
+LOOP AT yvetvg.
+  WRITE: / 'Delete:',
+         yvetvg-vstel,
+         yvetvg-ledat,
+         yvetvg-lprio,
+         yvetvg-route,
+         yvetvg-spdnr,
+         yvetvg-wadat,
+         yvetvg-kunwe,
+         yvetvg-vbeln,
+         yvetvg-vkorg,
+         yvetvg-vtweg,
+         yvetvg-spart,
+         yvetvg-auart,
+         yvetvg-reswk.
+  IF db_vetvg NE space.
+    DELETE vetvg FROM yvetvg.
+    IF sy-subrc EQ 0.
+      ADD 1 TO n_vetvg_del.
+    ENDIF.
+  ENDIF.
+ENDLOOP.
+
+SKIP 2.
+WRITE: / 'records of table VETVG to be inserted'.
+ULINE.
+
+LOOP AT xvetvg.
+  CHECK xvetvg-ledatn NE 0.
+  MOVE xvetvg TO tvetvg.
+  tvetvg-ledat = xvetvg-ledatn.
+  APPEND tvetvg.
+  MOVE tvetvg TO vetvg.
+  WRITE: / 'Insert:',
+         vetvg-vstel,
+         vetvg-ledat,
+         vetvg-lprio,
+         vetvg-route,
+         vetvg-spdnr,
+         vetvg-wadat,
+         vetvg-kunwe,
+         vetvg-vbeln,
+         vetvg-vkorg,
+         vetvg-vtweg,
+         vetvg-spart,
+         vetvg-auart,
+         vetvg-reswk.
+  IF db_vetvg NE space.
+    INSERT vetvg.                                           "wegen 2.2
+    IF sy-subrc EQ 0.
+      ADD 1 TO n_vetvg_ins.
+    ENDIF.
+  ENDIF.
+ENDLOOP.
+
+WRITE: / n_vetvg_ins, 'VETVG entries inserted',
+       / n_vetvg_del, 'VETVG entries deleted'.
+...
+*&--------------------------------------------------------------------*

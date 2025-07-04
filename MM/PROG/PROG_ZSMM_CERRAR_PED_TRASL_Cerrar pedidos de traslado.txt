@@ -1,0 +1,214 @@
+*&---------------------------------------------------------------------*
+*& Report  ZSMM_CERRAR_PED_TRASL
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+REPORT zsmm_cerrar_ped_trasl.
+
+DATA: lv_ebeln TYPE ebeln,
+      lv_fecha TYPE edatu.
+CONSTANTS c_2003 TYPE werks_d VALUE '2003'.
+CONSTANTS c_2001 TYPE werks_d VALUE '2001'.
+CONSTANTS c_bsart TYPE bsart VALUE 'ZPT1'.
+DATA: rg_semis TYPE RANGE OF mtart,
+      rg_pto   TYPE RANGE OF mtart.
+FREE: rg_semis, rg_pto.
+CONSTANTS: c_pto  TYPE rvari_vnam VALUE 'ZSPP_UPD_MTART_PTE',
+           c_semi TYPE rvari_vnam VALUE 'ZSPP_UPD_MTART_SEM'.
+
+DATA: gt_output TYPE bapiret2_tab.
+
+DATA lv_valor_fecha TYPE sy-datum.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME.
+
+SELECT-OPTIONS: so_ebeln FOR lv_ebeln,
+                so_edatu FOR lv_fecha OBLIGATORY.
+
+SELECTION-SCREEN END OF BLOCK b1.
+
+INITIALIZATION.
+  lv_valor_fecha = sy-datum - 3.
+  so_edatu-low = '20220101'.
+  so_edatu-high = lv_valor_fecha.
+  so_edatu-option = 'BT'.
+  so_edatu-sign = 'I'.
+  APPEND so_edatu.
+
+
+
+START-OF-SELECTION.
+  FREE: rg_pto, rg_semis.
+  SELECT sign, opti, low, high INTO TABLE @rg_pto FROM tvarvc WHERE name EQ @c_pto.
+  SELECT sign, opti, low, high INTO TABLE @rg_semis FROM tvarvc WHERE name EQ @c_semi.
+
+*-  Lanzamos la búsqueda contra la EKKO por clase de pedido ZPT1, RESWK = ‘2001’ y rango de fecha de creación desde
+*hoy – 3 días hasta infinito. (cliente me confirma que la creación de pedidos nuevos es al día, no se “reutilizan” pedidos existentes para meterle nuevas posiciones)
+*-  Identificamos posiciones (guardando matnr) en EKPO (excluimos las que tengan ya la marca de “entrega final” (EGLKZ) y filtramos por werks = ‘2003’)
+*-  Encontramos la relación pedido traslado posición con el número de pedido de cliente/posición (VBELN/VBELP) en la EKKN.
+*-  Accedemos a la AFPO con los datos de material/pedido cliente/posición para sacar la OF asociada.
+*-  Revisamos el status de la OF (tabla JEST) y si tiene el status CTEC o PTBO, actuamos y marcamos la posición del pedido de traslado con la marca de ‘entrega final’.
+
+
+  SELECT DISTINCT t1~ebeln, t2~ebelp, vbeln, vbelp AS posnr, t4~aufnr
+    INTO TABLE @DATA(it_ped)
+    FROM ekko AS t1 INNER JOIN ekpo AS t2 ON t1~ebeln EQ t2~ebeln
+    INNER JOIN ekkn AS t3 ON t2~ebeln EQ t3~ebeln AND t2~ebelp EQ t3~ebelp
+    INNER JOIN afpo AS t4 ON t3~vbeln EQ t4~kdauf AND t3~vbelp EQ t4~kdpos AND t4~matnr EQ t2~matnr
+    INNER JOIN aufk AS t5 ON t4~aufnr EQ t5~aufnr AND t5~autyp EQ 10
+    INNER JOIN mara AS t6 ON t2~matnr EQ t6~matnr
+    WHERE eglkz EQ @space
+    AND t2~werks EQ @c_2003
+    AND t1~aedat IN @so_edatu
+    AND t1~ebeln IN @so_ebeln
+    AND bsart EQ @c_bsart
+    AND reswk EQ @c_2001
+    AND t6~mtart IN @rg_semis
+    ORDER BY t1~ebeln, t2~ebelp ASCENDING.
+  IF sy-subrc = 0.
+
+    SORT it_ped BY ebeln ebelp ASCENDING.
+*    DELETE ADJACENT DUPLICATES FROM it_ped COMPARING ebeln ebelp.
+
+    "buscamos los status de las OFs para descartar aquellas que no esten ni PTBO ni CTEC
+    SELECT stat, inact, aufnr
+      INTO TABLE @DATA(it_status)
+      FROM jest AS t1 INNER JOIN caufv AS t2 ON t1~objnr EQ t2~objnr
+      FOR ALL ENTRIES IN @it_ped
+      WHERE aufnr EQ @it_ped-aufnr
+      AND stat IN ( 'I0045', 'I0076' )
+      AND inact = @space.
+
+    SORT it_status BY aufnr ASCENDING.
+
+    LOOP AT it_ped ASSIGNING FIELD-SYMBOL(<ped>).
+      READ TABLE it_status WITH KEY aufnr = <ped>-aufnr TRANSPORTING NO FIELDS.
+      IF sy-subrc <> 0.
+        "No tiene CTEC ni PTBO la OF, no la consideramos
+        DELETE it_ped WHERE ebeln = <ped>-ebeln AND ebelp = <ped>-ebelp.
+        CONTINUE.
+      ENDIF.
+    ENDLOOP.
+
+  ENDIF.
+
+  IF it_ped[] IS INITIAL  .
+    MESSAGE i398(00) WITH 'No se han encontrado' 'pedidos que' 'cumplan los' 'criterios' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+  SORT it_ped BY ebeln ebelp ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM it_ped COMPARING ebeln ebelp.
+
+  DATA: it_return TYPE TABLE OF bapiret2,
+        it_item   TYPE TABLE OF bapimepoitem,
+        it_itemx  TYPE TABLE OF bapimepoitemx,
+        it_sched  TYPE TABLE OF bapimeposchedule,
+        it_schedx TYPE TABLE OF bapimeposchedulx,
+        lv_ped    TYPE bapimepoheader-po_number.
+  DATA it_log TYPE TABLE OF zsmm_cierped_log.
+  FREE it_log.
+  FREE gt_output.
+
+  LOOP AT it_ped ASSIGNING <ped>.
+
+    FREE: it_return, it_item, it_itemx, it_sched, it_schedx.
+    CLEAR: it_return, it_item, it_itemx, it_sched, it_schedx.
+
+    lv_ped = <ped>-ebeln.
+
+    APPEND INITIAL LINE TO it_item ASSIGNING FIELD-SYMBOL(<item>).
+    <item>-po_item = <ped>-ebelp.
+    <item>-deliv_compl = abap_true.
+    <item>-unlimited_dlv = abap_true.
+    <item>-over_dlv_tol = <item>-under_dlv_tol = 99.
+
+    APPEND INITIAL LINE TO it_itemx ASSIGNING FIELD-SYMBOL(<itemx>).
+    <itemx>-po_item = <ped>-ebelp.
+    <itemx>-unlimited_dlv = <itemx>-over_dlv_tol = <itemx>-under_dlv_tol = <itemx>-deliv_compl = abap_true.
+
+    CALL FUNCTION 'BAPI_PO_CHANGE'
+      EXPORTING
+        purchaseorder = lv_ped
+      TABLES
+        return        = it_return
+        poitem        = it_item
+        poitemx       = it_itemx.
+
+    LOOP AT it_return TRANSPORTING NO FIELDS WHERE type EQ 'E' OR type EQ 'A' OR type EQ 'X'.
+      EXIT.
+    ENDLOOP.
+    IF sy-subrc <> 0.
+      COMMIT WORK AND WAIT.
+
+      APPEND INITIAL LINE TO it_log ASSIGNING FIELD-SYMBOL(<log>).
+      MOVE-CORRESPONDING <ped> TO <log>.
+      <log>-fproc = sy-datum.
+      <log>-hproc = sy-uzeit.
+      <log>-eglkz_new = 'X'.
+      <log>-uebto_new = 99.
+      <log>-untto_new = 99.
+      <log>-con_error = abap_false.
+      APPEND INITIAL LINE TO gt_output ASSIGNING FIELD-SYMBOL(<out>).
+      <out>-type = 'S'.
+      <out>-id = '00'.
+      <out>-number = 398.
+      <out>-message_v1 = text-001.
+      <out>-message_v2 = |{ <log>-ebeln }/{ <log>-ebelp }| .
+      <out>-message_v3 = text-002.
+      MESSAGE ID <out>-id TYPE <out>-type NUMBER <out>-number
+      WITH <out>-message_v1 <out>-message_v2 <out>-message_v3 <out>-message_v4
+      INTO <out>-message.
+
+    ELSE.
+
+      ROLLBACK WORK.
+      APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+      MOVE-CORRESPONDING <ped> TO <log>.
+      <log>-fproc = sy-datum.
+      <log>-hproc = sy-uzeit.
+      <log>-eglkz_new = 'X'.
+      <log>-uebto_new = 99.
+      <log>-untto_new = 99.
+      <log>-con_error = abap_true.
+      LOOP AT it_return ASSIGNING FIELD-SYMBOL(<return>) WHERE type EQ 'A' OR type EQ 'E' OR type EQ 'X'.
+        MESSAGE ID <return>-id TYPE <return>-type NUMBER <return>-number
+        WITH <return>-message_v1 <return>-message_v2 <return>-message_v3 <return>-message_v4
+        INTO <return>-message.
+        IF <log>-msj_error1 IS INITIAL.
+          <log>-msj_error1 = <return>-message.
+        ELSE.
+          CONCATENATE <log>-msj_error1 <return>-message INTO <log>-msj_error1 SEPARATED BY '//'.
+        ENDIF.
+      ENDLOOP.
+
+      APPEND INITIAL LINE TO gt_output ASSIGNING <out>.
+      <out>-type = 'E'.
+      <out>-id = '00'.
+      <out>-number = 398.
+      <out>-message_v1 = text-003.
+      <out>-message_v2 = |{ <log>-ebeln }/{ <log>-ebelp }| .
+      <out>-message_v3 = text-002.
+      MESSAGE ID <out>-id TYPE <out>-type NUMBER <out>-number
+      WITH <out>-message_v1 <out>-message_v2 <out>-message_v3 <out>-message_v4
+      INTO <out>-message.
+
+      APPEND LINES OF it_return TO gt_output.
+
+    ENDIF.
+
+  ENDLOOP.
+
+  IF it_log[] IS NOT INITIAL.
+    MODIFY zsmm_cierped_log FROM TABLE it_log.
+    COMMIT WORK.
+  ENDIF.
+
+  IF gt_output IS NOT INITIAL AND sy-binpt EQ space AND sy-batch EQ space.
+    CALL FUNCTION 'ZSBC_VENTANA_LOGSBAPI'
+      EXPORTING
+        mensajes = gt_output.
+
+  ENDIF.

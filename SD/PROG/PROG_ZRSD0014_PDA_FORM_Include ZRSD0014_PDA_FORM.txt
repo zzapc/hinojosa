@@ -1,0 +1,613 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRSD0014_PDA_FORM
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  VERIFICAR_BOBINA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM verificar_bobina CHANGING l_continuar TYPE bool.
+
+  l_continuar = si.
+*  DATA l_continuar TYPE bool VALUE si.
+  DATA l_objkey TYPE bapi1003_key-object.
+  DATA lt_allocvaluesnum TYPE STANDARD TABLE OF bapi1003_alloc_values_num.
+  DATA lt_allocvalueschar TYPE STANDARD TABLE OF bapi1003_alloc_values_char.
+  DATA lw_allocvalueschar TYPE bapi1003_alloc_values_char.
+  DATA lt_allocvaluescurr TYPE STANDARD TABLE OF bapi1003_alloc_values_curr.
+  DATA lt_return TYPE STANDARD TABLE OF bapiret2.
+
+  DATA: lv_matnr TYPE matnr.
+  DATA: lv_werks TYPE werks_d.
+  DATA: lv_lgort TYPE lgort_d.
+  DATA: lv_werks_bob TYPE werks_d.
+  DATA: lv_lgort_bob TYPE lgort_d.
+  DATA: lv_kunnr TYPE kunnr.
+  DATA  lv_vstel TYPE vstel.
+  DATA  lv_kunnr_likp TYPE kunnr.
+  DATA: lv_kunnr_bob TYPE kunnr.
+
+  DATA: lv_zzsegcal TYPE likp-zzsegcal. "cgijon: 02/03/16
+
+  IF gv_barcode(5) NE '00000'.
+    gv_charg = gv_barcode(10).
+  ELSE.
+    DATA(l_len)       = strlen( gv_barcode ).
+    DATA(l_len_charg) = l_len - 10.
+    IF l_len_charg < 0.
+      MESSAGE i035(zsd) WITH gv_charg  .
+      l_continuar = no.
+      CLEAR gv_charg.
+      EXIT.
+    ENDIF.
+    gv_charg          = gv_barcode+l_len_charg(10).
+  ENDIF.
+
+  TRANSLATE gv_charg TO UPPER CASE.
+
+* Verificamos que la bobina no esté ya indicada.
+  READ TABLE gt_datos WITH KEY charg = gv_charg TRANSPORTING NO FIELDS.
+  IF sy-subrc = 0.
+    MESSAGE i028(zsd) WITH gv_charg.
+    l_continuar = no.
+    CLEAR gv_charg.
+  ENDIF.
+  CHECK l_continuar = si.
+
+* Verificamos que la bobina no esté ya indicada en la tabla de transito.
+  SELECT SINGLE *
+  FROM ztsd0002
+  WHERE tknum = gv_tknum
+  AND charg = gv_charg.
+  IF sy-subrc = 0.
+    MESSAGE i028(zsd) WITH gv_charg.
+    l_continuar = no.
+    CLEAR gv_charg.
+  ENDIF.
+  CHECK l_continuar = si.
+
+  GET PARAMETER ID 'WRK' FIELD lv_werks.
+
+  IF lv_werks IS INITIAL.
+    SELECT SINGLE parva INTO lv_werks FROM usr05
+      WHERE bname = sy-uname AND parid = 'WRK'.
+  ENDIF.
+
+  "Verificamos el cliente y si está aprobado por calidad.
+  CLEAR lv_matnr.
+  SELECT matnr INTO TABLE @DATA(lt_matnr)
+  FROM mchb
+  WHERE werks = @lv_werks AND charg = @gv_charg AND clabs > 0 .
+  IF sy-subrc NE 0.
+    MESSAGE i035(zsd) WITH gv_charg  .
+    l_continuar = no.
+    CLEAR gv_charg.
+    EXIT.
+  ENDIF.
+  lv_matnr = lt_matnr[ 1 ].
+
+  CONCATENATE lv_matnr gv_charg INTO l_objkey.
+
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = l_objkey
+      objecttable     = 'MCH1'
+      classnum        = 'Z_BOBINA'
+      classtype       = '023'
+    TABLES
+      allocvaluesnum  = lt_allocvaluesnum
+      allocvalueschar = lt_allocvalueschar
+      allocvaluescurr = lt_allocvaluescurr
+      return          = lt_return.
+
+  READ TABLE lt_return WITH KEY type = 'E' TRANSPORTING NO FIELDS.
+  IF sy-subrc = 0.
+    MESSAGE 'No se ha podido obtener clasificación del lote' TYPE 'I'.
+    l_continuar = no.
+    CLEAR gv_charg.
+  ENDIF.
+  CHECK l_continuar = si.
+
+
+  CLEAR: lv_kunnr_bob, lv_kunnr, lv_zzsegcal,lv_vstel , lv_kunnr_likp.
+  SELECT SINGLE kunnr zzsegcal vstel kunnr INTO (lv_kunnr, lv_zzsegcal,lv_vstel , lv_kunnr_likp )
+  FROM likp
+  INNER JOIN vttp ON vttp~vbeln = likp~vbeln
+  WHERE vttp~tknum = gv_tknum.
+
+
+
+  DATA lw_mchb TYPE mchb.
+
+
+  SELECT SINGLE * INTO lw_mchb FROM mchb
+  WHERE matnr = lv_matnr
+    AND werks = lv_werks
+    AND charg = gv_charg.
+
+  IF sy-subrc <> 0.
+    MESSAGE i035(zsd) WITH gv_charg.
+    l_continuar = no.
+    CLEAR gv_charg.
+  ENDIF.
+
+  DATA lv_ancho TYPE mara-zzancho.
+
+  SELECT SINGLE zzancho FROM mara INTO lv_ancho WHERE matnr = lv_matnr.
+
+  SELECT * FROM mseg INTO TABLE @DATA(lt_mseg)
+                WHERE matnr = @lv_matnr AND werks = @lv_werks AND lgort = @lw_mchb-lgort
+                  AND charg = @gv_charg ORDER BY budat_mkpf DESCENDING, cputm_mkpf DESCENDING.
+  IF sy-subrc EQ 0 .
+    IF lv_ancho GT 1340.
+      DATA(l_bwart) = lt_mseg[ 1 ]-bwart.
+
+      IF l_bwart = '601' OR l_bwart = '643'.
+*     Bobina expedida previamente
+        MESSAGE i221(zsd) WITH gv_charg .
+        CLEAR gv_charg.
+        l_continuar = no.
+
+      ELSEIF l_bwart = '701'.
+
+*     Comprobar si se ha expedido anteriormente 601 o 643
+        LOOP AT lt_mseg INTO DATA(ls_mseg) WHERE bwart = '601' OR bwart = '643'.
+          EXIT.
+        ENDLOOP.
+        IF sy-subrc EQ 0.
+          MESSAGE i221(zsd) WITH gv_charg .
+          CLEAR gv_charg.
+          l_continuar = no.
+        ENDIF.
+
+      ENDIF.
+    ENDIF.
+  ELSE.
+    MESSAGE i035(zsd) WITH gv_charg  .
+    l_continuar = no.
+    CLEAR gv_charg.
+  ENDIF.
+
+  CHECK l_continuar = si.
+
+*    Validacions segons el tipus d’albarà:
+*
+*Albarà normal (ZSEGCAL = blanc), es valida que el client del lot de la bobina siga
+*igual al client de l’albarà i que la bobina tinga decisió d’empleo = A
+*
+*Albarà de caps (ZSEGCAL = 1), es valida que el client del lot de la bobina siga C3000 o C3020,
+*segons el centre, i NO es valida que el client siga igual al client de l’albarà NI la decisió d’empleo
+*de la bobina.
+*
+*Albarà de segona (ZSEGCAL = 2), NO es valida que el client del lot de la bobina siga igual al
+*client de l’albarà però SÍ que la bobina tinga decisió d’empleo = R
+
+  READ TABLE lt_allocvalueschar INTO lw_allocvalueschar WITH KEY charact = 'LOBM_UDCODE'.
+  IF sy-subrc EQ 0.
+    DATA(l_lobm_udcode) = lw_allocvalueschar-value_char.
+  ENDIF.
+
+  READ TABLE lt_allocvalueschar INTO lw_allocvalueschar WITH KEY charact = 'Z_CLIENTE'.
+  IF sy-subrc EQ 0.
+
+    DATA: l_cliente TYPE kunnr.
+    l_cliente = lw_allocvalueschar-value_char.
+    l_cliente = |{ l_cliente ALPHA = IN }|.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = lw_allocvalueschar-value_char
+      IMPORTING
+        output = l_cliente.
+  ENDIF.
+
+  DATA lv_txt TYPE text72.
+
+  SELECT SINGLE matkl INTO @DATA(l_matkl) FROM mara WHERE matnr = @lv_matnr.
+
+  CASE lv_zzsegcal.
+    WHEN space.
+      IF l_lobm_udcode NE 'DE       A'.
+        CONCATENATE 'La calidad del lote ' gv_charg  ' y del pedido no coinciden. ' INTO lv_txt SEPARATED BY space.
+        MESSAGE lv_txt TYPE 'I'.
+        l_continuar = no.
+        CLEAR gv_charg.
+      ENDIF.
+      CHECK l_continuar = si.
+      IF l_cliente NE lv_kunnr.
+        CONCATENATE 'El cliente del lote' gv_charg ' y del pedido no coinciden. '
+              INTO lv_txt SEPARATED BY space.
+        MESSAGE lv_txt TYPE 'I'.
+        l_continuar = no.
+        CLEAR gv_charg.
+      ENDIF.
+    WHEN '1'.
+      IF l_lobm_udcode NE 'DE       A'.
+        CONCATENATE 'La calidad del lote ' gv_charg  ' y del pedido no coinciden. ' INTO lv_txt SEPARATED BY space.
+        MESSAGE lv_txt TYPE 'I'.
+        l_continuar = no.
+        CLEAR gv_charg.
+      ENDIF.
+      CHECK l_continuar = si.
+      IF lv_vstel = '3000' OR
+         lv_vstel = '3020'.
+
+        CONCATENATE 'C' lv_vstel INTO DATA(lv_kunnr_aux).
+        IF l_cliente  NE lv_kunnr_aux AND
+           l_cliente  NE lv_kunnr_likp. " CMS 24/10/2019 Añadir 2 nuevos clientes a validar C2040 y C2070
+          .
+          CONCATENATE 'El cliente del lote' gv_charg ' y del pedido no coinciden. '
+                INTO lv_txt SEPARATED BY space.
+          MESSAGE lv_txt TYPE 'I'.
+          l_continuar = no.
+          CLEAR gv_charg.
+        ENDIF.
+      ENDIF.
+
+    WHEN '2'.
+      IF l_lobm_udcode NE 'DE       R'.
+        CONCATENATE 'La calidad del lote ' gv_charg  ' y del pedido no coinciden. ' INTO lv_txt SEPARATED BY space.
+        MESSAGE lv_txt TYPE 'I'.
+        l_continuar = no.
+        CLEAR gv_charg.
+      ENDIF.
+      CHECK l_continuar = si.
+
+      IF l_cliente EQ 'C3000' OR l_cliente EQ 'C3020' AND l_matkl NE '10199'.
+        CONCATENATE 'El cliente del lote' gv_charg ' y del pedido no coinciden. '
+              INTO lv_txt SEPARATED BY space.
+        MESSAGE lv_txt TYPE 'I'.
+        l_continuar = no.
+        CLEAR gv_charg.
+      ENDIF.
+
+* 68181 - 03/08/2021 - CMS - Validar bobina R tiene una antigüedad mínima de 15 días, excepto para HJNSP
+      DATA: lv_num  TYPE n LENGTH 8,
+            l_fecha TYPE datum,
+            l_int   TYPE i.
+
+      IF l_matkl NE '10199'.
+
+        TRY.
+            l_int    = lt_allocvaluesnum[ charact = 'Z_FECHA_FABRICACION' ]-value_from.
+            lv_num   = CONV #( l_int ).
+            l_fecha  = CONV #( lv_num ).
+            l_fecha  = l_fecha + 15.
+            IF l_fecha > sy-datum.
+              MESSAGE 'Antigüedad de bobina 2ª < 15 días' TYPE 'I'.
+* 11/08/2021 - CMS Se convierte el error en un aviso y se permite la lectura de estas bobinas
+*              l_continuar = no.
+*              CLEAR gv_charg.
+            ENDIF.
+          CATCH cx_root .
+            MESSAGE 'Bobina sin fecha fabricación.' TYPE 'I'.
+            l_continuar = no.
+            CLEAR gv_charg.
+
+        ENDTRY.
+
+      ENDIF.
+
+    WHEN '3'.
+*      IF l_lobm_udcode NE 'DE       R'.
+*        CONCATENATE 'La calidad del lote ' gv_charg  ' y del pedido no coinciden. ' INTO lv_txt SEPARATED BY space.
+*        MESSAGE lv_txt TYPE 'I'.
+*        l_continuar = no.
+*        CLEAR gv_charg.
+*      ENDIF.
+*      CHECk l_continuar = si.
+      IF lv_vstel = '3000' OR
+         lv_vstel = '3020'.
+
+        CONCATENATE 'C' lv_vstel INTO lv_kunnr_aux.
+        IF l_cliente NE lv_kunnr_aux AND
+           l_cliente  NE lv_kunnr_likp. " CMS 24/10/2019 Añadir 2 nuevos clientes a validar C2040 y C2070
+          CONCATENATE 'El cliente del lote' gv_charg ' y del pedido no coinciden. '
+                INTO lv_txt SEPARATED BY space.
+          MESSAGE lv_txt TYPE 'I'.
+          l_continuar = no.
+          CLEAR gv_charg.
+        ENDIF.
+      ENDIF.
+  ENDCASE.
+
+  CHECK l_continuar = si.
+
+*  IF lv_zzsegcal EQ space OR lv_zzsegcal = 2.
+*    READ TABLE lt_allocvalueschar INTO lw_allocvalueschar WITH KEY charact = 'LOBM_UDCODE'.
+*    IF sy-subrc <> 0 OR lw_allocvalueschar-value_char <> 'DE       A'.
+*      MESSAGE 'El lote no está aprobado en calidad. Revisar clasificación lote' TYPE 'I'.
+*      l_continuar = no.
+*      CLEAR gv_charg.
+*    ENDIF.
+*
+*    CHECK l_continuar = si.
+*
+*    READ TABLE lt_allocvalueschar INTO lw_allocvalueschar WITH KEY charact = 'Z_CLIENTE'.
+*    IF sy-subrc <> 0.
+*      MESSAGE 'No se ha indicado el cliente en el sistema de clasificación del lote' TYPE 'I'.
+*      l_continuar = no.
+*      CLEAR gv_charg.
+*    ELSE.
+*      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+*        EXPORTING
+*          input  = lw_allocvalueschar-value_char
+*        IMPORTING
+*          output = lv_kunnr_bob.
+*
+*      IF lv_kunnr_bob <> lv_kunnr.
+*        MESSAGE 'El cliente del lote no es el de la entrega.' TYPE 'I'.
+*        l_continuar = no.
+*        CLEAR gv_charg.
+*      ENDIF.
+*    ENDIF.
+*  ENDIF.
+*
+*  IF lv_zzsegcal EQ '1' OR lv_zzsegcal = '01'.
+*    READ TABLE lt_allocvalueschar INTO lw_allocvalueschar WITH KEY charact = 'Z_CLIENTE'.
+*    IF sy-subrc <> 0.
+*      MESSAGE 'No se ha indicado el cliente en el sistema de clasificación del lote' TYPE 'I'.
+*      l_continuar = no.
+*      CLEAR gv_charg.
+*    ELSE.
+*      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+*        EXPORTING
+*          input  = lw_allocvalueschar-value_char
+*        IMPORTING
+*          output = lv_kunnr_bob.
+*
+*      IF ( lv_kunnr_bob <> 'C3000' AND lv_werks EQ '3000' ) OR
+*         ( lv_kunnr_bob <> 'C3020' AND lv_werks EQ '3020' ).
+*        MESSAGE 'El cliente del lote es erroneo ' TYPE 'I'.
+*        l_continuar = no.
+*        CLEAR gv_charg.
+*      ENDIF.
+*    ENDIF.
+*  ENDIF.
+*
+
+
+
+* cgijon: 02/03/16 - si la entrega, tiene informado el campo de la segunda calidad, no hace el chequeo
+** de la decisión de empleo
+**  IF lv_zzsegcal IS NOT INITIAL.
+**  IF lv_zzsegcal NE '2' AND lv_zzsegcal NE '02'.
+*  IF lv_zzsegcal NE '2' AND lv_zzsegcal NE '02' AND
+*     lv_zzsegcal NE '1' AND lv_zzsegcal NE '01'.
+*    READ TABLE lt_allocvalueschar INTO lw_allocvalueschar WITH KEY charact = 'LOBM_UDCODE'.
+*    IF sy-subrc <> 0 OR lw_allocvalueschar-value_char <> 'DE       A'.
+*      MESSAGE 'El lote no está aprobado en calidad. Revisar clasificación lote' TYPE 'I'.
+*      l_continuar = no.
+*      CLEAR gv_charg.
+*    ENDIF.
+*    CHECK l_continuar = si.
+*  ENDIF.
+** fin cgijon: 02/03/16
+*
+*
+** Verificar si el cliente asignado a la bobina es el correcto
+*  READ TABLE lt_allocvalueschar INTO lw_allocvalueschar WITH KEY charact = 'Z_CLIENTE'.
+*  IF sy-subrc <> 0.
+*    MESSAGE 'No se ha indicado el cliente en el sistema de clasificación del lote' TYPE 'I'.
+*    l_continuar = no.
+*    CLEAR gv_charg.
+*  ELSE.
+*    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+*      EXPORTING
+*        input  = lw_allocvalueschar-value_char
+*      IMPORTING
+*        output = lv_kunnr_bob.
+*
+*    IF lv_kunnr_bob <> lv_kunnr.
+*      MESSAGE 'El cliente del lote no es el de la entrega.' TYPE 'I'.
+*      l_continuar = no.
+*      CLEAR gv_charg.
+*    ENDIF.
+*  ENDIF.
+
+  CHECK l_continuar = si.
+
+* GST - 29/06/2015 ->
+* No se puedan expedir, ni seleccionar bobinas reprocesadas:
+  CLEAR lw_allocvalueschar.
+  READ TABLE lt_allocvalueschar INTO lw_allocvalueschar WITH KEY charact = 'Z_REPROCESO'.
+  IF lw_allocvalueschar IS NOT INITIAL AND lw_allocvalueschar-value_neutral = '1'.
+    MESSAGE 'La bobina NO está reprocesada. No se puede expedir.' TYPE 'I'.
+    l_continuar = no.
+    CLEAR gv_charg.
+  ENDIF.
+
+  CHECK l_continuar = si.
+* GST - 29/06/2015 <-
+
+*  DATA l_msg TYPE char72.
+** Verificar que el material/almacen sea la de la entrega
+  SELECT SINGLE matnr werks lgort INTO (lv_matnr, lv_werks, lv_lgort)
+  FROM mchb
+  WHERE matnr = lv_matnr AND werks = lv_werks AND charg = gv_charg AND clabs > 0.
+*  IF sy-subrc NE 0.
+*    SELECT * FROM mseg INTO TABLE @DATA(lt_mseg)
+*                  WHERE matnr = @lv_matnr AND werks = @lv_werks
+*                    AND charg = @gv_charg ORDER BY budat_mkpf ASCENDING, cputm_mkpf DESCENDING.
+*    IF sy-subrc EQ 0.
+*      DATA(l_bwart) = lt_mseg[ 1 ]-bwart.
+*      IF l_bwart = '601' OR l_bwart = '643'.
+*        l_msg = 'La bobina & ya ha sido expedida'.
+*        REPLACE '&' IN l_msg WITH gv_charg.
+*        MESSAGE l_msg TYPE 'I'.
+*        l_continuar = no.
+*        CLEAR gv_charg.
+*      ELSE.
+*        l_msg = 'La bobina & no existe en el almacén'.
+*        REPLACE '&' IN l_msg WITH gv_charg.
+*        MESSAGE l_msg TYPE 'I'.
+*        l_continuar = no.
+*        CLEAR gv_charg.
+*      ENDIF.
+*    ELSE.
+*      l_msg = 'La bobina & no existe en el almacén'.
+*      REPLACE '&' IN l_msg WITH gv_charg.
+*      MESSAGE l_msg TYPE 'I'.
+*      l_continuar = no.
+*      CLEAR gv_charg.
+*    ENDIF.
+*  ENDIF.
+
+  CHECK l_continuar = si.
+
+  CLEAR: lv_werks_bob, lv_lgort_bob.
+  SELECT SINGLE lips~werks lips~lgort INTO (lv_werks_bob, lv_lgort_bob)
+  FROM lips
+  INNER JOIN vttp ON vttp~vbeln = lips~vbeln
+  WHERE vttp~tknum = gv_tknum
+  AND lips~matnr = lv_matnr.
+
+  IF lv_werks_bob <> lv_werks OR lv_lgort_bob <> lv_lgort.
+* CMS 03/01/2020 Error de correspondencia debido al cambio de material del lote
+*    MESSAGE 'La bobina no corresponde al mismo almacén que en la entrega' TYPE 'I'.
+    MESSAGE 'La bobina no corresponde al mismo material que en la entrega' TYPE 'I'.
+    l_continuar = no.
+    CLEAR gv_charg.
+  ENDIF.
+
+  CHECK l_continuar = si.
+*
+* >>> 7000015462 ZPICKPAP
+*  DATA: lv_object  TYPE          objnum,
+*        lv_tabelle TYPE          tabelle,
+*        lt_class   TYPE TABLE OF sclass,
+*        ls_object  TYPE          clobjdat,
+*        lt_object  TYPE TABLE OF clobjdat.
+*  CONSTANTS : lc_clas    TYPE klasse_d   VALUE 'Z_BOBINA',
+*              lc_type    TYPE klassenart VALUE '023',
+*              lc_tabelle TYPE tabelle    VALUE 'MCH1'.
+**
+*  CLEAR:lv_object,
+*        lt_class[],
+*        lt_object[].
+*  CONCATENATE lv_matnr gv_charg INTO lv_object.
+**
+*  CALL FUNCTION 'CLAF_CLASSIFICATION_OF_OBJECTS'
+*    EXPORTING
+*      class        = lc_clas
+*      classtype    = lc_type
+*      object       = lv_object
+*      objecttable  = lc_tabelle
+*    TABLES
+*      t_class      = lt_class
+*      t_objectdata = lt_object.
+**
+*  CLEAR: ls_object , gv_vbeln.
+*  READ TABLE lt_object INTO ls_object WITH KEY atnam = 'Z_PEDIDO'.
+*  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+*    EXPORTING
+*      input  = ls_object-ausp1
+*    IMPORTING
+*      output = gv_vbeln.
+*  CLEAR: ls_object , gv_posnr.
+*  READ TABLE lt_object INTO ls_object WITH KEY atnam = 'Z_POSICION'.
+*  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+*    EXPORTING
+*      input  = ls_object-ausp1
+*    IMPORTING
+*      output = gv_posnr.
+* <<< 7000015462 ZPICKPAP
+*
+ENDFORM.                    " VERIFICAR_BOBINA
+
+
+*&---------------------------------------------------------------------*
+*&      Form  ANADIR_BOBINA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM anadir_bobina .
+
+  DATA: lv_matnr TYPE matnr,lv_werks TYPE werks_d.
+
+  GET PARAMETER ID 'WRK' FIELD lv_werks.
+
+  IF lv_werks IS INITIAL.
+    SELECT SINGLE parva INTO lv_werks FROM usr05
+      WHERE bname = sy-uname AND parid = 'WRK'.
+  ENDIF.
+
+  CLEAR lv_matnr.
+  SELECT matnr INTO TABLE @DATA(lt_matnr)
+  FROM mcha
+  WHERE werks = @lv_werks AND charg = @gv_charg ORDER BY ersda DESCENDING .
+  CHECK sy-subrc EQ 0.
+  lv_matnr = lt_matnr[ 1 ].
+
+
+
+  gv_charg_u = gv_charg.
+
+  SELECT SINGLE clabs INTO gv_lfimg_u
+  FROM mchb
+  WHERE matnr = lv_matnr AND werks = lv_werks AND charg = gv_charg .
+
+  gv_lfimg_t = gv_lfimg_t + gv_lfimg_u.
+
+  CLEAR gs_datos.
+  gs_datos-tknum = gv_tknum.
+  gs_datos-charg = gv_charg.
+  gs_datos-brgew = gv_lfimg_u.
+  SELECT SINGLE meins INTO gs_datos-gewei
+  FROM mara
+  WHERE matnr = lv_matnr.
+  gs_datos-matnr = lv_matnr.
+
+* >>> 7000015462 ZPICKPAP
+*  gs_datos-vbeln = gv_vbe ln.
+*  gs_datos-posnr = gv_posnr.
+* <<< 7000015462 ZPICKPAP
+
+* 14/10/2019 CMS Sustituimos la grabación de la tabla interna,
+* por grabación del registro directamente en BBDD (ZTSD0002)
+*  APPEND gs_datos TO gt_datos.
+
+  CLEAR ztsd0002.
+  ztsd0002-tknum = gs_datos-tknum.
+  ztsd0002-charg = gs_datos-charg.
+  ztsd0002-matnr = gs_datos-matnr.
+  ztsd0002-brgew = gs_datos-brgew.
+  ztsd0002-gewei = gs_datos-gewei.
+  INSERT ztsd0002.
+*  insert into ZTSD0002 values  gs_datos.
+  ls_ztsd0002_old = ztsd0002.
+
+  CLEAR: gv_charg, gv_okcode2.
+ENDFORM.                    " ANADIR_BOBINA
+
+*&---------------------------------------------------------------------*
+*&      Form  GRABAR_TABLA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM grabar_tabla .
+
+  LOOP AT gt_datos INTO gs_datos.
+    ztsd0002-tknum = gs_datos-tknum.
+    ztsd0002-charg = gs_datos-charg.
+    ztsd0002-matnr = gs_datos-matnr.
+    ztsd0002-brgew = gs_datos-brgew.
+    ztsd0002-gewei = gs_datos-gewei.
+* >>> 7000015462 ZPICKPAP
+*    ztsd0002-vbeln = gs_datos-vbeln.
+*    ztsd0002-posnr = gs_datos-posnr.
+* <<< 7000015462 ZPICKPAP
+    INSERT ztsd0002.
+  ENDLOOP.
+
+  MESSAGE s032.
+ENDFORM.                    " GRABAR_TABLA

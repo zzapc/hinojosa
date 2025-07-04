@@ -1,0 +1,650 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZSQM_ESPTEC_FORM
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*& Form buscar_datos
+*&---------------------------------------------------------------------*
+FORM buscar_datos.
+
+**NLC.26.03.24.Limitar resultados solo a materiales incluidos set ZMM_PT_CARTON.
+
+  DATA: lt_r_mtart TYPE md_range_t_mtart.
+
+  TRY.
+      lt_r_mtart = zcl_mm_material_zpt=>zintf_mm_material_master~s_get_mtart_compatibles( i_setname = zcl_mm_material_zpt=>_c_setname_value ).
+    CATCH zcx_exception.
+  ENDTRY.
+
+  "Añadimos tipo material YREM. No lo pongo en el set de tipos de material compatible, no me atrevo
+  APPEND INITIAL LINE TO lt_r_mtart ASSIGNING FIELD-SYMBOL(<fs_r_mtart>).
+  <fs_r_mtart> = VALUE #( sign = 'I' option = 'EQ' low = 'YREM' ).
+
+  DATA: tl_matnr_rg  LIKE p_matnr[],
+        tl_kunnr_rg  LIKE p_kunnr[],
+        tl_werks_rg  TYPE RANGE OF marc-werks,
+        tl_vbeln_rg  LIKE s_vbeln[],
+        tl_posnr_rg  LIKE s_posnr[],
+        tl_zstatp_rg LIKE s_zstatp[].
+
+  CASE 'X'.
+    WHEN rb_espst.
+      tl_matnr_rg = p_matnr[].
+      tl_kunnr_rg = p_kunnr[].
+      APPEND INITIAL LINE TO tl_werks_rg ASSIGNING FIELD-SYMBOL(<fs_werks_rg>).
+      <fs_werks_rg> = VALUE #( sign = 'I' option = 'EQ' low = p_werks ).
+
+    WHEN rb_esppr.
+      tl_vbeln_rg  = s_vbeln[].
+      tl_posnr_rg  = s_posnr[].
+      tl_zstatp_rg = s_zstatp[].
+  ENDCASE.
+
+
+  SELECT DISTINCT vbap~matnr, vbak~kunnr
+    INTO CORRESPONDING FIELDS OF TABLE @gt_output
+    FROM vbap INNER JOIN vbak ON vbap~vbeln = vbak~vbeln
+              INNER JOIN marc ON vbap~matnr = marc~matnr
+              INNER JOIN mara ON vbap~matnr = mara~matnr
+    WHERE vbap~matnr  IN @tl_matnr_rg
+      AND vbak~kunnr  IN @tl_kunnr_rg
+      AND vbap~vbeln  IN @tl_vbeln_rg
+      AND vbap~posnr  IN @tl_posnr_rg
+      AND vbap~zstatp IN @tl_zstatp_rg
+      AND marc~werks  IN @tl_werks_rg
+      AND mara~mtart  IN @lt_r_mtart
+      AND vbak~vbtyp  IN ('B', 'C')
+    ORDER BY vbap~matnr.
+
+  LOOP AT gt_output ASSIGNING FIELD-SYMBOL(<fs_output>).
+    <fs_output>-icon = icon_pdf.
+  ENDLOOP.
+
+
+**FIN.NLC.26.03.24.Limitar resultados solo a materiales incluidos set ZMM_PT_CARTON.
+
+ENDFORM.
+
+*&--------------------------------------------------------------------
+*&      Form  load_data_into_grid
+*&--------------------------------------------------------------------
+FORM load_data_into_grid TABLES tabla       TYPE STANDARD TABLE
+                         USING nombre_cont TYPE        scrfname
+                               variant     LIKE        disvariant
+                               estruc      LIKE        dd02l-tabname
+                     CHANGING  contenedor  TYPE REF TO cl_gui_custom_container
+                               alv         TYPE REF TO cl_gui_alv_grid
+                               layout      TYPE        lvc_s_layo
+                               it_fieldcat TYPE        lvc_t_fcat
+                               excludin    TYPE        ui_functions.
+
+  IF alv IS INITIAL.
+    IF cl_gui_alv_grid=>offline( ) IS INITIAL.
+
+*      CREATE OBJECT eventos.
+
+      CREATE OBJECT contenedor
+        EXPORTING
+          container_name = nombre_cont
+        EXCEPTIONS
+          OTHERS         = 1.
+
+      CREATE OBJECT alv
+        EXPORTING
+          i_parent = contenedor
+        EXCEPTIONS
+          OTHERS   = 1.
+
+      CALL METHOD alv->register_edit_event
+        EXPORTING
+          i_event_id = cl_gui_alv_grid=>mc_evt_modified
+        EXCEPTIONS
+          error      = 1
+          OTHERS     = 2.
+
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                   WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      ENDIF.
+
+      CALL METHOD alv->register_edit_event
+        EXPORTING
+          i_event_id = cl_gui_alv_grid=>mc_evt_enter
+        EXCEPTIONS
+          error      = 1
+          OTHERS     = 2.
+
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                   WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      ENDIF.
+
+*      SET HANDLER eventos->hotspot_click FOR alv.
+    ELSE.
+
+      CREATE OBJECT alv
+        EXPORTING
+          i_parent = or_doc.
+
+    ENDIF.
+
+    PERFORM preparefieldcatalog USING    estruc
+                                CHANGING it_fieldcat.
+
+    PERFORM preparelayout       CHANGING layout.
+    PERFORM rellenar_toolbar    CHANGING excludin.
+
+    CALL METHOD alv->set_table_for_first_display
+      EXPORTING
+        is_variant           = variant
+        i_save               = 'A'
+        is_layout            = layout
+        it_toolbar_excluding = excludin
+      CHANGING
+        it_outtab            = tabla[]
+        it_fieldcatalog      = it_fieldcat
+      EXCEPTIONS
+        OTHERS               = 1.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                 WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+* Se crean los eventos, con sus respectivos manejadores.
+    CREATE OBJECT event_receiver.
+*    SET HANDLER event_receiver->handle_double_click FOR alv.
+    SET HANDLER event_receiver->handle_data_changed FOR alv.
+    SET HANDLER event_receiver->handle_data_changed_finished FOR alv.
+    SET HANDLER event_receiver->handle_before_user_command FOR alv.
+    SET HANDLER event_receiver->on_hotspot_click FOR alv.
+
+    CALL METHOD alv->register_edit_event
+      EXPORTING
+        i_event_id = cl_gui_alv_grid=>mc_evt_enter.
+    CALL METHOD alv->register_edit_event
+      EXPORTING
+        i_event_id = cl_gui_alv_grid=>mc_evt_modified.
+
+    CALL METHOD cl_gui_control=>set_focus
+      EXPORTING
+        control = alv.
+
+  ELSE.
+    DATA: BEGIN OF ls_stable,
+            row TYPE c,
+            col TYPE c,
+          END OF ls_stable.
+
+    ls_stable-row = 'X'.
+    ls_stable-col = 'X'.
+
+    CALL METHOD alv->refresh_table_display
+      EXPORTING
+        is_stable = ls_stable.
+
+  ENDIF.
+
+ENDFORM.                    "load_data_into_grid
+
+*&--------------------------------------------------------------------
+*&      Form  preparelayout
+*---------------------------------------------------------------------
+FORM preparelayout CHANGING cwa_layout TYPE lvc_s_layo.
+
+  cwa_layout-zebra    = 'X'.
+  cwa_layout-sel_mode = 'D'.
+
+ENDFORM.                    "preparelayout
+
+FORM preparefieldcatalog USING    estruc       LIKE dd02l-tabname
+                         CHANGING it_fieldcat1 TYPE lvc_t_fcat.
+
+  DATA: l_fieldcat TYPE LINE OF lvc_t_fcat.
+
+  REFRESH it_fieldcat1.
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_buffer_active        = 'X'
+      i_structure_name       = estruc
+      i_bypassing_buffer     = 'X'
+    CHANGING
+      ct_fieldcat            = it_fieldcat1[]
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+  LOOP AT it_fieldcat1 INTO l_fieldcat.
+    CASE l_fieldcat-fieldname.
+      WHEN 'KUNNR'.
+        l_fieldcat-coltext = 'Cliente'.
+      WHEN 'ICON'.
+        l_fieldcat-hotspot = 'X'.
+    ENDCASE.
+    MODIFY it_fieldcat1 FROM l_fieldcat.
+  ENDLOOP.
+
+ENDFORM.                    "preparefieldcatalog
+
+*&--------------------------------------------------------------------
+*&      Form  rellenar_toolbar
+*&--------------------------------------------------------------------
+FORM rellenar_toolbar CHANGING excluirtool TYPE ui_functions.
+
+  REFRESH: excluirtool.
+
+ENDFORM.
+*----------------------------------------------*
+* Form HANDLE_DATA_CHANGED
+*----------------------------------------------*
+FORM handle_data_changed USING data_changed TYPE REF TO cl_alv_changed_data_protocol.
+
+  READ TABLE data_changed->mt_mod_cells INDEX 1 INTO DATA(ls_linea).
+  READ TABLE gt_output INTO DATA(ls_output) INDEX ls_linea-row_id.
+
+ENDFORM. " HANDLE_DATA_CHANGED
+*----------------------------------------------*
+*& Form HANDLE_BEFORE_USER_COMMAND
+*----------------------------------------------*
+FORM handle_before_user_command USING p_e_ucomm.
+
+ENDFORM. " HANDLE_BEFORE_USER_COMMAND
+*----------------------------------------------*
+*& Form HANDLE_DATA_CHANGED_FINISHED
+*----------------------------------------------*
+FORM handle_data_changed_finished USING p_e_modified p_et_good_cells.
+
+ENDFORM. " HANDLE_DATA_CHANGED_FINISHED
+
+*----------------------------------------------*
+*& Form handle_on_hotspot_click
+*----------------------------------------------*
+FORM handle_on_hotspot_click USING wp_row_id    TYPE  lvc_s_row
+                                   wp_column_id  TYPE  lvc_s_col.
+  READ TABLE gt_output INTO DATA(wl_output) INDEX wp_row_id-index.
+  IF sy-subrc = 0.
+    DATA vl_pdf_material TYPE xstring.
+    PERFORM f_get_pdf_material USING wl_output-matnr CHANGING vl_pdf_material.
+    IF vl_pdf_material IS NOT INITIAL.
+      CALL FUNCTION 'Z_SEIS_MOSTRAR_PDF'
+        EXPORTING
+          iv_content = vl_pdf_material.
+    ELSE.
+      MESSAGE 'No se ha encontrado el fichero PDF' TYPE 'W'.
+    ENDIF.
+  ENDIF.
+
+
+ENDFORM. " HANDLE_DATA_CHANGED_FINISHED
+
+
+
+
+*----------------------------------------------*
+*& Form GENERAR_FORM
+*----------------------------------------------*
+FORM generar_form.
+
+  CALL FUNCTION 'FP_FUNCTION_MODULE_NAME'
+    EXPORTING
+      i_name     = 'ZSQM_ESPTEC'
+    IMPORTING
+      e_funcname = wl_fm_name.
+
+*  wl_params-nodialog = 'X'.
+**  wl_params-preview = 'X'.
+*  wl_params-dest     = 'PDF'.
+*  wl_params-getpdf   = 'M'.
+*  wl_params-bumode   = 'M'.
+
+
+  CALL FUNCTION 'FP_JOB_OPEN'
+    CHANGING
+      ie_outputparams = wl_params
+    EXCEPTIONS
+      cancel          = 1
+      usage_error     = 2
+      system_error    = 3
+      internal_error  = 4
+      OTHERS          = 5.
+
+  CASE 'X'.
+    WHEN rb_esp.
+      wl_docparams-langu    = 'S'.
+      wl_docparams-country  = 'ES'.
+    WHEN rb_ing.
+      wl_docparams-langu    = 'E'.
+      wl_docparams-country  = 'US'.
+    WHEN rb_fra.
+      "Para francés voy a usar el alemán, porque por ahora el francés no está instalado en el sistema
+      wl_docparams-langu    = 'D'.
+      wl_docparams-country  = 'DE'.
+    WHEN OTHERS.
+      wl_docparams-langu = sy-langu.
+  ENDCASE.
+
+  DATA: vl_texto_realizado TYPE zsqmt_esptec_rea,
+        vl_texto_revisado  TYPE zsqmt_esptec_rev.
+
+  IF cbx_rea = 'X'.
+    vl_texto_realizado = p_rea.
+  ENDIF.
+  IF cbx_rev = 'X'.
+    vl_texto_revisado = p_rev.
+  ENDIF.
+
+  "Revisión
+  SELECT SINGLE *
+    INTO @DATA(wl_zqm0002_revision)
+    FROM zqm0002_revision
+    WHERE werks = @p_werks          AND
+          kunnr = @ls_output-kunnr  AND
+          matnr = @ls_output-matnr.
+  IF sy-subrc = 0.
+    IF wl_zqm0002_revision-fecha_emision <> sy-datlo.
+      ADD 1 TO wl_zqm0002_revision-revision.
+      MODIFY zqm0002_revision FROM wl_zqm0002_revision.
+    ENDIF.
+  ELSE.
+    wl_zqm0002_revision-werks         = p_werks.
+    wl_zqm0002_revision-kunnr         = ls_output-kunnr.
+    wl_zqm0002_revision-matnr         = ls_output-matnr.
+    wl_zqm0002_revision-revision      = 1.
+    wl_zqm0002_revision-fecha_emision = sy-datlo.
+    MODIFY zqm0002_revision FROM wl_zqm0002_revision.
+  ENDIF.
+
+
+  DATA vl_formoutput  TYPE  fpformoutput.
+
+
+  CALL FUNCTION wl_fm_name
+    EXPORTING
+      /1bcdwb/docparams  = wl_docparams
+      user_settings      = 'X'
+      i_matnr            = ls_output-matnr
+      i_kunnr            = ls_output-kunnr
+      i_werks            = p_werks
+      i_mostrar_bct      = cbx_bct
+      i_indicar_bct      = cbx_bctm
+      i_bct              = p_bct
+      i_bct_um           = p_bct_um
+      i_texto_realizado  = vl_texto_realizado
+      i_texto_revisado   = vl_texto_revisado
+    IMPORTING
+      /1bcdwb/formoutput = vl_formoutput
+    EXCEPTIONS
+      usage_error        = 1
+      system_error       = 2
+      internal_error     = 3
+      OTHERS             = 4.
+
+  CALL FUNCTION 'FP_JOB_CLOSE'
+*   IMPORTING
+*     E_RESULT    = result
+    EXCEPTIONS
+      usage_error    = 1
+      system_error   = 2
+      internal_error = 3
+      OTHERS         = 4.
+
+*  DATA: tl_pdfs TYPE tfpcontent.
+*
+*  CALL FUNCTION 'FP_GET_PDF_TABLE'
+*    IMPORTING
+*      e_pdf_table = tl_pdfs.
+*
+*
+*  DATA vl_pdf_material TYPE xstring.
+*  PERFORM f_get_pdf_material USING ls_output-matnr CHANGING vl_pdf_material.
+*
+*
+*  DATA: vl_pdf_merged TYPE xstring,
+*        vl_rc         TYPE i.
+*
+*  TRY.
+*      DATA(rl_pdf_merger) = NEW cl_rspo_pdf_merge( ).
+*      LOOP AT tl_pdfs ASSIGNING FIELD-SYMBOL(<fs_pdf>).
+*        rl_pdf_merger->add_document( <fs_pdf> ).
+*      ENDLOOP.
+*      IF vl_pdf_material IS NOT INITIAL.
+*        rl_pdf_merger->add_document( vl_pdf_material ).
+*      ENDIF.
+*
+*      rl_pdf_merger->merge_documents( IMPORTING merged_document = vl_pdf_merged
+*                                                             rc = vl_rc ).
+*    CATCH cx_rspo_pdf_merge INTO DATA(rl_exc_merge).
+*      MESSAGE rl_exc_merge->get_text( ) TYPE 'W'.
+*      RETURN.
+*  ENDTRY.
+*
+*  IF vl_pdf_merged IS NOT INITIAL.
+*    CALL FUNCTION 'Z_SEIS_MOSTRAR_PDF'
+*      EXPORTING
+*        iv_content = vl_pdf_merged.
+*  ENDIF.
+
+ENDFORM. " GENERAR_FORM
+
+
+
+*----------------------------------------------*
+*& Form DESCARGAR_FORM
+*----------------------------------------------*
+FORM f_get_pdf_material USING vp_matnr CHANGING vp_pdf.
+*  IF SY-SYSID = 'HED' AND SY-UNAME = 'PARTNERSAP4'. RETURN. ENDIF.
+  CLEAR vp_pdf.
+
+  TRY.
+      DATA(tl_mtart_rg) = zcl_mm_material_zpt=>zintf_mm_material_master~s_get_mtart_compatibles( zcl_mm_material_zpt=>_c_setname_value  ).
+    CATCH zcx_mm_exception.
+  ENDTRY.
+
+  SELECT SINGLE matnr, mtart
+    INTO @DATA(wl_mara)
+    FROM mara
+    WHERE matnr = @vp_matnr AND
+          mtart IN @tl_mtart_rg.
+  CHECK sy-subrc = 0.
+
+
+  TRY.
+      vp_pdf = zhcl_materiales_core=>get_pdf( wl_mara-matnr ).
+    CATCH /iwbep/cx_mgw_busi_exception INTO DATA(rl_busy_exc).
+      DATA tl_message_split TYPE TABLE OF text255.
+      DATA(vl_message) = rl_busy_exc->get_text( ).
+      SPLIT vl_message AT cl_abap_char_utilities=>newline INTO TABLE tl_message_split.
+
+      WHILE lines( tl_message_split ) > 3.
+        APPEND INITIAL LINE TO tl_message_split.
+      ENDWHILE.
+
+
+      CALL FUNCTION 'POPUP_TO_INFORM'
+        EXPORTING
+          titel = 'Fichero no encontrado'
+          txt1  = tl_message_split[ 1 ]
+          txt2  = tl_message_split[ 2 ]
+          txt3  = tl_message_split[ 3 ]
+          txt4  = 'Comunique a Oficina Técnica'.
+
+
+      RETURN.
+  ENDTRY.
+
+
+
+
+
+ENDFORM.
+
+
+
+*----------------------------------------------*
+*& Form DESCARGAR_FORM
+*----------------------------------------------*
+FORM descargar_form USING p_path TYPE string.
+
+
+  DATA wa_pdf_file            TYPE fpformoutput.
+
+
+  CALL FUNCTION 'FP_FUNCTION_MODULE_NAME'
+    EXPORTING
+      i_name     = 'ZSQM_ESPTEC'
+    IMPORTING
+      e_funcname = wl_fm_name.
+
+  wl_params-nodialog = 'X'.
+  wl_params-preview = ''.
+  wl_params-getpdf  = 'X'.
+
+  CALL FUNCTION 'FP_JOB_OPEN'
+    CHANGING
+      ie_outputparams = wl_params
+    EXCEPTIONS
+      cancel          = 1
+      usage_error     = 2
+      system_error    = 3
+      internal_error  = 4
+      OTHERS          = 5.
+
+
+  CASE 'X'.
+    WHEN rb_esp.
+      wl_docparams-langu    = 'S'.
+      wl_docparams-country  = 'ES'.
+    WHEN rb_ing.
+      wl_docparams-langu    = 'E'.
+      wl_docparams-country  = 'US'.
+    WHEN rb_fra.
+      "Para francés voy a usar el alemán, porque por ahora el francés no está instalado en el sistema
+      wl_docparams-langu    = 'D'.
+      wl_docparams-country  = 'DE'.
+    WHEN OTHERS.
+      wl_docparams-langu = sy-langu.
+  ENDCASE.
+
+  DATA: vl_texto_realizado TYPE zsqmt_esptec_rea,
+        vl_texto_revisado  TYPE zsqmt_esptec_rev.
+
+  IF cbx_rea = 'X'.
+    vl_texto_realizado = p_rea.
+  ENDIF.
+  IF cbx_rev = 'X'.
+    vl_texto_revisado = p_rev.
+  ENDIF.
+
+  "Revisión
+  SELECT SINGLE *
+    INTO @DATA(wl_zqm0002_revision)
+    FROM zqm0002_revision
+    WHERE werks = @p_werks          AND
+          kunnr = @ls_output-kunnr  AND
+          matnr = @ls_output-matnr.
+  IF sy-subrc = 0.
+    IF wl_zqm0002_revision-fecha_emision <> sy-datlo.
+      ADD 1 TO wl_zqm0002_revision-revision.
+      MODIFY zqm0002_revision FROM wl_zqm0002_revision.
+    ENDIF.
+  ELSE.
+    wl_zqm0002_revision-werks         = p_werks.
+    wl_zqm0002_revision-kunnr         = ls_output-kunnr.
+    wl_zqm0002_revision-matnr         = ls_output-matnr.
+    wl_zqm0002_revision-revision      = 1.
+    wl_zqm0002_revision-fecha_emision = sy-datlo.
+    MODIFY zqm0002_revision FROM wl_zqm0002_revision.
+  ENDIF.
+
+
+
+  CALL FUNCTION wl_fm_name
+    EXPORTING
+      /1bcdwb/docparams  = wl_docparams
+      user_settings      = 'X'
+      i_matnr            = ls_output-matnr
+      i_kunnr            = ls_output-kunnr
+      i_werks            = p_werks
+      i_mostrar_bct      = cbx_bct
+      i_texto_realizado  = vl_texto_realizado
+      i_texto_revisado   = vl_texto_revisado
+    IMPORTING
+      /1bcdwb/formoutput = wa_pdf_file
+    EXCEPTIONS
+      usage_error        = 1
+      system_error       = 2
+      internal_error     = 3
+      OTHERS             = 4.
+
+  CALL FUNCTION 'FP_JOB_CLOSE'
+*   IMPORTING
+*     E_RESULT    = result
+    EXCEPTIONS
+      usage_error    = 1
+      system_error   = 2
+      internal_error = 3
+      OTHERS         = 4.
+
+  DATA data_tab TYPE         solix_tab.
+
+  CALL FUNCTION 'SCMS_XSTRING_TO_BINARY'
+    EXPORTING
+      buffer     = wa_pdf_file-pdf
+    TABLES
+      binary_tab = data_tab.
+
+  DATA lv_mat TYPE matnr.
+  lv_mat =  |{ ls_output-matnr ALPHA = OUT }|.
+
+**NLC.15.02.2024.Añadir texto material en fichero pdf.
+  DATA lv_maktx TYPE maktx.
+
+  SELECT maktx INTO lv_maktx
+    FROM makt
+    WHERE makt~matnr = lv_mat
+    AND makt~spras  = 'S'.
+  ENDSELECT.
+**FIN.NLC.15.02.2024.Añadir texto material en fichero pdf.
+
+  DATA lv_filename TYPE string.
+**NLC.15.02.2024.Nueva estructura texto fichero añadimos texto material.
+  "  lv_filename = p_path && '\' && 'Esp.Técnica_' && lv_mat && '_' && ls_output-kunnr && '.pdf'.
+  lv_filename = p_path && '\' && 'Esp.Técnica_' && lv_mat && '_' && lv_maktx && '_' && ls_output-kunnr && '.pdf'.
+**FIN.NLC.15.02.2024.Nueva estructura texto fichero añadimos texto material.
+
+  CALL METHOD cl_gui_frontend_services=>gui_download
+    EXPORTING
+      filename                = lv_filename
+      filetype                = 'BIN'
+    CHANGING
+      data_tab                = data_tab
+    EXCEPTIONS
+      file_write_error        = 1
+      no_batch                = 2
+      gui_refuse_filetransfer = 3
+      invalid_type            = 4
+      no_authority            = 5
+      unknown_error           = 6
+      header_not_allowed      = 7
+      separator_not_allowed   = 8
+      filesize_not_allowed    = 9
+      header_too_long         = 10
+      dp_error_create         = 11
+      dp_error_send           = 12
+      dp_error_write          = 13
+      unknown_dp_error        = 14
+      access_denied           = 15
+      dp_out_of_memory        = 16
+      disk_full               = 17
+      dp_timeout              = 18
+      file_not_found          = 19
+      dataprovider_exception  = 20
+      control_flush_error     = 21
+      not_supported_by_gui    = 22
+      error_no_gui            = 23
+      OTHERS                  = 24.
+  IF sy-subrc <> 0.
+  ENDIF.
+
+ENDFORM. " DESCARGAR_FORM

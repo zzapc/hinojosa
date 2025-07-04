@@ -1,0 +1,584 @@
+*&---------------------------------------------------------------------*
+*& Include ZEIC_F01
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  BAJADA_FICHERO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM bajada_fichero TABLES pt_tab_text
+                           pt_messages  STRUCTURE   bapiret2
+                    USING  ps_path_file TYPE  string
+                           pb_error     TYPE  boole-boole.
+
+
+  CALL FUNCTION 'GUI_DOWNLOAD'
+    EXPORTING
+      filename                = ps_path_file   "File Name
+      filetype                = 'ASC'
+      append                  = 'X'
+    TABLES
+      data_tab                = pt_tab_text   "Data table
+    EXCEPTIONS
+      file_write_error        = 1
+      no_batch                = 2
+      gui_refuse_filetransfer = 3
+      invalid_type            = 4
+      OTHERS                  = 5.
+
+  IF sy-subrc <> 0.
+
+    pb_error = con_true.
+*    message i010(ZEIC_MENSAJE).
+
+  ENDIF.
+
+
+ENDFORM.                    " BAJADA_FICHERO
+
+*&---------------------------------------------------------------------*
+*&      Form  CIFRADO DE DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM cifrado_datos TABLES pt_messages STRUCTURE bapiret2
+                    USING ps_path_file LIKE  zeic_visor-ruta_descarga
+                          ps_fich_encrip LIKE zeic_visor-prog_encripta
+                          pb_error     LIKE  boole-boole
+                          pb_ejecutar  LIKE  boole-boole.
+
+  DATA:   ls_ruta_exe_cifrado LIKE zeic_visor-ruta_descarga,
+          ls_returncode       TYPE i.
+
+
+  IF  pb_ejecutar = con_true.
+
+    CLEAR: ls_returncode,
+           ls_ruta_exe_cifrado.
+
+    CONCATENATE ps_path_file ps_fich_encrip INTO ls_ruta_exe_cifrado.
+
+*   Se realiza la llamada al ejecutable que encripta los ficheros
+    CALL FUNCTION 'GUI_RUN'
+      EXPORTING
+        command    = ls_ruta_exe_cifrado
+      IMPORTING
+        returncode = ls_returncode.
+
+    IF ls_returncode <> 0.
+      pb_error = con_true.
+*      MESSAGE i007(zeic_mensajes).
+
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.                    "cifrado_datos
+
+*&---------------------------------------------------------------------*
+*&      Form  obtener_nro_doc_fi
+*&---------------------------------------------------------------------*
+
+FORM obtener_nro_doc_fi USING ps_header LIKE /cockpit/thdr
+                        CHANGING ps_nro_doc_fi LIKE
+/cockpit/thdr-sap_doc_no
+                                 pb_posted LIKE boole-boole.
+
+  DATA:
+    lb_posted   LIKE          boole-boole,
+    ls_belegnr  LIKE          /cockpit/thdr-sap_doc_no,
+    lc_obj_type LIKE          bapiache01-obj_type,
+    lc_obj_key  LIKE          bapiache01-obj_key,
+    lt_receiver LIKE TABLE OF /cockpit/sacdonr WITH HEADER
+LINE,
+    lt_rec      LIKE          /cockpit/sacdonr.
+
+* Esperamos a que el documento se contabilize.
+
+  lb_posted = ''.
+
+  IF ps_header-fi_mm_flg EQ 'MM'.
+
+* Si es un documento MM, se obtiene el documento FI generado de la BKPF.
+
+    lc_obj_type = 'RMRP'.
+
+    CONCATENATE ps_header-sap_doc_no ps_header-fiscal_year INTO lc_obj_key.
+
+    CALL FUNCTION '/COCKPIT/ACC_DOCUMENT_RECORD'
+      EXPORTING
+        obj_type = lc_obj_type
+        obj_key  = lc_obj_key
+        obj_sys  = space
+      TABLES
+        receiver = lt_receiver[].
+
+    IF NOT lt_receiver[] IS INITIAL.
+
+      LOOP AT lt_receiver INTO lt_rec.
+
+        IF lt_rec-rec_type = 'BKPF'.
+*           Documento FI generado para el documento MM
+          ls_belegnr = lt_rec-rec_key.
+          EXIT.
+        ENDIF.
+
+      ENDLOOP.
+
+      lb_posted = 'X'.
+
+    ENDIF.
+
+* Para las FI, se obtiene directamente el documento FI
+  ELSE.
+
+    ls_belegnr = ps_header-sap_doc_no.
+
+  ENDIF.
+
+  lb_posted = 'X'.
+
+  CLEAR: ps_nro_doc_fi, pb_posted.
+
+  IF lb_posted = 'X' AND NOT ls_belegnr IS INITIAL.
+    ps_nro_doc_fi = ls_belegnr.
+    pb_posted     = lb_posted.
+  ENDIF.
+
+ENDFORM.                    " OBTENER_NRO_DOC_FI
+
+*&---------------------------------------------------------------------*
+*&      Form  datos_documento_contable
+*&---------------------------------------------------------------------*
+FORM datos_documento_contable TABLES p_tab_bkpf        STRUCTURE bkpf
+                                     p_tab_bseg        STRUCTURE bseg
+                                     p_tab_datos_cab   STRUCTURE
+zeic_datos_carga
+                                     p_tab_datos_det   STRUCTURE
+zeic_datos_det
+                               USING pb_error          LIKE boole-boole.
+  TABLES: lfa1.
+
+  DATA: ls_datos_cab          LIKE zeic_datos_carga,
+        ls_datos_det          LIKE zeic_datos_det,
+        ls_companycode_detail LIKE bapi0002_2,
+        ls_messages           LIKE bapireturn,
+        ls_messages1          LIKE bapiret1,
+        lt_tab_bset           LIKE bset OCCURS 0 WITH HEADER LINE,
+        lt_tab_bseg           LIKE bseg OCCURS 0 WITH HEADER LINE.
+
+  DATA: ls_id_doc(50)      TYPE c,
+        ls_bapivendor_04   TYPE bapivendor_04,
+        ls_nombre_sociedad TYPE butxt,
+        ls_nombre          TYPE name1_gp,
+        li_nroreg          TYPE i,
+        ls_nom_imagen      LIKE zeic_visor-ruta_descarga,
+        ls_zeic_image      LIKE zeic_visor-ruta_descarga.
+
+  DATA: ls_datos_proveedor(255) TYPE c,
+        ls_datos_sociedad(255)  TYPE c.
+
+  DATA: ls_separador2 TYPE c VALUE '|'.
+  DATA: ls_cif_prov LIKE lfa1-stcd1.
+  DATA: li_nro_lin TYPE i.
+
+  DATA: ls_vat_country LIKE t001n-land1.
+  DATA: ls_vat_addr LIKE t001n-adrnr.
+  DATA: lb_abono TYPE boole-boole.
+
+  CLEAR: p_tab_datos_cab, pb_error, ls_vat_country, ls_vat_addr,
+lb_abono.
+  REFRESH: p_tab_datos_cab.
+
+* Se obtienen los datos si es una factura
+  LOOP AT p_tab_bseg WHERE koart = 'K' AND shkzg = 'H'.
+
+    ls_datos_cab-invoice_ind = con_true.
+
+    MOVE   p_tab_bseg  TO  lt_tab_bseg.
+    APPEND lt_tab_bseg.
+
+*   Tipo e importe IVA del documento
+    SELECT * INTO CORRESPONDING FIELDS OF TABLE lt_tab_bset
+        FROM bset WHERE bukrs = p_tab_bseg-bukrs
+                    AND belnr = p_tab_bseg-belnr
+                    AND gjahr = p_tab_bseg-gjahr
+                    AND shkzg = 'S'.
+    EXIT.
+  ENDLOOP.
+
+* Se obtienen los datos si es un abono
+  IF sy-subrc NE 0.
+    LOOP AT p_tab_bseg WHERE koart = 'K' AND shkzg = 'S'.
+
+      ls_datos_cab-invoice_ind = con_false.
+
+      MOVE   p_tab_bseg  TO  lt_tab_bseg.
+      APPEND lt_tab_bseg.
+
+*     Tipo e importe IVA del documento
+      SELECT * INTO CORRESPONDING FIELDS OF TABLE lt_tab_bset
+          FROM bset WHERE bukrs = p_tab_bseg-bukrs
+                      AND belnr = p_tab_bseg-belnr
+                      AND gjahr = p_tab_bseg-gjahr
+                      AND shkzg = 'H'.
+      EXIT.
+    ENDLOOP.
+
+    IF sy-subrc NE 0.
+      pb_error = con_true.
+    ENDIF.
+  ENDIF.
+
+  IF pb_error = con_false.
+*   Se obtienen los datos de cabecera.
+    LOOP AT lt_tab_bseg.
+
+      CLEAR: ls_id_doc, ls_datos_cab.
+
+*     Se genera el nro ID del documento
+      CONCATENATE lt_tab_bseg-bukrs
+                  lt_tab_bseg-belnr
+                  lt_tab_bseg-gjahr
+      INTO ls_id_doc.
+
+*     Datos de la sociedad
+      CLEAR: ls_messages, ls_datos_sociedad.
+      CALL FUNCTION 'BAPI_COMPANYCODE_GETDETAIL'
+        EXPORTING
+          companycodeid      = lt_tab_bseg-bukrs
+        IMPORTING
+          companycode_detail = ls_companycode_detail
+          return             = ls_messages.
+
+      IF NOT ls_companycode_detail IS INITIAL.
+
+        ls_nombre_sociedad = ls_companycode_detail-comp_name.
+
+*       Se obtienen mas datos de la sociedad
+        CONCATENATE ls_companycode_detail-vat_reg_no
+                   ls_separador2
+                   ls_companycode_detail-country
+                   ls_separador2
+                   ls_companycode_detail-city
+                   ls_separador2
+                   ls_companycode_detail-addr_no
+                   ls_separador2
+*                  código postal
+                   ls_separador2
+*                  telefono
+        INTO ls_datos_sociedad.
+
+      ENDIF.
+
+*     Datos del proveedor
+      CLEAR ls_messages1.
+      CALL FUNCTION 'BAPI_VENDOR_GETDETAIL'
+        EXPORTING
+          vendorno      = lt_tab_bseg-lifnr
+          companycode   = lt_tab_bseg-bukrs
+        IMPORTING
+          generaldetail = ls_bapivendor_04
+          return        = ls_messages1.
+
+      IF NOT ls_bapivendor_04 IS INITIAL.
+        ls_nombre   =  ls_bapivendor_04-name.
+
+*       Se obtienen mas datos del proveedor
+        CLEAR lfa1.
+        SELECT SINGLE stcd1 INTO lfa1-stcd1
+          FROM lfa1
+         WHERE lifnr = lt_tab_bseg-lifnr.
+        ls_datos_cab-lifnr = lfa1-lifnr.
+
+        IF sy-subrc = 0.
+          ls_cif_prov = lfa1-stcd1.
+        ENDIF.
+
+        CONCATENATE ls_cif_prov
+                    ls_separador2
+                    ls_bapivendor_04-country
+                    ls_separador2
+                    ls_bapivendor_04-city
+                    ls_separador2
+                    ls_bapivendor_04-street
+                    ls_separador2
+                    ls_bapivendor_04-postl_code
+                    ls_separador2
+                    ls_bapivendor_04-telephone
+                    ls_separador2
+                    lt_tab_bseg-pswsl
+          INTO ls_datos_proveedor.
+
+      ENDIF.
+      ls_datos_cab-wrbtr   = lt_tab_bseg-wrbtr.
+*     Tipo e importe IVA del documento
+      CLEAR: li_nro_lin.
+
+      IF lt_tab_bset[] IS INITIAL.
+        ls_datos_cab-tax_rate1      = 0.
+        ls_datos_cab-tax_amount1    = 0.
+        ls_datos_cab-base1          = lt_tab_bseg-wrbtr.
+        ls_datos_cab-net_amount   = lt_tab_bseg-wrbtr -
+ls_datos_cab-tax_amount1.
+      ELSE.
+
+        READ TABLE lt_tab_bset INDEX 1.
+        li_nro_lin = 1.
+        ls_datos_cab-net_amount   = lt_tab_bseg-wrbtr.
+
+
+        LOOP AT lt_tab_bset.
+
+          CLEAR: ls_datos_det.
+
+          ls_datos_det-guid       = ls_id_doc.
+          ls_datos_det-buzei      = li_nro_lin.
+          ls_datos_det-wrbtr      = lt_tab_bset-fwbas.
+          ls_datos_det-tax_rate   = lt_tab_bset-kbetr / 10.
+          ls_datos_det-tax_amount = lt_tab_bset-fwste.
+
+          IF li_nro_lin > 1.
+*           Si la factura es multiIva se genera el fichero de detalle.
+            APPEND ls_datos_det TO p_tab_datos_det.
+          ENDIF.
+
+          IF li_nro_lin = 1.
+            ls_datos_cab-tax_rate1      = ls_datos_det-tax_rate.
+            ls_datos_cab-tax_amount1    = ls_datos_det-tax_amount.
+            ls_datos_cab-base1          = ls_datos_det-wrbtr.
+
+          ENDIF.
+
+          IF li_nro_lin = 2.
+            ls_datos_cab-tax_rate2      = ls_datos_det-tax_rate.
+            ls_datos_cab-tax_amount2    = ls_datos_det-tax_amount.
+            ls_datos_cab-base2          = ls_datos_det-wrbtr.
+
+          ENDIF.
+
+          IF li_nro_lin = 3.
+            ls_datos_cab-tax_rate3      = ls_datos_det-tax_rate.
+            ls_datos_cab-tax_amount3    = ls_datos_det-tax_amount.
+            ls_datos_cab-base3          = ls_datos_det-wrbtr.
+
+          ENDIF.
+
+
+          IF li_nro_lin = 4.
+            ls_datos_cab-tax_rate4      = ls_datos_det-tax_rate.
+            ls_datos_cab-tax_amount4    = ls_datos_det-tax_amount.
+            ls_datos_cab-base4          = ls_datos_det-wrbtr.
+
+          ENDIF.
+
+
+          IF li_nro_lin = 5.
+            ls_datos_cab-tax_rate5      = ls_datos_det-tax_rate.
+            ls_datos_cab-tax_amount5    = ls_datos_det-tax_amount.
+            ls_datos_cab-base5          = ls_datos_det-wrbtr.
+
+          ENDIF.
+
+
+          IF li_nro_lin = 6.
+            ls_datos_cab-tax_rate6      = ls_datos_det-tax_rate.
+            ls_datos_cab-tax_amount6    = ls_datos_det-tax_amount.
+            ls_datos_cab-base3          = ls_datos_det-wrbtr.
+
+          ENDIF.
+
+          ls_datos_cab-net_amount   =  ls_datos_cab-net_amount  -
+ls_datos_det-tax_amount.
+
+          li_nro_lin = li_nro_lin + 1.
+        ENDLOOP.
+
+      ENDIF.
+
+*     Se obtienen campos de la BKPF
+      READ TABLE p_tab_bkpf WITH KEY bukrs = lt_tab_bseg-bukrs
+                                     belnr = lt_tab_bseg-belnr
+                                     gjahr = lt_tab_bseg-gjahr.
+
+      ls_datos_cab-bukrs       = p_tab_bkpf-bukrs.
+      ls_datos_cab-belnr       = p_tab_bkpf-belnr.
+      ls_datos_cab-gjahr       = p_tab_bkpf-gjahr.
+      ls_datos_cab-xblnr       = p_tab_bkpf-xblnr.
+
+*   Se cambia la fecha a formato externo.
+
+      CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+        EXPORTING
+          date_internal = p_tab_bkpf-bldat
+        IMPORTING
+          date_external = ls_datos_cab-bldat.
+
+*   Se cambia la fecha a formato externo.
+
+      CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+        EXPORTING
+          date_internal = p_tab_bkpf-budat
+        IMPORTING
+          date_external = ls_datos_cab-budat.
+
+
+
+*Fin modificaciones fechas formato externo
+      ls_datos_cab-bldat = p_tab_bkpf-bldat.
+      ls_datos_cab-budat = p_tab_bkpf-budat.
+      ls_datos_cab-waers = p_tab_bkpf-waers.
+
+*     Se obtienen campos de la BSEG
+      ls_datos_cab-wrbtr         = lt_tab_bseg-wrbtr.
+*      ls_datos_cab-net_amount   = lt_tab_bseg-wrbtr -
+*lt_tab_bseg-WMWST.
+      ls_datos_cab-lifnr         = lt_tab_bseg-lifnr.
+
+*     Se asignan los valores obtenidos
+      ls_datos_cab-guid          = ls_id_doc.
+      ls_datos_cab-comp_name     = ls_nombre_sociedad.
+      ls_datos_cab-name          = ls_nombre.
+      ls_datos_cab-datos_prov    = ls_datos_proveedor.
+      ls_datos_cab-datos_soc     = ls_datos_sociedad.
+
+*     Se inserta en la tabla datos de cabecera
+      APPEND ls_datos_cab TO p_tab_datos_cab.
+
+    ENDLOOP.
+
+  ENDIF.
+
+ENDFORM.                    " DATOS_DOCUMENTO_CONTABLE
+
+
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_NRO_DOC_FI_CORRECTIVO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_HEADER  text
+*      <--P_LS_BELNR  text
+*      <--P_LB_POSTED  text
+*----------------------------------------------------------------------*
+FORM obtener_nro_doc_fi_correctivo USING ps_header LIKE /cockpit/thdr
+                        CHANGING ps_nro_doc_fi LIKE
+/cockpit/thdr-sap_doc_no
+                                 pb_posted LIKE boole-boole.
+
+  DATA:
+    lb_posted   LIKE          boole-boole,
+    ls_belegnr  LIKE          /cockpit/thdr-sap_doc_no,
+    lc_obj_type LIKE          bapiache01-obj_type,
+    lc_obj_key  LIKE          bapiache01-obj_key,
+    lt_receiver LIKE TABLE OF /cockpit/sacdonr WITH HEADER
+LINE,
+    lt_rec      LIKE          /cockpit/sacdonr.
+
+* Esperamos a que el documento se contabilize.
+
+  lb_posted = ''.
+
+  IF ps_header-fi_mm_flg EQ 'MM'.
+
+* Si es un documento MM, se obtiene el documento FI generado de la BKPF.
+
+    lc_obj_type = 'RMRP'.
+
+    CONCATENATE ps_header-sap_doc_no
+                ps_header-fiscal_year
+                INTO lc_obj_key.
+
+    DO 1 TIMES.
+
+      CALL FUNCTION '/COCKPIT/ACC_DOCUMENT_RECORD'
+        EXPORTING
+          obj_type = lc_obj_type
+          obj_key  = lc_obj_key
+          obj_sys  = space
+        TABLES
+          receiver = lt_receiver[].
+
+      IF NOT lt_receiver[] IS INITIAL.
+
+        LOOP AT lt_receiver INTO lt_rec.
+
+          IF lt_rec-rec_type = 'BKPF'.
+
+*           Documento FI generado para el documento MM
+            ls_belegnr = lt_rec-rec_key.
+
+            EXIT.
+
+          ENDIF.
+
+        ENDLOOP.
+
+        lb_posted = 'X'.
+
+        EXIT.
+
+      ENDIF.
+
+    ENDDO.
+
+
+* Para las FI, se obtiene directamente el documento FI
+  ELSE.
+
+    ls_belegnr = ps_header-sap_doc_no.
+
+  ENDIF.
+
+
+  DO 1 TIMES.
+
+    CALL FUNCTION 'ENQUEUE_EFBKPF'
+      EXPORTING
+        bukrs  = ps_header-comp_code
+        belnr  = ls_belegnr
+        gjahr  = ps_header-fiscal_year
+      EXCEPTIONS
+        OTHERS = 1.
+
+    IF sy-subrc EQ 0.
+
+      CALL FUNCTION 'DEQUEUE_EFBKPF'
+        EXPORTING
+          bukrs = ps_header-comp_code
+          belnr = ls_belegnr
+          gjahr = ps_header-fiscal_year.
+
+      lb_posted = 'X'.
+
+      EXIT.
+
+    ENDIF.
+
+  ENDDO.
+
+
+  CLEAR: ps_nro_doc_fi,
+         pb_posted.
+
+  IF lb_posted = 'X' AND NOT ls_belegnr IS INITIAL.
+
+    ps_nro_doc_fi = ls_belegnr.
+    pb_posted = lb_posted.
+
+  ENDIF.
+
+
+ENDFORM.                     " OBTENER_NRO_DOC_FI_CORRECTIVO

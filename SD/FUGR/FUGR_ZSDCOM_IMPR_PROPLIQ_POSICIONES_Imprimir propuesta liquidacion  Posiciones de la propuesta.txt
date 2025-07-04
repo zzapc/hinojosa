@@ -1,0 +1,135 @@
+FUNCTION zsdcom_impr_propliq_posiciones.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IS_CABLIQ) TYPE  ZSSDCOM_PRLIQCAB_KEY
+*"     VALUE(I_LIFNR) TYPE  LIFNR OPTIONAL
+*"     VALUE(IT_AUX) TYPE  ZTTSDCOM002_SEL OPTIONAL
+*"  EXPORTING
+*"     VALUE(ET_POS) TYPE  ZTTSDCOM_PRLIQPOS_PRINT
+*"----------------------------------------------------------------------
+
+  DATA: ls_pos       TYPE zssdcom_prliqpos_print,
+        ls_exch_rate TYPE bapi1093_0.
+
+  DATA: lv_ind   TYPE i,
+        lv_waers TYPE waers.
+* Inicializamos
+  REFRESH et_pos.
+* Sacamos todas las posiciones del comisionista en la propuesta
+*  SELECT z~*
+*  FROM @it_aux AS l
+*  INNER JOIN ztsdcom_prliqpos AS z ON z~bukrs = l~bukrs AND z~lifnr = l~lifnr AND z~waerk = l~waerk
+*  WHERE z~checkbox  = 'X'
+*  AND   z~bukrs     = @is_cabliq-bukrs
+*  AND   z~laufd     = @is_cabliq-laufd
+*  AND   z~laufi     = @is_cabliq-laufi
+*  INTO CORRESPONDING FIELDS OF TABLE @et_pos.
+
+    IF it_aux is not INITIAL.
+    SELECT * FROM ztsdcom_prliqpos
+      INTO CORRESPONDING FIELDS OF TABLE et_pos
+      FOR ALL ENTRIES IN it_aux
+      WHERE bukrs = it_aux-bukrs AND lifnr = it_aux-lifnr AND waerk = it_aux-waerk AND checkbox = 'X' and laufi = is_cabliq-laufi AND laufd = is_cabliq-laufd.
+    ENDIF.
+
+  CHECK sy-subrc = 0.
+* Moneda del comisionista
+  SELECT SINGLE waers INTO lv_waers
+      FROM  ztsdcom002
+      WHERE bukrs = is_cabliq-bukrs
+      AND   lifnr = i_lifnr.
+  IF lv_waers IS INITIAL.
+    SELECT SINGLE waers INTO lv_waers
+        FROM  t001
+        WHERE bukrs = is_cabliq-bukrs.
+  ENDIF.
+
+* Recorremos las posiciones sacando los datos que faltan
+  LOOP AT et_pos INTO ls_pos.
+    lv_ind = sy-tabix.
+
+*   Para sacar el porcentaje.
+    IF ls_pos-kawrt IS NOT INITIAL.
+      ls_pos-kbetr = ( ls_pos-zimp_liq * 100 ) / ls_pos-kawrt.
+    ELSE.
+      ls_pos-kbetr = 0.
+    ENDIF.
+
+*   Fecha de la factura
+    SELECT SINGLE fkdat INTO ls_pos-fkdat
+        FROM  vbrk
+        WHERE vbeln = ls_pos-vbeln.
+
+*   Nombre del cliente
+    SELECT SINGLE name1 INTO ls_pos-name1
+        FROM  kna1
+        WHERE kunnr = ls_pos-kunnr.
+
+*   Moneda de liquidación
+    ls_pos-waers = lv_waers.
+    ls_pos-kursf = 1.
+    ls_pos-dmbtr = ls_pos-zimp_liq.
+
+*   Tipo de cambio
+    IF lv_waers <>  ls_pos-waerk AND lv_waers = 'EUR'.
+*     Sacamos el tipo de cambio
+      CALL FUNCTION 'BAPI_EXCHANGERATE_GETDETAIL'
+        EXPORTING
+          rate_type  = 'EURX'
+          from_curr  = ls_pos-waerk
+          to_currncy = lv_waers
+          date       = ls_pos-fkdat
+        IMPORTING
+          exch_rate  = ls_exch_rate.
+
+*     Cargamos el tipo de cambio
+      ls_pos-kursf = ls_exch_rate-exch_rate_v.
+
+*     Realizamos la conversión del total + impuestos a moneda local
+      CALL FUNCTION 'CONVERT_CURRENCY_BY_RATE'
+        EXPORTING
+          from_amount   = ls_pos-dmbtr
+          from_currency = ls_pos-waerk
+          from_factor   = ls_exch_rate-from_factor
+          rate          = ls_exch_rate-exch_rate_v
+          to_currency   = lv_waers
+          to_factor     = ls_exch_rate-to_factor
+        IMPORTING
+          to_amount     = ls_pos-dmbtr
+        EXCEPTIONS
+          no_rate_found = 1
+          OTHERS        = 2.
+    ELSEIF lv_waers <>  ls_pos-waerk AND lv_waers <> 'EUR'.
+*     Sacamos el tipo de cambio
+      CALL FUNCTION 'BAPI_EXCHANGERATE_GETDETAIL'
+        EXPORTING
+          rate_type  = 'EURX'
+          from_curr  = lv_waers
+          to_currncy = ls_pos-waerk
+          date       = ls_pos-fkdat
+        IMPORTING
+          exch_rate  = ls_exch_rate.
+*     Cargamos el tipo de cambio
+      ls_pos-kursf = ls_exch_rate-exch_rate.
+*     Realizamos la conversión del total + impuestos a moneda local
+      CALL FUNCTION 'CONVERT_CURRENCY_BY_RATE'
+        EXPORTING
+          from_amount   = ls_pos-dmbtr
+          from_currency = ls_pos-waerk
+          from_factor   = ls_exch_rate-from_factor
+          rate          = ls_exch_rate-exch_rate
+          to_currency   = lv_waers
+          to_factor     = ls_exch_rate-to_factor
+        IMPORTING
+          to_amount     = ls_pos-dmbtr
+        EXCEPTIONS
+          no_rate_found = 1
+          OTHERS        = 2.
+    ENDIF.
+
+*   Modificamos la línea
+    MODIFY et_pos FROM ls_pos INDEX lv_ind.
+  ENDLOOP.
+
+ENDFUNCTION.

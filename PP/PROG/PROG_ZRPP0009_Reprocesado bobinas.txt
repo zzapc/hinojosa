@@ -1,0 +1,154 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRPP0009
+*&
+*&---------------------------------------------------------------------*
+*& Reprocesado de bobinas
+*&
+*&---------------------------------------------------------------------*
+
+REPORT zrpp0009 MESSAGE-ID zpp.
+
+
+INCLUDE zrpp0009_top.
+INCLUDE zbc_batch.
+
+SELECTION-SCREEN BEGIN OF BLOCK zrpp0009 WITH FRAME TITLE text-001.
+PARAMETERS: p_matco TYPE aufm-matnr OBLIGATORY,
+            p_charg TYPE aufm-charg OBLIGATORY,
+* GST - 22/10/2015 - Almacén origen ->
+            p_lgorto TYPE mard-lgort.
+* GST - 22/10/2015 - Almacén origen <-
+
+SELECTION-SCREEN END OF BLOCK zrpp0009.
+
+SELECTION-SCREEN BEGIN OF BLOCK zrpp0009_v2 WITH FRAME TITLE text-003.
+PARAMETERS: p_werks LIKE mard-werks OBLIGATORY,
+            p_lgort LIKE mard-lgort OBLIGATORY,
+            p_oper TYPE atwrt OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK zrpp0009_v2.
+
+SELECTION-SCREEN BEGIN OF BLOCK zrpp0009_v3 WITH FRAME TITLE text-004.
+PARAMETERS: p_matnr LIKE mard-matnr OBLIGATORY,
+            p_menge TYPE erfmg OBLIGATORY,
+            p_n_bob TYPE int1 OBLIGATORY,
+            p_diam TYPE zzdiametro OBLIGATORY,
+            p_long TYPE atinn OBLIGATORY,
+            p_empa TYPE atinn OBLIGATORY.
+
+PARAMETERS: p_cli TYPE kunnr,
+            p_ped TYPE vbeln_va,
+            p_pos TYPE posnr_va.
+SELECTION-SCREEN END OF BLOCK zrpp0009_v3.
+
+
+INCLUDE zrpp0009_form.
+
+* GST - 07/07/2016 ->
+INITIALIZATION.
+  PERFORM inicializacion_sel.
+* GST - 07/07/2016 <-
+
+
+START-OF-SELECTION.
+
+
+  " Inicializar variables:
+  PERFORM iniciar_var.
+
+  " Chequeo material/lote consumir con stock:
+  CLEAR gv_clabs.
+  IF p_lgorto IS NOT INITIAL.
+    SELECT SINGLE clabs INTO gv_clabs
+      FROM mchb
+      WHERE matnr = p_matco
+      AND werks = p_werks
+      AND charg = p_charg
+* GST - 22/10/2015 - Almacén origen ->
+      AND lgort = p_lgorto.
+* GST - 22/10/2015 - Almacén origen <-
+
+  ELSE.
+
+    SELECT SINGLE clabs INTO gv_clabs
+      FROM mchb
+      WHERE matnr = p_matco
+      AND werks = p_werks
+      AND charg = p_charg.
+
+  ENDIF.
+
+  IF gv_clabs IS INITIAL OR gv_clabs < p_menge.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = p_matco
+      IMPORTING
+        output = gv_matnr.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = p_charg
+      IMPORTING
+        output = gv_charg.
+
+    MESSAGE i040 WITH gv_matnr gv_charg.
+
+  ELSE.
+
+*   INI CGIJON: SAT 7000014245 - Ticket_25868
+    DATA: lv_ok TYPE xfeld.
+    CLEAR: lv_ok.
+    PERFORM verificar_calculo_costes USING p_matnr
+                                           p_werks
+                                     CHANGING lv_ok.
+
+    CHECK lv_ok IS INITIAL.
+*   FIN CGIJON: SAT 7000014245 - Ticket_25868
+
+    " 1) Crear orden:
+    PERFORM crear_orden CHANGING gv_aufnr
+                                 gv_error.
+
+    IF gv_error <> 'X'.
+      " 2) Añadir componente a orden:
+      PERFORM anadir_componente USING gv_aufnr
+                                CHANGING gv_error.
+
+      IF gv_error <> 'X'.
+
+        " 3) Liberación orden de proceso:
+        PERFORM liberar_orden USING gv_aufnr
+                              CHANGING gv_error.
+
+        IF gv_error <> 'X'.
+
+          " 4) Movimientos alta:
+          "    (tantos como bobinas resultantes)
+          PERFORM alta_stock USING gv_aufnr.
+
+          " 5) Clasificación de los lotes:
+          "    (clasificamos los lotes que se han creado)
+          PERFORM clasif_lotes.
+
+          " 6) Mov. mercancía: consumir totalmente material
+          PERFORM cons_material.
+
+          " 7) Notificar orden de proceso:
+          PERFORM notificar_orden.
+
+          " 8) Impresión de etiquetas:
+          "    (sólo aquellas de los lotes que se han creado)
+          PERFORM imprimir_etiquetas.
+        ENDIF.
+
+      ENDIF.
+
+    ENDIF.
+
+    " 9) Mostrar log:
+    PERFORM mostrar_log.
+
+    " 10) Limpiar variables:
+    PERFORM limpiar_var.
+
+  ENDIF.

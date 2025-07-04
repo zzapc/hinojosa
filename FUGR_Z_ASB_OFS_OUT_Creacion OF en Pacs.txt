@@ -1,0 +1,338 @@
+FUNCTION z_asb_ofs_out.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(OBJKEY) TYPE  ZWHS_CLAVE
+*"     REFERENCE(MENSAJE) TYPE  ZWHS_MENSAJE
+*"     REFERENCE(SIMULAR) TYPE  OAF_AGENT_SIMULATION_RUN DEFAULT ''
+*"     REFERENCE(VAR1) TYPE  ANY DEFAULT ''
+*"     REFERENCE(VAR2) TYPE  ANY DEFAULT ''
+*"     REFERENCE(MODO_CT) TYPE  BDCMODE DEFAULT 'N'
+*"     REFERENCE(CAUFVDB) TYPE  CAUFVDB OPTIONAL
+*"  EXPORTING
+*"     REFERENCE(CONTENIDO) TYPE  ZCONTENIDO_FICHERO
+*"     REFERENCE(MESSAGE) TYPE  BAPI_MSG
+*"  CHANGING
+*"     REFERENCE(COLA) TYPE  ZWHS_COLA
+*"----------------------------------------------------------------------
+  DATA: l_caufv         TYPE caufv,
+        i_caufv_dest    TYPE TABLE OF caufv,
+        l_marc          TYPE marc,
+        l_mvke          TYPE mvke,
+        l_mara          TYPE mara,
+        l_order         TYPE  bapi_pp_order_create,
+        l_order_change  TYPE bapi_pp_order_change,
+        l_order_changex TYPE bapi_pp_order_changex,
+        l_return        TYPE bapiret2,
+        l_aufnr_semi    TYPE aufnr,
+        it_orders       TYPE zspp_tt_update_ordenes,
+        l_ord_prev      TYPE aufnr.
+
+  cola-aufnr = objkey.
+  __poner_ceros cola-aufnr.
+
+  break_simular.
+
+  IF NOT caufvdb IS INITIAL.
+    MOVE-CORRESPONDING caufvdb TO l_caufv.
+  ELSE.
+    SELECT SINGLE * FROM caufv
+      INTO l_caufv
+     WHERE aufnr = cola-aufnr.
+    IF sy-subrc NE 0.
+      message = 'Orden no existe'.
+      RETURN.
+    ELSE.
+      cola-auart = l_caufv-auart.
+      cola-werks = l_caufv-werks.
+    ENDIF.
+  ENDIF.
+
+  DATA(o_wrk) = NEW zhcl_core_wrk( ).
+  ASSIGN o_wrk->i_par_centro[ werks = l_caufv-werks ] TO FIELD-SYMBOL(<par_centro>).
+  IF sy-subrc NE 0.
+    message = |No existe parametrización para centro { l_caufv-werks }|.
+    RETURN.
+  ENDIF.
+
+  IF <par_centro>-full_sap IS INITIAL.
+    message = 'Centro no es Full SAP'.
+    RETURN.
+  ENDIF.
+
+  IF <par_centro>-mes NE 'OMP'.
+    message = 'Centro no es OMP'.
+    RETURN.
+  ENDIF.
+
+  IF <par_centro>-fab_plancha IS INITIAL.
+    message = 'Centro no tiene indicado centro destino fabricación de plancha'.
+    RETURN.
+  ENDIF.
+
+  SELECT SINGLE lvorm FROM mara
+    INTO CORRESPONDING FIELDS OF l_mara
+   WHERE matnr = l_caufv-plnbez.
+  IF l_mara-lvorm = 'X'.
+    message = 'Material a fabricar marcado para borrado'.
+    RETURN.
+  ENDIF.
+
+
+  SELECT SINGLE lvorm strgr FROM marc
+    INTO CORRESPONDING FIELDS OF l_marc
+   WHERE matnr = l_caufv-plnbez
+     AND werks = l_caufv-werks.
+  IF l_marc-lvorm = 'X'.
+    message = |Material a fabricar marcado para borrado en centro { l_caufv-werks }|.
+    RETURN.
+  ENDIF.
+
+  SELECT SINGLE cuobj FROM marc
+    INTO @DATA(l_cuobj_2001)
+   WHERE matnr = @l_caufv-plnbez
+     AND werks = '2001'
+     AND cuobj NE ''.
+
+  SELECT SINGLE mtpos FROM mvke JOIN tvkwz ON tvkwz~vkorg = mvke~vkorg
+                                          AND tvkwz~vtweg = mvke~vtweg
+    INTO CORRESPONDING FIELDS OF l_mvke
+    WHERE matnr = l_caufv-plnbez
+      AND werks = l_caufv-werks.
+
+
+  IF NOT (  l_marc-strgr = 'ZH'   "Grupo de estrategia de planificación = Contra pedido traslado planta(2003/2001)
+      OR  ( l_marc-strgr = 'ZS'  AND NOT l_cuobj_2001 IS INITIAL ) "Grupo de estrategia de planificación = Assembly (sd-pp) Sarriá
+      OR  ( l_marc-strgr = '' AND l_mvke-mtpos = 'ZREL' ) "Grupo de tipos de posición = Relocated PACS
+         ).
+    message = |Material a fabricar tiene STRGR={ l_marc-strgr } y MTPOS={ l_mvke-mtpos }. No cumple|.
+    RETURN.
+  ENDIF.
+
+
+  DATA(r_mtart_semi) =  NEW zhcl_core( )->get_rango_tipos_mat( zhcl_core=>c_set_tipo_mat_semi_packaging ).
+
+  SELECT resb~matnr, strgr, mtpos, SUM( resb~bdmng ) AS bdmng, resb~meins, marc~mmsta
+    FROM resb JOIN mara ON mara~matnr = resb~matnr
+    JOIN marc ON marc~matnr = resb~matnr
+     AND marc~werks = resb~werks
+    JOIN tvkwz ON tvkwz~werks = marc~werks
+    JOIN mvke ON mvke~matnr = resb~matnr
+     AND mvke~vkorg = tvkwz~vkorg
+     AND mvke~vtweg = tvkwz~vtweg
+    INTO TABLE @DATA(i_semis)
+   WHERE rsnum = @l_caufv-rsnum
+     AND xloek = @l_caufv-loekz
+     AND mtart IN @r_mtart_semi
+     AND mara~lvorm = ''
+     AND marc~lvorm = ''
+*     AND NOT marc~mmsta IN ( '88',   "Bloqueado por Calidad
+*                             'Z3',   "Bloqueo fabricación
+*                             'ZZ' ) "Bloqueo compras y fabric.
+    GROUP BY resb~matnr, strgr, mtpos, resb~meins, marc~mmsta
+    ORDER BY resb~matnr, strgr, mtpos.
+
+  IF i_semis IS INITIAL.
+    message = 'No existen semielaborados en la orden'.
+    RETURN.
+  ENDIF.
+
+  IF var1 = 'TEST'.
+    message = 'OK'.
+    RETURN.
+  ENDIF.
+
+  cola-pedido = l_caufv-kdauf.
+  cola-posnr = l_caufv-kdpos.
+
+* Buscamos si tenemos ya la orden creada
+  SELECT DISTINCT aufnr2 FROM zwhs_cola
+    INTO TABLE @DATA(i_ord_prev)
+   WHERE idmsg = 'OFS'
+     AND aufnr = @l_caufv-aufnr
+     AND aufnr2 NE ''.
+
+  LOOP AT i_ord_prev ASSIGNING FIELD-SYMBOL(<oprev>).
+    SELECT aufnr plnbez gamng gltrp gstrp FROM caufv
+      APPENDING CORRESPONDING FIELDS OF TABLE i_caufv_dest
+     WHERE aufnr = <oprev>
+       AND loekz = ''.
+  ENDLOOP.
+
+  IF ( cola-tcode NE 'CO01' AND cola-tcode NE 'ZMSG_MONITOR' ) AND i_ord_prev IS INITIAL.
+    message = 'Sólo se crean ordenes cuando viene desde CO01'.
+    RETURN.
+  ENDIF.
+
+  CLEAR cola-fichero.
+  LOOP AT i_semis ASSIGNING FIELD-SYMBOL(<semi>).
+
+    IF NOT <semi>-mmsta IS INITIAL AND <semi>-mmsta NE '00'.
+      SELECT SINGLE mtstb FROM t141t
+        INTO @DATA(l_mtstb)
+       WHERE spras = @sy-langu
+         AND mmsta = @<semi>-mmsta.
+      zwhs=>inserta_log( idcola = cola-idcola tipo = 'W' mensaje = |Material { <semi>-matnr ALPHA = OUT } tiene bloqueo { <semi>-mmsta } { l_mtstb }| ).
+    ENDIF.
+
+
+    CLEAR: l_order, l_order_change, l_order_changex, l_ord_prev.
+    l_order-material = cola-matnr = <semi>-matnr.
+    l_order-plant = cola-werks = <par_centro>-fab_plancha.
+    SELECT SINGLE cuobj FROM marc
+      INTO l_order-configuration
+      WHERE matnr = <semi>-matnr
+       AND werks = l_order-plant.
+    cola-cuobj = l_order-configuration.
+    cola-cantidad = <semi>-bdmng.
+    cola-meins = <semi>-meins.
+
+    l_order-planning_plant  =    l_order-plant.
+    l_order-quantity = <semi>-bdmng.
+    SELECT SINGLE auart FROM t399x
+      INTO l_order-order_type
+     WHERE werks = l_order-plant
+       AND auart LIKE 'Z___'.
+    l_order-basic_start_date = l_order-basic_end_date = l_caufv-gstrp.
+
+    ASSIGN i_caufv_dest[ plnbez = <semi>-matnr ] TO FIELD-SYMBOL(<prev>).
+    IF sy-subrc = 0.
+      zwhs=>inserta_log( idcola = cola-idcola tipo = 'W' mensaje = |Existe orden previa { <prev>-aufnr ALPHA = OUT }| ).
+      cola-aufnr2 = l_ord_prev = <prev>-aufnr.
+    ELSEIF NOT l_caufv-kdauf IS INITIAL.
+* Buscamos órdenes previas del proceso anterior
+      SELECT aufnr, plnbez, gamng, gltrp, gstrp FROM caufv
+        APPENDING CORRESPONDING FIELDS OF TABLE @i_caufv_dest
+        UP TO 1 ROWS
+       WHERE auart = @l_order-order_type
+         AND werks = @l_order-plant
+         AND kdauf = @l_caufv-kdauf
+         AND kdpos = @l_caufv-kdpos
+         AND plnbez = @<semi>-matnr
+         AND loekz = ''
+      ORDER BY aufnr DESCENDING.
+      ASSIGN i_caufv_dest[ plnbez = <semi>-matnr ] TO <prev>.
+      IF sy-subrc = 0.
+        zwhs=>inserta_log( idcola = cola-idcola tipo = 'W' mensaje = |Existe orden previa { <prev>-aufnr ALPHA = OUT } buscando por pedido { <prev>-kdauf ALPHA = OUT } { <prev>-kdpos ALPHA = OUT }| ).
+        cola-aufnr2 = l_ord_prev = <prev>-aufnr.
+      ENDIF.
+    ENDIF.
+
+    IF NOT l_ord_prev IS INITIAL.
+      IF zcl_ap_orden_pp=>contiene_status( aufnr = l_ord_prev status = 'CTEC' spras = 'S' ) OR
+         zcl_ap_orden_pp=>contiene_status( aufnr = l_ord_prev status = 'CERR' spras = 'S' ).
+        zwhs=>inserta_log( idcola = cola-idcola tipo = 'W' mensaje = |La orden estaba cerrada, salimos sin hacer nada| ).
+        cola-estado = 'X'.
+        RETURN.
+      ENDIF.
+
+      IF <prev>-gltrp = l_caufv-gstrp AND "GLTRP FECHA FIN EXTREMA
+         <prev>-gamng = <semi>-bdmng.
+        zwhs=>inserta_log( idcola = cola-idcola tipo = 'I' mensaje = |Sin modificaciones| ).
+        CONTINUE.
+      ELSE.
+        MOVE-CORRESPONDING l_order TO l_order_change.
+        IF <prev>-gltrp NE l_caufv-gstrp.
+          l_order_change-basic_end_date = l_caufv-gstrp.
+          l_order_changex-basic_end_date = 'X'.
+          IF <prev>-gstrp NE l_caufv-gstrp.
+            l_order_change-basic_start_date = l_caufv-gstrp.
+            l_order_changex-basic_start_date = 'X'.
+          ENDIF.
+        ENDIF.
+        IF <prev>-gamng NE <semi>-bdmng.
+          l_order_change-quantity = <semi>-bdmng.
+          l_order_changex-quantity = 'X'.
+          zwhs=>inserta_log( idcola = cola-idcola tipo = 'I' mensaje = |Se modifica cantidad desde { <prev>-gamng  } hasta { <semi>-bdmng }| ).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    COMMIT WORK AND WAIT.
+    IF l_order_change IS INITIAL.
+      IF l_caufv-loekz IS INITIAL.
+        CALL FUNCTION 'BAPI_PRODORD_CREATE'
+          EXPORTING
+            orderdata    = l_order
+          IMPORTING
+            return       = l_return
+            order_number = l_aufnr_semi.
+
+        IF l_aufnr_semi IS NOT INITIAL.
+          cola-aufnr2 = l_aufnr_semi.
+          __add_lista cola-fichero l_aufnr_semi.
+          zwhs=>inserta_log( idcola = cola-idcola tipo = 'S' mensaje = |Se ha creado orden { l_aufnr_semi ALPHA = OUT }| ).
+          cola-estado = 'X'.
+          zcl_ap_dev=>commit( ).
+
+          APPEND INITIAL LINE TO it_orders ASSIGNING FIELD-SYMBOL(<auf>).
+          <auf>-aufnr = cola-aufnr2.
+        ELSE.
+          ROLLBACK WORK.
+          message = l_return-message.
+        ENDIF.
+      ELSE.
+        zwhs=>inserta_log( idcola = cola-idcola tipo = 'W' mensaje = |La orden esta borrada, sin ninguna orden de semi previa, salimos sin hacer nada| ).
+        cola-estado = 'X'.
+        RETURN.
+      ENDIF.
+    ELSE.
+      IF l_caufv-loekz IS INITIAL.
+        CALL FUNCTION 'BAPI_PRODORD_CHANGE'
+          EXPORTING
+            number     = <prev>-aufnr
+            orderdata  = l_order_change
+            orderdatax = l_order_changex
+          IMPORTING
+            return     = l_return.
+        IF l_return-type = 'E'.
+          ROLLBACK WORK.
+          message = l_return-message.
+        ELSE.
+          zcl_ap_dev=>commit( ).
+          SELECT SINGLE gstrp, gltrp FROM caufv
+            INTO (@DATA(l_finicio), @DATA(l_ffin))
+           WHERE aufnr = @<prev>-aufnr.
+
+          IF <prev>-gltrp NE l_ffin.
+            zwhs=>inserta_log( idcola = cola-idcola tipo = 'I' mensaje = |Se modifica fecha fin extrema esde { <prev>-gltrp DATE = USER } hasta { l_ffin DATE = USER }| ).
+          ENDIF.
+          IF <prev>-gstrp NE l_finicio.
+            zwhs=>inserta_log( idcola = cola-idcola tipo = 'I' mensaje = |Se modifica fecha inicio extrema esde { <prev>-gstrp DATE = USER } hasta { l_ffin DATE = USER }| ).
+          ENDIF.
+
+          APPEND INITIAL LINE TO it_orders ASSIGNING <auf>.
+          <auf>-aufnr = <prev>-aufnr.
+        ENDIF.
+      ELSE.
+        DATA i_orders TYPE TABLE OF bapi_order_key.
+        i_orders = VALUE #( ( order_number = <prev>-aufnr ) ).
+        CALL FUNCTION 'BAPI_PRODORD_SET_DELETION_FLAG'
+          IMPORTING
+            return = l_return
+          TABLES
+            orders = i_orders.
+
+*        message = zcl_ap_orden_pp=>cambia_status( aufnr = <prev>-aufnr status = 'PTBO' spras = 'S' ).
+        IF l_return-type = 'E'.
+          message = l_return-message.
+        ELSE.
+          zwhs=>inserta_log( idcola = cola-idcola tipo = 'I' mensaje = |Se marca para borrado la orden { <prev>-aufnr ALPHA = OUT }| ).
+        ENDIF.
+        zcl_ap_dev=>commit( ).
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  IF NOT it_orders IS INITIAL.
+    CALL FUNCTION 'ZSPP_ENVIO_ORDERS_BACKGROUND'
+      EXPORTING
+        it_aufnr = it_orders.
+  ENDIF.
+
+  IF message IS INITIAL.
+    cola-estado = 'X'.
+  ENDIF.
+
+
+ENDFUNCTION.

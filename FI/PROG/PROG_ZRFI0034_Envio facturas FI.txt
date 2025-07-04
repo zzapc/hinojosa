@@ -1,0 +1,397 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRFI0034
+*&
+*&---------------------------------------------------------------------*
+*& Envío facturas FI.
+*& 73957. Automatización envío FI
+*& Javier Calás. 06.10.22
+*&---------------------------------------------------------------------*
+
+"Se han realizado ampliaciones en el programa RFKORD30_PDF
+"Se ha implementado la user exit EXIT_RFKORIEX_001
+REPORT zrfi0034.
+TABLES: bkpf, sscrfields.
+
+
+*********************
+* Variables globales
+*********************
+DATA: tg_alv  TYPE TABLE OF zrfi0034_s_alv.
+DATA: rg_alv  TYPE REF TO cl_salv_table.
+
+*********************
+* Pantalla de selección
+*********************
+SELECTION-SCREEN FUNCTION KEY 1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-b01.
+SELECT-OPTIONS: s_bukrs FOR bkpf-bukrs,
+                s_belnr FOR bkpf-belnr,
+                s_gjahr FOR bkpf-gjahr.
+SELECTION-SCREEN END OF BLOCK b01.
+
+
+
+*********************
+* Clases locales
+*********************
+CLASS lcl_handle_events DEFINITION.
+  PUBLIC SECTION.
+    METHODS: on_user_command FOR EVENT added_function OF cl_salv_events IMPORTING e_salv_function.
+ENDCLASS.
+
+CLASS lcl_handle_events IMPLEMENTATION.
+  METHOD on_user_command.
+    CASE e_salv_function.
+      WHEN 'ENVIOS'.
+        PERFORM f_generar_envios.
+    ENDCASE.
+
+  ENDMETHOD.
+ENDCLASS.
+
+
+*********************
+* Eventos
+*********************
+INITIALIZATION.
+  sscrfields-functxt_01 = |{ icon_eml } Emails|.
+
+
+AT SELECTION-SCREEN.
+  IF sy-ucomm = 'FC01'.
+    CALL TRANSACTION 'ZFI0034_EMAIL' AND SKIP FIRST SCREEN.
+  ELSE.
+    IF s_belnr IS INITIAL.
+      MESSAGE 'Debe indicar los documentos' TYPE 'E'.
+    ENDIF.
+  ENDIF.
+
+
+
+START-OF-SELECTION.
+  PERFORM f_start_of_selection.
+
+
+END-OF-SELECTION.
+  PERFORM f_end_of_selection.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_START_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_start_of_selection.
+  CLEAR tg_alv.
+  CHECK s_belnr IS NOT INITIAL.
+
+
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      percentage = 0
+      text       = 'Seleccionando documentos...'.
+
+
+  SELECT bukrs, belnr, gjahr, blart
+    INTO TABLE @DATA(tl_bkpf)
+    FROM bkpf
+    WHERE bukrs IN @s_bukrs AND
+          belnr IN @s_belnr AND
+          gjahr IN @s_gjahr.
+  CHECK tl_bkpf IS NOT INITIAL.
+
+  SELECT bukrs, belnr, gjahr, bschl, vbund, kunnr
+    INTO TABLE @DATA(tl_bseg)
+    FROM bseg
+    WHERE bukrs IN @s_bukrs AND
+          belnr IN @s_belnr AND
+          gjahr IN @s_gjahr AND
+          buzei = '001'.
+  CHECK tl_bseg IS NOT INITIAL.
+
+  SELECT *
+    INTO TABLE @DATA(tl_mails)
+    FROM zfi_mailfrasdfc
+    FOR ALL ENTRIES IN @tl_bseg
+    WHERE kunnr = @tl_bseg-kunnr.
+
+  "Chequeo de los documentos introducidos en la pantalla de selección:
+  LOOP AT tl_bkpf ASSIGNING FIELD-SYMBOL(<fs_bkpf>).
+    APPEND INITIAL LINE TO tg_alv ASSIGNING FIELD-SYMBOL(<fs_alv>).
+    MOVE-CORRESPONDING <fs_bkpf> TO <fs_alv>.
+
+***** Inicio modificación ticket 80025 LER 02.11.23 para permitir DA***
+    IF <fs_bkpf>-blart <> 'DF' AND <fs_bkpf>-blart <> 'DA'.
+      <fs_alv>-message  = 'El documento no cumple los criterios de envio'.
+      <fs_alv>-semaforo = icon_led_red.
+      CONTINUE.
+    ENDIF.
+
+    READ TABLE tl_bseg ASSIGNING FIELD-SYMBOL(<fs_bseg>) WITH KEY bukrs = <fs_bkpf>-bukrs
+                                                                  belnr = <fs_bkpf>-belnr
+                                                                  gjahr = <fs_bkpf>-gjahr.
+    IF sy-subrc <> 0.
+      <fs_alv>-message  = 'El documento no cumple los criterios de envio'.
+      <fs_alv>-semaforo = icon_led_red.
+      CONTINUE.
+    ENDIF.
+
+***** Inicio modificación ticket 80025 LER 02.11.23 para permitir abonos***
+    IF <fs_bseg>-bschl <> '01' AND <fs_bseg>-bschl <> '11' OR <fs_bseg>-vbund IS INITIAL OR <fs_bseg>-kunnr NP 'C*'.
+      <fs_alv>-message  = 'El documento no cumple los criterios de envio'.
+      <fs_alv>-semaforo = icon_led_red.
+      CONTINUE.
+    ENDIF.
+
+    <fs_alv>-kunnr = <fs_bseg>-kunnr.
+
+    READ TABLE tl_mails ASSIGNING FIELD-SYMBOL(<fs_mails>) WITH KEY kunnr = <fs_alv>-kunnr.
+    IF sy-subrc <> 0.
+      <fs_alv>-message  = 'Indique el email del deudor en botón "Mails" de la pantalla principal'.
+      <fs_alv>-semaforo = icon_led_red.
+      CONTINUE.
+    ENDIF.
+    <fs_alv>-email    = <fs_mails>-email.
+    <fs_alv>-email_cc = <fs_mails>-email_copia.
+    <fs_alv>-semaforo = icon_led_inactive.
+  ENDLOOP.
+
+
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_END_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_end_of_selection .
+
+  "Mostrar ALV
+  TRY.
+      CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+        EXPORTING
+          percentage = 0
+          text       = 'Mostrando ALV...'.
+      cl_salv_table=>factory( IMPORTING r_salv_table = rg_alv
+                              CHANGING  t_table      = tg_alv ).
+      rg_alv->get_columns( )->set_optimize( abap_false ).
+      rg_alv->get_functions( )->set_all( abap_true ).
+      rg_alv->set_screen_status( pfstatus = 'STA_ALV'
+                                 report   = sy-repid
+      set_functions = rg_alv->c_functions_all ).
+
+      rg_alv->get_columns( )->get_column( 'SEMAFORO' )->set_output_length( 2 ).
+      rg_alv->get_columns( )->get_column( 'EMAIL' )->set_output_length( 30 ).
+      rg_alv->get_columns( )->get_column( 'EMAIL_CC' )->set_output_length( 30 ).
+      rg_alv->get_columns( )->get_column( 'MESSAGE' )->set_output_length( 60 ).
+
+
+      DATA(rl_event_handler) = NEW lcl_handle_events( ).
+      SET HANDLER rl_event_handler->on_user_command FOR rg_alv->get_event( ).
+
+      rg_alv->display( ).
+    CATCH cx_salv_msg
+          cx_salv_wrong_call
+          cx_salv_existing
+          cx_salv_not_found.
+  ENDTRY.
+
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_GENERAR_ENVIOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_generar_envios .
+
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      percentage = 0
+      text       = 'Generando envíos...'.
+
+  DATA: vl_pdf TYPE xstring.
+  DATA: vl_asunto           TYPE so_obj_des,
+        vl_result           TYPE boolean,
+        tl_message          TYPE soli_tab,
+        tl_destinatarios    TYPE zemail_t_mailaddress,
+        tl_destinatarios_cc TYPE zemail_t_mailaddress,
+        tl_anexos           TYPE zemail_t_mailattach,
+        tl_asunto           TYPE TABLE OF tline,
+        tl_cuerpo           TYPE TABLE OF tline.
+
+  IF tg_alv IS INITIAL.
+    MESSAGE 'No se han seleccionado documentos' TYPE 'I' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+  READ TABLE tg_alv TRANSPORTING NO FIELDS WITH KEY semaforo = icon_led_red.
+  IF sy-subrc = 0.
+    MESSAGE 'Existen documentos que no cumplen los criterios de envío' TYPE 'I' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+
+  CALL FUNCTION 'READ_TEXT'
+    EXPORTING
+      id                      = 'ST'
+      language                = 'S'
+      name                    = 'ZRFI0034_ASUNTO'
+      object                  = 'TEXT'
+    TABLES
+      lines                   = tl_asunto
+    EXCEPTIONS
+      id                      = 1
+      language                = 2
+      name                    = 3
+      not_found               = 4
+      object                  = 5
+      reference_check         = 6
+      wrong_access_to_archive = 7
+      OTHERS                  = 8.
+  LOOP AT tl_asunto ASSIGNING FIELD-SYMBOL(<fs_asunto>) WHERE tdline IS NOT INITIAL.
+    vl_asunto = <fs_asunto>-tdline. EXIT.
+  ENDLOOP.
+
+
+  CALL FUNCTION 'READ_TEXT'
+    EXPORTING
+      id                      = 'ST'
+      language                = 'S'
+      name                    = 'ZRFI0034_EMAIL'
+      object                  = 'TEXT'
+    TABLES
+      lines                   = tl_cuerpo
+    EXCEPTIONS
+      id                      = 1
+      language                = 2
+      name                    = 3
+      not_found               = 4
+      object                  = 5
+      reference_check         = 6
+      wrong_access_to_archive = 7
+      OTHERS                  = 8.
+
+  LOOP AT tl_cuerpo ASSIGNING FIELD-SYMBOL(<fs_cuerpo>).
+    APPEND INITIAL LINE TO tl_message ASSIGNING FIELD-SYMBOL(<fs_message>).
+    <fs_message>-line = <fs_cuerpo>-tdline.
+
+  ENDLOOP.
+
+  DATA(vl_num_envios) = lines( tg_alv ) .
+  DATA: vl_tabix      TYPE i,
+        vl_num_envio  TYPE i,
+        vl_porcentaje TYPE p DECIMALS 2.
+  LOOP AT tg_alv ASSIGNING FIELD-SYMBOL(<fs_alv>).
+    vl_num_envio = sy-tabix.
+
+    CLEAR vl_pdf.
+    CLEAR: tl_destinatarios, tl_destinatarios_cc, tl_anexos.
+
+    vl_porcentaje = vl_num_envio / vl_num_envios * 100.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = vl_porcentaje
+        text       = |Generando envío { vl_num_envio }/{ vl_num_envios }|.
+
+    PERFORM f_get_pdf USING <fs_alv>-bukrs <fs_alv>-belnr <fs_alv>-gjahr
+                      CHANGING vl_pdf.
+    IF vl_pdf IS INITIAL.
+      <fs_alv>-message  = 'No se ha podido recuperar la factura PDF'.
+      <fs_alv>-semaforo = icon_led_red.
+      CONTINUE.
+    ENDIF.
+
+
+    APPEND INITIAL LINE TO tl_anexos ASSIGNING FIELD-SYMBOL(<fs_anexo>).
+    <fs_anexo>-attachment_type    = 'pdf'.
+    <fs_anexo>-attachment_subject = <fs_alv>-belnr.
+    <fs_anexo>-att_content_hex    = cl_bcs_convert=>xstring_to_solix( vl_pdf ).
+
+
+    APPEND INITIAL LINE TO tl_destinatarios ASSIGNING FIELD-SYMBOL(<fs_destinatarios>).
+    <fs_destinatarios>-email = <fs_alv>-email.
+
+    IF <fs_alv>-email_cc IS NOT INITIAL.
+      APPEND INITIAL LINE TO tl_destinatarios_cc ASSIGNING FIELD-SYMBOL(<fs_destinatarios_cc>).
+      <fs_destinatarios_cc>-email = <fs_alv>-email_cc.
+    ENDIF.
+
+    CLEAR vl_result.
+    CALL FUNCTION 'Z_ENVIO_CORREO'
+      EXPORTING
+        vp_asunto           = vl_asunto
+        vp_commit           = 'X'
+      IMPORTING
+        vp_result           = vl_result
+      CHANGING
+        tp_message_body     = tl_message
+        tp_destinatarios    = tl_destinatarios
+        tp_destinatarios_cc = tl_destinatarios_cc
+        tp_anexos           = tl_anexos.
+    IF vl_result = 'X'.
+      <fs_alv>-message  = 'Mail generado correctamente'.
+      <fs_alv>-semaforo = icon_led_green.
+    ELSE.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+        WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 INTO  <fs_alv>-message.
+      <fs_alv>-semaforo = icon_led_red.
+    ENDIF.
+  ENDLOOP.
+
+  rg_alv->refresh( ).
+
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_PDF
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_<FS_BKPF>_BUKRS  text
+*      -->P_<FS_BKPF>_BELNR  text
+*      -->P_<FS_BKPF>_GJAHR  text
+*----------------------------------------------------------------------*
+FORM f_get_pdf  USING    vp_bukrs TYPE bkpf-bukrs
+                         vp_belnr TYPE bkpf-belnr
+                         vp_gjahr TYPE bkpf-gjahr
+                CHANGING vp_pdf TYPE xstring.
+
+  DATA: tl_bukrs_rg TYPE RANGE OF bkpf-bukrs,
+        tl_belnr_rg TYPE RANGE OF bkpf-belnr,
+        tl_gjahr_rg TYPE RANGE OF bkpf-gjahr.
+
+  tl_bukrs_rg = VALUE #( ( sign = 'I' option = 'EQ' low = vp_bukrs ) ).
+  tl_belnr_rg = VALUE #( ( sign = 'I' option = 'EQ' low = vp_belnr ) ).
+  tl_gjahr_rg = VALUE #( ( sign = 'I' option = 'EQ' low = vp_gjahr ) ).
+
+  FREE MEMORY ID 'ZFI0034'.
+  EXPORT exportar_pdf = 'X' TO MEMORY ID 'ZFI0034'.
+  SUBMIT rfkord30_pdf WITH rbukrs IN tl_bukrs_rg
+                      WITH rbelnr IN tl_belnr_rg
+                      WITH rgjahr IN tl_gjahr_rg
+                      WITH revent = 'ZSAPR'
+                      WITH sortvk = 'B2'
+                      WITH tddest = 'PDF'
+                      WITH rimmd  = space
+                      AND RETURN.
+  IMPORT pdf = vp_pdf FROM MEMORY ID 'ZFI0034'.
+
+ENDFORM.

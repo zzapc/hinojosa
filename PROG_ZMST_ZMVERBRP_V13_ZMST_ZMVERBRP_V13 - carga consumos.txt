@@ -1,0 +1,1237 @@
+*&---------------------------------------------------------------------*
+*& Report  ZMST_ZMVERBRP_V13
+*&  report from note 1832196                                                                   *
+*&---------------------------------------------------------------------*
+*& Version 13 12.10.2017 -  Changes MQ                                 *
+*& original ZMST_ZMVERBRP_V13 in E38                                   *
+*& Changes:                                                            *
+*&                                                                     *
+*& - enable calculation / update with MRP areas (DVER)       "12102017 *
+*&                                                                     *
+*& - Unplanned consumption was not updated properly          "29042014 *
+*&   There was no check for reservation when KZVBU = R       "29042014 *
+*&   KZVBU = R was handled like U always                     "29042014 *
+*& - UMKZV was not considered (T156M-KZVBL if CNT02 = 02     "29042014 *
+*&                                                                     *
+*&                                                                     *
+*& Version 10  22.12.2011 - Changes MS                                 *
+*& original ZMST_ZMVERBRP in E38                                       *
+*& Changes:                                                            *
+*&                                                                     *
+*& - enabled PERKZ = P                                                 *
+*&                                                                     *
+*& Version 14.07.2011 - Changes TS                                     *
+*& original ZMST_ZMVERBRP in E38                                       *
+*& Changes:                                                            *
+*&                                                                     *
+*& - XVSTAT is now sorted before call of MB_UPDATE_MATERIAL_CONSUMPTION*                                                                    *
+*& - T156M is selected only once                                       *
+*& - MB_UPDATE_MATERIAL_CONSUMPTION is called after COMMIT with initial*
+*&   line in XVSTAT in order to destroy the internal buffer (dirty but *
+*&   the only possibility to destroy the buffer in function group MBMS)*
+*& - Switched language of the log to English                           *
+*& - Exception handling after MB_UPDATE_MATERIAL_CONSUMPTION           *
+*& - Handling GR/Cancellation of POs with account assignment           *
+*&                                                                     *
+*& Version 03.01.2011 - Changes MS                                     *
+*& functionally improved                                               *
+*& Changes:                                                            *
+*&                                                                     *
+*& - Report considers T156M-KZVBL now                                  *
+*& - Report doesn't select MSEG-XAUTO items                            *
+*& - Report works now also properly for PERKZ different from M         *
+*& - Delete from MVER optimized                                        *
+*& - Report considers DVER as well                                     *
+*&                                                                     *
+*& Version 27.11.2006 - Changes JS                                     *
+*& => Performance optimized Version                                    *
+*&                                                                     *
+*& Changes:                                                            *
+*& - Select fiscal year variant from material master (MARC-PERIV)      *
+*& - Period indicator as new selection parameter                       *
+*& - Posting date (firstday/lastday) only once at the beginning        *
+*& - Confirmation PopUp when executed with Updatemode                  *
+*& - It is not necessary to read MVER twice, takeover data from MVER_CH*
+*& - Select MKPF and MSEG with a single Join into internal table       *
+*&   BUDAT and BWART included into the WHERE clause, and therefore     *
+*&   only relevant documents are selected from database. Only necessary*
+*&   fields are transported                                            *
+*&---------------------------------------------------------------------*
+
+REPORT  zmst_zmverbrp_v13.
+
+TABLES: mver, mseg, mkpf, t156, t156m.
+
+DATA: BEGIN OF mver_ch OCCURS 0.   "MVERs which need to be corrected
+        INCLUDE STRUCTURE mver.
+DATA: END OF mver_ch.
+DATA: ls_mver TYPE mver.
+
+DATA: BEGIN OF mkpfmseg OCCURS 0,  "Movements
+        budat TYPE mkpf-budat,
+        matnr TYPE mseg-matnr,
+        werks TYPE mseg-werks,
+        lgort TYPE mseg-lgort,
+        bwart TYPE mseg-bwart,
+        shkzg TYPE mseg-shkzg,
+        menge TYPE mseg-menge,
+        kzvbr TYPE mseg-kzvbr,
+        bustm TYPE mseg-bustm,
+        rspos TYPE mseg-rspos,                              "29042014
+        xauto TYPE mseg-xauto.                              "29042014
+DATA END OF mkpfmseg.
+
+DATA: BEGIN OF xvstat OCCURS 0.    "Contains consumptions
+        INCLUDE STRUCTURE vstat.
+DATA: END OF xvstat.
+
+DATA: BEGIN OF xvstat_b OCCURS 0,  "Contains consumptions + bwart
+        matnr LIKE vstat-matnr,
+        werks LIKE vstat-werks,
+        datum LIKE vstat-datum,
+        perkz LIKE vstat-perkz,
+        perim LIKE vstat-perim,
+        gsvbr LIKE vstat-gsvbr,
+        unvbr LIKE vstat-unvbr,
+        lgort LIKE vstat-lgort,
+        sobkz LIKE vstat-sobkz,
+        emlif LIKE vstat-emlif,
+        bwart LIKE  mseg-bwart.
+DATA: END OF xvstat_b.
+
+DATA: gsvxx LIKE mver-gsv01,       "Total consumption
+      unvxx LIKE mver-unv01,       "Unplanned consumption
+      mgvxx LIKE mver-mgv01,       "Manually corrected total consumption
+      muvxx LIKE mver-muv01,       "Manually corrected unplanned consumption
+      blank TYPE gsvbr.
+
+DATA: g_periv LIKE marc-periv.
+
+DATA: firstday LIKE mkpf-budat,
+      lastday  LIKE mkpf-budat,
+      shkzg_s  LIKE mseg-shkzg VALUE 'S',
+      shkzg_h  LIKE mseg-shkzg VALUE 'H',
+      kzvbu_g  LIKE t156-kzvbu VALUE 'G',
+      kzvbu_u  LIKE t156-kzvbu VALUE 'U',        "ch 08.10.97
+      kzvbu_r  LIKE t156-kzvbu VALUE 'R'.
+
+DATA: lt_t156m TYPE TABLE OF t156m.
+DATA: ls_t156m TYPE t156m.
+
+DATA: save_matnr TYPE matnr.
+DATA: save_werks TYPE werks.
+
+DATA: lt_marc TYPE TABLE OF marc.
+DATA: ls_marc TYPE marc.
+
+*-----------------------------------------------------------------------
+"Selection screen
+SELECT-OPTIONS: material FOR  mver-matnr,
+                werk     FOR  mver-werks.
+
+PARAMETERS: ch_gjahr TYPE  mver-gjahr,
+            p_perkz  TYPE  mver-perkz, "Period indicator
+            test     AS CHECKBOX DEFAULT 'X',
+            langprot AS CHECKBOX,
+            mrp_area AS CHECKBOX,
+            refresh  AS CHECKBOX.
+
+*-----------------------------------------------------------------------
+START-OF-SELECTION.
+  "Confirm step in update mode
+  IF test = space.
+    PERFORM  confirm_step
+             USING 'Run with update?'.
+  ENDIF.
+
+
+
+  WRITE: / 'Material           Plant'.
+  IF langprot NE space.
+    WRITE: /3 'Date         Total Consumption Unplanned Cons.'.
+  ENDIF.
+  SKIP.
+
+  IF test EQ space AND refresh NE space.
+    DELETE FROM mver
+      WHERE matnr IN material
+        AND werks IN werk
+        AND perkz = p_perkz.
+
+    COMMIT WORK AND WAIT.
+  ENDIF.
+
+
+  SELECT * FROM mver INTO TABLE mver_ch
+                WHERE matnr IN material
+                AND   werks IN werk
+                AND   gjahr = ch_gjahr
+                AND   perkz = p_perkz.
+
+  "Select once quantity posting strings
+  SELECT * FROM t156m INTO TABLE lt_t156m.
+
+  CLEAR: save_matnr, save_werks.
+
+*usamos para generar entradas en la tabla de los materiales que no tienen
+*  IF mrp_area = 'X'.
+  SELECT * FROM marc INTO TABLE lt_marc
+    WHERE matnr IN material AND
+          werks IN werk.
+  LOOP AT lt_marc INTO ls_marc.
+    READ TABLE mver_ch WITH KEY
+      matnr = ls_marc-matnr
+      werks = ls_marc-werks
+      gjahr = ch_gjahr
+      perkz = p_perkz
+      TRANSPORTING NO FIELDS.
+    IF sy-subrc NE 0.
+*       create dummy entry
+      ls_mver-matnr = ls_marc-matnr.
+      ls_mver-werks = ls_marc-werks.
+      ls_mver-gjahr = ch_gjahr.
+      ls_mver-perkz = p_perkz.
+      ls_mver-zahlr = 1.
+*     ls_mver-muv13 = ' '.
+      INSERT ls_mver INTO mver_ch INDEX 1.
+    ENDIF.
+  ENDLOOP.
+  SORT mver_ch BY matnr werks gjahr perkz zahlr.
+*  ENDIF.
+
+  "Main processing loop over all selected materials
+  LOOP AT mver_ch.
+
+    "Get fiscal year variant from MARC
+    CLEAR g_periv.
+    SELECT SINGLE periv FROM marc INTO g_periv
+              WHERE matnr = mver_ch-matnr AND
+                    werks = mver_ch-werks.
+
+    IF p_perkz <> 'M'.
+      IF save_matnr     = mver_ch-matnr
+         AND save_werks = mver_ch-werks.
+        CONTINUE.
+      ELSE.
+        save_matnr = mver_ch-matnr.
+        save_werks = mver_ch-werks.
+      ENDIF.
+    ENDIF.
+
+    IF p_perkz = 'P'.
+*  **  Possible adjustment: Material documents with a specific period
+      CALL FUNCTION 'FIRST_AND_LAST_DAY_IN_YEAR_GET'
+        EXPORTING
+          i_gjahr        = ch_gjahr
+          i_periv        = g_periv
+        IMPORTING
+          e_first_day    = firstday
+          e_last_day     = lastday
+        EXCEPTIONS
+          input_false    = 1
+          t009_notfound  = 2
+          t009b_notfound = 3
+          OTHERS         = 4.
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      ENDIF.
+    ELSE.
+      "CONCATENATE ch_gjahr '0101' INTO firstday.  "Example whole year
+      "CONCATENATE ch_gjahr '1231' INTO lastday.
+      firstday = '01012015'.
+      lastday = '31122020'.
+
+    ENDIF.
+
+    "Enqueue material
+    CALL FUNCTION 'ENQUEUE_EMMARCE'
+      EXPORTING
+        matnr          = mver_ch-matnr
+        werks          = mver_ch-werks
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+
+    IF sy-subrc NE 0.
+      "Material is locked
+      WRITE: / mver_ch-matnr, mver_ch-werks,
+               'locked -> Material cannot be repaired'.
+      DELETE mver_ch.
+      sy-subrc = 04.
+    ENDIF.
+
+    WRITE: / mver_ch-matnr, mver_ch-werks.
+    CHECK sy-subrc = 0.
+
+    IF test = space.
+      PERFORM clear_mver.
+      PERFORM clear_dver.
+    ENDIF.
+
+
+
+    CLEAR mkpfmseg. REFRESH mkpfmseg.
+
+
+
+
+    "All entries in T156M where KZVBL is set are CNT01 ! No entries for
+    "CNT02. XAUTO lines are never relevant for statistic updates
+    SELECT mkpf~budat mseg~matnr mseg~werks mseg~xauto
+           mseg~lgort mseg~bwart
+           mseg~shkzg mseg~menge mseg~kzvbr mseg~bustm mseg~rspos
+           FROM mkpf AS mkpf INNER JOIN mseg
+           ON mkpf~mblnr = mseg~mblnr AND mkpf~mjahr = mseg~mjahr
+           INTO CORRESPONDING FIELDS OF TABLE mkpfmseg
+           WHERE mseg~matnr = mver_ch-matnr AND
+                 mseg~werks = mver_ch-werks AND
+                 mseg~xauto <> 'X' AND
+                 ( mkpf~budat => firstday AND
+                   mkpf~budat <= lastday )." AND
+*                 ( mseg~bwart < '701' OR
+*                   mseg~bwart > '718' ).    " No Inventory postings
+
+    LOOP AT mkpfmseg.
+*      Original logic till version 10:
+*      IF ( mkpfmseg-shkzg = shkzg_s AND mkpfmseg-kzvbr IS INITIAL ) OR     "29042014
+*         ( mkpfmseg-shkzg = shkzg_h AND mkpfmseg-kzvbr IS NOT INITIAL ) .  "29042014
+*      Took logic from MM07MFV0_V_SEGMENT_GENERIEREN                        "29042014
+*      IF xmseg-shkzg = s.                                                  "29042014
+*          xvstat-gsvbr = 0 - xvstat-gsvbr.                                 "29042014
+*          xvstat-unvbr = 0 - xvstat-unvbr.                                 "29042014
+*        ENDIF.                                                             "29042014
+*      IF ( zdm07m-kzvbl = minus AND NOT xmseg-xauto = x ) OR               "29042014
+*         ( zdm07m-umkzv = minus AND xmseg-xauto = x ).                     "29042014
+*        xvstat-gsvbr = 0 - xvstat-gsvbr.                                   "29042014
+*        xvstat-unvbr = 0 - xvstat-unvbr.                                   "29042014
+*      ENDIF.                                                               "29042014
+
+
+
+      CLEAR: gsvxx, unvxx, mgvxx, muvxx, t156.
+      SELECT SINGLE * FROM t156 WHERE bwart = mkpfmseg-bwart.
+      CHECK mkpfmseg-shkzg = t156-shkzg.
+
+      IF mkpfmseg-xauto IS INITIAL.                         "29042014
+        READ TABLE lt_t156m WITH KEY                        "29042014
+           bustm = mkpfmseg-bustm                           "29042014
+           zustd = ' '                                      "29042014
+           cnt02 = 1                                        "29042014
+           INTO ls_t156m.                                   "29042014
+      ELSE.                                                 "29042014
+        READ TABLE lt_t156m WITH KEY                        "29042014
+           bustm = mkpfmseg-bustm                           "29042014
+           zustd = ' '                                      "29042014
+           cnt02 = 2                                        "29042014
+           INTO ls_t156m.                                   "29042014
+      ENDIF.                                                "29042014
+      IF mkpfmseg-shkzg = shkzg_s .                         "29042014
+        mkpfmseg-menge = 0 - mkpfmseg-menge.                "29042014
+      ENDIF.                                                "29042014
+      IF ls_t156m-kzvbl = '-'.                              "29042014
+        mkpfmseg-menge = 0 - mkpfmseg-menge.                "29042014
+      ENDIF.                                                "29042014
+
+      "Consumption update only if KZVBL sets for the qty string
+      CHECK ls_t156m-kzvbl IS NOT INITIAL.
+
+      "Planned consumption
+      IF t156-kzvbu = kzvbu_g
+         OR t156-kzvbu = kzvbu_u
+         OR t156-kzvbu = kzvbu_r.
+        gsvxx = mkpfmseg-menge.
+        mgvxx = mkpfmseg-menge.
+      ENDIF.
+
+      "Unplanned consumption
+      IF t156-kzvbu = kzvbu_r
+        OR t156-kzvbu = kzvbu_u.
+*       Not complete logic from MM07MFV0_V_SEGMENT_GENERIEREN "29042014
+        IF mkpfmseg-rspos IS INITIAL.                       "29042014
+          unvxx = mkpfmseg-menge.
+          muvxx = mkpfmseg-menge.
+        ENDIF.                                              "29042014
+      ENDIF.
+
+      CHECK NOT ( ( gsvxx IS INITIAL ) AND ( unvxx IS INITIAL ) ).
+
+      "take over consumption into XVSTAT
+      xvstat_b-matnr = mver_ch-matnr.
+      xvstat_b-werks = mver_ch-werks.
+      xvstat_b-datum = mkpfmseg-budat.
+      xvstat_b-perkz = p_perkz.
+      xvstat_b-perim = g_periv.
+      xvstat_b-gsvbr = gsvxx.
+      xvstat_b-unvbr = unvxx.
+      xvstat_b-bwart = mkpfmseg-bwart.
+      xvstat_b-lgort = mkpfmseg-lgort.
+      APPEND xvstat_b.
+
+      MOVE-CORRESPONDING xvstat_b TO xvstat.
+      APPEND xvstat.
+    ENDLOOP.
+
+    IF langprot NE space.
+      SORT xvstat_b[] BY datum.
+      LOOP AT xvstat_b.
+        WRITE: /3 xvstat_b-datum, xvstat_b-gsvbr, xvstat_b-unvbr,
+        xvstat_b-bwart .
+      ENDLOOP.
+    ENDIF.
+
+* refresh before update
+
+    "Update consumption per plant/material combination
+    IF test = space AND ( NOT xvstat[] IS INITIAL ).
+      SORT xvstat.
+      CALL FUNCTION 'MB_UPDATE_MATERIAL_CONSUMPTION'
+        TABLES
+          xvstat = xvstat
+        EXCEPTIONS
+          OTHERS = 1.
+    ENDIF.
+
+    IF sy-subrc = 0.
+      COMMIT WORK.
+    ELSE.
+      "Exception might be caused in the factory calendar
+      ROLLBACK WORK.
+      WRITE: / mver_ch-matnr, mver_ch-werks,
+               'MB_UPDATE_MATERIAL_CONSUMPTION returned with exception'.
+      DELETE mver_ch.
+    ENDIF.
+
+    CLEAR xvstat.
+    CLEAR xvstat_b.
+    REFRESH xvstat.
+    REFRESH xvstat_b.
+
+    "Not really a nice solution in order to invalidate the buffer, but
+    "we do not have any REFRESH function module available and there we
+    "have to use a second call with initial line. It would also be
+    "possible to call the function before with an additional initial line,
+    "but I would like to avoid any side effects with the same call.
+    "XVSTAT-GSVBR or XVSTAT-UNVBR do not have any value and therefore the
+    "COLLECT to IMVER or IDVER does not take place and as a result no
+    "update takes place.
+    APPEND INITIAL LINE TO xvstat.
+    CALL FUNCTION 'MB_UPDATE_MATERIAL_CONSUMPTION'
+      TABLES
+        xvstat = xvstat
+      EXCEPTIONS
+        OTHERS = 1.
+    REFRESH xvstat.
+
+    "Dequeue material
+    CALL FUNCTION 'DEQUEUE_EMMARCE'
+      EXPORTING
+        matnr = mver_ch-matnr
+        werks = mver_ch-werks.
+  ENDLOOP.
+  NEW-LINE.
+  WRITE: 'End'.
+
+*---------------------------------------------------------------------*
+*       FORM confirm_step                                             *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  L_F_TITEL                                                     *
+*---------------------------------------------------------------------*
+FORM confirm_step
+           USING     l_f_titel.
+
+  DATA flag_answer TYPE c.
+
+  "Only in dialog
+  CHECK sy-batch = space.
+
+  "ONLY SAP
+  CALL FUNCTION 'POPUP_TO_CONFIRM_STEP'
+    EXPORTING
+      textline1 = 'This report must only be used by SAP!'
+      textline2 = 'Continue?'
+      titel     = l_f_titel
+    IMPORTING
+      answer    = flag_answer.
+
+  "Go on when the user confirmed
+  CASE    flag_answer.
+    WHEN  'J'.
+      "continue
+    WHEN  OTHERS.
+      STOP.
+  ENDCASE.
+
+ENDFORM.                    "confirm_step
+*&---------------------------------------------------------------------*
+*&      Form  CLEAR_MVER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM clear_mver .
+
+  CLEAR blank.
+  UPDATE mver
+   SET gsv01 = blank
+       gsv02 = blank
+       gsv03 = blank
+       gsv04 = blank
+       gsv05 = blank
+       gsv06 = blank
+       gsv07 = blank
+       gsv08 = blank
+       gsv09 = blank
+       gsv10 = blank
+       gsv11 = blank
+       gsv12 = blank
+       gsv13 = blank
+       unv01 = blank
+       unv02 = blank
+       unv03 = blank
+       unv04 = blank
+       unv05 = blank
+       unv06 = blank
+       unv07 = blank
+       unv08 = blank
+       unv09 = blank
+       unv10 = blank
+       unv11 = blank
+       unv12 = blank
+       unv13 = blank
+       mgv01 = blank
+       mgv02 = blank
+       mgv03 = blank
+       mgv04 = blank
+       mgv05 = blank
+       mgv06 = blank
+       mgv07 = blank
+       mgv08 = blank
+       mgv09 = blank
+       mgv10 = blank
+       mgv11 = blank
+       mgv12 = blank
+       mgv13 = blank
+       muv01 = blank
+       muv02 = blank
+       muv03 = blank
+       muv04 = blank
+       muv05 = blank
+       muv06 = blank
+       muv07 = blank
+       muv08 = blank
+       muv09 = blank
+       muv10 = blank
+       muv11 = blank
+       muv12 = blank
+       muv13 = blank
+       perkz = p_perkz
+     WHERE
+      matnr = mver_ch-matnr AND
+      werks = mver_ch-werks AND
+      gjahr = '2015'.
+*
+  CLEAR blank.
+  UPDATE mver
+   SET gsv01 = blank
+       gsv02 = blank
+       gsv03 = blank
+       gsv04 = blank
+       gsv05 = blank
+       gsv06 = blank
+       gsv07 = blank
+       gsv08 = blank
+       gsv09 = blank
+       gsv10 = blank
+       gsv11 = blank
+       gsv12 = blank
+       gsv13 = blank
+       unv01 = blank
+       unv02 = blank
+       unv03 = blank
+       unv04 = blank
+       unv05 = blank
+       unv06 = blank
+       unv07 = blank
+       unv08 = blank
+       unv09 = blank
+       unv10 = blank
+       unv11 = blank
+       unv12 = blank
+       unv13 = blank
+       mgv01 = blank
+       mgv02 = blank
+       mgv03 = blank
+       mgv04 = blank
+       mgv05 = blank
+       mgv06 = blank
+       mgv07 = blank
+       mgv08 = blank
+       mgv09 = blank
+       mgv10 = blank
+       mgv11 = blank
+       mgv12 = blank
+       mgv13 = blank
+       muv01 = blank
+       muv02 = blank
+       muv03 = blank
+       muv04 = blank
+       muv05 = blank
+       muv06 = blank
+       muv07 = blank
+       muv08 = blank
+       muv09 = blank
+       muv10 = blank
+       muv11 = blank
+       muv12 = blank
+       muv13 = blank
+        perkz = p_perkz
+     WHERE
+      matnr = mver_ch-matnr AND
+      werks = mver_ch-werks AND
+      gjahr = '2016'.
+  CLEAR blank.
+  UPDATE mver
+   SET gsv01 = blank
+       gsv02 = blank
+       gsv03 = blank
+       gsv04 = blank
+       gsv05 = blank
+       gsv06 = blank
+       gsv07 = blank
+       gsv08 = blank
+       gsv09 = blank
+       gsv10 = blank
+       gsv11 = blank
+       gsv12 = blank
+       gsv13 = blank
+       unv01 = blank
+       unv02 = blank
+       unv03 = blank
+       unv04 = blank
+       unv05 = blank
+       unv06 = blank
+       unv07 = blank
+       unv08 = blank
+       unv09 = blank
+       unv10 = blank
+       unv11 = blank
+       unv12 = blank
+       unv13 = blank
+       mgv01 = blank
+       mgv02 = blank
+       mgv03 = blank
+       mgv04 = blank
+       mgv05 = blank
+       mgv06 = blank
+       mgv07 = blank
+       mgv08 = blank
+       mgv09 = blank
+       mgv10 = blank
+       mgv11 = blank
+       mgv12 = blank
+       mgv13 = blank
+       muv01 = blank
+       muv02 = blank
+       muv03 = blank
+       muv04 = blank
+       muv05 = blank
+       muv06 = blank
+       muv07 = blank
+       muv08 = blank
+       muv09 = blank
+       muv10 = blank
+       muv11 = blank
+       muv12 = blank
+       muv13 = blank
+        perkz = p_perkz
+     WHERE
+      matnr = mver_ch-matnr AND
+      werks = mver_ch-werks AND
+      gjahr = '2017'.
+  CLEAR blank.
+  UPDATE mver
+   SET gsv01 = blank
+       gsv02 = blank
+       gsv03 = blank
+       gsv04 = blank
+       gsv05 = blank
+       gsv06 = blank
+       gsv07 = blank
+       gsv08 = blank
+       gsv09 = blank
+       gsv10 = blank
+       gsv11 = blank
+       gsv12 = blank
+       gsv13 = blank
+       unv01 = blank
+       unv02 = blank
+       unv03 = blank
+       unv04 = blank
+       unv05 = blank
+       unv06 = blank
+       unv07 = blank
+       unv08 = blank
+       unv09 = blank
+       unv10 = blank
+       unv11 = blank
+       unv12 = blank
+       unv13 = blank
+       mgv01 = blank
+       mgv02 = blank
+       mgv03 = blank
+       mgv04 = blank
+       mgv05 = blank
+       mgv06 = blank
+       mgv07 = blank
+       mgv08 = blank
+       mgv09 = blank
+       mgv10 = blank
+       mgv11 = blank
+       mgv12 = blank
+       mgv13 = blank
+       muv01 = blank
+       muv02 = blank
+       muv03 = blank
+       muv04 = blank
+       muv05 = blank
+       muv06 = blank
+       muv07 = blank
+       muv08 = blank
+       muv09 = blank
+       muv10 = blank
+       muv11 = blank
+       muv12 = blank
+       muv13 = blank
+        perkz = p_perkz
+     WHERE
+      matnr = mver_ch-matnr AND
+      werks = mver_ch-werks AND
+      gjahr = '2018'.
+  CLEAR blank.
+  UPDATE mver
+   SET gsv01 = blank
+       gsv02 = blank
+       gsv03 = blank
+       gsv04 = blank
+       gsv05 = blank
+       gsv06 = blank
+       gsv07 = blank
+       gsv08 = blank
+       gsv09 = blank
+       gsv10 = blank
+       gsv11 = blank
+       gsv12 = blank
+       gsv13 = blank
+       unv01 = blank
+       unv02 = blank
+       unv03 = blank
+       unv04 = blank
+       unv05 = blank
+       unv06 = blank
+       unv07 = blank
+       unv08 = blank
+       unv09 = blank
+       unv10 = blank
+       unv11 = blank
+       unv12 = blank
+       unv13 = blank
+       mgv01 = blank
+       mgv02 = blank
+       mgv03 = blank
+       mgv04 = blank
+       mgv05 = blank
+       mgv06 = blank
+       mgv07 = blank
+       mgv08 = blank
+       mgv09 = blank
+       mgv10 = blank
+       mgv11 = blank
+       mgv12 = blank
+       mgv13 = blank
+       muv01 = blank
+       muv02 = blank
+       muv03 = blank
+       muv04 = blank
+       muv05 = blank
+       muv06 = blank
+       muv07 = blank
+       muv08 = blank
+       muv09 = blank
+       muv10 = blank
+       muv11 = blank
+       muv12 = blank
+       muv13 = blank
+        perkz = p_perkz
+     WHERE
+      matnr = mver_ch-matnr AND
+      werks = mver_ch-werks AND
+      gjahr = '2019'.
+  CLEAR blank.
+  UPDATE mver
+   SET gsv01 = blank
+       gsv02 = blank
+       gsv03 = blank
+       gsv04 = blank
+       gsv05 = blank
+       gsv06 = blank
+       gsv07 = blank
+       gsv08 = blank
+       gsv09 = blank
+       gsv10 = blank
+       gsv11 = blank
+       gsv12 = blank
+       gsv13 = blank
+       unv01 = blank
+       unv02 = blank
+       unv03 = blank
+       unv04 = blank
+       unv05 = blank
+       unv06 = blank
+       unv07 = blank
+       unv08 = blank
+       unv09 = blank
+       unv10 = blank
+       unv11 = blank
+       unv12 = blank
+       unv13 = blank
+       mgv01 = blank
+       mgv02 = blank
+       mgv03 = blank
+       mgv04 = blank
+       mgv05 = blank
+       mgv06 = blank
+       mgv07 = blank
+       mgv08 = blank
+       mgv09 = blank
+       mgv10 = blank
+       mgv11 = blank
+       mgv12 = blank
+       mgv13 = blank
+       muv01 = blank
+       muv02 = blank
+       muv03 = blank
+       muv04 = blank
+       muv05 = blank
+       muv06 = blank
+       muv07 = blank
+       muv08 = blank
+       muv09 = blank
+       muv10 = blank
+       muv11 = blank
+       muv12 = blank
+       muv13 = blank
+        perkz = p_perkz
+     WHERE
+      matnr = mver_ch-matnr AND
+      werks = mver_ch-werks AND
+      gjahr = '2020'.
+  IF sy-subrc = 0.
+    COMMIT WORK.
+  ELSEIF mrp_area = 'X' AND mver_ch-muv13 = '123.456'.
+*   mver is dummy only, DVER is relevant
+  ELSE.
+*    MESSAGE a895(m7) WITH 'MVER could not be refreshed'.
+    CLEAR mver.
+    mver-matnr = mver_ch-matnr.
+    mver-werks = mver_ch-werks.
+    mver-gjahr = mver_ch-gjahr.
+    mver-perkz = p_perkz.
+    mver-zahlr = 1.
+    MODIFY mver.
+  ENDIF.
+
+ENDFORM.                    " CLEAR_MVER
+*&---------------------------------------------------------------------*
+*&      Form  CLEAR_DVER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM clear_dver .
+
+  DATA: lt_mdma TYPE TABLE OF mdma.
+  DATA: ls_mdma TYPE          mdma.
+  DATA: ls_gjahr LIKE dver-gjahr.
+
+  "get all MRP areas assigned to the material and plant
+  SELECT berid FROM mdma INTO CORRESPONDING FIELDS OF TABLE lt_mdma
+   WHERE matnr = mver_ch-matnr
+     AND werks = mver_ch-werks.
+  IF sy-subrc = 0.
+    LOOP AT lt_mdma INTO ls_mdma.
+      SELECT SINGLE gjahr FROM dver INTO ls_gjahr
+        WHERE
+          matnr = mver_ch-matnr AND
+          berid = ls_mdma-berid AND
+          gjahr = mver_ch-gjahr.
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+      CLEAR blank.
+      UPDATE dver
+       SET gsv01 = blank
+           gsv02 = blank
+           gsv03 = blank
+           gsv04 = blank
+           gsv05 = blank
+           gsv06 = blank
+           gsv07 = blank
+           gsv08 = blank
+           gsv09 = blank
+           gsv10 = blank
+           gsv11 = blank
+           gsv12 = blank
+           gsv13 = blank
+           unv01 = blank
+           unv02 = blank
+           unv03 = blank
+           unv04 = blank
+           unv05 = blank
+           unv06 = blank
+           unv07 = blank
+           unv08 = blank
+           unv09 = blank
+           unv10 = blank
+           unv11 = blank
+           unv12 = blank
+           unv13 = blank
+           mgv01 = blank
+           mgv02 = blank
+           mgv03 = blank
+           mgv04 = blank
+           mgv05 = blank
+           mgv06 = blank
+           mgv07 = blank
+           mgv08 = blank
+           mgv09 = blank
+           mgv10 = blank
+           mgv11 = blank
+           mgv12 = blank
+           mgv13 = blank
+           muv01 = blank
+           muv02 = blank
+           muv03 = blank
+           muv04 = blank
+           muv05 = blank
+           muv06 = blank
+           muv07 = blank
+           muv08 = blank
+           muv09 = blank
+           muv10 = blank
+           muv11 = blank
+           muv12 = blank
+           muv13 = blank
+         WHERE
+          matnr = mver_ch-matnr AND
+          berid = ls_mdma-berid AND
+          gjahr = '2015'.
+      CLEAR blank.
+      UPDATE dver
+       SET gsv01 = blank
+           gsv02 = blank
+           gsv03 = blank
+           gsv04 = blank
+           gsv05 = blank
+           gsv06 = blank
+           gsv07 = blank
+           gsv08 = blank
+           gsv09 = blank
+           gsv10 = blank
+           gsv11 = blank
+           gsv12 = blank
+           gsv13 = blank
+           unv01 = blank
+           unv02 = blank
+           unv03 = blank
+           unv04 = blank
+           unv05 = blank
+           unv06 = blank
+           unv07 = blank
+           unv08 = blank
+           unv09 = blank
+           unv10 = blank
+           unv11 = blank
+           unv12 = blank
+           unv13 = blank
+           mgv01 = blank
+           mgv02 = blank
+           mgv03 = blank
+           mgv04 = blank
+           mgv05 = blank
+           mgv06 = blank
+           mgv07 = blank
+           mgv08 = blank
+           mgv09 = blank
+           mgv10 = blank
+           mgv11 = blank
+           mgv12 = blank
+           mgv13 = blank
+           muv01 = blank
+           muv02 = blank
+           muv03 = blank
+           muv04 = blank
+           muv05 = blank
+           muv06 = blank
+           muv07 = blank
+           muv08 = blank
+           muv09 = blank
+           muv10 = blank
+           muv11 = blank
+           muv12 = blank
+           muv13 = blank
+         WHERE
+          matnr = mver_ch-matnr AND
+          berid = ls_mdma-berid AND
+          gjahr = '2016'.
+      CLEAR blank.
+      UPDATE dver
+       SET gsv01 = blank
+           gsv02 = blank
+           gsv03 = blank
+           gsv04 = blank
+           gsv05 = blank
+           gsv06 = blank
+           gsv07 = blank
+           gsv08 = blank
+           gsv09 = blank
+           gsv10 = blank
+           gsv11 = blank
+           gsv12 = blank
+           gsv13 = blank
+           unv01 = blank
+           unv02 = blank
+           unv03 = blank
+           unv04 = blank
+           unv05 = blank
+           unv06 = blank
+           unv07 = blank
+           unv08 = blank
+           unv09 = blank
+           unv10 = blank
+           unv11 = blank
+           unv12 = blank
+           unv13 = blank
+           mgv01 = blank
+           mgv02 = blank
+           mgv03 = blank
+           mgv04 = blank
+           mgv05 = blank
+           mgv06 = blank
+           mgv07 = blank
+           mgv08 = blank
+           mgv09 = blank
+           mgv10 = blank
+           mgv11 = blank
+           mgv12 = blank
+           mgv13 = blank
+           muv01 = blank
+           muv02 = blank
+           muv03 = blank
+           muv04 = blank
+           muv05 = blank
+           muv06 = blank
+           muv07 = blank
+           muv08 = blank
+           muv09 = blank
+           muv10 = blank
+           muv11 = blank
+           muv12 = blank
+           muv13 = blank
+         WHERE
+          matnr = mver_ch-matnr AND
+          berid = ls_mdma-berid AND
+          gjahr = '2017'.
+      CLEAR blank.
+      UPDATE dver
+       SET gsv01 = blank
+           gsv02 = blank
+           gsv03 = blank
+           gsv04 = blank
+           gsv05 = blank
+           gsv06 = blank
+           gsv07 = blank
+           gsv08 = blank
+           gsv09 = blank
+           gsv10 = blank
+           gsv11 = blank
+           gsv12 = blank
+           gsv13 = blank
+           unv01 = blank
+           unv02 = blank
+           unv03 = blank
+           unv04 = blank
+           unv05 = blank
+           unv06 = blank
+           unv07 = blank
+           unv08 = blank
+           unv09 = blank
+           unv10 = blank
+           unv11 = blank
+           unv12 = blank
+           unv13 = blank
+           mgv01 = blank
+           mgv02 = blank
+           mgv03 = blank
+           mgv04 = blank
+           mgv05 = blank
+           mgv06 = blank
+           mgv07 = blank
+           mgv08 = blank
+           mgv09 = blank
+           mgv10 = blank
+           mgv11 = blank
+           mgv12 = blank
+           mgv13 = blank
+           muv01 = blank
+           muv02 = blank
+           muv03 = blank
+           muv04 = blank
+           muv05 = blank
+           muv06 = blank
+           muv07 = blank
+           muv08 = blank
+           muv09 = blank
+           muv10 = blank
+           muv11 = blank
+           muv12 = blank
+           muv13 = blank
+         WHERE
+          matnr = mver_ch-matnr AND
+          berid = ls_mdma-berid AND
+          gjahr = '2018'.
+      CLEAR blank.
+      UPDATE dver
+       SET gsv01 = blank
+           gsv02 = blank
+           gsv03 = blank
+           gsv04 = blank
+           gsv05 = blank
+           gsv06 = blank
+           gsv07 = blank
+           gsv08 = blank
+           gsv09 = blank
+           gsv10 = blank
+           gsv11 = blank
+           gsv12 = blank
+           gsv13 = blank
+           unv01 = blank
+           unv02 = blank
+           unv03 = blank
+           unv04 = blank
+           unv05 = blank
+           unv06 = blank
+           unv07 = blank
+           unv08 = blank
+           unv09 = blank
+           unv10 = blank
+           unv11 = blank
+           unv12 = blank
+           unv13 = blank
+           mgv01 = blank
+           mgv02 = blank
+           mgv03 = blank
+           mgv04 = blank
+           mgv05 = blank
+           mgv06 = blank
+           mgv07 = blank
+           mgv08 = blank
+           mgv09 = blank
+           mgv10 = blank
+           mgv11 = blank
+           mgv12 = blank
+           mgv13 = blank
+           muv01 = blank
+           muv02 = blank
+           muv03 = blank
+           muv04 = blank
+           muv05 = blank
+           muv06 = blank
+           muv07 = blank
+           muv08 = blank
+           muv09 = blank
+           muv10 = blank
+           muv11 = blank
+           muv12 = blank
+           muv13 = blank
+         WHERE
+          matnr = mver_ch-matnr AND
+          berid = ls_mdma-berid AND
+          gjahr = '2019'.
+      CLEAR blank.
+      UPDATE dver
+       SET gsv01 = blank
+           gsv02 = blank
+           gsv03 = blank
+           gsv04 = blank
+           gsv05 = blank
+           gsv06 = blank
+           gsv07 = blank
+           gsv08 = blank
+           gsv09 = blank
+           gsv10 = blank
+           gsv11 = blank
+           gsv12 = blank
+           gsv13 = blank
+           unv01 = blank
+           unv02 = blank
+           unv03 = blank
+           unv04 = blank
+           unv05 = blank
+           unv06 = blank
+           unv07 = blank
+           unv08 = blank
+           unv09 = blank
+           unv10 = blank
+           unv11 = blank
+           unv12 = blank
+           unv13 = blank
+           mgv01 = blank
+           mgv02 = blank
+           mgv03 = blank
+           mgv04 = blank
+           mgv05 = blank
+           mgv06 = blank
+           mgv07 = blank
+           mgv08 = blank
+           mgv09 = blank
+           mgv10 = blank
+           mgv11 = blank
+           mgv12 = blank
+           mgv13 = blank
+           muv01 = blank
+           muv02 = blank
+           muv03 = blank
+           muv04 = blank
+           muv05 = blank
+           muv06 = blank
+           muv07 = blank
+           muv08 = blank
+           muv09 = blank
+           muv10 = blank
+           muv11 = blank
+           muv12 = blank
+           muv13 = blank
+         WHERE
+          matnr = mver_ch-matnr AND
+          berid = ls_mdma-berid AND
+          gjahr = '2020'.
+      IF sy-subrc = 0.
+        COMMIT WORK.
+      ELSE.
+        MESSAGE a895(m7) WITH 'DVER could not be refreshed'.
+      ENDIF.
+
+    ENDLOOP.
+  ELSE.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    " CLEAR_DVER

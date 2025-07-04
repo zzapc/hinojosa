@@ -1,0 +1,928 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0061_F01
+*&---------------------------------------------------------------------*
+FORM obtener_lotes_sin_etiqueta.
+
+  DATA: lt_41      TYPE STANDARD TABLE OF ztpp0041,
+        lw_no_fict TYPE char1.
+
+  CLEAR: gt_lotes_sin_etiq[].
+
+  SELECT m~matnr , k~maktx , m~charg , m~clabs , m~lgort , s~lifnr , l~name1 , s~budat_mkpf
+    INTO TABLE @DATA(lt_mchb)
+    FROM mchb AS m
+    INNER JOIN mseg AS s ON s~charg = m~charg
+    INNER JOIN lfa1 AS l ON s~lifnr = l~lifnr
+    INNER JOIN makt AS k ON k~matnr = m~matnr   AND
+                            k~spras = @sy-langu
+    WHERE m~werks = @p_werks AND
+          m~lgort = @p_lgort AND
+          m~clabs > 0 AND
+          s~bwart = '101'
+    ORDER BY m~charg.
+
+  CLEAR lw_no_fict.
+  LOOP AT lt_mchb INTO DATA(ls_mchb).
+
+    APPEND INITIAL LINE TO gt_lotes_sin_etiq ASSIGNING FIELD-SYMBOL(<fs>).
+    CLEAR lt_41[].
+    CALL METHOD zclpp_recetas_reparto_pulper=>obtener_lotes_fict_dsd_sin_eti
+      EXPORTING
+        i_werks     = p_werks
+        i_matnr     = ls_mchb-matnr
+        i_kgs       = ls_mchb-clabs
+        i_lgort     = ls_mchb-lgort
+        i_lifnr     = ls_mchb-lifnr
+      IMPORTING
+        ot_ztpp0041 = lt_41.
+
+    IF lines( lt_41 ) > 0.
+      lw_no_fict = 'X'.
+      <fs>-icon         = '@08@'. " con lotes ficticios
+    ELSE.
+      <fs>-icon         = '@0A@'. " sin lotes ficticios
+    ENDIF.
+
+    <fs>-matnr        = ls_mchb-matnr.
+    <fs>-maktx        = ls_mchb-maktx.
+    <fs>-charg        = ls_mchb-charg.
+    <fs>-clabs        = ls_mchb-clabs.
+    <fs>-meins        = 'KG'.
+    <fs>-lifnr        = ls_mchb-lifnr.
+    <fs>-nom_prov     = ls_mchb-name1.
+    <fs>-fecha_compra = ls_mchb-budat_mkpf.
+    <fs>-antiguedad   = sy-datum - <fs>-fecha_compra.
+
+
+    "Calculamos la diferencia de lotes
+    DATA vl_num_lote TYPE int4.
+    DATA vl_num_lote_hermano TYPE int4.
+
+    DATA(vl_num_lote_c) = <fs>-charg+5.
+    IF vl_num_lote_c CO '0123456789 '.
+      vl_num_lote = vl_num_lote_c.
+
+      CLEAR lt_41.
+      CALL METHOD zclpp_recetas_reparto_pulper=>obtener_lotes_herm_dsd_sinetiq
+        EXPORTING
+          i_werks     = p_werks
+          i_matnr     = ls_mchb-matnr
+          i_kgs       = ls_mchb-clabs
+          i_lgort     = ls_mchb-lgort
+          i_lifnr     = ls_mchb-lifnr
+        IMPORTING
+          ot_ztpp0041 = lt_41.
+
+
+      LOOP AT lt_41 ASSIGNING FIELD-SYMBOL(<fs_41>).
+        DATA(vl_num_lote_hermano_c) = <fs_41>-charg+5.
+        CHECK vl_num_lote_hermano_c CO '0123456789 '.
+
+        vl_num_lote_hermano = vl_num_lote_hermano_c.
+        DATA(vl_diferencia) = abs( vl_num_lote_hermano - vl_num_lote ).
+        CHECK vl_diferencia <> 0.
+
+        IF <fs>-diferencia_lotes = 0 OR <fs>-diferencia_lotes > vl_diferencia.
+          <fs>-charg_hermano      = <fs_41>-charg.
+          <fs>-id_receta_hermano  = <fs_41>-id_receta.
+          <fs>-diferencia_lotes   = vl_diferencia.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+  ENDLOOP.
+
+* Si no hay "semaforos verdes" y g_sin_ficticios es blancos, marcamos IND_SIN_ETIQ = '9'.
+  IF lw_no_fict = ' ' AND g_sin_ficticios = ' '.
+    CALL METHOD zclpp_recetas_reparto_pulper=>marcar_ficticios_sin_pareja
+      EXPORTING
+        i_werks     = p_werks
+        i_ubicacion = p_lgort.
+
+    g_sin_ficticios = 'X'.
+  ENDIF.
+
+ENDFORM.
+
+
+FORM tuning_alv_100_sin.
+
+  DATA: lr_columns  TYPE REF TO cl_salv_columns,
+        lr_cols_tab TYPE REF TO cl_salv_columns_table,
+        lr_column   TYPE REF TO cl_salv_column.
+
+  DATA: lr_events    TYPE REF TO cl_salv_events_table,
+        lr_functions TYPE REF TO cl_salv_functions_list,
+        l_text       TYPE string.
+
+  lr_columns = gs_dyn100-alv_sin->get_columns( ).
+  lr_cols_tab = gs_dyn100-alv_sin->get_columns( ).
+  lr_columns->set_optimize( 'X' ).
+
+  DATA(gr_layout) = gs_dyn100-alv_sin->get_layout( ).
+  key-report = sy-repid.
+  gr_layout->set_key( key ).
+  gr_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  gr_layout->set_default( abap_true ).
+
+*ind_lot_herm
+  TRY.
+      lr_column = lr_columns->get_column( 'IND_LOT_HERM' ).
+      lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+      lr_column = lr_columns->get_column( 'MAKTX' ).
+      lr_column->set_short_text( 'Desc.Mat' ).
+      lr_column->set_medium_text( 'Descripción Material' ).
+      lr_column->set_long_text( 'Descripción Material' ).
+
+      lr_column = lr_columns->get_column( 'CLABS' ).
+      lr_column->set_short_text( 'Peso' ).
+      lr_column->set_medium_text( 'Peso' ).
+      lr_column->set_long_text( 'Peso' ).
+
+      lr_column = lr_columns->get_column( 'MEINS' ).
+      lr_column->set_short_text( 'UMB' ).
+      lr_column->set_medium_text( 'UMB' ).
+      lr_column->set_long_text( 'UMB' ).
+
+      lr_column = lr_columns->get_column( 'LIFNR' ).
+      lr_column->set_short_text( 'Proveedor' ).
+      lr_column->set_medium_text( 'Proveedor' ).
+      lr_column->set_long_text( 'Proveedor' ).
+
+      lr_column = lr_columns->get_column( 'NOM_PROV' ).
+      lr_column->set_short_text( 'Nom.prov' ).
+      lr_column->set_medium_text( 'Nombre proveedor' ).
+      lr_column->set_long_text( 'Nombre proveedor' ).
+
+      lr_column = lr_columns->get_column( 'FECHA_COMPRA' ).
+      lr_column->set_short_text( 'F.compra' ).
+      lr_column->set_medium_text( 'Fecha compra' ).
+      lr_column->set_long_text( 'Fecha compra' ).
+
+      lr_column = lr_columns->get_column( 'ANTIGUEDAD' ).
+      lr_column->set_short_text( 'Antigüedad' ).
+      lr_column->set_medium_text( 'Antigüedad' ).
+      lr_column->set_long_text( 'Antigüedad' ).
+
+      lr_column = lr_columns->get_column( 'CHARG_HERMANO' ).
+      lr_column->set_short_text( CONV #( 'Lote her.'(004) ) ).
+      lr_column->set_medium_text( CONV #( 'Lote hermano'(006) ) ).
+      lr_column->set_long_text( CONV #( 'Lote hermano'(006) ) ).
+
+      lr_column = lr_columns->get_column( 'DIFERENCIA_LOTES' ).
+      lr_column->set_short_text( CONV #( 'Dif. lotes'(007) ) ).
+      lr_column->set_medium_text( CONV #( 'Diferencia lotes'(008) ) ).
+      lr_column->set_long_text( CONV #( 'Diferencia lotes'(008) ) ).
+
+    CATCH cx_root .
+  ENDTRY.
+
+
+  lr_functions = gs_dyn100-alv_sin->get_functions( ).
+  lr_functions->set_all( 'X' ).
+
+  TRY.
+      l_text = text-b03.
+      lr_functions->add_function(
+        name     = 'SINET'
+        icon     = '@7E@'
+        text     = l_text
+        tooltip  = l_text
+        position = if_salv_c_function_position=>right_of_salv_functions ).
+    CATCH cx_salv_wrong_call cx_salv_existing.
+  ENDTRY.
+
+  TRY.
+      l_text = text-b04. "Buscar lote hermano
+      lr_functions->add_function(
+        name     = 'HERM'
+        icon     = '@13@'
+        text     = l_text
+        tooltip  = l_text
+        position = if_salv_c_function_position=>right_of_salv_functions ).
+    CATCH cx_salv_wrong_call cx_salv_existing.
+  ENDTRY.
+
+  TRY.
+      l_text = text-b02.
+      lr_functions->add_function(
+        name     = 'REGU'
+        icon     = '@EN@'
+        text     = l_text
+        tooltip  = l_text
+        position = if_salv_c_function_position=>right_of_salv_functions ).
+
+      lr_functions->add_function(
+        name     = 'CONSUMIR'
+        icon     = CONV #( icon_operation )
+        text     = 'Consumir'
+        tooltip  = 'Consumir'
+        position = if_salv_c_function_position=>right_of_salv_functions ).
+
+
+    CATCH cx_salv_wrong_call cx_salv_existing.
+  ENDTRY.
+
+
+
+  CREATE OBJECT gr_events.
+  lr_events = gs_dyn100-alv_sin->get_event( ).
+
+  SET HANDLER gr_events->on_user_command FOR lr_events.
+
+  DATA: lr_selections TYPE REF TO cl_salv_selections,
+        lt_rows       TYPE salv_t_row,
+        lt_column     TYPE salv_t_column,
+        ls_cell       TYPE salv_s_cell.
+
+  lr_selections = gs_dyn100-alv_sin->get_selections( ).
+
+  lr_selections->set_selection_mode( if_salv_c_selection_mode=>multiple ).
+
+ENDFORM.
+
+
+FORM handle_user_command100 USING i_ucomm TYPE salv_de_function.
+
+  DATA: lt_rows TYPE salv_t_row.
+
+  DATA: lr_selections TYPE REF TO cl_salv_selections.
+
+  lr_selections = gs_dyn100-alv_sin->get_selections( ).
+  lt_rows       = lr_selections->get_selected_rows( ).
+
+  IF lines( lt_rows ) <> 1.
+    MESSAGE i345(zpp). "Seleccione un único lote para tratarlo
+    EXIT.
+  ENDIF.
+
+  g_row = lt_rows[ 1 ].
+
+
+  CASE i_ucomm.
+
+    WHEN 'SINET'.
+      CLEAR i_ucomm.
+      IF gt_lotes_sin_etiq[ g_row ]-icon <> '@08@'.
+        MESSAGE i346(zpp). "No existen lotes sin etiqueta pendientes de vincular
+        EXIT.
+      ENDIF.
+
+      PERFORM mostrar_ficticios USING g_row.
+
+    WHEN 'HERM'.
+      CLEAR i_ucomm.
+      IF gt_lotes_sin_etiq[ g_row ]-icon <> '@0A@'. " or gt_lotes_sin_etiq[ g_row ]-ind_lot_herm <> 'X'.
+        MESSAGE i347(zpp). "Existen lotes sin etiqueta pendientes de vincular.
+        EXIT.
+      ENDIF.
+
+      PERFORM mostrar_hermanos USING g_row.
+
+    WHEN 'REGU'.
+      CLEAR i_ucomm.
+      IF gt_lotes_sin_etiq[ g_row ]-icon <> '@0A@'.
+        MESSAGE i347(zpp). "Existen lotes sin etiqueta pendientes de vincular.
+        EXIT.
+      ENDIF.
+
+      PERFORM regularizar_lote USING g_row 'X'.
+
+    WHEN 'CONSUMIR'.
+      CLEAR i_ucomm.
+      IF gt_lotes_sin_etiq[ g_row ]-icon <> '@0A@'.
+        MESSAGE i347(zpp). "Existen lotes sin etiqueta pendientes de vincular.
+        EXIT.
+      ENDIF.
+
+      PERFORM consumir_lote USING g_row.
+
+
+    WHEN OTHERS.
+  ENDCASE.
+
+ENDFORM.
+
+FORM mostrar_ficticios USING p_row TYPE int4.
+
+  DATA: lt_selected_rows TYPE salv_t_row,
+        lv_item_pointer  TYPE i.
+
+  CLEAR gs_lote_selec.
+  gs_lote_selec = gt_lotes_sin_etiq[ p_row ].
+
+  CALL METHOD zclpp_recetas_reparto_pulper=>obtener_lotes_fict_dsd_sin_eti
+    EXPORTING
+      i_werks     = gs_dyn100-werks
+      i_matnr     = gt_lotes_sin_etiq[ p_row ]-matnr
+      i_kgs       = gt_lotes_sin_etiq[ p_row ]-clabs
+      i_lgort     = gs_dyn100-lgort
+      i_lifnr     = gt_lotes_sin_etiq[ p_row ]-lifnr
+    IMPORTING
+      ot_ztpp0041 = DATA(lt_ztpp0041).
+
+
+  CLEAR gt_lotes_ficticios[].
+
+  LOOP AT lt_ztpp0041 INTO DATA(ls_41).
+
+    APPEND INITIAL LINE TO gt_lotes_ficticios ASSIGNING FIELD-SYMBOL(<fs>).
+
+    <fs>-charg         = ls_41-charg.
+    <fs>-charg_her     = ls_41-lote_mp_hermano.
+    <fs>-fecha_ins     = ls_41-fecha_ins.
+    <fs>-hora_ins      = ls_41-hora_ins.
+    <fs>-turno         = ls_41-turno.
+    <fs>-operario      = ls_41-contr_ins.
+    <fs>-id_receta     = ls_41-id_receta.
+
+  ENDLOOP.
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = alv_popup
+        CHANGING
+          t_table      = gt_lotes_ficticios[] ).
+
+    CATCH cx_salv_msg.
+  ENDTRY.
+
+* Titulo ALV
+  gr_display_popup_herm = alv_popup->get_display_settings( ).
+  gr_display_popup_herm->set_list_header( 'Regularizar lotes MP - Lotes lanzados a pulper sin etiqueta' ).
+
+  CLEAR gv_key.
+  gv_key-report         = sy-repid.
+*  lv_key_popup-logical_group  = '1'.
+  gv_key-handle         = '2'.
+  gr_layout = alv_popup->get_layout( ).
+  gr_layout->set_key( gv_key ).
+  gr_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  gr_layout->set_default( abap_true ).
+
+  gr_functions = alv_popup->get_functions( ).
+  gr_functions->set_all( 'X' ).
+
+  TRY.
+      CALL METHOD alv_popup->set_screen_status
+        EXPORTING
+          report        = sy-repid
+          pfstatus      = 'STATUS_POPUP'
+          set_functions = alv_popup->c_functions_all.
+  ENDTRY.
+
+  IF alv_popup IS BOUND.
+
+* Assign selection mode: Single
+    DATA    lr_selections2            TYPE REF TO cl_salv_selections.
+    lr_selections2 = alv_popup->get_selections( ).
+    lr_selections2->set_selection_mode( if_salv_c_selection_mode=>single ).
+
+*   Get the event object
+    DATA: lo_events TYPE REF TO cl_salv_events_table.
+    lo_events = alv_popup->get_event( ).
+*
+*   Instantiate the event handler object
+    CREATE OBJECT gr_events_popup.
+    SET HANDLER gr_events_popup->on_user_command_mp        FOR lo_events.
+
+
+* Formateo de columnas.
+    DATA:
+      lo_column  TYPE REF TO cl_salv_column,
+      lo_columns TYPE REF TO cl_salv_columns_table.
+
+    TRY.
+        lo_columns = alv_popup->get_columns( ).
+        lo_column = lo_columns->get_column( 'CHARG' ).
+        lo_column->set_short_text( 'L.ficticio' ).
+        lo_column->set_medium_text( 'Lote ficticio' ).
+        lo_column->set_long_text( 'Lote ficticio' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'CHARG_HER' ).
+        lo_column->set_short_text( 'L. hermano' ).
+        lo_column->set_medium_text( 'Lote hermano' ).
+        lo_column->set_long_text( 'Lote hermano' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'FECHA_INS' ).
+        lo_column->set_short_text( 'F.traspaso' ).
+        lo_column->set_medium_text( 'Fecha traspaso' ).
+        lo_column->set_long_text( 'Fecha traspaso' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'HORA_INS' ).
+        lo_column->set_short_text( 'H.traspaso' ).
+        lo_column->set_medium_text( 'Hora traspaso' ).
+        lo_column->set_long_text( 'Hora traspaso' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'TURNO' ).
+        lo_column->set_short_text( 'Turno' ).
+        lo_column->set_medium_text( 'Turno' ).
+        lo_column->set_long_text( 'Turno' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'OPERARIO' ).
+        lo_column->set_short_text( 'Operario' ).
+        lo_column->set_medium_text( 'Operario' ).
+        lo_column->set_long_text( 'Operario' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'ID_RECETA' ).
+        lo_column->set_short_text( 'Receta' ).
+        lo_column->set_medium_text( 'Receta' ).
+        lo_column->set_long_text( 'Receta' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    alv_popup->set_screen_popup(
+      start_column = 50      "i_start_column
+      end_column   = 152    "i_end_column
+      start_line   = 10      "i_start_line
+      end_line     = 20 ).  "i_end_line
+
+    alv_popup->display( ).
+
+  ELSE.
+*   mark an already marked item again
+    CLEAR lt_selected_rows.
+    lr_selections2 = alv_popup->get_selections( ).
+    lr_selections2->set_selected_rows( lt_selected_rows ).
+    IF NOT lv_item_pointer IS INITIAL.
+      APPEND lv_item_pointer TO lt_selected_rows.
+      lr_selections2->set_selected_rows( lt_selected_rows ).
+    ENDIF.
+
+*   refresh table display
+    alv_popup->refresh( ).
+  ENDIF.
+
+ENDFORM.
+
+FORM mostrar_hermanos USING p_row TYPE int4.
+
+  DATA: lt_selected_rows TYPE salv_t_row,
+        lv_item_pointer  TYPE i.
+
+  CLEAR gs_lote_selec.
+  gs_lote_selec = gt_lotes_sin_etiq[ p_row ].
+
+  CALL METHOD zclpp_recetas_reparto_pulper=>obtener_lotes_herm_dsd_sinetiq
+    EXPORTING
+      i_werks     = gs_dyn100-werks
+      i_matnr     = gt_lotes_sin_etiq[ p_row ]-matnr
+      i_kgs       = gt_lotes_sin_etiq[ p_row ]-clabs
+      i_lgort     = gs_dyn100-lgort  "
+      i_lifnr     = gt_lotes_sin_etiq[ p_row ]-lifnr
+    IMPORTING
+      ot_ztpp0041 = DATA(lt_ztpp0041).
+
+  IF lt_ztpp0041 IS INITIAL.
+    MESSAGE i349(zpp). "No se han encontrado lotes germanos del mismo peso y proveedor.
+    EXIT.
+  ENDIF.
+  CLEAR gt_lotes_hermanos[].
+
+  LOOP AT lt_ztpp0041 INTO DATA(ls_41).
+
+    APPEND INITIAL LINE TO gt_lotes_hermanos ASSIGNING FIELD-SYMBOL(<fs_herm>).
+
+    <fs_herm>-charg         = ls_41-charg.
+*    <fs>-charg_her     = ls_41-lote_mp_hermano.
+    <fs_herm>-fecha_ins     = ls_41-fecha_ins.
+    <fs_herm>-hora_ins      = ls_41-hora_ins.
+    <fs_herm>-turno         = ls_41-turno.
+    <fs_herm>-operario      = ls_41-contr_ins.
+    <fs_herm>-id_receta     = ls_41-id_receta.
+
+  ENDLOOP.
+
+  SORT gt_lotes_hermanos BY charg ASCENDING.
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = alv_popup_herm
+        CHANGING
+          t_table      = gt_lotes_hermanos[] ).
+
+    CATCH cx_salv_msg.
+  ENDTRY.
+
+* Titulo ALV
+  gr_display_popup_herm = alv_popup_herm->get_display_settings( ).
+  gr_display_popup_herm->set_list_header( 'Búsqueda de lotes hermanos por peso y proveedor' ).
+
+  CLEAR gv_key.
+  gv_key-report         = sy-repid.
+  gv_key-handle         = '2'.
+  gr_layout_herm = alv_popup_herm->get_layout( ).
+  gr_layout_herm->set_key( gv_key ).
+  gr_layout_herm->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  gr_layout_herm->set_default( abap_true ).
+
+  gr_functions_herm = alv_popup_herm->get_functions( ).
+  gr_functions_herm->set_all( 'X' ).
+
+  TRY.
+      CALL METHOD alv_popup_herm->set_screen_status
+        EXPORTING
+          report        = sy-repid
+          pfstatus      = 'STATUS_HERMANO'
+**          pfstatus      = 'STATUS_POPUP_HERM'
+          set_functions = alv_popup_herm->c_functions_all.
+    CATCH cx_root .
+  ENDTRY.
+
+
+  IF alv_popup_herm IS BOUND.
+
+* Assign selection mode: Single
+    DATA    lr_selections2            TYPE REF TO cl_salv_selections.
+    lr_selections2 = alv_popup_herm->get_selections( ).
+    lr_selections2->set_selection_mode( if_salv_c_selection_mode=>single ).
+
+*   Get the event object
+*    DATA: lo_events TYPE REF TO cl_salv_events_table.
+    DATA: lo_events_herm TYPE REF TO cl_salv_events_table.
+    lo_events_herm = alv_popup_herm->get_event( ).
+*
+*   Instantiate the event handler object
+    CREATE OBJECT gr_events_popup_herm.
+    SET HANDLER gr_events_popup_herm->on_user_command_herm        FOR lo_events_herm.
+
+
+* Formateo de columnas.
+    DATA:
+      lo_column  TYPE REF TO cl_salv_column,
+      lo_columns TYPE REF TO cl_salv_columns_table.
+
+    TRY.
+        lo_columns = alv_popup_herm->get_columns( ).
+        lo_column = lo_columns->get_column( 'CHARG' ).
+        lo_column->set_short_text( 'Lote MP' ).
+        lo_column->set_medium_text( 'Lote MP' ).
+        lo_column->set_long_text( 'Lote MP' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'CHARG_HER' ).
+        lo_column->set_short_text( 'L. hermano' ).
+        lo_column->set_medium_text( 'Lote hermano' ).
+        lo_column->set_long_text( 'Lote hermano' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'FECHA_INS' ).
+        lo_column->set_short_text( 'F.traspaso' ).
+        lo_column->set_medium_text( 'Fecha traspaso' ).
+        lo_column->set_long_text( 'Fecha traspaso' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'HORA_INS' ).
+        lo_column->set_short_text( 'H.traspaso' ).
+        lo_column->set_medium_text( 'Hora traspaso' ).
+        lo_column->set_long_text( 'Hora traspaso' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'TURNO' ).
+        lo_column->set_short_text( 'Turno' ).
+        lo_column->set_medium_text( 'Turno' ).
+        lo_column->set_long_text( 'Turno' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'OPERARIO' ).
+        lo_column->set_short_text( 'Operario' ).
+        lo_column->set_medium_text( 'Operario' ).
+        lo_column->set_long_text( 'Operario' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    TRY.
+        lo_column = lo_columns->get_column( 'ID_RECETA' ).
+        lo_column->set_short_text( 'Receta' ).
+        lo_column->set_medium_text( 'Receta' ).
+        lo_column->set_long_text( 'Receta' ).
+
+      CATCH cx_root .
+    ENDTRY.
+
+    alv_popup_herm->set_screen_popup(
+      start_column = 50      "i_start_column
+      end_column   = 152    "i_end_column
+      start_line   = 10      "i_start_line
+      end_line     = 20 ).  "i_end_line
+
+    alv_popup_herm->display( ).
+
+  ELSE.
+*   mark an already marked item again
+    CLEAR lt_selected_rows.
+    lr_selections2 = alv_popup_herm->get_selections( ).
+    lr_selections2->set_selected_rows( lt_selected_rows ).
+    IF NOT lv_item_pointer IS INITIAL.
+      APPEND lv_item_pointer TO lt_selected_rows.
+      lr_selections2->set_selected_rows( lt_selected_rows ).
+    ENDIF.
+
+*   refresh table display
+    alv_popup_herm->refresh( ).
+  ENDIF.
+
+ENDFORM.
+
+
+FORM tratar_consumo_mp USING p_row TYPE int4.
+
+  DATA: lv_answer(1) TYPE c,
+        l_msg        TYPE string,
+        l_haydatos   TYPE flag.
+
+  l_msg = |¿Desea consumir el lote { gs_lote_selec-charg } ?|.
+  l_msg = |El lote { gs_lote_selec-charg } se consumirá como su lote hermano { gt_lotes_ficticios[ p_row ]-charg_her }.|.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar              = 'Aviso'
+      text_question         = l_msg
+      text_button_1         = 'Consumir' " 'Aceptar'
+      icon_button_1         = 'ICON_CHECKED' " 'Aceptar'
+      text_button_2         = 'Cancelar' " 'Cancelar'
+      icon_button_2         = 'ICON_CANCEL' " 'Cancelar'
+      default_button        = '2'
+      display_cancel_button = ' '
+    IMPORTING
+      answer                = lv_answer
+    EXCEPTIONS
+      text_not_found        = 1
+      OTHERS                = 2.
+
+  CHECK lv_answer = '1'.
+
+  CALL METHOD zclpp_recetas_reparto_pulper=>consumir_lote_mp
+    EXPORTING
+      i_werks        = p_werks
+      i_receta       = gt_lotes_ficticios[ p_row ]-id_receta
+      i_matnr        = gs_lote_selec-matnr
+      i_fict         = gt_lotes_ficticios[ p_row ]-charg
+      i_sin_etiq     = gs_lote_selec-charg
+      i_lgort_ori    = gs_dyn100-lgort
+      i_cantidad     = gs_lote_selec-clabs
+*     i_operario     =
+*     i_old          = 'X'
+    IMPORTING
+      o_rc           = DATA(l_rc)
+      o_mblnr        = DATA(l_mblnr)
+      o_mjahr        = DATA(l_mjahr)
+      o_message      = DATA(l_bapi_msg)
+      o_lote_hermano = DATA(l_lote_hermano).
+
+  CASE l_rc.
+    WHEN '00'. "Lote repartido OK
+      MESSAGE
+      |Lote { gs_lote_selec-charg } consumido correctamente con el doc. material: { l_mblnr }/{ l_mjahr }.| TYPE 'S'.
+
+      PERFORM obtener_lotes_sin_etiqueta.
+      gs_dyn100-alv_sin->refresh( ).
+    WHEN '01'. "Error en la BAPI
+      MESSAGE |Error en la generación del consumo: { l_bapi_msg }| TYPE 'S' DISPLAY LIKE 'E'.
+      EXIT.
+    WHEN '02'. " NO se encontra reparto en ZPP0043, se regulariza el lote (Transitorio inicialmente, a partir de 2020 debería existir reparto
+*      PERFORM regularizar_lote USING g_row ' ' .
+*      MESSAGE |No se ha encontrado reparto para el lote { gs_lote_selec-charg }, se ha regularizado.| TYPE 'S' DISPLAY LIKE 'E'.
+*      MESSAGE |Lote { gs_lote_selec-charg } sin reparto de consumo de lote hermano. Se regulariza (mov 702).| TYPE 'S' DISPLAY LIKE 'E'.
+      MESSAGE |Lote hermano { l_lote_hermano } sin reparto contra orden. Regularizar más tarde.| TYPE 'S' DISPLAY LIKE 'E'.
+*      PERFORM obtener_lotes_sin_etiqueta.
+*      gs_dyn100-alv_sin->refresh( ).
+    WHEN OTHERS.
+  ENDCASE.
+
+  alv_popup->close_screen( ).
+
+ENDFORM.
+
+FORM generar_hermano USING p_row TYPE int4.
+
+  DATA: l_operario TYPE znombre_oper.
+
+  l_operario = sy-uname.
+
+  CALL METHOD zclpp_consumo_recetas_mp=>generar_lote_hermano
+    EXPORTING
+      i_werks      = p_werks
+      i_id_receta  = gt_lotes_hermanos[ p_row ]-id_receta
+      i_lote       = gt_lotes_hermanos[ p_row ]-charg
+      i_operario   = l_operario
+      i_sw_pis_reg = 'R'.
+*     IMPORTING
+*       o_rc         =
+*       .
+  alv_popup_herm->close_screen( ).
+
+ENDFORM.
+
+
+FORM regularizar_lote USING p_row TYPE int4
+                            p_popup TYPE char01.
+
+  DATA: lv_answer(1) TYPE c,
+        l_msg        TYPE string,
+        l_haydatos   TYPE flag,
+        lt_msg       TYPE wdkmsg_tty,
+        lt_bapiret2  TYPE STANDARD TABLE OF bapiret2.
+
+  IF p_popup = 'X'.
+
+
+
+    l_msg = |¿Desea regularizar el lote { gt_lotes_sin_etiq[ p_row ]-charg } ?|.
+
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        titlebar              = 'Aviso'
+        text_question         = l_msg
+        text_button_1         = 'Regularizar' " 'Aceptar'
+        icon_button_1         = 'ICON_CHECKED' " 'Aceptar'
+        text_button_2         = 'Cancelar' " 'Cancelar'
+        icon_button_2         = 'ICON_CANCEL' " 'Cancelar'
+        default_button        = '2'
+        display_cancel_button = ' '
+      IMPORTING
+        answer                = lv_answer
+      EXCEPTIONS
+        text_not_found        = 1
+        OTHERS                = 2.
+
+    CHECK lv_answer = '1'.
+
+  ENDIF.
+
+  CALL FUNCTION 'ZMP_BATCH_INPUT_MI10'
+    EXPORTING
+      i_werks = gs_dyn100-werks
+      i_lgort = gs_dyn100-lgort
+      i_matnr = gt_lotes_sin_etiq[ p_row ]-matnr
+      i_charg = gt_lotes_sin_etiq[ p_row ]-charg
+    IMPORTING
+      ot_msg  = lt_msg.
+  IF line_exists( lt_msg[ msgtyp = 'E' ] ).
+
+    CALL FUNCTION 'CONVERT_BDCMSGCOLL_TO_BAPIRET2'
+      TABLES
+        imt_bdcmsgcoll = lt_msg[]
+        ext_return     = lt_bapiret2.
+*
+
+*Display messages from BAPIRET2
+    CALL FUNCTION 'RSCRMBW_DISPLAY_BAPIRET2'
+      TABLES
+        it_return = lt_bapiret2.
+*    MESSAGE |Error al regularizar lote. Rc = { l_rc }.| TYPE 'S' DISPLAY LIKE 'E'.
+
+  ELSE.
+    MESSAGE |Lote { gt_lotes_sin_etiq[ p_row ]-charg } regularizado correctamente.| TYPE 'S'.
+
+    PERFORM obtener_lotes_sin_etiqueta.
+    gs_dyn100-alv_sin->refresh( ).
+
+  ENDIF.
+  .
+
+
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  CONSUMIR_LOTE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_ROW  text
+*----------------------------------------------------------------------*
+FORM consumir_lote  USING vp_row.
+  DATA: lv_answer(1) TYPE c,
+        l_msg        TYPE string.
+
+
+  READ TABLE gt_lotes_sin_etiq ASSIGNING FIELD-SYMBOL(<fs_lote_selec>) INDEX vp_row.
+  CHECK sy-subrc = 0.
+
+
+  l_msg = |El lote { <fs_lote_selec>-charg } se consumirá como su lote hermano { <fs_lote_selec>-charg_hermano }.|.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar              = 'Aviso'
+      text_question         = l_msg
+      text_button_1         = 'Consumir' " 'Aceptar'
+      icon_button_1         = 'ICON_CHECKED' " 'Aceptar'
+      text_button_2         = 'Cancelar' " 'Cancelar'
+      icon_button_2         = 'ICON_CANCEL' " 'Cancelar'
+      default_button        = '2'
+      display_cancel_button = ' '
+    IMPORTING
+      answer                = lv_answer
+    EXCEPTIONS
+      text_not_found        = 1
+      OTHERS                = 2.
+
+
+
+  CHECK lv_answer = '1'.
+
+
+
+  "PERFORM generar_hermano   USING vp_row.
+  DATA: l_operario TYPE znombre_oper.
+  l_operario = sy-uname.
+
+  DATA wl_lote_hermano  TYPE ztpp0041.
+  CALL METHOD zclpp_consumo_recetas_mp=>generar_lote_hermano
+    EXPORTING
+      i_werks        = p_werks
+      i_id_receta    = <fs_lote_selec>-id_receta_hermano
+      i_lote         = <fs_lote_selec>-charg_hermano
+     i_operario     = l_operario
+      i_sw_pis_reg   = 'R'
+    IMPORTING
+      o_lote_hermano = wl_lote_hermano.
+
+
+  "PERFORM tratar_consumo_mp USING lv_row.
+  CALL METHOD zclpp_recetas_reparto_pulper=>consumir_lote_mp
+    EXPORTING
+      i_werks        = p_werks
+      i_receta       = <fs_lote_selec>-id_receta_hermano
+      i_matnr        = <fs_lote_selec>-matnr
+      i_fict         = wl_lote_hermano-charg
+      i_sin_etiq     = <fs_lote_selec>-charg
+      i_lgort_ori    = gs_dyn100-lgort
+      i_cantidad     = <fs_lote_selec>-clabs
+    IMPORTING
+      o_rc           = DATA(l_rc)
+      o_mblnr        = DATA(l_mblnr)
+      o_mjahr        = DATA(l_mjahr)
+      o_message      = DATA(l_bapi_msg)
+      o_lote_hermano = DATA(l_lote_hermano).
+
+  CASE l_rc.
+    WHEN '00'. "Lote repartido OK
+      MESSAGE
+      |Lote { <fs_lote_selec>-charg } consumido correctamente con el doc. material: { l_mblnr }/{ l_mjahr }.| TYPE 'S'.
+
+      PERFORM obtener_lotes_sin_etiqueta.
+      gs_dyn100-alv_sin->refresh( ).
+    WHEN '01'. "Error en la BAPI
+      MESSAGE |Error en la generación del consumo: { l_bapi_msg }| TYPE 'S' DISPLAY LIKE 'E'.
+      EXIT.
+    WHEN '02'. " NO se encontra reparto en ZPP0043, se regulariza el lote (Transitorio inicialmente, a partir de 2020 debería existir reparto
+      MESSAGE |Lote hermano { l_lote_hermano } sin reparto contra orden. Regularizar más tarde.| TYPE 'S' DISPLAY LIKE 'E'.
+      EXIT.
+  ENDCASE.
+
+
+
+
+
+
+
+
+ENDFORM.

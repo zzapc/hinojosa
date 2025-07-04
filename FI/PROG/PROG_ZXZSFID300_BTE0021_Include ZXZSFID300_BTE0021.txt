@@ -1,0 +1,177 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZXZSFID300_BTE0021
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  texto_posicion
+*&---------------------------------------------------------------------*
+FORM texto_posicion TABLES t_bseg    STRUCTURE bseg
+                           t_bsegsub STRUCTURE bseg_subst
+                           t_bkpf    STRUCTURE bkpf.
+* ACV
+  DATA: vsgtxt LIKE bseg-sgtxt.
+  DATA: vzuonr LIKE bseg-zuonr.
+  DATA: vkunnr LIKE bseg-kunnr.
+  DATA: vlifnr LIKE bseg-lifnr.
+  DATA: vfdtag(10).
+  DATA: cambiozuonr.
+  FIELD-SYMBOLS: <ft_vbpa> TYPE ANY TABLE.
+  DATA: BEGIN OF lt_vbpa OCCURS 0.                          "#EC ENHOK
+          INCLUDE STRUCTURE vbpavb.
+        DATA: END OF lt_vbpa.
+  FIELD-SYMBOLS: <vbeln> TYPE any.
+  DATA v_name1 TYPE name1_gp.
+
+* Comprobamos que este activo el perform por parametrización
+  GET PARAMETER ID 'BUK'  FIELD vbukrs.
+
+  SELECT SINGLE * FROM zsfit300_bte_001
+    WHERE bukrs     = vbukrs
+    AND   progrname = program
+    AND   formname  = 'TEXTO_POSICION'
+    AND   act       = 'X'.
+
+  CHECK sy-subrc = 0.
+
+  ASSIGN ('(SAPMV60A)XVBPA[]') TO <ft_vbpa>.
+  IF sy-subrc <> 0.
+    ASSIGN ('(SAPLV60A)XVBPA[]') TO <ft_vbpa>.
+  ENDIF.
+  IF <vbeln> IS ASSIGNED. UNASSIGN <vbeln>. ENDIF.
+  ASSIGN ('(SAPLV60B)XVBRP_KEY-VBELN') TO <vbeln>.
+
+  IF <ft_vbpa> IS ASSIGNED.
+    lt_vbpa[] = <ft_vbpa>[].
+  ENDIF.
+****
+***** Buscamos la vía de pago del proveedor o del cliente y el banco propio
+  READ TABLE t_bkpf INDEX 1.
+***** Solamente lo ponemos para las clases de doc.de factura / abono
+****
+  CASE t_bkpf-blart.
+    WHEN 'KG' OR 'KD' OR 'KR' OR 'KF'.
+    WHEN OTHERS.
+  ENDCASE.
+
+  LOOP AT t_bseg WHERE koart EQ 'D' OR koart EQ 'K'.
+    vkunnr = t_bseg-kunnr.
+    vlifnr = t_bseg-lifnr.
+  ENDLOOP.
+
+*   Buscamos posiciones de mayor
+  DATA t_accit TYPE TABLE OF accit WITH HEADER LINE.
+  DATA: BEGIN OF ti_int OCCURS 0,
+          posnr_sd TYPE posnr,
+          pospa    LIKE vbrp-pospa,
+        END OF ti_int.
+
+  CLEAR t_accit[].
+  ASSIGN ('(SAPLFACI)T_ACCIT[]') TO FIELD-SYMBOL(<fs>).
+  IF sy-subrc = 0 AND <vbeln> IS ASSIGNED.
+    DATA t_vbrp TYPE TABLE OF vbrpvb WITH HEADER LINE.
+    ASSIGN ('(SAPLV60B)XVBRP[]') TO FIELD-SYMBOL(<pos>).
+    IF sy-subrc = 0.
+      t_vbrp[] = <pos>.
+      DELETE t_vbrp WHERE vbeln <> <vbeln>.
+    ENDIF.
+    t_accit[] = <fs>.
+    "DELETE t_accit WHERE awref <> <vbeln>.
+*    DELETE t_accit WHERE koart NE 'S'.
+*    CASE t_bkpf-blart.
+*      WHEN 'RV' OR 'RW' OR 'ZV' OR 'ZW' OR 'RU' OR 'RT'.
+*        DELETE t_accit WHERE hkont NE '0004009010'.
+*    ENDCASE.
+
+    IF t_accit[] IS NOT INITIAL AND t_vbrp[] IS NOT INITIAL.
+      LOOP AT t_accit ASSIGNING FIELD-SYMBOL(<fs_accit>). "CVP
+        <fs_accit>-pswbt = abs( <fs_accit>-pswbt )."cambia signo para búsqueda por importe
+        SELECT SINGLE parvw FROM ztsdcom001 INTO @DATA(l_parvw)
+        WHERE bukrs = @t_bkpf-bukrs
+        AND kschl = @<fs_accit>-kschl.
+        IF sy-subrc = 0.
+          <fs_accit>-kschl = l_parvw. "usa este campo como auxiliar para guardar el Interlocutor
+        ENDIF.
+        READ TABLE t_vbrp WITH KEY posnr = <fs_accit>-posnr_sd.
+        IF sy-subrc = 0.
+          <fs_accit>-posnr_sd = t_vbrp-pospa.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+  DATA existe.
+
+  LOOP AT t_bseg WHERE koart EQ 'S'.
+    indice = sy-tabix.
+    CLEAR: cambiozuonr,vzuonr.
+    READ TABLE t_bsegsub INDEX indice.
+    CASE t_bkpf-blart.
+      WHEN 'DR' OR 'DG' OR 'DW'.
+        IF ( t_bseg-hkont = '0004009010').
+          IF <vbeln> IS ASSIGNED.
+            READ TABLE t_accit INTO DATA(ls_accit) WITH KEY pswbt = t_bseg-pswbt. "wrbtr."dmbtr. "CVP
+            IF sy-subrc = 0.
+              DATA(l_tabix1) = sy-tabix.
+              LOOP AT lt_vbpa WHERE vbeln = <vbeln>
+                                AND posnr = ls_accit-posnr_sd
+                                AND parvw = ls_accit-kschl.
+                SELECT SINGLE name1 INTO v_name1 FROM lfa1 WHERE lifnr = lt_vbpa-lifnr.
+                vsgtxt = v_name1.
+                vzuonr = lt_vbpa-lifnr.
+                cambiozuonr = 'X'.
+                EXIT.
+              ENDLOOP.
+              IF sy-subrc <> 0.
+                LOOP AT lt_vbpa WHERE vbeln = <vbeln>
+                                  AND posnr = '000000'
+                                  AND parvw = ls_accit-kschl.
+
+                  vzuonr = lt_vbpa-lifnr.
+                  cambiozuonr = 'X'.
+                ENDLOOP.
+              ENDIF.
+              DELETE t_accit INDEX l_tabix1.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      WHEN 'KR' OR 'KD' OR 'KF' OR 'KG'.
+
+        IF t_bseg-hkont = '0004009010'.
+          IF vlifnr IS NOT INITIAL.
+            vzuonr = vlifnr.
+
+            SELECT SINGLE name1 INTO v_name1 FROM lfa1 WHERE lifnr = vzuonr.
+              vsgtxt = v_name1.
+
+          ENDIF.
+
+
+
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+            EXPORTING
+              input  = vzuonr
+            IMPORTING
+              output = vzuonr.
+          cambiozuonr = 'X'.
+        ENDIF.
+    ENDCASE.
+
+
+    IF cambiozuonr = 'X'.
+
+*     Si el campo text esta completo se omite la adaptación
+*      IF t_bsegsub-sgtxt IS INITIAL.
+      t_bsegsub-sgtxt = vsgtxt.
+      MODIFY t_bsegsub INDEX indice.
+      t_bseg-sgtxt = vsgtxt.
+      MODIFY t_bseg.
+*      ENDIF.
+      IF t_bsegsub-zuonr IS INITIAL.
+        t_bsegsub-zuonr = vzuonr.
+        MODIFY t_bsegsub INDEX indice.
+        t_bseg-zuonr = vzuonr.
+        MODIFY t_bseg.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " texto_posicion

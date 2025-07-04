@@ -1,0 +1,747 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZINCBATC
+*&---------------------------------------------------------------------*
+***********************************************************************
+*                  INCLUDE Standard para Batch-inputs                 *
+***********************************************************************
+* Tablas ----
+TABLES: t100.
+
+* Valores BOOLEANs
+DATA: cierto VALUE 'X',
+      falso  VALUE ' '.
+
+* Tabla de BATCH-INPUTs
+DATA BEGIN OF bdc_tab OCCURS 100.
+        INCLUDE STRUCTURE bdcdata.
+DATA END OF bdc_tab.
+
+* Tabla interna de errores del batch input.
+DATA: BEGIN OF MESSTAB OCCURS 10.
+        INCLUDE STRUCTURE BDCMSGCOLL.
+DATA: END OF MESSTAB.
+
+* Tabla interna para mensajes de la transacción
+DATA BEGIN OF eco OCCURS 10.
+        INCLUDE STRUCTURE bdcmsgcoll.
+DATA END OF eco.
+
+* TI para almacenar el fichero de logs
+DATA: BEGIN OF fichero_log OCCURS 0,
+      tira(120),
+      END OF fichero_log.
+
+* Variable para crear un juego de datos
+DATA: juegodat LIKE apqi-groupid.
+
+* Variables control proceso
+DATA: online VALUE 'X'. " online = cierto -> ejecutar call transaction
+" online = falso  -> crear juego de datos
+
+DATA: modo VALUE 'N'.    " N = call transaction en modo 'N' (invisible)
+" A = call transaction en modo 'A' (visible)
+" E = call transaction en modo 'E' (errores)
+
+* variables control errores.
+DATA: numero_registros   TYPE i,
+      numero_aciertos    TYPE i,
+      numero_errores     TYPE i.
+
+* variables barra de progreso
+DATA: numero_lineas      TYPE i,
+      numero_lineas_txt(8),
+      porcentaje         TYPE p DECIMALS 0,
+      porcentaje_txt(3),
+      linea_actual       TYPE i,
+      linea_actual_txt(8),
+      texto_barra_progreso(60).
+
+* variables fichero logs
+DATA: tira(180).
+
+
+
+*---------------------------------------------------------------------*
+*       FORM DYNPRO                                                   *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VALUE(DYNBEGIN)                                               *
+*  -->  VALUE(NAME)                                                   *
+*  -->  VALUE(VALUE)                                                  *
+*---------------------------------------------------------------------*
+FORM dynpro USING value(dynbegin) value(name) value(value).
+
+  CLEAR bdc_tab.
+  IF dynbegin = 'X'.
+    bdc_tab-program  = name.
+    bdc_tab-dynpro   = value.
+    bdc_tab-dynbegin = 'X'.
+  ELSE .
+    bdc_tab-fnam = name.
+    bdc_tab-fval = value.
+  ENDIF.
+  APPEND bdc_tab.
+  CLEAR bdc_tab.
+
+ENDFORM.                               " DYNPRO
+*----------------------------------------------------------------------*
+*        Start new screen                                              *
+*----------------------------------------------------------------------*
+FORM bdc_dynpro USING program dynpro.
+  CLEAR bdc_tab.
+  bdc_tab-program  = program.
+  bdc_tab-dynpro   = dynpro.
+  bdc_tab-dynbegin = 'X'.
+  APPEND bdc_tab.
+ENDFORM.                    "bdc_dynpro
+
+*----------------------------------------------------------------------*
+*        Insert field                                                  *
+*----------------------------------------------------------------------*
+FORM bdc_field USING fnam fval.
+  CLEAR bdc_tab.
+  bdc_tab-fnam = fnam.
+  bdc_tab-fval = fval.
+  APPEND bdc_tab.
+ENDFORM.                    "bdc_field
+
+*---------------------------------------------------------------------*
+*       FORM BDC_OPEN                                                 *
+*---------------------------------------------------------------------*
+* Abre un juego de datos con el nombre indicado por group             *
+*---------------------------------------------------------------------*
+*  -->  GROUP                                                         *
+*---------------------------------------------------------------------*
+FORM bdc_open USING group.
+  online = cierto.
+  IF NOT group IS INITIAL.
+    CALL FUNCTION 'BDC_OPEN_GROUP'
+      EXPORTING
+        client              = sy-mandt
+        group               = group
+        user                = sy-uname
+        keep                = ' '
+      EXCEPTIONS
+        client_invalid      = 1
+        destination_invalid = 2
+        group_invalid       = 3
+        holddate_invalid    = 4
+        internal_error      = 5
+        queue_error         = 6
+        running             = 7
+        user_invalid        = 8.
+    IF sy-subrc = 0. " Si se ha podido abrir, OFFLINE; si no, ONLINE
+      online = falso.
+    ENDIF.
+  ENDIF.
+ENDFORM.                               " BDC_OPEN
+
+*---------------------------------------------------------------------*
+*       FORM BDC_INSERT                                               *
+*---------------------------------------------------------------------*
+* Inserta la transacción tcode en la tabla de batch input             *
+* y ejecuta el call transaction                                       *
+*---------------------------------------------------------------------*
+*  -->  TCODE                                                         *
+*---------------------------------------------------------------------*
+FORM bdc_insert USING tcode.
+
+  IF online IS INITIAL.
+    CALL FUNCTION 'BDC_INSERT'
+      EXPORTING
+        tcode          = tcode
+      TABLES
+        dynprotab      = bdc_tab
+      EXCEPTIONS
+        internal_error = 1
+        not_open       = 2
+        queue_error    = 3
+        tcode_invalid  = 4.
+  ELSE.
+    CALL TRANSACTION tcode USING bdc_tab MODE modo.
+  ENDIF.
+* RESETEO TABLA INTERNA EN FUNCION BDC_CLOSE.
+*  REFRESH BDC_TAB.
+ENDFORM.                               " BDC_INSERT
+
+*---------------------------------------------------------------------*
+*       FORM BDC_INSERT_ECO                                           *
+*---------------------------------------------------------------------*
+* Inserta la transacción tcode en la tabla de batch input             *
+* y ejecuta el call transaction devolviendo mensajes en la tabla eco  *
+*---------------------------------------------------------------------*
+*  -->  ECO                                                           *
+*  -->  TCODE                                                         *
+*---------------------------------------------------------------------*
+FORM bdc_insert_eco TABLES eco STRUCTURE bdcmsgcoll USING tcode.
+  CLEAR eco.
+  REFRESH eco.
+  IF online IS INITIAL.
+    CALL FUNCTION 'BDC_INSERT'
+      EXPORTING
+        tcode          = tcode
+      TABLES
+        dynprotab      = bdc_tab
+      EXCEPTIONS
+        internal_error = 1
+        not_open       = 2
+        queue_error    = 3
+        tcode_invalid  = 4.
+  ELSE.
+    CALL TRANSACTION tcode USING bdc_tab
+                           MODE modo
+                           MESSAGES INTO eco.
+  ENDIF.
+ENDFORM.                               " BDC_INSERT
+
+*---------------------------------------------------------------------*
+*       FORM BDC_INSERT_S                                             *
+*---------------------------------------------------------------------*
+* Inserta la transacción tcode en la tabla de batch input             *
+* y ejecuta el call transaction en modo síncrono                      *
+*---------------------------------------------------------------------*
+*  -->  TCODE                                                         *
+*---------------------------------------------------------------------*
+FORM bdc_insert_s USING tcode.
+  IF online IS INITIAL.
+    CALL FUNCTION 'BDC_INSERT'
+      EXPORTING
+        tcode          = tcode
+      TABLES
+        dynprotab      = bdc_tab
+      EXCEPTIONS
+        internal_error = 1
+        not_open       = 2
+        queue_error    = 3
+        tcode_invalid  = 4.
+  ELSE.
+    CALL TRANSACTION tcode USING bdc_tab
+                           MODE modo
+                           UPDATE 'S'.
+  ENDIF.
+ENDFORM.                               " BDC_INSERT
+
+*---------------------------------------------------------------------*
+*       FORM BDC_INSERT_S_ECO                                         *
+*---------------------------------------------------------------------*
+* Inserta la transacción tcode en la tabla de batch input y           *
+* ejecuta el call transaction en modo síncrono, devolviendo mensajes  *
+* en la tabla eco                                                     *
+*---------------------------------------------------------------------*
+*  -->  ECO                                                           *
+*  -->  TCODE                                                         *
+*---------------------------------------------------------------------*
+FORM bdc_insert_s_eco TABLES eco STRUCTURE bdcmsgcoll USING tcode.
+  CLEAR eco.
+  REFRESH eco.
+  IF online IS INITIAL.
+    CALL FUNCTION 'BDC_INSERT'
+      EXPORTING
+        tcode          = tcode
+      TABLES
+        dynprotab      = bdc_tab
+      EXCEPTIONS
+        internal_error = 1
+        not_open       = 2
+        queue_error    = 3
+        tcode_invalid  = 4.
+  ELSE.
+    CALL TRANSACTION tcode USING bdc_tab
+                           MODE modo
+                           UPDATE 'S'
+                           MESSAGES INTO eco.
+  ENDIF.
+ENDFORM.                               " BDC_INSERT
+
+*---------------------------------------------------------------------*
+*       FORM BDC_CLOSE                                                *
+*---------------------------------------------------------------------*
+* Cierra el juego de datos abierto con bdc_open y resetea bdc_tab     *
+*---------------------------------------------------------------------*
+FORM bdc_close.
+  IF online = falso.
+    CALL FUNCTION 'BDC_CLOSE_GROUP'
+      EXCEPTIONS
+        not_open    = 1
+        queue_error = 2.
+    online = cierto.
+  ENDIF.
+  REFRESH bdc_tab.
+ENDFORM.                               " BDC_CLOSE
+
+*---------------------------------------------------------------------*
+*FORM grabar_fichero_local                                           *
+*---------------------------------------------------------------------*
+*  -->  DATA_TAB                                                      *
+*  -->  FILE                                                          *
+*---------------------------------------------------------------------*
+FORM grabar_fichero_local TABLES data_tab USING file.
+
+  CALL FUNCTION 'WS_DOWNLOAD'
+    EXPORTING
+      filename                = file
+      filetype                = 'DAT'
+    TABLES
+      data_tab                = data_tab
+    EXCEPTIONS
+      invalid_filesize        = 1
+      invalid_table_width     = 2
+      invalid_type            = 3
+      no_batch                = 4
+      unknown_error           = 5
+      gui_refuse_filetransfer = 6
+      customer_error          = 7
+      OTHERS                  = 8.
+  IF sy-subrc NE 0.
+    MESSAGE s000(zb) WITH 'Error en escritura de fichero' file.
+  ENDIF.
+
+ENDFORM.                    "grabar_fichero_local
+
+*---------------------------------------------------------------------*
+*       FORM leer_fichero                                             *
+*---------------------------------------------------------------------*
+*  -->  DATA_TAB                                                      *
+*  -->  FILE                                                          *
+*---------------------------------------------------------------------*
+FORM leer_fichero TABLES data_tab USING file.
+
+  CALL FUNCTION 'WS_UPLOAD'
+    EXPORTING
+      filename                = file
+      filetype                = 'DAT'
+    TABLES
+      data_tab                = data_tab
+    EXCEPTIONS
+      conversion_error        = 1
+      invalid_table_width     = 2
+      invalid_type            = 3
+      no_batch                = 4
+      unknown_error           = 5
+      gui_refuse_filetransfer = 6
+      OTHERS                  = 7.
+
+  IF sy-subrc NE 0.
+    MESSAGE s000(zb) WITH 'Error opening file' file.
+  ENDIF.
+
+ENDFORM.                    "leer_fichero
+
+*---------------------------------------------------------------------*
+*       FORM LOAD                                                     *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  DATA_TAB                                                      *
+*  -->  VALUE(FROM)                                                   *
+*  -->  FILE                                                          *
+*---------------------------------------------------------------------*
+FORM load TABLES data_tab USING value(from) file.
+
+  TRANSLATE from TO UPPER CASE.
+  IF from = 'UNIX'.                    " FILE CS '/'.
+    OPEN DATASET file FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+    IF sy-subrc <> 0. sy-subrc = 2. EXIT. ENDIF.
+    DO.
+      READ DATASET file INTO data_tab.
+      IF sy-subrc <> 0.
+        EXIT.
+      ENDIF.
+      APPEND data_tab.
+    ENDDO.
+    IF sy-subrc = 8. sy-subrc = 3. EXIT. ENDIF.
+    CLOSE DATASET file.
+  ELSE.
+    CALL FUNCTION 'WS_UPLOAD'
+      EXPORTING
+        codepage            = 'IBM'
+        filename            = file
+        filetype            = 'ASC'
+        headlen             = space
+        line_exit           = space
+        trunclen            = space
+        user_form           = space
+        user_prog           = space
+      TABLES
+        data_tab            = data_tab
+      EXCEPTIONS
+        conversion_error    = 1
+        file_open_error     = 2
+        file_read_error     = 3
+        invalid_table_width = 4
+        invalid_type        = 5
+        no_batch            = 6
+        unknown_error       = 7.
+    IF sy-subrc NE 0.
+      MESSAGE s051(z1) WITH file.      "Error en apertura de fichero
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "load
+
+*---------------------------------------------------------------------*
+*       FORM SAVE                                                     *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  DATA_TAB                                                      *
+*  -->  VALUE(DEST)                                                   *
+*  -->  FILE                                                          *
+*---------------------------------------------------------------------*
+FORM save TABLES data_tab USING value(dest) file.
+
+  TRANSLATE dest TO UPPER CASE.
+  IF dest = 'UNIX'.                    " FILE CS '/'.
+    OPEN DATASET file FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+    IF sy-subrc <> 0. sy-subrc = 2. EXIT. ENDIF.
+    LOOP AT data_tab.
+      TRANSFER data_tab TO file.
+      IF sy-subrc <> 0. EXIT. ENDIF.
+    ENDLOOP.
+    IF sy-subrc = 8. sy-subrc = 3. EXIT. ENDIF.
+    CLOSE DATASET file.
+  ELSE.
+    CALL FUNCTION 'WS_DOWNLOAD'
+      EXPORTING
+        codepage            = 'IBM'
+        filename            = file
+        filetype            = 'ASC'
+      TABLES
+        data_tab            = data_tab
+      EXCEPTIONS
+        file_open_error     = 1
+        file_write_error    = 2
+        invalid_filesize    = 3
+        invalid_table_width = 4
+        invalid_type        = 5
+        no_batch            = 6
+        unknown_error       = 7.
+  ENDIF.
+ENDFORM.                    "save
+
+*&---------------------------------------------------------------------*
+*&      Form  OBTEN_AYUDA_FICHERO
+*&---------------------------------------------------------------------*
+*       Módulo de ayuda para búsqueda de fichero                       *
+*----------------------------------------------------------------------*
+FORM obten_ayuda_fichero USING p_file p_title .
+  DATA: l_aux_filename LIKE rlgrap-filename .
+
+* M¢dulo de funci¢n para obtener fichero
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_filename     = ''
+      def_path         = 'C:\'
+      mask             = ',*.*,*.*.'
+      mode             = '0'
+      title            = p_title
+    IMPORTING
+      filename         = l_aux_filename
+    EXCEPTIONS
+      inv_winsys       = 1
+      no_batch         = 2
+      selection_cancel = 3
+      selection_error  = 4
+      OTHERS           = 5.
+  IF sy-subrc EQ 0.
+    p_file = l_aux_filename .
+  ENDIF.
+
+ENDFORM.                               " OBTEN_AYUDA_FICHERO
+
+*---------------------------------------------------------------------*
+*       FORM PROCESA_BI                                               *
+*---------------------------------------------------------------------*
+*  -->  VALUE(BI_NAME)                                                *
+*---------------------------------------------------------------------*
+FORM procesa_bi USING value(bi_name).
+
+  TABLES: apqi.                        " Maestro de Batch-input's
+  DATA: jobcount LIKE tbtcjob-jobcount,
+        jobname  LIKE tbtcjob-jobname.
+
+  jobname = bi_name.
+  SELECT * FROM apqi WHERE destsys = '        '
+                       AND destapp = '        '
+                       AND datatyp = 'BDC'
+                       AND mandant = sy-mandt
+                       AND groupid = bi_name
+                       AND progid  = '        '
+                       AND qattrib = ' '
+                       AND qstate  = ' '.
+    EXIT.
+  ENDSELECT.
+
+  IF sy-subrc = 0.
+    CALL FUNCTION 'JOB_OPEN'
+      EXPORTING
+        jobgroup = 'BATCH-INPUT'
+        jobname  = jobname
+      IMPORTING
+        jobcount = jobcount.
+
+    SUBMIT rsbdcbtc USER sy-uname
+          VIA JOB jobname NUMBER jobcount
+          WITH queue-id EQ apqi-qid
+          WITH mappe    EQ apqi-groupid
+          WITH modus    EQ 'N'
+          AND RETURN.
+
+    CALL FUNCTION 'JOB_CLOSE'
+      EXPORTING
+        jobcount  = jobcount
+        jobname   = jobname
+        strtimmed = 'X'.
+
+  ENDIF.
+
+ENDFORM.                               " PROCESA_BI
+
+*&---------------------------------------------------------------------*
+*&      Form  SELEC_MESSAGE
+*&---------------------------------------------------------------------*
+FORM selec_message USING mess_id
+                         mess_type
+                         mess_number
+                         mess_text1 mess_text2 mess_text3 mess_text4
+                   CHANGING   mensaje.
+  DATA: textoa(20),
+        textob(10),
+        textoc(20),
+        textod(20),
+        long TYPE i.
+
+  CLEAR: textoa, textob, textoc, textod.
+  textoa = mess_text1.
+  textob = mess_text2.
+  textoc = mess_text3.
+  textod = mess_text4.
+
+  SELECT SINGLE       * FROM  t100
+         WHERE  sprsl       = 'S'
+         AND    arbgb       = mess_id
+         AND    msgnr       = mess_number .
+  IF sy-subrc EQ 0.
+    IF NOT textoa IS INITIAL.
+      long = STRLEN( textoa ).
+      REPLACE '&' WITH textoa INTO t100-text.
+    ENDIF.
+    IF NOT textob IS INITIAL.
+      CLEAR long.
+      long = STRLEN( textob ).
+      REPLACE '&' WITH textob LENGTH long INTO t100-text.
+    ENDIF.
+    IF NOT textoc IS INITIAL.
+      CLEAR long.
+      long = STRLEN( textoc ).
+      REPLACE '&' WITH textoc LENGTH long INTO t100-text.
+    ENDIF.
+    IF NOT textod IS INITIAL.
+      CLEAR long.
+      long = STRLEN( textod ).
+      REPLACE '&' WITH textod LENGTH long INTO t100-text.
+    ENDIF.
+    mensaje  =  t100-text.
+  ENDIF.
+
+ENDFORM.                               " SELEC_MESSAGE
+
+*---------------------------------------------------------------------*
+*       FORM PINTA_MENSAJES                                           *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM pinta_mensajes TABLES eco STRUCTURE bdcmsgcoll.
+
+  DATA: num_msg(3) TYPE n.
+  DATA: BEGIN OF mensajes OCCURS 10.
+  DATA: texto(100).
+  DATA: END OF mensajes.
+  DATA: wmessage LIKE message.
+
+  LOOP AT eco.
+    CLEAR wmessage.
+    num_msg = eco-msgnr.
+    CALL FUNCTION 'WRITE_MESSAGE'
+      EXPORTING
+        msgid  = eco-msgid
+        msgno  = num_msg
+        msgty  = eco-msgtyp
+        msgv1  = eco-msgv1
+        msgv2  = eco-msgv2
+      IMPORTING
+        messg  = wmessage
+      EXCEPTIONS
+        OTHERS = 1.
+    CONCATENATE wmessage-msgty wmessage-msgid INTO mensajes-texto.
+    CONDENSE mensajes-texto.
+    CONCATENATE  mensajes-texto wmessage-msgno INTO mensajes-texto.
+    CONDENSE mensajes-texto.
+    CONCATENATE  mensajes-texto wmessage-msspc INTO mensajes-texto.
+    CONDENSE mensajes-texto.
+    CONCATENATE  mensajes-texto wmessage-msgtx INTO mensajes-texto.
+    CONDENSE mensajes-texto.
+    APPEND mensajes.
+
+  ENDLOOP.
+  LOOP AT mensajes.
+    WRITE: / mensajes-texto.
+  ENDLOOP.
+  SKIP.
+ENDFORM.                    "pinta_mensajes
+
+*&---------------------------------------------------------------------*
+*&      Form  rellenar_fichero_log
+*&---------------------------------------------------------------------*
+
+FORM rellenar_fichero_log.
+
+  DATA: num_msg(3) TYPE n.
+  DATA: wmessage LIKE message.
+
+  LOOP AT eco.
+    CLEAR wmessage.
+    num_msg = eco-msgnr.
+    CALL FUNCTION 'WRITE_MESSAGE'
+      EXPORTING
+        msgid  = eco-msgid
+        msgno  = num_msg
+        msgty  = eco-msgtyp
+        msgv1  = eco-msgv1
+        msgv2  = eco-msgv2
+      IMPORTING
+        messg  = wmessage
+      EXCEPTIONS
+        OTHERS = 1.
+    CONCATENATE wmessage-msgty wmessage-msgid INTO fichero_log-tira.
+    CONDENSE fichero_log-tira.
+    CONCATENATE  fichero_log-tira wmessage-msgno INTO fichero_log-tira.
+    CONDENSE fichero_log-tira.
+    CONCATENATE fichero_log-tira wmessage-msspc INTO fichero_log-tira.
+    CONDENSE fichero_log-tira.
+    CONCATENATE  fichero_log-tira wmessage-msgtx INTO fichero_log-tira.
+    CONDENSE fichero_log-tira.
+    APPEND fichero_log.
+
+  ENDLOOP.
+
+ENDFORM.                    " rellenar_fichero_log
+
+*&---------------------------------------------------------------------*
+*&      Form  pintar_resumen_errores
+*&---------------------------------------------------------------------*
+FORM pintar_resumen_errores.
+
+  DATA: porcentaje_aciertos TYPE i.
+
+  CLEAR: numero_aciertos,porcentaje_aciertos.
+  numero_aciertos = numero_registros - numero_errores.
+  porcentaje_aciertos = ( numero_aciertos * 100 ) / numero_registros.
+
+  FORMAT COLOR 1 INTENSIFIED ON.
+  ULINE /(70).
+  WRITE: / '|', 'RESUMEN DEL PROCESO',70 '|'.
+  ULINE /(70).
+  WRITE: / '|', 'Numero Registros:',50 '|'.
+  FORMAT COLOR 3 INTENSIFIED OFF.
+  WRITE:         numero_registros,70 '|'.
+  FORMAT COLOR 1 INTENSIFIED ON.
+  WRITE: / '|', 'Numero Registros Correctos:',50 '|'.
+  FORMAT COLOR 3 INTENSIFIED OFF.
+  WRITE:         numero_aciertos,70 '|'.
+  FORMAT COLOR 1 INTENSIFIED ON.
+  WRITE: / '|', 'Numero Registros Erroneos:',50 '|'.
+  FORMAT COLOR 3 INTENSIFIED OFF.
+  WRITE:         numero_errores ,70 '|'.
+  FORMAT COLOR 1 INTENSIFIED ON.
+  WRITE: / '|', 'Pocentaje de Registros Correctos:',50 '|'.
+  FORMAT COLOR 3 INTENSIFIED OFF.
+  WRITE:         porcentaje_aciertos,70 '|'.
+  FORMAT COLOR 1 INTENSIFIED ON.
+  ULINE /(70).
+  FORMAT RESET.
+
+ENDFORM.                    " pintar_resumen_errores
+
+*&---------------------------------------------------------------------*
+*&      Form  barra_progreso
+*&---------------------------------------------------------------------*
+FORM barra_progreso.
+
+  linea_actual = linea_actual + 1.
+*   datos para la barra de progreso
+  IF numero_lineas > 0.
+    porcentaje = ( linea_actual / numero_lineas ) * 100.
+    WRITE porcentaje TO porcentaje_txt.
+    WRITE linea_actual TO linea_actual_txt .
+    WRITE numero_lineas TO numero_lineas_txt.
+    CONCATENATE porcentaje_txt '%' 'Procesando linea'
+                linea_actual_txt 'de' numero_lineas_txt
+           INTO texto_barra_progreso SEPARATED BY space.
+    IF porcentaje = 0. porcentaje = 1. ENDIF.
+    CALL FUNCTION 'TB_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = porcentaje
+        text       = texto_barra_progreso
+      EXCEPTIONS
+        OTHERS     = 1.
+  ENDIF.
+
+ENDFORM.                    " barra_progreso
+*&---------------------------------------------------------------------*
+*&      Form  GRABAR_FICHERO_SERV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_T_DATOS_FILE  text
+*      -->P_LV_DSN  text
+*----------------------------------------------------------------------*
+FORM grabar_fichero_serv TABLES data_tab USING file.
+
+  OPEN DATASET file FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    EXIT.
+  ENDIF.
+
+  LOOP AT data_tab.
+    TRANSFER data_tab TO file.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+  IF sy-subrc <> 0.
+    EXIT.
+  ENDIF.
+
+  CLOSE DATASET file.
+
+ENDFORM.                    " GRABAR_FICHERO_SERV
+*&---------------------------------------------------------------------*
+*&      Form  cargar_fichero_serv
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM cargar_fichero_serv TABLES data_tab USING file.
+
+  OPEN DATASET file FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc NE 0.
+  ENDIF.
+
+  DO.
+    READ DATASET file INTO data_tab.
+    IF sy-subrc NE 0.
+      EXIT.
+    ELSE.
+      APPEND data_tab.
+    ENDIF.
+  ENDDO.
+
+  CLOSE DATASET file.
+  IF sy-subrc NE 0.
+  ENDIF.
+
+ENDFORM.                    " cargar_fichero

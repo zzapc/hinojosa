@@ -1,0 +1,655 @@
+FUNCTION Z_ENVIO_MAIL.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(SUBJECT)
+*"     REFERENCE(DIRECCION) OPTIONAL
+*"     REFERENCE(URGENTE) OPTIONAL
+*"     REFERENCE(DOC_ID) LIKE  SOFOLENTI1-DOC_ID OPTIONAL
+*"     REFERENCE(HTML) OPTIONAL
+*"     REFERENCE(SENDER) OPTIONAL
+*"     REFERENCE(COMMIT) DEFAULT 'X'
+*"     REFERENCE(FORZAR_MAIL_EXTERNO) OPTIONAL
+*"     REFERENCE(OUTBOX_FLAG) LIKE  SONV-FLAG DEFAULT ''
+*"  EXPORTING
+*"     REFERENCE(RETURNCODE) LIKE  SY-SUBRC
+*"  TABLES
+*"      TEXTO STRUCTURE  SOLISTI1 OPTIONAL
+*"      T_FICHEROS STRUCTURE  TNOTETEM OPTIONAL
+*"      I_DESTINATARIOS STRUCTURE  SOLISTI1 OPTIONAL
+*"      I_OTFDATA STRUCTURE  ITCOO OPTIONAL
+*"----------------------------------------------------------------------
+DATA: i_receivers LIKE soos1 OCCURS 1 WITH HEADER LINE,
+         i_objpara LIKE selc OCCURS 1 WITH HEADER LINE,
+         i_objhead LIKE soli OCCURS 1 WITH HEADER LINE,
+         i_objcont LIKE soli OCCURS 1 WITH HEADER LINE,
+         l_document_data LIKE  sofolenti1,
+         i_object_parb LIKE soparbi1 OCCURS 1 WITH HEADER LINE,
+         i_attachment_list LIKE soattlsti1 OCCURS 1 WITH HEADER LINE,
+         i_receiver_list LIKE soreclsti1 OCCURS 1 WITH HEADER LINE,
+         i_att_cont LIKE soli OCCURS 1 WITH HEADER LINE,
+         i_att_cont2 LIKE soli OCCURS 1 WITH HEADER LINE,
+         i_packing_list     LIKE soxpl OCCURS 0 WITH HEADER LINE,
+         l_originator LIKE  soos1-recextnam,
+         l_originator_type LIKE  soos1-recesc VALUE 'J',
+         i_direccion(200) OCCURS 0 WITH HEADER LINE,
+         l_direccion(200),
+         l_usr21 TYPE usr21.
+
+  DATA: r_object_hd_change LIKE sood1,
+        v_lineas TYPE i.
+
+  SEARCH sender FOR '@'.
+  IF sy-subrc = 0.
+    l_originator = sender.
+    l_originator_type = 'U'.
+  ELSE.
+    IF sender IS INITIAL.
+      l_originator = sy-uname.
+    ELSE.
+      l_originator = sender.
+    ENDIF.
+    l_originator_type = 'B'.
+  ENDIF.
+
+  IF NOT direccion IS INITIAL.
+    l_direccion = direccion.
+    SEARCH l_direccion FOR ';'.
+    IF sy-subrc = 0.
+      DO 5 TIMES.
+        REPLACE ';' WITH ',' INTO l_direccion.
+      ENDDO.
+    ENDIF.
+    SEARCH l_direccion FOR ','.
+    IF sy-subrc = 0.
+      SPLIT l_direccion AT ',' INTO TABLE i_direccion.
+    ELSE.
+      i_direccion = l_direccion.
+      APPEND i_direccion.
+    ENDIF.
+
+    LOOP AT i_direccion.
+      CLEAR i_receivers.
+      CONDENSE i_direccion NO-GAPS.
+      i_receivers-recnam = i_direccion.
+      l_direccion = i_direccion.
+      SEARCH l_direccion FOR '@'.
+      IF sy-subrc = 0.
+        i_receivers-recextnam = i_direccion.
+        i_receivers-recesc = 'U'.
+      ELSE.
+        i_receivers-recnam = i_direccion.
+        i_receivers-recesc = 'B'.
+      ENDIF.
+      i_receivers-rtunam = ''.              " Nombre del Destinatario
+      i_receivers-sndex = urgente.            " Urgente
+      APPEND i_receivers.
+    ENDLOOP.
+  ENDIF.
+
+
+  DATA l_dest TYPE solisti1.
+  LOOP AT i_destinatarios INTO l_dest.
+    CLEAR i_receivers.
+    i_receivers-recnam = l_dest.
+    SEARCH l_dest FOR '@'.
+    IF sy-subrc = 0.
+      i_receivers-recextnam = l_dest.
+      i_receivers-recesc = 'U'.
+    ELSE.
+      i_receivers-recnam = l_dest.
+      i_receivers-recesc = 'B'.
+    ENDIF.
+    i_receivers-rtunam = ''.              " Nombre del Destinatario
+    i_receivers-sndex = urgente.            " Urgente
+    APPEND i_receivers.
+  ENDLOOP.
+
+  IF forzar_mail_externo = 'X'.
+    LOOP AT i_receivers WHERE recesc = 'B'.
+      SELECT SINGLE * FROM usr21
+        INTO l_usr21
+       WHERE bname = i_receivers-recnam.
+      IF sy-subrc = 0.
+        SELECT SINGLE smtp_addr FROM adr6
+          INTO i_receivers-recextnam
+         WHERE addrnumber = l_usr21-addrnumber
+           AND persnumber = l_usr21-persnumber.
+        IF NOT i_receivers-recextnam IS INITIAL.
+          i_receivers-recesc = 'U'.
+          MODIFY i_receivers.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  LOOP AT i_receivers WHERE recesc = 'U'.
+    TRANSLATE i_receivers-recextnam TO LOWER CASE.
+    MODIFY i_receivers.
+  ENDLOOP.
+
+* Informamos el parámetro OBJECT_HD_CHANGE.
+  CLEAR r_object_hd_change.
+  r_object_hd_change-objla = sy-langu.          " Idioma del documento
+  r_object_hd_change-objsns = 'F'.   " Atributos del objeto
+  r_object_hd_change-objnam = sy-uname.      " Nombre Documento
+  r_object_hd_change-objdes = subject.      " Título
+  IF html = 'X'.
+    r_object_hd_change-file_ext = 'HTM'. "Enviamos en formato HTML
+  ENDIF.
+
+  REFRESH i_objcont.
+  DESCRIBE TABLE texto LINES v_lineas.
+  IF v_lineas <> 0.
+    LOOP AT texto.
+      CLEAR i_objcont.
+      i_objcont-line = texto.
+      APPEND i_objcont.
+    ENDLOOP.
+  ENDIF.
+
+* Obtengo el adjunto
+  IF NOT doc_id IS INITIAL.
+    CALL FUNCTION 'SO_DOCUMENT_READ_API1'
+      EXPORTING
+        document_id                = doc_id
+      IMPORTING
+        document_data              = l_document_data
+      TABLES
+        object_header              = i_objhead
+        object_content             = i_objcont
+        object_para                = i_objpara
+        object_parb                = i_object_parb
+        attachment_list            = i_attachment_list
+        receiver_list              = i_receiver_list
+      EXCEPTIONS
+        document_id_not_exist      = 1
+        operation_no_authorization = 2
+        x_error                    = 3
+        OTHERS                     = 4.
+
+* Envío del mensaje por SAPOffice
+    CALL FUNCTION 'SO_OBJECT_SEND'
+      EXPORTING
+        object_hd_change           = r_object_hd_change
+        folder_id                  = doc_id(17)
+        object_id                  = doc_id+17(17)
+        link_folder_id             = doc_id(17)
+        owner                      = sy-uname
+        outbox_flag                = outbox_flag
+        originator                 = l_originator
+        originator_type            = l_originator_type
+      TABLES
+        objcont                    = i_objcont  " Mensaje
+        objhead                    = i_objhead " Nº líneas objcont
+        objpara                    = i_objpara
+        receivers                  = i_receivers  " Destinatario
+      EXCEPTIONS
+        active_user_not_exist      = 1
+        communication_failure      = 2
+        component_not_available    = 3
+        folder_not_exist           = 4
+        folder_no_authorization    = 5
+        forwarder_not_exist        = 6
+        note_not_exist             = 7
+        object_not_exist           = 8
+        object_not_sent            = 9
+        object_no_authorization    = 10
+        object_type_not_exist      = 11
+        operation_no_authorization = 12
+        owner_not_exist            = 13
+        parameter_error            = 14
+        substitute_not_active      = 15
+        substitute_not_defined     = 16
+        system_failure             = 17
+        too_much_receivers         = 18
+        user_not_exist             = 19
+        x_error                    = 20
+        OTHERS                     = 21.
+
+    returncode = sy-subrc.
+  ELSEIF NOT t_ficheros[] IS INITIAL.
+    LOOP AT t_ficheros.
+      IF t_ficheros-notetype IS INITIAL.
+        PERFORM anyadir_adjunto TABLES i_packing_list
+                                       i_att_cont
+                                USING  t_ficheros-template.
+      ELSEIF t_ficheros-notetype = 'INT'.
+        PERFORM anyadir_doc_int TABLES i_packing_list
+                                       i_att_cont
+                                USING  t_ficheros-template.
+      ELSEIF t_ficheros-notetype = 'OTF'.
+        PERFORM anyadir_otf TABLES i_packing_list
+                                   i_att_cont
+                                   i_otfdata
+                                USING  t_ficheros-template.
+      ENDIF.
+    ENDLOOP.
+
+    CALL FUNCTION 'SO_OBJECT_SEND'
+      EXPORTING
+        object_hd_change           = r_object_hd_change
+        object_type                = 'RAW'  " Tipo Documento
+        outbox_flag                = outbox_flag
+        owner                      = sy-uname
+        delete_flag                = 'X'
+      TABLES
+        objcont                    = i_objcont  " Mensaje
+        objpara                    = i_objpara
+        receivers                  = i_receivers  " Destinatario
+        packing_list               = i_packing_list
+        att_cont                   = i_att_cont
+      EXCEPTIONS
+        active_user_not_exist      = 1
+        communication_failure      = 2
+        component_not_available    = 3
+        folder_not_exist           = 4
+        folder_no_authorization    = 5
+        forwarder_not_exist        = 6
+        note_not_exist             = 7
+        object_not_exist           = 8
+        object_not_sent            = 9
+        object_no_authorization    = 10
+        object_type_not_exist      = 11
+        operation_no_authorization = 12
+        owner_not_exist            = 13
+        parameter_error            = 14
+        substitute_not_active      = 15
+        substitute_not_defined     = 16
+        system_failure             = 17
+        too_much_receivers         = 18
+        user_not_exist             = 19
+        x_error                    = 20
+        OTHERS                     = 21.
+
+    returncode = sy-subrc.
+
+  ELSE.
+    IF commit = 'X'.
+      CALL FUNCTION 'SO_OBJECT_SEND'
+        EXPORTING
+          object_hd_change           = r_object_hd_change
+          object_type                = 'RAW'  " Tipo Documento
+          outbox_flag                = outbox_flag
+          owner                      = sy-uname
+          delete_flag                = 'X'
+        TABLES
+          objcont                    = i_objcont  " Mensaje
+          objhead                    = i_objhead " Nº líneas objcont
+          objpara                    = i_objpara
+          receivers                  = i_receivers  " Destinatario
+        EXCEPTIONS
+          active_user_not_exist      = 1
+          communication_failure      = 2
+          component_not_available    = 3
+          folder_not_exist           = 4
+          folder_no_authorization    = 5
+          forwarder_not_exist        = 6
+          note_not_exist             = 7
+          object_not_exist           = 8
+          object_not_sent            = 9
+          object_no_authorization    = 10
+          object_type_not_exist      = 11
+          operation_no_authorization = 12
+          owner_not_exist            = 13
+          parameter_error            = 14
+          substitute_not_active      = 15
+          substitute_not_defined     = 16
+          system_failure             = 17
+          too_much_receivers         = 18
+          user_not_exist             = 19
+          x_error                    = 20
+          OTHERS                     = 21.
+    ELSE.
+      DATA: w_doc_data            TYPE sodocchgi1,
+       t_packing_list        TYPE STANDARD TABLE OF sopcklsti1,
+       w_packing_list        TYPE sopcklsti1,
+       t_receivers           TYPE STANDARD TABLE OF somlreci1,
+       w_receivers           TYPE somlreci1.
+
+*           Atributos del asunto y atributos genéricos
+      w_doc_data-obj_langu  = sy-langu.
+      w_doc_data-obj_name   = 'SAPRPT'.
+      w_doc_data-obj_descr  = subject.
+      w_doc_data-sensitivty = 'F'.
+
+*           Describe el body de el mensaje
+      CLEAR w_packing_list.
+      REFRESH t_packing_list.
+      w_packing_list-transf_bin = space.
+      w_packing_list-head_start = 1.
+      w_packing_list-head_num   = 0.
+      w_packing_list-body_start = 1.
+      DESCRIBE TABLE i_objcont LINES w_packing_list-body_num.
+      w_packing_list-doc_type   = 'RAW'.
+      INSERT w_packing_list INTO TABLE t_packing_list.
+
+      LOOP AT i_receivers.
+        CLEAR w_receivers.
+        w_receivers-rec_type   = i_receivers-recesc.
+        IF NOT i_receivers-recextnam IS INITIAL.
+          w_receivers-com_type   = 'INT'.
+          w_receivers-receiver = i_receivers-recextnam.
+        ELSE.
+          w_receivers-receiver = i_receivers-recnam.
+        ENDIF.
+        w_receivers-express = urgente.
+        INSERT w_receivers INTO TABLE t_receivers.
+      ENDLOOP.
+
+      CALL FUNCTION 'SO_DOCUMENT_SEND_API1' IN BACKGROUND TASK
+        EXPORTING
+          document_data              = w_doc_data
+          put_in_outbox              = 'X'
+          commit_work                = 'X'
+        TABLES
+          packing_list               = t_packing_list
+          contents_txt               = i_objcont
+          receivers                  = t_receivers
+        EXCEPTIONS
+          too_many_receivers         = 1
+          document_not_sent          = 2
+          document_type_not_exist    = 3
+          operation_no_authorization = 4
+          parameter_error            = 5
+          x_error                    = 6
+          enqueue_error              = 7
+          OTHERS                     = 8.
+    ENDIF.
+    returncode = sy-subrc.
+  ENDIF.
+
+  IF commit = 'X'.
+    COMMIT WORK AND WAIT.
+  ENDIF.
+
+  IF sy-subrc = 0 AND urgente = 'X'.
+    SUBMIT rsconn01 AND RETURN.
+  ENDIF.
+
+ENDFUNCTION.
+
+*---------------------------------------------------------------------*
+*       FORM ANYADIR_ADJUNTO                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  I_PACKING_LIST                                                *
+*  -->  I_ATT_CONT                                                    *
+*  -->  PE_FICHERO                                                    *
+*---------------------------------------------------------------------*
+FORM anyadir_adjunto TABLES i_packing_list  STRUCTURE soxpl
+                            i_att_cont      STRUCTURE soli
+                      USING pe_fichero.
+  DATA: i_att_cont2 LIKE soli OCCURS 1 WITH HEADER LINE,
+        l_fichero   TYPE dsvasdocid,
+        l_ruta      TYPE dsvasdocid,
+        l_nombre    TYPE dsvasdocid,
+        l_extension TYPE dsvasdocid,
+        l_file      TYPE string,
+        l_len       TYPE i.
+
+  CLEAR i_packing_list.
+
+  DESCRIBE TABLE i_att_cont LINES i_packing_list-head_start.
+  i_packing_list-head_start = i_packing_list-head_start.
+  i_packing_list-body_start = i_packing_list-head_start + 1.
+
+  IF pe_fichero CS '\'.
+    l_file = pe_fichero.
+    DATA: i_soli  TYPE  soli_tab,
+          i_solix TYPE solix_tab.
+
+    CALL FUNCTION 'GUI_UPLOAD'
+      EXPORTING
+                filename                = l_file
+                filetype                = 'BIN'
+*   HAS_FIELD_SEPARATOR           = ' '
+*   HEADER_LENGTH                 = 0
+*   READ_BY_LINE                  = 'X'
+*   DAT_MODE                      = ' '
+*   CODEPAGE                      = ' '
+*   IGNORE_CERR                   = ABAP_TRUE
+*   REPLACEMENT                   = '#'
+*   CHECK_BOM                     = ' '
+*   NO_AUTH_CHECK                 = ' '
+     IMPORTING
+        filelength              = l_len
+*   HEADER                        =
+      TABLES
+        data_tab                      = i_solix
+     EXCEPTIONS
+       file_open_error               = 1
+       file_read_error               = 2
+       no_batch                      = 3
+       gui_refuse_filetransfer       = 4
+       invalid_type                  = 5
+       no_authority                  = 6
+       unknown_error                 = 7
+       bad_data_format               = 8
+       header_not_allowed            = 9
+       separator_not_allowed         = 10
+       header_too_long               = 11
+       unknown_dp_error              = 12
+       access_denied                 = 13
+       dp_out_of_memory              = 14
+       disk_full                     = 15
+       dp_timeout                    = 16
+       OTHERS                        = 17.
+    i_packing_list-objlen = l_len.
+
+    CALL FUNCTION 'SO_SOLIXTAB_TO_SOLITAB'
+      EXPORTING
+        ip_solixtab = i_solix
+      IMPORTING
+        ep_solitab  = i_soli.
+
+    LOOP AT i_soli INTO i_att_cont2.
+      APPEND i_att_cont2.
+    ENDLOOP.
+  ELSE.
+    CALL FUNCTION 'Z_CARGA_FICHERO_SERV'
+      EXPORTING
+        fichero                    = pe_fichero
+        modo_texto                 = ''
+*      MOSTRAR_MENSAJES           =
+      TABLES
+        tabla                      = i_att_cont2
+     EXCEPTIONS
+       error_abrir_fichero        = 1
+       error_read                 = 2
+       error_cerrar_fichero       = 3
+       OTHERS                     = 4.
+  ENDIF.
+
+  IF sy-subrc NE 0.
+    MESSAGE e398(00) WITH 'Error al acceder al documento' pe_fichero.
+  ENDIF.
+
+  DESCRIBE TABLE i_att_cont2 LINES i_packing_list-body_num.
+  LOOP AT i_att_cont2 INTO i_att_cont.
+    APPEND i_att_cont.
+  ENDLOOP.
+
+  l_fichero = pe_fichero.
+  CALL FUNCTION 'DSVAS_DOC_FILENAME_SPLIT'
+    EXPORTING
+      pf_docid     = l_fichero
+    IMPORTING
+      pf_directory = l_ruta
+      pf_filename  = l_nombre
+      pf_extension = l_extension.
+
+  i_packing_list-transf_bin = 'X'.
+  i_packing_list-objdes   = l_nombre.
+  i_packing_list-objnam   = l_nombre.
+  i_packing_list-objtp    = 'EXT'.
+  i_packing_list-file_ext = l_extension.
+  APPEND i_packing_list.
+
+ENDFORM.                    "anyadir_adjunto
+
+*---------------------------------------------------------------------*
+*       FORM anyadir_doc_int                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  I_PACKING_LIST                                                *
+*  -->  I_ATT_CONT                                                    *
+*  -->  PE_FICHERO                                                    *
+*---------------------------------------------------------------------*
+FORM anyadir_doc_int TABLES i_packing_list  STRUCTURE soxpl
+                            i_att_cont      STRUCTURE soli
+                      USING pe_fichero.
+  DATA: i_att_cont2 LIKE soli OCCURS 1 WITH HEADER LINE,
+        l_fichero   TYPE dsvasdocid,
+        l_ruta      TYPE dsvasdocid,
+        l_nombre    TYPE dsvasdocid,
+        l_extension TYPE dsvasdocid,
+        l_doc_id    LIKE sofolenti1-doc_id,
+        l_doc_data  LIKE sofolenti1,
+        i_objcont LIKE solisti1 OCCURS 0 WITH HEADER LINE,
+        i_attachment_list LIKE  soattlsti1 OCCURS 0 WITH HEADER LINE.
+
+
+  CLEAR i_packing_list.
+
+  DESCRIBE TABLE i_att_cont LINES i_packing_list-head_start.
+  i_packing_list-head_start = i_packing_list-head_start.
+  i_packing_list-body_start = i_packing_list-head_start + 1.
+
+  l_doc_id = pe_fichero.
+  CALL FUNCTION 'SO_DOCUMENT_READ_API1'
+       EXPORTING
+            document_id                = l_doc_id
+       IMPORTING
+            document_data              = l_doc_data
+       TABLES
+*              object_header              = i_objhead
+            object_content             = i_objcont
+*              object_para                = i_objpara
+*              object_parb                = i_object_parb
+             attachment_list            = i_attachment_list
+*              receiver_list              = i_receiver_list
+       EXCEPTIONS
+            document_id_not_exist      = 1
+            operation_no_authorization = 2
+            x_error                    = 3
+            OTHERS                     = 4.
+
+
+  i_packing_list-objlen = l_doc_data-doc_size.
+  LOOP AT i_objcont.
+    i_att_cont2 = i_objcont.
+    APPEND i_att_cont2.
+  ENDLOOP.
+
+  DESCRIBE TABLE i_att_cont2 LINES i_packing_list-body_num.
+  LOOP AT i_att_cont2 INTO i_att_cont.
+    APPEND i_att_cont.
+  ENDLOOP.
+
+
+  i_packing_list-objdes   = l_doc_data-obj_descr.
+  i_packing_list-objnam   = l_doc_data-obj_descr.
+  i_packing_list-objtp    = 'EXT'.
+  i_packing_list-file_ext =  l_doc_data-obj_type.
+  APPEND i_packing_list.
+
+ENDFORM.                    "anyadir_doc_int
+
+*&---------------------------------------------------------------------*
+*&      Form  anyadir_otf
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->I_PACKING_LIST  text
+*      -->I_ATT_CONT      text
+*      -->I_OTFDATA       text
+*      -->PE_FICHERO      text
+*----------------------------------------------------------------------*
+FORM anyadir_otf TABLES i_packing_list  STRUCTURE soxpl
+                        i_att_cont      STRUCTURE soli
+                        i_otfdata      STRUCTURE itcoo
+                      USING pe_fichero.
+  DATA: l_dir TYPE string,
+        l_fichero TYPE string,
+        i_pdf LIKE tline OCCURS 1000 WITH HEADER LINE,
+        content_txt TYPE soli_tab,
+        ac LIKE LINE OF content_txt,
+        l_itcoo TYPE itcoo,
+        l_transfer_bin TYPE sx_boolean,
+        l_len TYPE  so_obj_len,
+        content_bin TYPE solix_tab,
+        objhead TYPE soli_tab,
+        l_longitud_pdf TYPE i.
+
+  LOOP AT i_otfdata INTO l_itcoo.
+    CONCATENATE l_itcoo-tdprintcom l_itcoo-tdprintpar INTO ac.
+    APPEND ac TO content_txt.
+  ENDLOOP.
+
+  CALL FUNCTION 'SX_OBJECT_CONVERT_OTF_PDF'
+    EXPORTING
+      format_src      = 'OTF'
+      format_dst      = 'PDF'
+      devtype         = 'ASCIIPRI'
+    CHANGING
+      transfer_bin    = l_transfer_bin
+      len             = l_len
+      content_txt     = content_txt
+      content_bin     = content_bin
+      objhead         = objhead
+    EXCEPTIONS
+      err_conv_failed = 1
+      OTHERS          = 2.
+
+  l_longitud_pdf = l_len.
+
+  l_dir = zcl_documentos=>get_directorio_temporal( ).
+  CONCATENATE l_dir '\' pe_fichero '.PDF' INTO l_fichero.
+  CALL FUNCTION 'GUI_DOWNLOAD'
+    EXPORTING
+      bin_filesize            = l_longitud_pdf
+      filename                = l_fichero
+      filetype                = 'BIN'
+    TABLES
+      data_tab                = content_bin
+    EXCEPTIONS
+      file_write_error        = 1
+      no_batch                = 2
+      gui_refuse_filetransfer = 3
+      invalid_type            = 4
+      no_authority            = 5
+      unknown_error           = 6
+      header_not_allowed      = 7
+      separator_not_allowed   = 8
+      filesize_not_allowed    = 9
+      header_too_long         = 10
+      dp_error_create         = 11
+      dp_error_send           = 12
+      dp_error_write          = 13
+      unknown_dp_error        = 14
+      access_denied           = 15
+      dp_out_of_memory        = 16
+      disk_full               = 17
+      dp_timeout              = 18
+      file_not_found          = 19
+      dataprovider_exception  = 20
+      control_flush_error     = 21
+      OTHERS                  = 22.
+
+  PERFORM anyadir_adjunto TABLES i_packing_list
+                                 i_att_cont
+                          USING  l_fichero.
+
+  DATA l_file TYPE rlgrap-filename.
+  l_file = l_fichero.
+  CALL FUNCTION 'GUI_DELETE_FILE'
+    EXPORTING
+      file_name = l_file
+    EXCEPTIONS
+      failed    = 1
+      OTHERS    = 2.
+
+ENDFORM.                    "anyadir_otf

@@ -1,0 +1,371 @@
+*&---------------------------------------------------------------------*
+*& Report  ZSWM_UAS_ACCIONE
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+REPORT zswm_uas_accione.
+* JTM SEIDOR: este programa se lanza una vez tomada la decisión de empleo
+INCLUDE zswm_macro.
+
+TABLES: zswm_uas_accione,
+        lubu.
+PARAMETERS: p_lgnum LIKE zswm_uas_accione-lgnum OBLIGATORY.
+SELECT-OPTIONS: s_lenum FOR zswm_uas_accione-lenum,
+                s_pruef FOR zswm_uas_accione-prueflos,
+                s_tpo_a FOR zswm_uas_accione-tpo_acc DEFAULT 'R',
+                s_proce FOR zswm_uas_accione-procesada_321,
+                s_bwart FOR lubu-bwart.
+SELECTION-SCREEN SKIP 1.
+SELECT-OPTIONS: s_fmlot FOR zswm_uas_accione-fecha_mod_lote,
+                s_hmlot FOR zswm_uas_accione-hora_mod_lote.
+SELECTION-SCREEN SKIP 1.
+
+SELECT-OPTIONS: s_erdat FOR zswm_uas_accione-erdat,
+                s_erzei FOR zswm_uas_accione-erzeit,
+                s_ernam FOR zswm_uas_accione-ernam,
+                s_aedat FOR zswm_uas_accione-aedat,
+                s_aezei FOR zswm_uas_accione-aezeit,
+                s_aenam FOR zswm_uas_accione-aenam.
+*PARAMETERS: p_test TYPE flag DEFAULT 'X'.
+PARAMETERS: p_test TYPE flag DEFAULT 'X',
+            p_mode OBLIGATORY DEFAULT 'N'.
+
+INITIALIZATION.
+  s_proce+0(3) = 'INE'. s_proce-low = abap_true. APPEND s_proce.
+  s_bwart+0(3) = 'IEQ'. s_bwart-low = '321'. APPEND s_bwart.
+  s_bwart-low = '350'. APPEND s_bwart.
+  DATA n_reg TYPE i.
+
+START-OF-SELECTION.
+  DATA sw_bloqueo.
+  PERFORM bloqueo USING 'B' p_test p_lgnum CHANGING sw_bloqueo.
+  CHECK sw_bloqueo EQ abap_true.
+  n_reg = 0.
+* Modificamos las intrucciones de traspaso
+  SELECT * INTO TABLE @DATA(tt_aciones) FROM zswm_uas_accione WHERE lgnum     EQ @p_lgnum
+                                                                AND lenum     IN @s_lenum
+                                                                AND prueflos  IN @s_pruef
+                                                                AND tpo_acc   IN @s_tpo_a
+                                                                AND ( procesada_321 IN @s_proce
+                                                                   OR procesada_350 IN @s_proce )
+                                                                AND erdat     IN @s_erdat
+                                                                AND aedat     IN @s_aedat
+                                                                AND erzeit    IN @s_erzei
+                                                                AND aezeit    IN @s_aezei
+                                                                AND ernam     IN @s_ernam
+                                                                AND aenam     IN @s_aenam
+                                                                AND fecha_mod_lote IN @s_fmlot
+                                                                AND hora_mod_lote  IN @s_hmlot.
+  IF p_test NE abap_true.
+    LOOP AT tt_aciones INTO DATA(rt_acciones) WHERE procesada_321 NE abap_true
+                                                 OR procesada_350 NE abap_true.
+      DATA(sw_tabix) = sy-tabix.
+      SELECT * INTO TABLE @DATA(tt_lqua) FROM lqua WHERE lgnum EQ @rt_acciones-lgnum
+                                                     AND lenum EQ @rt_acciones-lenum.
+      IF sy-subrc NE 0.
+        DELETE tt_aciones INDEX sw_tabix.
+        CONTINUE.
+      ENDIF.
+      READ TABLE tt_lqua INTO DATA(rt_lqua) INDEX 1.
+      IF sy-subrc NE 0.
+        DELETE tt_aciones INDEX sw_tabix.
+        CONTINUE.
+      ENDIF.
+*     en este caso solo me interesan las instrucciones de traspaso
+      SELECT * INTO TABLE @DATA(tt_lubu) FROM lubu
+                                         WHERE lgnum EQ @rt_lqua-lgnum
+                                           AND statu NE 'U'
+                                           AND qplos EQ @rt_acciones-prueflos
+                                           AND bwart IN @s_bwart
+                                           AND matn1 EQ @rt_lqua-matnr
+                                           AND werk1 EQ @rt_lqua-werks
+                                           AND lgor1 EQ @rt_lqua-lgort
+                                           AND chrg1 EQ @rt_lqua-charg
+                                           AND sokz1 EQ @rt_lqua-sobkz
+                                           AND sonr1 EQ @rt_lqua-sonum.
+      IF sy-subrc NE 0.
+        DELETE tt_aciones INDEX sw_tabix.
+        CONTINUE.
+      ENDIF.
+
+*     Si la LQUA apunta  a un Lote de inspección y luego hay otro abierto, hay que modificar la instruccion de traspaso
+*     para borrarlo
+*     cambiar jtm 15.09.2022
+      IF  ( rt_lqua-qplos IS NOT INITIAL or rt_lqua-qplos is INITIAL )
+      AND rt_acciones-prueflos NE rt_lqua-qplos.
+*     fin de cambiar jtm 15.09.2022
+        LOOP AT tt_lubu INTO DATA(rt_lubu).
+          CASE rt_lubu-bwart.
+            WHEN '321'. CHECK rt_acciones-ubnum_321 IS INITIAL.
+            WHEN '331'. CHECK rt_acciones-ubnum_331 IS INITIAL.
+
+            WHEN '350'. CHECK rt_acciones-ubnum_350 IS INITIAL.
+            WHEN '553'. CHECK rt_acciones-ubnum_553 IS INITIAL.
+
+          ENDCASE.
+          CLEAR t_bdc[].
+          CLEAR t_bdcmsgcoll[].
+          dynpro 'SAPML02B' '0300'.
+          campo  'LUBU-LGNUM' rt_lubu-lgnum.
+          campo  'LUBU-UBNUM' rt_lubu-ubnum.
+          boton  '/00'.
+          dynpro 'SAPML02B' '0302'.
+          campo  'LUBU-QPLOS' space.
+          boton  '=BU'.
+          CALL TRANSACTION 'LU02' USING t_bdc MODE p_mode MESSAGES INTO t_bdcmsgcoll.
+          READ TABLE t_bdcmsgcoll WITH KEY msgtyp = 'E'.
+          CHECK sy-subrc NE 0.
+          ADD 1 TO n_reg.
+          CASE rt_lubu-bwart.
+            WHEN '321'. rt_acciones-ubnum_321 = rt_lubu-ubnum.
+            WHEN '331'. rt_acciones-ubnum_331 = rt_lubu-ubnum.
+            WHEN '350'. rt_acciones-ubnum_350 = rt_lubu-ubnum.
+            WHEN '553'. rt_acciones-ubnum_553 = rt_lubu-ubnum.
+          ENDCASE.
+          rt_acciones-tratar = abap_true.
+          rt_acciones-aedat  = sy-datum.
+          rt_acciones-aezeit = sy-uzeit.
+          rt_acciones-aenam  = sy-uname.
+
+*              rt_acciones-ubnum_321 = rt_lubu-ubnum.
+          rt_acciones-tratar    = abap_true.
+          UPDATE zswm_uas_accione SET   aedat     = sy-datum
+                                        aezeit    = sy-uzeit
+                                        aenam     = sy-uname
+                                        ubnum_321 = rt_acciones-ubnum_321
+                                        ubnum_331 = rt_acciones-ubnum_331
+                                        ubnum_350 = rt_acciones-ubnum_350
+                                        ubnum_553 = rt_acciones-ubnum_553
+                                   WHERE prueflos EQ rt_acciones-prueflos.
+*                                      and buzei    eq rt_acciones-buzei.
+*            WHEN '350'.
+*              rt_acciones-ubnum_350 = rt_lubu-ubnum.
+*              rt_acciones-tratar    = abap_true.
+*              UPDATE zswm_uas_accione SET   aedat     = sy-datum
+*                                            aezeit    = sy-uzeit
+*                                            aenam     = sy-uname
+*                                            ubnum_350 = rt_lubu-ubnum
+*                                       WHERE prueflos EQ rt_acciones-prueflos.
+**                                      and buzei    eq rt_acciones-buzei.
+*
+*          ENDCASE.
+          MODIFY tt_aciones FROM rt_acciones INDEX sw_tabix.
+        ENDLOOP.
+**     add jtm 15.09.2022
+*      ELSEIF rt_lqua-qplos        IS INITIAL
+*          OR rt_acciones-prueflos NE rt_lqua-qplos.
+**
+*        rt_acciones-tratar = abap_true.
+*        rt_acciones-aedat  = sy-datum.
+*        rt_acciones-aezeit = sy-uzeit.
+*        rt_acciones-aenam  = sy-uname.
+*
+**              rt_acciones-ubnum_321 = rt_lubu-ubnum.
+*        rt_acciones-tratar    = abap_true.
+*        UPDATE zswm_uas_accione SET   aedat     = sy-datum
+*                                      aezeit    = sy-uzeit
+*                                      aenam     = sy-uname
+*                                      ubnum_321 = rt_acciones-ubnum_321
+*                                      ubnum_331 = rt_acciones-ubnum_331
+*                                      ubnum_350 = rt_acciones-ubnum_350
+*                                      ubnum_553 = rt_acciones-ubnum_553
+*                                 WHERE prueflos EQ rt_acciones-prueflos.
+*
+*        MODIFY tt_aciones FROM rt_acciones INDEX sw_tabix.
+*
+**     fin de add jtm 15.09.2022
+      ENDIF.
+
+*      IF rt_acciones-ubnum_321 IS NOT INITIAL AND rt_acciones-procesada_321 NE abap_true.
+*        WAIT UP TO 1 SECONDS.
+*        CLEAR t_bdc[].
+*        CLEAR t_bdcmsgcoll[].
+*        dynpro 'SAPML03T' '0141'.
+*        campo  'LUBU-LGNUM' rt_acciones-lgnum.
+*        campo  'LUBU-UBNUM' rt_acciones-ubnum_321.
+*        boton  '/00'.
+*        CALL TRANSACTION 'LT05' USING t_bdc MODE p_mode MESSAGES INTO t_bdcmsgcoll.
+*          READ TABLE t_bdcmsgcoll WITH KEY msgtyp = 'E'.
+*          CHECK sy-subrc NE 0.
+*
+*      ENDIF.
+*      IF rt_acciones-ubnum_350 IS NOT INITIAL AND rt_acciones-procesada_350 NE abap_true.
+*        WAIT UP TO 1 SECONDS.
+*        CLEAR t_bdc[].
+*        CLEAR t_bdcmsgcoll[].
+*        dynpro 'SAPML03T' '0141'.
+*        campo  'LUBU-LGNUM' rt_acciones-lgnum.
+*        campo  'LUBU-UBNUM' rt_acciones-ubnum_350.
+*        boton  '/00'.
+*        CALL TRANSACTION 'LT05' USING t_bdc MODE p_mode MESSAGES INTO t_bdcmsgcoll.
+*          READ TABLE t_bdcmsgcoll WITH KEY msgtyp = 'E'.
+*          CHECK sy-subrc NE 0.
+*
+*      ENDIF.
+    ENDLOOP.
+    IF n_reg > 0.
+      COMMIT WORK AND WAIT.
+      PERFORM bloqueo USING 'B' p_test p_lgnum CHANGING sw_bloqueo.
+    ENDIF.
+    LOOP AT tt_aciones INTO rt_acciones WHERE ( ubnum_321 IS NOT INITIAL AND procesada_321 NE abap_true )
+                                           OR ( ubnum_331 IS NOT INITIAL AND procesada_331 NE abap_true )
+                                           OR ( ubnum_350 IS NOT INITIAL AND procesada_350 NE abap_true )
+                                           OR ( ubnum_553 IS NOT INITIAL AND procesada_553 NE abap_true ).
+      DATA cadena TYPE string.
+      DO 4 TIMES.
+        DATA(sw_index) = sy-index.
+        CONSTANTS: c_comillas VALUE ''''.
+        CLEAR cadena.
+*        DATA ubnum TYPE lubu-ubnum.
+*        CLEAR ubnum.
+        CASE sw_index.
+          WHEN 1.
+            IF rt_acciones-ubnum_321 IS NOT INITIAL AND rt_acciones-procesada_321 NE abap_true.
+*              ubnum = rt_acciones-ubnum_321.
+              CONCATENATE 'LGNUM EQ@' c_comillas rt_acciones-lgnum  c_comillas '@AND UBNUM EQ@' c_comillas rt_acciones-ubnum_321 c_comillas '@AND STATU NE@' c_comillas 'U' c_comillas
+              INTO cadena.
+            ENDIF.
+          WHEN 2.
+            IF rt_acciones-ubnum_331 IS NOT INITIAL AND rt_acciones-procesada_331 NE abap_true.
+*              ubnum = rt_acciones-ubnum_331.
+              CONCATENATE 'LGNUM EQ@' c_comillas rt_acciones-lgnum  c_comillas '@AND UBNUM EQ@' c_comillas rt_acciones-ubnum_331 c_comillas '@AND STATU NE@' c_comillas 'U' c_comillas
+              INTO cadena.
+            ENDIF.
+
+          WHEN 3.
+            IF rt_acciones-ubnum_350 IS NOT INITIAL AND rt_acciones-procesada_350 NE abap_true.
+*              ubnum = rt_acciones-ubnum_350.
+              CONCATENATE 'LGNUM EQ@' c_comillas rt_acciones-lgnum  c_comillas '@AND UBNUM EQ@' c_comillas rt_acciones-ubnum_350 c_comillas '@AND STATU NE@' c_comillas 'U' c_comillas
+              INTO cadena.
+            ENDIF.
+
+          WHEN 4.
+            IF rt_acciones-ubnum_553 IS NOT INITIAL AND rt_acciones-procesada_553 NE abap_true.
+*              ubnum = rt_acciones-ubnum_553.
+              CONCATENATE 'LGNUM EQ@' c_comillas rt_acciones-lgnum  c_comillas '@AND UBNUM EQ@' c_comillas rt_acciones-ubnum_553 c_comillas '@AND STATU NE@' c_comillas 'U' c_comillas
+              INTO cadena.
+            ENDIF.
+
+        ENDCASE.
+        CHECK cadena IS NOT INITIAL.
+*        CHECK ubnum  IS NOT INITIAL.
+        while sy-subrc eq 0.
+          replace '@' into cadena WITH space.
+        ENDWHILE.
+*        SELECT COUNT( * ) FROM lubu
+*                            WHERE lgnum   EQ rt_acciones-lgnum
+*                              AND ubnum   EQ ubnum
+*                              AND statu   NE 'U' .
+
+        SELECT SINGLE COUNT( * ) FROM lubu WHERE (cadena).
+        CHECK sy-subrc EQ 0.
+        DATA ubnum TYPE lubu-ubnum.
+
+        CASE sw_index.
+          WHEN 1. ubnum = rt_acciones-ubnum_321.
+          WHEN 2. ubnum = rt_acciones-ubnum_331.
+          WHEN 3. ubnum = rt_acciones-ubnum_350.
+          WHEN 4. ubnum = rt_acciones-ubnum_553.
+        ENDCASE.
+
+        CLEAR t_bdc[].
+        CLEAR t_bdcmsgcoll[].
+        dynpro 'SAPML03T' '0141'.
+        campo  'LUBU-LGNUM' rt_acciones-lgnum.
+        campo  'LUBU-UBNUM' ubnum.
+        boton  '/00'.
+
+      ENDDO.
+
+*      IF rt_acciones-ubnum_321 IS NOT INITIAL AND rt_acciones-procesada_321 NE abap_true.
+*        SELECT SINGLE COUNT( * ) FROM lubu WHERE lgnum EQ rt_acciones-lgnum
+*                                             AND ubnum EQ rt_acciones-ubnum_321
+*                                             AND statu NE 'U'.
+*        IF sy-subrc EQ 0.
+*
+*          CLEAR t_bdc[].
+*          CLEAR t_bdcmsgcoll[].
+*          dynpro 'SAPML03T' '0141'.
+*          campo  'LUBU-LGNUM' rt_acciones-lgnum.
+*          campo  'LUBU-UBNUM' rt_acciones-ubnum_321.
+*          boton  '/00'.
+*          CALL TRANSACTION 'LT05' USING t_bdc MODE p_mode MESSAGES INTO t_bdcmsgcoll.
+**          READ TABLE t_bdcmsgcoll WITH KEY msgtyp = 'E'.
+**          CHECK sy-subrc NE 0.
+*        ENDIF.
+*      ENDIF.
+*      IF rt_acciones-ubnum_350 IS NOT INITIAL AND rt_acciones-procesada_350 NE abap_true.
+*        SELECT SINGLE COUNT( * ) FROM lubu WHERE lgnum EQ rt_acciones-lgnum
+*                                             AND ubnum EQ rt_acciones-ubnum_350
+*                                             AND statu NE 'U'.
+*        IF sy-subrc EQ 0.
+*
+*          CLEAR t_bdc[].
+*          CLEAR t_bdcmsgcoll[].
+*          dynpro 'SAPML03T' '0141'.
+*          campo  'LUBU-LGNUM' rt_acciones-lgnum.
+*          campo  'LUBU-UBNUM' rt_acciones-ubnum_350.
+*          boton  '/00'.
+*          CALL TRANSACTION 'LT05' USING t_bdc MODE p_mode MESSAGES INTO t_bdcmsgcoll.
+**          READ TABLE t_bdcmsgcoll WITH KEY msgtyp = 'E'.
+**          CHECK sy-subrc NE 0.
+*        ENDIF.
+*      ENDIF.
+
+    ENDLOOP.
+  ENDIF.
+*  CHECK n_reg > 0.
+*  COMMIT WORK AND WAIT.
+  PERFORM bloqueo USING 'D' p_test p_lgnum CHANGING sw_bloqueo.
+
+*&---------------------------------------------------------------------*
+*&      Form  BLOQUEO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_0106   text
+*      -->P_P_TEST  text
+*      -->P_P_LGNUM  text
+*      <--P_SW_BLOQUEO  text
+*----------------------------------------------------------------------*
+FORM bloqueo  USING    VALUE(p_tipo_bloqueo)
+                       p_test                 TYPE flag
+                       p_lgnum                TYPE lgnum
+              CHANGING p_bloqueo.
+  MOVE abap_true TO p_bloqueo.
+  CHECK p_test NE abap_true.
+  DATA name TYPE trdir-name.
+  CONCATENATE p_lgnum 'ZSWM_UAS_ACCIONE' INTO name.
+  CASE p_tipo_bloqueo.
+    WHEN 'B'.
+      WAIT UP TO 10 SECONDS.
+      CALL FUNCTION 'ENQUEUE_E_TRDIR'
+        EXPORTING
+          mode_trdir     = 'X'
+          name           = name
+*         X_NAME         = ' '
+*         _SCOPE         = '2'
+          _wait          = 'X'
+*         _COLLECT       = ' '
+        EXCEPTIONS
+          foreign_lock   = 1
+          system_failure = 2
+          OTHERS         = 3.
+      IF sy-subrc <> 0.
+        MOVE abap_false TO p_bloqueo.
+      ENDIF.
+    WHEN 'D'.
+      CALL FUNCTION 'DEQUEUE_E_TRDIR'
+        EXPORTING
+*         MODE_TRDIR       = 'X'
+          name = name
+*         X_NAME           = ' '
+*         _SCOPE           = '3'
+*         _SYNCHRON        = ' '
+*         _COLLECT         = ' '
+        .
+
+  ENDCASE.
+ENDFORM.

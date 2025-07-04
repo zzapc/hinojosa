@@ -1,0 +1,2214 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0076_FORMS
+*&---------------------------------------------------------------------*
+
+FORM obtener_datos.
+
+  gr_sgpi = NEW zcl_ap_sgpi( COMMIT_WORK = 'X' ).
+
+  IF p_comp = 'X'.
+    gr_sgpi->texto( 'Obteniendo datos de compras' ).
+
+    PERFORM obtener_datos_compras.
+    INSERT LINES OF gt_datos_compras INTO TABLE gt_datos.
+  ENDIF.
+
+  IF p_vent = 'X'.
+    gr_sgpi->texto( 'Obteniendo datos de ventas' ).
+
+    PERFORM obtener_datos_ventas.
+    INSERT LINES OF gt_datos_ventas INTO TABLE gt_datos.
+  ENDIF.
+
+
+  PERFORM tratar_entregas.
+
+ENDFORM.
+
+FORM tratar_entregas.
+
+  TABLES: vttk.
+
+  SELECT vbeln , vttk~erdat , dalbg , daten , uzdis , ualbg , ualen , uzabf , vttk~handle
+    FROM vttk
+    INNER JOIN vttp ON vttk~tknum = vttp~tknum
+*    left OUTER join tsege on tsege~head_hd1 =
+    INTO TABLE @DATA(lt_vttk)
+    FOR ALL ENTRIES IN @gt_datos
+ WHERE vbeln = @gt_datos-vbeln_ent.
+
+* Acceso a LIKP + tsege, de momento asteriscado.
+***      SELECT SINGLE handle FROM vttk
+***        INTO likp-handle
+***       WHERE tknum = <fs_datos>-tknum.
+***      IF sy-subrc = 0 AND likp-handle NE ''.
+***
+***        SELECT * FROM tsege INTO @DATA(ls_tsege)
+***         WHERE head_hdl = @likp-handle
+***           AND even  = 'WSHDR0003'.
+***        ENDSELECT.
+***
+***        DATA: l_utc(15).
+***
+***        IF sy-subrc = 0.
+***          l_utc = ls_tsege-even_tstfr.
+***          <fs_datos>-fentregacliente = l_utc(10).
+***        ENDIF.
+***      ENDIF.
+
+  LOOP AT gt_datos ASSIGNING FIELD-SYMBOL(<fs_datos>).
+
+* data(ls) = <entregas_ventas>[ vbeln = <fs_datos>-vbeln ].
+*    assign <entregas_ventas>[ vbeln = <fs_datos>-vbeln ] to FIELD-SYMBOL(<fs_datos_entrega_venta>).
+
+
+* VIA de PAGO
+*    IF NOT <fs_datos>-zlsch IS INITIAL.
+    "Descripción de la Vía de Pago
+*      SELECT SINGLE * FROM tvko
+*        INTO @DATA(ls_tvko)
+*       WHERE vkorg = @<fs_datos>-vkorg.
+*      IF sy-subrc = 0.
+*        SELECT SINGLE text1 FROM  t042z
+*          INTO <fs_datos>-text1
+*         WHERE land1  = ls_tvko-vkokl
+*          AND  zlsch  = <fs_datos>-zlsch.
+*      ENDIF.
+*    ENDIF.
+
+
+    <fs_datos>-prdha = <fs_datos>-prdha(2).
+
+    SELECT SINGLE zzfpickingreal erzet
+      FROM likp
+      INTO (<fs_datos>-fpickingreal, <fs_datos>-hcr_entrega)
+      WHERE vbeln = <fs_datos>-vbeln_ent.
+
+
+*****************************************
+*    IF <fs_datos>-fpickingreal IS INITIAL OR <fs_datos>-fpickingreal = ''.
+*
+*      <fs_datos>-fpickingreal = zcl_ap_control_cambios=>get_fecha_ult_cambio( objectclas = 'LIEFERUNG'
+*                                                                              objectid   = <fs_datos>-vbeln_ent
+*                                                                              tabname    = 'VBUK'
+*                                                                              fname      = 'KOSTK' ).
+******          IF NOT <fs_datos>-fpickingreal IS INITIAL.
+******            UPDATE likp
+******               SET zzfpickingreal = <fs_datos>-fpickingreal
+******             WHERE vbeln = l_listado-vbeln_ent.
+******          ENDIF.
+*    ENDIF.
+    DATA(l_semana) = zcl_ap_fechas=>get_semana( <fs_datos>-fpickingreal ).
+    <fs_datos>-sem_pickingreal = l_semana+4(2).
+    IF <fs_datos>-vbeln_ent IS NOT INITIAL.
+
+      DATA(i_cdpos) =  zcl_ap_control_cambios=>get_cdpos( objectclas = 'LIEFERUNG'
+                                            objectid   = <fs_datos>-vbeln_ent
+                                            tabname    = 'VBUK'
+                                            fname  =  'KOSTK').
+    ENDIF.
+
+    READ TABLE i_cdpos INTO DATA(l_cdpos) WITH KEY value_old = 'A'
+                                             value_new = 'B'.
+    IF sy-subrc = 0.
+      <fs_datos>-fini_picking = l_cdpos-udate.
+      <fs_datos>-hini_picking = l_cdpos-utime.
+    ENDIF.
+    READ TABLE i_cdpos INTO l_cdpos WITH KEY value_old = 'B'
+                                             value_new = 'C'.
+    IF sy-subrc = 0.
+      <fs_datos>-ffin_picking = l_cdpos-udate.
+      <fs_datos>-hfin_picking = l_cdpos-utime.
+    ELSE.
+      READ TABLE i_cdpos INTO l_cdpos WITH KEY value_old = 'A'
+                                               value_new = 'C'.
+      IF sy-subrc = 0.
+        <fs_datos>-fini_picking = l_cdpos-udate.
+        <fs_datos>-hini_picking = l_cdpos-utime.
+        <fs_datos>-ffin_picking = l_cdpos-udate.
+        <fs_datos>-hfin_picking = l_cdpos-utime.
+      ENDIF.
+    ENDIF.
+
+    IF <fs_datos>-tp_pedido = 'V'.
+      <fs_datos>-fsolicitada = zcl_ap_control_cambios=>get_primer_valor_campo( objectclas = 'VERKBELEG'
+                                                                               objectid   = <fs_datos>-vbeln
+                                                                               tabname    = 'VBEP'
+                                                                               fname      = 'EDATU' ).
+    ENDIF.
+*  IF NOT <fs_datos>-fpickingreal IN s_fpickr.
+*    CONTINUE.
+*  ENDIF.
+* Recuparar datos de transportes.
+    TRY.
+        DATA(ls_vttk) = lt_vttk[ vbeln = <fs_datos>-vbeln_ent ].
+        <fs_datos>-fcrdoctrans      = ls_vttk-erdat.
+        <fs_datos>-dalbg            = ls_vttk-dalbg.
+        <fs_datos>-fentregacliente  = ls_vttk-daten.
+        <fs_datos>-fentregacli      = ls_vttk-daten.
+        <fs_datos>-uzdis            = ls_vttk-uzdis.
+        <fs_datos>-ualbg            = ls_vttk-ualbg.
+        <fs_datos>-ualen            = ls_vttk-ualen.
+        <fs_datos>-uzabf            = ls_vttk-uzabf.
+        IF ls_vttk-handle IS NOT INITIAL.
+
+        ENDIF.
+      CATCH cx_root .
+    ENDTRY.
+
+
+*    SELECT SINGLE tknum FROM vttp
+*      INTO <fs_datos>-tknum
+*     WHERE vbeln = <fs_datos>-vbeln_ent.
+    IF sy-subrc = 0.
+*      SELECT SINGLE erdat dalbg daten
+*                    uzdis ualbg ualen uzabf FROM vttk
+*  INTO (<fs_datos>-fcrdoctrans, <fs_datos>-dalbg, vttk-daten,
+*  <fs_datos>-uzdis, <fs_datos>-ualbg, <fs_datos>-ualen,
+*  <fs_datos>-uzabf)
+*  WHERE tknum = <fs_datos>-tknum.
+*      <fs_datos>-fentregacliente = <fs_datos>-fentregacli =
+*      vttk-daten.
+      SELECT SINGLE handle FROM vttk
+        INTO likp-handle
+       WHERE tknum = <fs_datos>-tknum.
+      IF sy-subrc = 0 AND likp-handle NE ''.
+
+        SELECT * FROM tsege INTO @DATA(ls_tsege)
+         WHERE head_hdl = @likp-handle
+           AND even  = 'WSHDR0003'.
+        ENDSELECT.
+
+        DATA: l_utc(15).
+
+        IF sy-subrc = 0.
+          l_utc = ls_tsege-even_tstfr.
+          <fs_datos>-fentregacliente = l_utc(10).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+* recuperar datos de la entrega.
+    IF <fs_datos>-fentregacliente IS INITIAL OR
+    <fs_datos>-fentregacliente = '00000000'.
+      SELECT SINGLE handle FROM likp
+        INTO likp-handle
+       WHERE vbeln = <fs_datos>-vbeln_ent.
+      IF sy-subrc = 0 AND likp-handle NE ''.
+        SELECT * FROM tsege INTO ls_tsege
+         WHERE head_hdl = likp-handle
+           AND even  = 'WSHDR0003'.
+        ENDSELECT.
+        IF sy-subrc = 0.
+          l_utc = ls_tsege-even_tstfr.
+          <fs_datos>-fentregacli = l_utc.
+          <fs_datos>-fentregacliente = l_utc(10).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    IF <fs_datos>-fentregacliente = '00000000'.
+      CLEAR <fs_datos>-fentregacliente.
+    ELSEIF NOT ( <fs_datos>-fentregacliente IS INITIAL OR
+    <fs_datos>-fentregacliente = '00000000' ).
+      vttk-daten = <fs_datos>-fentregacliente.
+      <fs_datos>-fentregacli = vttk-daten.
+      WRITE vttk-daten TO <fs_datos>-fentregacliente.
+    ENDIF.
+
+*  PERFORM tratar_colores CHANGING <fs_datos>.
+
+  ENDLOOP.
+
+ENDFORM.
+
+
+FORM tratar_colores CHANGING p_reg TYPE zsd_estado_pedidos_n.
+
+* Tratamiento de colores.
+  IF p_reg-vbtyp = 'H'.
+    APPEND INITIAL LINE TO p_reg-color[] ASSIGNING FIELD-SYMBOL(<fs_color>).
+    PERFORM colorear_celda_fila USING ' '
+                                      '6' "Amarillo
+                             CHANGING <fs_color>.
+  ENDIF.
+
+  IF p_reg-vbeln_ent IS INITIAL.
+    APPEND INITIAL LINE TO p_reg-color[] ASSIGNING <fs_color>.
+    PERFORM colorear_celda_fila USING 'VBELN_ENT'
+                                      '6' "Amarillo
+                             CHANGING <fs_color>.
+  ENDIF.
+
+
+ENDFORM.
+
+FORM obtener_datos_compras.
+
+  CONSTANTS: gc_zint     TYPE char4  VALUE 'ZINT'.
+
+  DATA: ls_datos_cli TYPE ty_cli,
+        l_semana     TYPE scal-week,
+        l_lifnr      TYPE lifnr.
+
+  l_lifnr = |P{ p_werks }|.
+
+  gr_sgpi->texto( 'Obteniendo datos de compras...' ).
+
+  SELECT ekko~ekorg          ,
+         ekko~bukrs          ,
+         bsart               ,
+         lifnr               ,
+         ekko~bedat          ,
+         ekpo~ebeln          ,
+         ekpo~ebelp          ,
+         eket~etenr          ,
+         ekko~bstyp          ,
+         ekpo~pstyp          ,
+         ekpo~knttp          ,
+         ekpo~matnr          ,
+         mara~matkl          ,
+         prdha               ,
+         zzcalidad           ,
+         zzgramaje           ,
+         zzancho             ,
+         zzlargo             ,
+         eket~menge          ,     "Cantidad Pedido Compras
+         wemng               ,     "Cantidad Fabricada
+         ekpo~meins          ,
+         netwr               ,
+         brtwr               ,
+         waers               ,
+         eindt               ,
+         route               ,
+         lprio               ,
+         ekko~ernam          ,
+         werks               ,
+         zzcausa_retraso     ,
+         kzwi5               ,
+         retpo               ,
+         ekpo~loekz          ,
+         ekpo~zzbloq_plan    ,
+         zzbloq_fabr         ,
+         ekko~aedat
+     INTO CORRESPONDING FIELDS OF TABLE @gt_sql_compras
+     FROM  ekko
+     JOIN ekpo ON ekko~ebeln = ekpo~ebeln
+     JOIN eket ON ekpo~ebeln = eket~ebeln AND ekpo~ebelp = eket~ebelp
+     JOIN ekpv ON ekpo~ebeln = ekpv~ebeln AND ekpo~ebelp = ekpv~ebelp
+     JOIN mara ON ekpo~matnr = mara~matnr
+     WHERE ekko~lifnr = @l_lifnr AND
+           ekko~bsart = @gc_zint AND
+           ekko~bedat IN @s_bedat AND
+           ekpv~kunnr IN @s_kunnr AND
+           ekpo~matnr IN @s_matnr AND
+           ekpo~matkl IN @s_matkl AND
+           eket~eindt IN @s_lfdat AND
+           NOT (  ekpo~eglkz = 'X' OR "indicador de entrega  completa
+                  ekpo~elikz = 'X'    "indicador de entrega salida completa
+               ) AND
+           ekpo~loekz = ' ' AND "indicador de borrado
+           ekko~zzsegcal IN @s_zsegca.
+
+  CHECK gt_sql_compras IS NOT INITIAL. "No se han encontrado
+
+* Convertir la posición para filtrar por LIPS-VGPOS
+  LOOP AT gt_sql_compras ASSIGNING FIELD-SYMBOL(<fs_com>).
+    <fs_com>-vgpos = CONV vgpos( <fs_com>-ebelp ).
+
+  ENDLOOP.
+
+  PERFORM buscar_cant_ped_abie_compras.
+
+
+  gr_sgpi->texto( 'Obteniendo datos de pedidos compra...' ).
+
+  SELECT  lp~vbeln , lp~posnr , lp~vgbel , lp~vgpos , lp~vtweg , lp~spart , lp~lfimg ,
+          lk~kunnr , lk~vkorg , lk~erdat , lk~wadat_ist , lk~kodat ,
+          bu~fkivp , bu~wbsta , bu~kosta
+    FROM lips AS lp
+    INNER JOIN vbup AS bu ON bu~vbeln = lp~vbeln AND  bu~posnr = lp~posnr
+    INNER JOIN likp AS lk ON lk~vbeln = lp~vbeln
+    INTO CORRESPONDING FIELDS OF TABLE @gt_lips_vbup
+    FOR ALL ENTRIES IN @gt_sql_compras
+    WHERE lp~vgbel = @gt_sql_compras-ebeln  AND
+          lp~vgpos = @gt_sql_compras-vgpos AND
+          bu~fkivp = 'C'.
+
+
+* Seleccionar el margen de tolerancia del destino de mercancias
+  SELECT kunnr , vkorg , vtweg , spart , untto
+    FROM knvv
+    INTO CORRESPONDING FIELDS OF TABLE @gt_knvv
+*      INTO CORRESPONDING FIELDS OF TABLE @DATA(gt_knvv)
+    FOR ALL ENTRIES IN @gt_lips_vbup
+      WHERE kunnr = @gt_lips_vbup-kunnr
+        AND vkorg = @gt_lips_vbup-vkorg
+        AND vtweg = @gt_lips_vbup-vtweg
+        AND spart = @gt_lips_vbup-spart.
+
+* SELECCIONAR DATOS DE LA PESTAÑA "EXPEDICIÓN" DEL PEDIDO DE COMPRAS.
+  SELECT ebeln , ebelp , route , lprio , kunnr
+    INTO TABLE @DATA(lt_ekpv)
+    FROM ekpv
+    FOR ALL ENTRIES IN @gt_sql_compras
+    WHERE ebeln = @gt_sql_compras-ebeln AND
+          ebelp = @gt_sql_compras-ebelp.
+
+
+
+*  LOOP AT gt_sql_compras INTO DATA(ls_datos_compras).
+*    APPEND INITIAL LINE TO gt_datos_compras ASSIGNING FIELD-SYMBOL(<fs_compras>).
+  LOOP AT gt_datos_compras ASSIGNING FIELD-SYMBOL(<fs_compras>).
+    TRY.
+        DATA(ls_datos_compras) = gt_sql_compras[ ebeln = <fs_compras>-ebeln
+                                                 ebelp = <fs_compras>-ebelp  ].
+      CATCH cx_root .
+    ENDTRY.
+
+*    SELECT SINGLE aufnr ps_psp_pnr nplnr
+*      FROM ekkn
+*      INTO (<fs_compras>-aufnr, <fs_compras>-ps_psp_pnr, <fs_compras>-nplnr)
+*      WHERE ebeln = ls_datos_compras-ebeln
+*        AND ebelp = ls_datos_compras-ebelp.
+
+    <fs_compras>-vbeln = ls_datos_compras-ebeln.
+    CONCATENATE '0' ls_datos_compras-ebelp INTO <fs_compras>-posnr.
+    <fs_compras>-ernam            = ls_datos_compras-ernam.        "CREADOR.
+    <fs_compras>-erdat            = ls_datos_compras-aedat.        "CREADOR.
+    <fs_compras>-vkorg            = ls_datos_compras-lifnr+1(4).   " Org. Ventas = Proveedor sin "P".
+    <fs_compras>-werks            = <fs_compras>-vkorg.
+    <fs_compras>-vtweg            = '10'.                          "Canal de Distribución.
+    <fs_compras>-auart            = ls_datos_compras-bsart.        "Clase de documento.
+    <fs_compras>-kwmeng           = ls_datos_compras-menge.
+    <fs_compras>-vbtyp            = 'C'            .        "Tipo de Documento = "C".
+    <fs_compras>-arktx            = zcl_utils_hpap_pp=>get_descr_material( <fs_compras>-matnr ).
+    <fs_compras>-bstnk            = ls_datos_compras-ebeln.        "Nº de pedido de compras
+    <fs_compras>-audat            = ls_datos_compras-bedat.        "Fecha del documento.
+    <fs_compras>-vrkme            = ls_datos_compras-meins.
+    <fs_compras>-vdatu            = ls_datos_compras-eindt.        "Fecha Preferente de Entrega.
+    <fs_compras>-prdha            = ls_datos_compras-prdha.
+    <fs_compras>-precio_final     = ls_datos_compras-netwr.
+    <fs_compras>-transporte       = ls_datos_compras-kzwi5.
+
+    PERFORM datos_centro USING <fs_compras>-vkorg
+                      CHANGING <fs_compras>-vtext.
+
+    IF ls_datos_compras-zzbloq_plan = 'X'.      "Bloqueo de pedidos MM.
+      <fs_compras>-lifsk = 'Z1'.           "Asimilamos al bloq. de pedidos SD.
+      PERFORM datos_lifsk USING <fs_compras>-lifsk
+                      CHANGING <fs_compras>-lifsk_t.
+    ENDIF.
+
+    IF ls_datos_compras-zzbloq_fabr = 'X'.
+      "Bloqueo de pedidos MM PARA FABRICACIÓN.
+      <fs_compras>-pstyv = 'ZTAN'.
+      "Asimilamos al TIPO DE POSICIÓN DE VENTAS CONTRA STOCK.
+    ELSE.
+      <fs_compras>-pstyv = 'TAN'.
+      "Asimilamos al TIPO DE POSICIÓN DE VENTAS NORMAL.
+    ENDIF.
+
+    IF ls_datos_compras-waers NE 'EUR'.
+
+      <fs_compras>-precio_final = zcl_ap_doc_fi=>convertir_moneda_eur( importe = <fs_compras>-precio_final
+                                                                       moneda  = ls_datos_compras-waers
+                                                                       fecha   = ls_datos_compras-bedat ).
+
+      <fs_compras>-transporte = zcl_ap_doc_fi=>convertir_moneda_eur( importe = <fs_compras>-transporte
+                                                                     moneda  = ls_datos_compras-waers
+                                                                     fecha   = ls_datos_compras-bedat ).
+    ENDIF.
+
+*CONVIERTO LOS IMPORTES EN NEGATIVOS SI PROCEDEN DE DEVOLUCIONES DE
+*COMPRAS.
+    IF ls_datos_compras-retpo = 'X'.
+      "PEDIDO INTERCO DE DEVOLUCIÓN.
+      <fs_compras>-vbtyp        = 'H'.  "Cambio Tipo de Documento a "H".
+      <fs_compras>-netwr        = <fs_compras>-netwr * -1.               "PRECIO NETO.
+      <fs_compras>-precio_final = <fs_compras>-precio_final * -1. "PRECIO FINAL.
+    ENDIF.
+
+* SELECCIONAR DATOS DE LA PESTAÑA "EXPEDICIÓN" DEL PEDIDO DE COMPRAS.
+    TRY.
+        <fs_compras>-route = lt_ekpv[ ebeln = ls_datos_compras-ebeln
+                                      ebelp = ls_datos_compras-ebelp ]-route.
+        <fs_compras>-lprio = lt_ekpv[ ebeln = ls_datos_compras-ebeln
+                                      ebelp = ls_datos_compras-ebelp ]-lprio.
+        <fs_compras>-kunnr = lt_ekpv[ ebeln = ls_datos_compras-ebeln
+                                      ebelp = ls_datos_compras-ebelp ]-kunnr.
+      CATCH cx_root .
+    ENDTRY.
+
+    <fs_compras>-kunwe = <fs_compras>-kunnr.
+
+    PERFORM datos_prio USING ls_datos_compras-lprio
+                 CHANGING <fs_compras>-lprio_txt.
+
+    CALL METHOD zcl_utils_hpap_pp=>get_datos_cliente
+      EXPORTING
+        i_kunnr = <fs_compras>-kunnr
+      IMPORTING
+        o_name1 = DATA(l_name)
+        o_pstlz = <fs_compras>-pstlz
+        o_land1 = <fs_compras>-land1.
+
+    <fs_compras>-name1 = l_name.
+    <fs_compras>-zlsch = ls_datos_cli-zlsch.
+    <fs_compras>-text1 = ls_datos_cli-text1.
+
+** RECUPERAR LOS TEXTOS DE LA CAUSA DE RETRASO:
+    IF <fs_compras>-zzcausa_retraso IS NOT INITIAL.
+      <fs_compras>-causa_retrasot = zcl_ap_utils=>get_texto_dominio( dominio = 'ZCAUSA_RETRASO'
+                                                                     valor   = <fs_compras>-zzcausa_retraso ).
+    ENDIF.
+
+*
+** RESCATAR FECHAS DEL PEDIDO.
+    <fs_compras>-fasignada = ls_datos_compras-eindt.
+    WRITE ls_datos_compras-eindt TO <fs_compras>-fasignada.
+    <fs_compras>-fsolicitada = zcl_ap_control_cambios=>get_primer_valor_campo(
+    objectclas = 'EINKBELEG'
+                        objectid   = <fs_compras>-vbeln
+                        tabname    = 'EKET'
+                        fname      = 'EINDT' ).
+    IF <fs_compras>-fsolicitada IS INITIAL OR <fs_compras>-fsolicitada = ''.
+      <fs_compras>-fsolicitada  = ls_datos_compras-eindt.
+      "FECHA solicitada por cliente.
+      <fs_compras>-fasign       = ls_datos_compras-eindt.
+      "FECHA solicitada por cliente.
+    ENDIF.
+    l_semana = zcl_ap_fechas=>get_semana( <fs_compras>-fsolicitada ).
+    <fs_compras>-sem_fsolicitada = l_semana+4(2).
+
+    l_semana = zcl_ap_fechas=>get_semana( ls_datos_compras-eindt ).
+    "SEMANA de entrega a cliente.
+    <fs_compras>-sem_entrega = l_semana+4(2).
+*
+** ESTADO DE PEDIDOS DE COMPRAS RECHAZADOS.
+    IF ls_datos_compras-loekz NE ''.
+      <fs_compras>-estado = 'RE'.   "Rechazada la posción (Marcada para borrar).
+*            CHECK <fs_compras>-estado IN s_estado.
+      <fs_compras>-kwmeng = 0.
+      " AL SER POSICIÓN RECHAZADA, NO QUEREMOS REFLEJAR LAS CANTIDADES.
+
+    ELSE.
+      PERFORM get_estado_ped_compras   USING <fs_compras>-ebeln
+                                             <fs_compras>-ebelp
+                                             <fs_compras>-etenr
+                                     ls_datos_compras-menge
+                               CHANGING <fs_compras>.
+    ENDIF.
+
+
+* CALCULAR LA CANTIDAD ABIERTA DEL PEDIDO.
+    CASE <fs_compras>-estado.
+      WHEN ''.
+        <fs_compras>-ctd_ped_abierta = <fs_compras>-kwmeng.
+*                  CHECK <fs_compras>-estado IN s_estado.
+      WHEN 'RE'.
+        <fs_compras>-ctd_ped_abierta = 0.
+*          WHEN 'ET' OR 'FT'.
+*            l_listado-ctd_ped_abierta = 0.
+      WHEN OTHERS.
+        DATA(l_ctd_entregada) = zcl_ped_sd=>get_cantidad_entregada( vbeln = <fs_compras>-vbeln
+                                                                    posnr = <fs_compras>-posnr ).
+        IF <fs_compras>-kwmeng > 0.
+          <fs_compras>-ctd_ped_abierta = <fs_compras>-kwmeng - l_ctd_entregada.
+        ELSEIF <fs_compras>-kwmeng = 0.
+          <fs_compras>-ctd_ped_abierta = 0.
+        ENDIF.
+    ENDCASE.
+
+****
+    IF ls_datos_compras-retpo = 'X'.
+      "PEDIDO INTERCO DE DEVOLUCIÓN.
+      <fs_compras>-vbtyp        = 'H'.  "Cambio Tipo de Documento a "H".
+      <fs_compras>-netwr        = <fs_compras>-netwr * -1.               "PRECIO NETO.
+      <fs_compras>-precio_final = <fs_compras>-precio_final * -1. "PRECIO FINAL.
+
+      IF  <fs_compras>-kwmeng > 0.
+        "PEDIDO INTERCO DE DEVOLUCIÓN Y SI LA CANT. ES POSITIVA...
+        <fs_compras>-kwmeng           = <fs_compras>-kwmeng * -1.    "CANTIDAD.
+        <fs_compras>-lfimg            = <fs_compras>-lfimg  * -1.    "CANTIDAD ENTREGA
+        <fs_compras>-pikmg            = <fs_compras>-pikmg  * -1.    "CANTIDAD DE PICKING
+        <fs_compras>-ctd_ped_abierta  = <fs_compras>-ctd_ped_abierta * -1.    "CANTIDAD PEDIDO ABIERTA
+      ENDIF.
+    ENDIF.
+
+*    TYPES: BEGIN OF ty_datos_cab,
+*             name1 TYPE name1,
+*             pstlz TYPE pstlz,
+*             land1 TYPE land1,
+*             zlsch TYPE schzw_bseg,
+*             text1 TYPE text1,
+*             lifsk TYPE lifsk,
+*             pstyv TYPE pstyv,
+*           END OF ty_datos_cab.
+
+  ENDLOOP.
+
+
+ENDFORM.
+
+FORM get_estado_ped_compras  USING    pe_ebeln
+                                      pe_ebelp
+                                      pe_etenr
+                                      pe_menge
+                             CHANGING " ps_estado
+                                      fs_pedido TYPE zsd_estado_pedidos_n.
+
+  DATA:  l_cant_tol_inf TYPE   ekpo-menge.
+  DATA:  l_toler        TYPE   knvv-untto.
+  DATA:  l_entregas     TYPE   tslvt.
+
+
+  CLEAR fs_pedido-wemng.
+
+  SELECT SINGLE k~aufnr , k~objnr , p~wemng , ko~igmng
+    FROM aufk AS k
+    INNER JOIN afpo AS p ON k~aufnr = p~aufnr
+    INNER JOIN afko AS ko ON ko~aufnr = k~aufnr
+    INTO @DATA(ls_aufk)
+     WHERE auart  = 'ZI02'
+       AND autyp   = '40'
+       AND
+    (
+      ( zzebeln1 = @pe_ebeln AND zzebelp1 = @pe_ebelp AND zzurgt1 = @pe_etenr ) OR
+      ( zzebeln2 = @pe_ebeln AND zzebelp2 = @pe_ebelp AND zzurgt2 = @pe_etenr ) OR
+      ( zzebeln3 = @pe_ebeln AND zzebelp3 = @pe_ebelp AND zzurgt3 = @pe_etenr ) OR
+      ( zzebeln1 = @pe_ebeln AND zzebelp1 = @pe_ebelp AND zzurgt1 = ' ' ) OR " para pedidos anteriores a implementar el reparto
+      ( zzebeln2 = @pe_ebeln AND zzebelp2 = @pe_ebelp AND zzurgt2 = ' ' ) OR
+      ( zzebeln3 = @pe_ebeln AND zzebelp3 = @pe_ebelp AND zzurgt3 = ' ' )
+
+    )   AND
+    p~posnr = '0001'.
+
+  IF sy-subrc = 0.
+    fs_pedido-aufnr = ls_aufk-aufnr.
+
+*    IF fs_pedido-kwmeng = 0  AND fs_pedido-wemng <> ls_aufk-wemng.
+    IF fs_pedido-kwmeng = 0  AND ls_aufk-wemng <> 0.
+      CLEAR fs_pedido-wemng.
+    ELSE.
+      fs_pedido-wemng = ls_aufk-wemng.
+    ENDIF.
+
+*  CON ESTOS DATOS COMPRUEBO EL STATUS DE LA ORDEN SI EXISTE:
+    SELECT SINGLE stat
+      FROM jest
+      INTO @DATA(l_est_ord)
+     WHERE objnr = @ls_aufk-objnr
+       AND inact = ' ' AND
+           stat IN ( @zcl_secuenciador=>gc_i0001_abierta ,
+                     @zcl_secuenciador=>gc_i0002_liberada ,
+                     @zcl_secuenciador=>gc_i0045_out , "CTEC
+                      'I0046' ). "CERR
+
+    CASE l_est_ord.
+      WHEN zcl_secuenciador=>gc_i0001_abierta.
+        fs_pedido-estado = ''.     " "PEDIDO PENDIENTE DE FABRICAR.
+        fs_pedido-estado_of = 'ABIE'.
+      WHEN zcl_secuenciador=>gc_i0002_liberada.
+        fs_pedido-estado = 'MP'.   "EN FABRICACIÓN; ORDEN SE HA LANZADO A PRODUCCIÓN.
+        fs_pedido-estado_of = 'LIB'.
+      WHEN zcl_secuenciador=>gc_i0045_out.
+        IF ls_aufk-igmng > 0.
+          fs_pedido-estado = 'MF'.   "FABRICADO; CIERRE TÉCNICO REALIZADO.
+          fs_pedido-estado_of = 'CTEC'.
+        ENDIF.
+      WHEN 'I0046'."CERR
+        fs_pedido-estado_of = 'CERR'.
+
+      WHEN OTHERS.
+    ENDCASE.
+  ENDIF.
+
+  l_entregas =  zcl_ap_pedido_mm=>get_valor_salidas( ebeln = pe_ebeln
+                                                     ebelp = pe_ebelp
+                                                     cantidad = 'X' ).
+
+  IF l_entregas <> 0.
+
+* Obtener datos de entregas.
+    TRY.
+*        DATA(ls_lips_vbup) = gt_lips_vbup[ vgbel = pe_ebeln
+*                                           vgpos = pe_ebelp
+*                                           ].
+*        fs_pedido-vbeln_ent   = ls_lips_vbup-vbeln.
+*        fs_pedido-posnr_ent   = ls_lips_vbup-posnr.
+**        fs_pedido-fcr_enrega = ls_lips_vbup-erdat.
+*        fs_pedido-fcr_entrega = ls_lips_vbup-erdat.
+*        fs_pedido-wadat_ist   = ls_lips_vbup-wadat_ist.
+*        fs_pedido-kodat       = ls_lips_vbup-kodat.
+
+*        DATA(l_semana)          = zcl_ap_fechas=>get_semana( fs_pedido-kodat ).
+*        fs_pedido-sem_picking   = l_semana.
+*
+*        PERFORM obtener_margen_tolerancia USING ls_lips_vbup-kunnr
+*                                                ls_lips_vbup-vkorg
+*                                                ls_lips_vbup-vtweg
+*                                                ls_lips_vbup-spart
+*                                      CHANGING  l_toler.
+*        l_cant_tol_inf = pe_menge * l_toler / 100.
+*
+*** IDENTIFICAMOS EL ESTADO DE LOS PEDIDOS / ENTREGAS.
+*        IF abs( l_entregas ) >= abs( ekpo-menge - l_cant_tol_inf ).
+*          fs_pedido-estado = 'FT'. "Facturado totalmente
+*        ELSE.
+*          fs_pedido-estado = 'FP'. "Factura parcialmente.
+*        ENDIF.
+
+
+
+
+*        IF ls_lips_vbup-kosta = 'C' AND ls_lips_vbup-wbsta NE 'C'.
+*          IF abs( l_entregas ) >= abs( pe_menge - l_cant_tol_inf ).
+*            fs_pedido-estado = 'PT'.  "Picking Total
+*          ELSE.
+*            fs_pedido-estado = 'PP'.  "Picking Parcial -> Picking de la entrega
+*          ENDIF.
+*        ELSEIF ls_lips_vbup-kosta = 'C' AND ls_lips_vbup-wbsta = 'C'.
+*          IF abs( l_entregas ) >= abs( pe_menge - l_cant_tol_inf ).
+*            fs_pedido-estado = 'ET'.  "Entrega Total
+*          ELSE.
+*            fs_pedido-estado = 'EP'.  "Entrega Parcial
+*          ENDIF.
+*        ELSE.
+*          IF abs( l_entregas ) >= abs( pe_menge - l_cant_tol_inf ).
+*            fs_pedido-estado = 'ET'.  "Entrega Total
+*          ELSE.
+*            fs_pedido-estado = 'EP'.  "Entrega Parcial
+*          ENDIF.
+*        ENDIF.
+
+      CATCH cx_root .
+
+
+    ENDTRY.
+
+
+
+
+  ENDIF.
+
+
+
+** IDENTIFICAMOS EL ESTADO DE LOS PEDIDOS / ENTREGAS.
+**        IF vbup-kosta = 'C' AND vbup-wbsta NE 'C'.
+**          IF abs( l_entregas ) >= abs( ekpo-menge - cant_tol_inf ).
+**            ps_estado = 'PT'.  "Picking Total
+**          ELSE.
+**            ps_estado = 'PP'.  "Picking Parcial -> Picking de la entrega
+**          ENDIF.
+**        ELSEIF vbup-kosta = 'C' AND vbup-wbsta = 'C'.
+**          IF abs( l_entregas ) >= abs( ekpo-menge - cant_tol_inf ).
+**            ps_estado = 'ET'.  "Entrega Total
+**          ELSE.
+**            ps_estado = 'EP'.  "Entrega Parcial
+**          ENDIF.
+**        ELSE.
+**          IF abs( l_entregas ) >= abs( ekpo-menge - cant_tol_inf ).
+**            ps_estado = 'ET'.  "Entrega Total
+**          ELSE.
+**            ps_estado = 'EP'.  "Entrega Parcial
+**          ENDIF.
+**        ENDIF.
+**      ENDIF.
+**    ENDIF.
+**  ENDIF.
+
+
+
+
+
+ENDFORM.
+
+FORM obtener_margen_tolerancia USING
+  p_kunnr
+  p_vkorg
+  p_vtweg
+  p_spart
+*  menge
+  CHANGING p_tolerancia.
+
+
+* Obtener el margen de tolerancia del destino de mercancias
+  TRY.
+
+      p_tolerancia = gt_knvv[
+                               kunnr = p_kunnr
+                               vkorg = p_vkorg
+                               vtweg = p_vkorg
+                               spart = p_spart
+                               ]-untto.
+
+    CATCH cx_root .
+      p_tolerancia = 1.
+* Seleccionar el margen de tolerancia del destino de mercancias
+*  SELECT kunnr , vkorg , vtweg , spart , untto
+*    FROM knvv
+*    INTO CORRESPONDING FIELDS OF TABLE @gt_knvv
+**      INTO CORRESPONDING FIELDS OF TABLE @DATA(gt_knvv)
+**    FOR ALL ENTRIES IN @gt_lips_vbup
+*      WHERE kunnr = @p_kunnr
+*        AND vkorg = @p_vkorg
+*        AND vtweg = @p_vtweg
+*        AND spart = @p_spart.
+**      WHERE kunnr = @gt_lips_vbup-kunnr
+**        AND vkorg = @gt_lips_vbup-vkorg
+**        AND vtweg = @gt_lips_vbup-vtweg
+**        AND spart = @gt_lips_vbup-spart.
+
+
+
+  ENDTRY.
+
+
+ENDFORM.
+
+FORM obtener_datos_ventas.
+
+  DATA: ls_datos_cli TYPE ty_cli,
+        l_lifnr      TYPE lifnr,
+        l_vbeln_ant  TYPE vbeln,
+        l_estado_ant TYPE zestado_pedido.
+
+  gr_sgpi->texto( 'Obteniendo datos de ventas...' ).
+
+  TRY.
+
+      SELECT *
+        INTO CORRESPONDING FIELDS OF TABLE gt_sql_ventas
+        FROM vbak
+        JOIN vbap ON vbak~vbeln = vbap~vbeln
+        JOIN vbep ON vbap~vbeln = vbep~vbeln AND vbap~posnr = vbep~posnr
+        LEFT JOIN vbup ON vbap~vbeln = vbup~vbeln AND vbap~posnr = vbup~posnr
+        JOIN mara ON vbap~matnr = mara~matnr
+        WHERE vbak~kunnr IN s_kunnr
+          AND vbak~audat IN s_bedat
+          AND vdatu      IN s_lfdat
+          AND vbap~matnr IN s_matnr
+          AND vbap~matkl IN s_matkl
+          AND auart      IN ( 'ZTA' , 'ZTAS' , 'ZRE' )
+          AND werks      = p_werks
+          AND vbak~zzsegcal IN s_zsegca
+*          AND vbup~gbsta <> 'C'
+        ORDER BY vbap~vbeln vbap~posnr.
+
+    CATCH cx_sy_open_sql_db.
+      MESSAGE 'Fallo en la selección. Seleccione menos datos.' TYPE 'E'.
+  ENDTRY.
+
+  CHECK gt_sql_ventas IS NOT INITIAL.
+
+  SELECT vbeln , posnr , gbsta
+    INTO TABLE @DATA(lt_vbup)
+    FROM vbup
+    FOR ALL ENTRIES IN @gt_sql_ventas
+    WHERE vbeln = @gt_sql_ventas-vbeln AND
+          posnr = @gt_sql_ventas-posnr.
+
+  CLEAR l_vbeln_ant.
+  LOOP AT gt_sql_ventas INTO DATA(ls_datos_ventas).
+
+    TRY.
+        DATA(ls_vbup) = lt_vbup[ vbeln = ls_datos_ventas-vbeln
+                                 posnr = ls_datos_ventas-posnr ].
+        IF ls_vbup-gbsta = 'C'. "•  No completada totalmente por entrega o por rechazo.
+          CONTINUE.
+        ENDIF.
+      CATCH cx_root .
+    ENDTRY.
+
+
+    APPEND INITIAL LINE TO gt_ped_entreg_ab_ventas ASSIGNING FIELD-SYMBOL(<fs_ventas>).
+    <fs_ventas> = CORRESPONDING #( ls_datos_ventas ).
+
+* Para cada cabecera obtener datos de cab. y sus posiciones:
+    IF l_vbeln_ant <> <fs_ventas>-vbeln.
+      CALL METHOD zcl_ped_sd=>get_estado_cabecera
+        EXPORTING
+          vbeln          = <fs_ventas>-vbeln
+        IMPORTING
+          ot_estados_pos = DATA(lt_estados_pos)
+          estado         = DATA(l_estado).
+
+      <fs_ventas>-zzestado_pedido = l_estado.
+      l_vbeln_ant                 = <fs_ventas>-vbeln.
+      l_estado_ant                = <fs_ventas>-zzestado_pedido.
+    ELSE.
+      <fs_ventas>-zzestado_pedido = l_estado_ant.
+    ENDIF.
+
+* Obtener estado de la posición
+    TRY.
+        <fs_ventas>-estado = lt_estados_pos[ vbeln = <fs_ventas>-vbeln
+                                             posnr = <fs_ventas>-posnr ]-zzestado.
+      CATCH cx_root .
+    ENDTRY.
+
+  ENDLOOP.
+
+  PERFORM buscar_cant_ped_abierta_ventas.
+
+  LOOP AT gt_datos_ventas ASSIGNING <fs_ventas>.
+
+    TRY.
+        ls_datos_ventas = gt_sql_ventas[ vbeln = <fs_ventas>-vbeln
+                                         posnr = <fs_ventas>-posnr ].
+
+      CATCH cx_root .
+    ENDTRY.
+* Obtener estado de posición
+
+    PERFORM get_estado_posicion_venta USING ls_datos_ventas
+                                   CHANGING <fs_ventas>.
+
+
+    PERFORM datos_centro USING <fs_ventas>-werks
+                      CHANGING <fs_ventas>-vtext.
+
+
+
+
+* Obtener el destinatario de mercancias.
+    SELECT SINGLE kunnr , pernr
+      FROM vbpa                  "Destinatario de Mercancías
+      INTO ( @DATA(l_kunnr) , @DATA(l_pernr) )
+     WHERE vbeln = @<fs_ventas>-vbeln
+       AND posnr = '000000'
+       AND parvw = 'WE'.
+
+    <fs_ventas>-vendedor = l_pernr.
+    IF NOT <fs_ventas>-vendedor IS INITIAL.
+      SELECT SINGLE ename FROM pa0001
+        INTO <fs_ventas>-vendedor_t
+       WHERE pernr = <fs_ventas>-vendedor.
+    ENDIF.
+
+
+    <fs_ventas>-kunnr = l_kunnr.
+    <fs_ventas>-kunwe = l_kunnr.
+    l_lifnr = |P{ ls_datos_ventas-bukrs_vf }|.
+
+    CALL METHOD zcl_utils_hpap_pp=>get_datos_cliente
+      EXPORTING
+        i_kunnr = <fs_ventas>-kunnr
+      IMPORTING
+        o_name1 = DATA(l_name)
+        o_pstlz = <fs_ventas>-pstlz
+        o_land1 = <fs_ventas>-land1.
+    <fs_ventas>-name1  = l_name.
+*    PERFORM datos_cliente    USING  <fs_ventas>-kunnr
+*                                    l_lifnr
+*                          CHANGING  ls_datos_cli.
+
+    <fs_ventas>-zlsch         = ls_datos_cli-zlsch.
+*    <fs_ventas>-name1         = ls_datos_cli-name1.
+*    <fs_ventas>-pstlz         = ls_datos_cli-pstlz.
+*    <fs_ventas>-land1         = ls_datos_cli-land1.
+    <fs_ventas>-text1         = ls_datos_cli-text1.
+    <fs_ventas>-prdha         = ls_datos_ventas-prodh.
+    <fs_ventas>-werks         = ls_datos_ventas-bukrs_vf.
+    <fs_ventas>-precio_final  = ls_datos_ventas-netwr + ls_datos_ventas-mwsbp.
+
+
+    SELECT SINGLE zlsch , inco1 , inco2
+       FROM vbkd
+      INTO ( @<fs_ventas>-zlsch , @<fs_ventas>-inco1 , @<fs_ventas>-inco2 )
+*      INTO @DATA(ls_vbkd)
+     WHERE vbeln = @<fs_ventas>-vbeln
+       AND posnr = '000000'.
+
+
+    IF NOT ls_datos_ventas-banfn IS INITIAL.
+      SELECT SINGLE ebeln ebelp FROM eban
+        INTO (<fs_ventas>-ebeln, <fs_ventas>-ebelp)
+       WHERE banfn = ls_datos_ventas-banfn
+         AND bnfpo = ls_datos_ventas-bnfpo.
+    ENDIF.
+
+    PERFORM obtener_datos_of USING ls_datos_ventas-kwmeng "cantidad de pedido abierta
+                          CHANGING <fs_ventas>.
+
+
+    SELECT *
+      FROM konv
+      INTO TABLE @DATA(lt_konv)
+     WHERE knumv = @ls_datos_ventas-knumv
+       AND ( kschl = 'ZPRP'
+         OR  kschl = 'ZKF0' ).
+
+
+
+    IF <fs_ventas>-abgru NE ''.
+      CLEAR: <fs_ventas>-kwmeng, <fs_ventas>-precio_final.
+    ELSE.
+
+      TRY.
+          <fs_ventas>-transporte = lt_konv[ kposn = <fs_ventas>-posnr ]-kwert.
+        CATCH cx_root .
+      ENDTRY.
+
+    ENDIF.
+
+
+
+*ini pegat
+    IF ls_datos_ventas-waerk NE 'EUR'.
+      <fs_ventas>-precio_final = zcl_ap_doc_fi=>convertir_moneda_eur( importe =
+                                        <fs_ventas>-precio_final
+                                        moneda  = ls_datos_ventas-waerk
+                                        fecha   = <fs_ventas>-audat ).
+    ENDIF.
+*EBA 24062014 Verificamos si tiene más de un reparto, y si es así,
+*mostramos el último.
+    <fs_ventas>-fasign = ls_datos_ventas-edatu.
+    SELECT MAX( edatu ) MAX( mbdat ) FROM vbep
+      INTO (<fs_ventas>-fasign, <fs_ventas>-mbdat)
+     WHERE vbeln = <fs_ventas>-vbeln
+       AND posnr = <fs_ventas>-posnr.
+
+    WRITE <fs_ventas>-fasign TO <fs_ventas>-fasignada.
+
+    WRITE <fs_ventas>-mbdat TO <fs_ventas>-mbdat_text.
+
+*      WRITE i_pedidos-zzpld TO l_listado-zzpld_text.
+    WRITE ls_datos_ventas-lddat TO <fs_ventas>-lddat_text.
+
+    IF ls_datos_ventas-zzfecha_prim_sol IS INITIAL.
+      <fs_ventas>-fsolicitada = zcl_ap_control_cambios=>get_primer_valor_campo(
+      objectclas = 'VERKBELEG'
+                          objectid   = <fs_ventas>-vbeln
+                          tabname    = 'VBEP'
+                          fname      = 'EDATU' ).
+      IF <fs_ventas>-fsolicitada IS INITIAL OR <fs_ventas>-fsolicitada = ''.
+        <fs_ventas>-fsolicitada  = ls_datos_ventas-edatu.
+      ENDIF.
+
+********          UPDATE vbap
+********             SET zzfecha_prim_sol = <fs_ventas>-fsolicitada
+********           WHERE vbeln = ls_datos_ventas-vbeln
+********             AND posnr = ls_datos_ventas-posnr.
+    ELSE.
+      <fs_ventas>-fsolicitada  = ls_datos_ventas-zzfecha_prim_sol.
+    ENDIF.
+
+    DATA(l_semana) = zcl_ap_fechas=>get_semana( <fs_ventas>-fsolicitada ).
+    <fs_ventas>-sem_fsolicitada = l_semana+4(2).
+
+    l_semana = zcl_ap_fechas=>get_semana( ls_datos_ventas-edatu ).
+    <fs_ventas>-sem_entrega = l_semana+4(2).
+
+    l_semana = zcl_ap_fechas=>get_semana( ls_datos_ventas-mbdat ).
+    <fs_ventas>-sem_mbdat = l_semana+4(2).
+
+    DATA(l_status) = zcl_ped_sd=>get_status_activo( vbeln = <fs_ventas>-vbeln
+                                           posnr = <fs_ventas>-posnr ).
+
+* Verificamos si tenemos que corregir el status de la posición
+    IF l_status NE 'E0004' AND ( <fs_ventas>-estado = 'ET' OR
+    <fs_ventas>-estado(1) = 'F' ).
+      SELECT SINGLE *
+        INTO @DATA(ls_vbup2)
+        FROM vbup
+       WHERE vbeln = @<fs_ventas>-vbeln
+         AND posnr = @<fs_ventas>-posnr.
+      IF sy-subrc = 0.
+        IF  ( ls_vbup2-lfgsa = 'C' AND ls_vbup2-lfsta = 'C' )
+        "Status de entrega de la posición
+        OR ( ls_vbup2-fksaa = 'C' AND <fs_ventas>-pstyv = 'ZTAS' ).
+          l_status = 'E0004'.
+* Solo cambiamos pedidos durante el proceso batch
+          IF sy-batch = 'X'.
+            zcl_ped_sd=>cambiar_status_p2p( vbeln = <fs_ventas>-vbeln
+                                            posnr = <fs_ventas>-posnr
+                                          nuevo_status = l_status ).
+            DATA(l_cambio_pedido) = 'X'.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    IF ls_datos_ventas-abgru NE ''.
+      IF l_status NE 'E0001'.
+        SELECT SINGLE * FROM vbup
+          INTO @ls_vbup2
+         WHERE vbeln = @<fs_ventas>-vbeln
+           AND posnr = @<fs_ventas>-posnr.
+        IF sy-subrc = 0.
+          IF ls_vbup2-absta = 'C' AND ( ls_vbup2-gbsta = 'C' OR ls_vbup2-gbsta = '' ).
+            l_status = 'E0001'.
+* Solo cambiamos pedidos durante el proceso batch
+*                IF sy-batch = 'X' AND p_jobol = ''.
+*                  zcl_ped_sd=>cambiar_status_p2p( vbeln = <fs_ventas>-vbeln
+*                                                  posnr = <fs_ventas>-posnr
+*                                               nuevo_status = l_status ).
+*                  l_cambio_pedido = 'X'.
+*                 ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ELSEIF l_status = 'E0001'.
+      SELECT SINGLE * FROM vbup
+        INTO @ls_vbup2
+       WHERE vbeln = @<fs_ventas>-vbeln
+         AND posnr = @<fs_ventas>-posnr.
+      IF sy-subrc = 0.
+        IF ls_vbup2-lfgsa = 'C' AND ls_vbup2-lfsta = 'C'.
+          "Status de entrega de la posición
+          l_status = 'E0004'.
+        ELSE.
+          l_status = 'E0003'.
+        ENDIF.
+* Solo cambiamos pedidos durante el proceso batch
+*            IF sy-batch = 'X' AND p_jobol = ''.
+*              zcl_ped_sd=>cambiar_status_p2p( vbeln = <fs_ventas>-vbeln
+*                                              posnr = <fs_ventas>-posnr
+*                                              nuevo_status = l_status ).
+*              l_cambio_pedido = 'X'.
+*            ENDIF.
+      ENDIF.
+    ENDIF.
+
+
+*****        LOOP AT i_partidas WHERE posn2 = <fs_ventas>-posnr.
+*****          IF i_partidas-shkzg = 'H'.
+*****          ELSE.
+*****          ENDIF.
+*****        ENDLOOP.
+*****        LOOP AT i_partidas WHERE posn2 = '000000'.
+*****          IF i_partidas-shkzg = 'H'.
+*****          ELSE.
+*****          ENDIF.
+*****        ENDLOOP.
+
+*    IF <fs_ventas>-fcr_entrega IN s_lfdat.
+*
+**
+*      APPEND l_listado TO i_listado.
+*    ENDIF.
+
+****    AT END OF vbeln.
+****      IF l_cambio_pedido = 'X' AND sy-batch = 'X' AND p_jobol = ''.
+****        COMMIT WORK AND WAIT.
+****        o_bi->inicio( ).
+****        o_bi->dynpro( program = 'SAPMV45A' dynpro = '0102').
+****        o_bi->campos( campo = 'BDC_OKCODE' valor = '/00').
+****        o_bi->campos( campo = 'VBAK-VBELN' valor = <fs_ventas>-vbeln ).
+****        o_bi->dynpro( program = 'SAPMV45A' dynpro = '4001').
+****        o_bi->campos( campo = 'BDC_OKCODE' valor = '=KBES').
+****        o_bi->dynpro( program = 'SAPMV45A' dynpro = '4002').
+****        SELECT SINGLE * FROM vbak
+****         WHERE vbeln = <fs_ventas>-vbeln.
+****        IF vbak-bstzd IS INITIAL.
+****          o_bi->campos( campo = 'VBAK-BSTZD' valor = '.').
+****        ELSEIF vbak-bstzd = '.'.
+****          o_bi->campos( campo = 'VBAK-BSTZD' valor = '').
+****        ENDIF.
+****        o_bi->campos( campo = 'BDC_OKCODE' valor = '=SICH').
+****        o_bi->llamar_transaccion( tcode = 'VA02' modo = 'N').
+****      ENDIF.
+****    ENDAT.
+*  ENDIF.
+*ENDIF.
+
+*  gr_sgpi->texto( 'Buscando entregas de ventas...' ).
+*
+*  DATA: i_listado_aux TYPE TABLE OF zsd_estado_pedidos_n,
+*        i_vbfa2       TYPE TABLE OF vbfa WITH HEADER LINE,
+*        l_cent.
+*
+*  i_listado_aux[] = gt_datos_ventas[].
+*CLEAR i_listado.
+
+*******  LOOP AT i_listado_aux INTO DATA(l_listado).
+
+****    SELECT *
+****      FROM vbfa
+****      INTO TABLE @i_vbfa2
+****     WHERE vbelv = @<fs_ventas>-vbeln
+****       AND posnv = @<fs_ventas>-posnr
+****       AND posnn < '900000'
+****       AND vbtyp_n IN ('J','T')
+****       AND vbtyp_v = @<fs_ventas>-vbtyp
+****       AND stufe = '00'.
+****    DATA: i_vbfa      TYPE TABLE OF vbfa WITH HEADER LINE.
+****
+****    LOOP AT i_vbfa2 INTO i_vbfa.
+*****    LOOP AT i_vbfa2 ASSIGNING FIELD-SYMBOL(<fs_vbfa>).
+****      SELECT SINGLE uecha FROM lips
+*****      INTO lips-uecha
+****        INTO @DATA(l_uecha)
+****       WHERE vbeln = @i_vbfa-vbeln
+****         AND posnr = @i_vbfa-posnn.
+****      IF sy-subrc = 0 AND NOT l_uecha IS INITIAL.
+****        i_vbfa-posnn = l_uecha.
+****      ENDIF.
+****      CLEAR: i_vbfa-erdat, i_vbfa-erzet.
+****      COLLECT i_vbfa.
+****    ENDLOOP.
+****
+****    CLEAR l_cent.
+*****    LOOP AT i_vbfa.
+*****      IF l_cent = 'X'.
+*****        CLEAR: <fs_ventas>-kwmeng, <fs_ventas>-precio_final,
+*****               <fs_ventas>-transporte, <fs_ventas>-wemng,
+******               <fs_ventas>-anticipo,
+******               <fs_ventas>-anticipo_cab,
+******               <fs_ventas>-porc_cobro,
+*****               <fs_ventas>-netwr, <fs_ventas>-ctd_ped_abierta.
+*****      ENDIF.
+*****      <fs_ventas>-vbeln_ent = i_vbfa-vbeln.
+*****      <fs_ventas>-posnr_ent = i_vbfa-posnn.
+*****
+*****      SELECT SUM( lfimg )
+*****        FROM lips
+*****        JOIN vbup ON lips~vbeln = vbup~vbeln AND lips~posnr = vbup~posnr
+*****        INTO <fs_ventas>-pikmg
+*****       WHERE lips~vbeln = <fs_ventas>-vbeln_ent
+*****         AND ( lips~posnr = <fs_ventas>-posnr_ent
+*****            OR uecha = <fs_ventas>-posnr_ent )
+*****         AND kosta = 'C'.
+****
+****
+*****      IF i_vbfa-rfmng IS INITIAL.
+*****        SELECT SINGLE * FROM lips
+*****          INTO @DATA(ls_lips)
+*****         WHERE vbeln = @<fs_ventas>-vbeln_ent
+*****           AND posnr = @<fs_ventas>-posnr_ent.
+*****        IF sy-subrc = 0.
+*****          IF ls_lips-lfimg = 0.
+*****            <fs_ventas>-lfimg = ls_lips-kcmeng.
+*****          ELSE.
+*****            <fs_ventas>-lfimg = ls_lips-lfimg.
+*****          ENDIF.
+*****        ENDIF.
+*****      ELSE.
+*****        <fs_ventas>-lfimg = i_vbfa-rfmng.
+*****      ENDIF.
+*****      CASE <fs_ventas>-estado.
+*****        WHEN ''.
+*****          <fs_ventas>-ctd_ped_abierta = <fs_ventas>-kwmeng.
+******        WHEN 'ET' OR 'FT'.
+******          <fs_ventas>-ctd_ped_abierta = 0.
+*****        WHEN OTHERS.
+*****          DATA(l_ctd_entregada) = zcl_ped_sd=>get_cantidad_entregada( vbeln =
+*****          <fs_ventas>-vbeln posnr = <fs_ventas>-posnr ).
+*****          IF <fs_ventas>-kwmeng > 0.
+*****            <fs_ventas>-ctd_ped_abierta = <fs_ventas>-kwmeng - l_ctd_entregada.
+*****          ELSEIF <fs_ventas>-kwmeng = 0.
+*****            <fs_ventas>-ctd_ped_abierta = 0.
+*****          ENDIF.
+*****      ENDCASE.
+*****EN CASO DE SER DEVOLUCIONES O ABONOS, LOS VALORES SE VUELVEN NEGATIVOS.
+****      IF <fs_ventas>-vbtyp = 'H' OR <fs_ventas>-vbtyp = 'K' .
+****        "DEVOLUCIONES Y ABONOS * -1
+****        <fs_ventas>-precio_final = <fs_ventas>-precio_final * -1.
+****        ls_datos_ventas-netwr        = ls_datos_ventas-netwr * -1.
+****        ls_datos_ventas-netwr        = ls_datos_ventas-netwr * -1.
+****        ls_datos_ventas-mwsbp        = ls_datos_ventas-mwsbp  * -1.
+****        <fs_ventas>-transporte   = <fs_ventas>-transporte * -1.
+****        <fs_ventas>-ctd_ped_abierta = <fs_ventas>-ctd_ped_abierta * -1.
+****        <fs_ventas>-kwmeng       = <fs_ventas>-kwmeng * -1.
+*****        l_ctd_entregada        = l_ctd_entregada  * -1.
+****      ENDIF.
+****      IF <fs_ventas>-vbtyp = 'H' OR <fs_ventas>-vbtyp = 'K' .
+****        "DEVOLUCIONES Y ABONOS * -1
+****        <fs_ventas>-lfimg = <fs_ventas>-lfimg * -1.
+****        <fs_ventas>-pikmg = <fs_ventas>-pikmg * -1.
+****      ENDIF.
+****      SELECT SINGLE erdat wadat_ist kodat FROM likp
+****      INTO (<fs_ventas>-fcr_entrega, <fs_ventas>-wadat_ist, <fs_ventas>-kodat)
+****     WHERE vbeln = <fs_ventas>-vbeln_ent.
+****
+****      l_semana = zcl_ap_fechas=>get_semana( <fs_ventas>-kodat ).
+****      <fs_ventas>-sem_picking = l_semana+4(2).
+****
+****      l_cent = 'X'.
+*      APPEND l_listado TO i_listado.
+*    ENDLOOP.
+*    IF sy-subrc NE 0.
+*      APPEND l_listado TO i_listado.
+*    ENDIF.
+**********************    ENDLOOP.
+
+    IF <fs_ventas>-ctd_ped_abierta = 0.
+      CLEAR <fs_ventas>.
+      CONTINUE.
+    ENDIF.
+*  FI pegat
+
+    PERFORM obtener_descripciones_ventas USING <fs_ventas>-zlsch
+                                               <fs_ventas>-lprio
+                                      CHANGING ls_datos_cli-text1
+                                               <fs_ventas>-lprio_txt.
+
+    PERFORM datos_lifsk USING <fs_ventas>-lifsk
+                     CHANGING <fs_ventas>-lifsk_t. "p_lifsk_t.
+
+  ENDLOOP.
+
+  DELETE gt_datos_ventas WHERE vbeln IS INITIAL.
+
+ENDFORM.
+
+FORM buscar_cant_ped_abie_compras.
+*  TYPES: BEGIN OF ty_ped_entr,
+*           ebeln       TYPE ebeln,
+*           ebelp       TYPE ebelp,
+*           vbeln_ent   TYPE vbeln,
+*           posnr_ent   TYPE posnr,
+*           cantidad_ab TYPE kwmeng,
+*           estado      TYPE zestado_plen_ent,
+*           kostk       TYPE kostk,
+*           wbstk       TYPE wbstk,
+*           trsta       TYPE trsta,
+*         END OF ty_ped_entr.
+*  DATA: lt_ped_entrega TYPE STANDARD TABLE OF ty_ped_entr.
+  DATA: l_cont TYPE n.
+
+
+  SELECT * FROM ekbe
+*            INTO TABLE i_ekbe
+  INTO TABLE @DATA(lt_ekbe)
+    FOR ALL ENTRIES IN @gt_sql_compras
+ WHERE ebeln = @gt_sql_compras-ebeln
+   AND ebelp = @gt_sql_compras-ebelp
+   AND vgabe = '8'
+   AND gjahr = '0000'.
+
+* Cabecera entrega.
+  SELECT  vbeln , erdat , wadat_ist , kodat , zzfpickingreal , erzet
+    FROM likp
+    INTO TABLE @DATA(lt_likp)
+    FOR ALL ENTRIES IN @lt_ekbe
+ WHERE vbeln = @lt_ekbe-belnr.
+
+  TYPES: BEGIN OF ty_ekbe_lips,
+           belnr TYPE mblnr,
+           buzei TYPE mblpo,
+           posnr TYPE posnr_vl,
+         END OF ty_ekbe_lips.
+  DATA:lt_ekbe_lips TYPE STANDARD TABLE OF ty_ekbe_lips.
+
+* Conversion de posicion de entrega para acceder a tabla LIPS.
+  LOOP AT lt_ekbe INTO DATA(ls_ekbe_lips).
+    APPEND INITIAL LINE TO lt_ekbe_lips ASSIGNING FIELD-SYMBOL(<fs_ekbe_lips>).
+    <fs_ekbe_lips>-belnr = ls_ekbe_lips-belnr.
+    <fs_ekbe_lips>-buzei = ls_ekbe_lips-buzei.
+    <fs_ekbe_lips>-posnr = CONV #( ls_ekbe_lips-buzei ).
+  ENDLOOP.
+
+* Posiciones de entrega
+  SELECT  vbeln , posnr , uecha , kcmeng , lfimg
+    FROM lips
+    INTO TABLE         @DATA(lt_lips)
+    FOR ALL ENTRIES IN @lt_ekbe_lips
+    WHERE vbeln      = @lt_ekbe_lips-belnr
+      AND posnr      = @lt_ekbe_lips-posnr.
+
+
+  SELECT vbeln , kostk ,  wbstk , trsta
+    FROM vbuk
+*INTO (l_listado_color-kostk, l_listado_color-wbstk,
+*l_listado_color-trsta)
+    INTO TABLE @DATA(lt_vbuk)
+    FOR ALL ENTRIES IN @lt_ekbe
+    WHERE vbeln = @lt_ekbe-belnr.
+
+  LOOP AT gt_sql_compras INTO DATA(ls_datos_ini).
+
+    CLEAR l_cont.
+    LOOP AT lt_ekbe INTO DATA(ls_ekbe) WHERE ebeln = ls_datos_ini-ebeln AND ebelp = ls_datos_ini-ebelp.
+      APPEND INITIAL LINE TO gt_datos_compras ASSIGNING FIELD-SYMBOL(<fs_compras>).
+      <fs_compras> = CORRESPONDING #( ls_datos_ini ).
+      <fs_compras>-tp_pedido = 'C'.
+      <fs_compras>-vbeln     = ls_ekbe-ebeln.
+      <fs_compras>-posnr     = CONV #( ls_ekbe-ebelp ).
+      <fs_compras>-vbeln_ent = ls_ekbe-belnr.
+      <fs_compras>-posnr_ent = |00{ ls_ekbe-buzei }|."ls_EKBE-posnn.
+
+      DATA: l_sum_lips TYPE lfimg.
+
+      CLEAR l_sum_lips.
+*      LOOP AT lt_lips INTO DATA(ls_lips2) where vbeln = <fs_compras>-vbeln_ent and
+*                                                ( posnr = <fs_compras>-posnr_ent or
+*                                                  uecha = <fs_compras>-posnr_ent   ) and
+*                                                kosta = 'C'.
+*        l_sum_lips = l_sum_lips + ls_lips2.
+*      ENDLOOP.
+*
+*      SELECT SUM( lfimg )
+*        FROM lips
+*        JOIN vbup ON lips~vbeln = vbup~vbeln AND lips~posnr = vbup~posnr
+*        INTO <fs_compras>-pikmg
+*       WHERE lips~vbeln = <fs_compras>-vbeln_ent
+*         AND ( lips~posnr = <fs_compras>-posnr_ent
+*            OR uecha = <fs_compras>-posnr_ent )
+*         AND kosta = 'C'.
+
+      TRY.
+          DATA(ls_vbuk) = lt_vbuk[ vbeln = <fs_compras>-vbeln_ent ].
+          <fs_compras>-kostk = ls_vbuk-kostk .
+          <fs_compras>-wbstk = ls_vbuk-wbstk .
+          <fs_compras>-trsta = ls_vbuk-trsta .
+        CATCH cx_root .
+      ENDTRY.
+
+* Obtener datos de cab.entrega (LIKP)
+      TRY.
+          <fs_compras>-fcr_entrega = lt_likp[ vbeln = ls_ekbe-belnr ]-erdat.
+          <fs_compras>-wadat_ist   = lt_likp[ vbeln = ls_ekbe-belnr ]-wadat_ist.
+          <fs_compras>-kodat       = lt_likp[ vbeln = ls_ekbe-belnr ]-kodat.
+        CATCH cx_root .
+      ENDTRY.
+
+* acumular cantidad por pedido/posición.
+*      ASSIGN  lt_ped_entrega[ ebeln = ls_datos_ini-ebeln
+*                              ebelp = ls_datos_ini-ebelp ] TO FIELD-FIELD-SYMBOL(<fs_ped_entr>).
+*      IF sy-subrc = 0.
+*        <fs_ped_entr>-cantidad_ab = <fs_ped_entr>-cantidad_ab + <fs_compras>-ctd_ped_abierta.
+*      ELSE.
+*      APPEND INITIAL LINE TO lt_ped_entrega ASSIGNING FIELD-SYMBOL(<fs_ped_entr>).
+*      <fs_ped_entr>-ebeln       = ls_datos_ini-ebeln.
+*      <fs_ped_entr>-ebelp       = ls_datos_ini-ebelp.
+*      <fs_ped_entr>-vbeln_ent   = <fs_compras>-vbeln_ent.
+*      <fs_ped_entr>-posnr_ent   = <fs_compras>-posnr_ent.
+*      <fs_ped_entr>-cantidad_ab = <fs_compras>-ctd_ped_abierta.
+*      <fs_ped_entr>-estado      = <fs_compras>-estado.
+*      <fs_ped_entr>-kostk       = <fs_compras>-kostk.
+*      <fs_ped_entr>-wbstk       = <fs_compras>-wbstk.
+*      <fs_ped_entr>-trsta       = <fs_compras>-trsta.
+*      ENDIF.
+* Borrar datos de ped/posición a partir de la 2a ocurrencia.
+      ADD 1 TO l_cont.
+      IF l_cont <> 1.
+        CLEAR: <fs_compras>-kwmeng, <fs_compras>-precio_final,
+                       <fs_compras>-transporte, <fs_compras>-wemng, <fs_compras>-ctd_ped_abierta.
+
+      ENDIF.
+
+
+    ENDLOOP.
+* Si no hay entregas(todavia), volcamos registro sin entregas.
+    IF sy-subrc <> 0.
+      APPEND INITIAL LINE TO gt_datos_compras ASSIGNING <fs_compras>.
+      <fs_compras> = CORRESPONDING #( ls_datos_ini ).
+      <fs_compras>-tp_pedido = 'C'.
+    ENDIF.
+  ENDLOOP.
+
+
+*****
+*  DATA: l_ebeln_ant TYPE ebeln.
+*  DATA: l_ebelp_ant TYPE ebelp.
+*  DATA: l_no_borrar TYPE flag.
+*  CLEAR: l_ebeln_ant , l_ebelp_ant , l_no_borrar.
+*
+*  SORT lt_ped_entrega BY ebeln ebelp.
+
+* Borrar pedidos cuyas entregas suma "Cantidad pedidos abiertos" = 0.
+*  LOOP AT lt_ped_entrega INTO DATA(ls_ped_entr). " WHERE cantidad_ab = 0 AND estado <> 'FT'.
+*
+*    IF l_ebeln_ant <> ls_ped_entr-ebeln AND
+*       l_ebelp_ant <> ls_ped_entr-ebelp AND
+*       l_ebeln_ant IS NOT INITIAL.
+*
+*      IF l_no_borrar = ' '.
+*        DELETE gt_datos_compras WHERE ebeln = l_ebeln_ant AND ebelp = l_ebelp_ant.
+*      ENDIF.
+*
+*      CLEAR: l_no_borrar.
+*      l_ebeln_ant = ls_ped_entr-ebeln .
+*      l_ebelp_ant = ls_ped_entr-ebelp .
+*
+*    ENDIF.
+*
+*    IF  ls_ped_entr-kostk  <> 'C' OR
+*        ls_ped_entr-wbstk  <> 'C' OR
+*        ls_ped_entr-trsta  <> 'C'.
+*      l_no_borrar    = 'X'.
+*    ENDIF.
+*
+*  ENDLOOP.
+
+*  IF l_ebeln_ant IS NOT INITIAL AND l_no_borrar = ' '.
+*    DELETE gt_datos_compras WHERE ebeln = l_ebeln_ant AND ebelp = l_ebelp_ant.
+*  ENDIF.
+
+ENDFORM.
+
+FORM buscar_cant_ped_abierta_ventas.
+
+*  TYPES: BEGIN OF ty_ped_entr,
+*           vbeln       TYPE vbeln,
+*           posnr       TYPE posnr,
+*           vbeln_ent   TYPE vbeln,
+*           posnr_ent   TYPE posnr,
+*           cantidad_ab TYPE kwmeng,
+*           estado      TYPE zestado_plen_ent,
+*           kostk       TYPE kostk,
+*           wbstk       TYPE wbstk,
+*           trsta       TYPE trsta,
+*         END OF ty_ped_entr.
+*  DATA: lt_ped_entrega TYPE STANDARD TABLE OF ty_ped_entr.
+  DATA: l_total_entrega TYPE lfimg.
+  DATA: l_cont TYPE n.
+
+* Flujo de documentos: buscar  pedido->entrega
+  SELECT vbelv , posnv , vbeln , posnn , rfmng " *
+    FROM vbfa
+    INTO TABLE @DATA(lt_vbfa)
+    FOR ALL ENTRIES IN @gt_ped_entreg_ab_ventas
+   WHERE vbelv = @gt_ped_entreg_ab_ventas-vbeln
+     AND posnv = @gt_ped_entreg_ab_ventas-posnr
+     AND posnn < '900000'
+     AND vbtyp_n IN ('J','T')
+     AND vbtyp_v = @gt_ped_entreg_ab_ventas-vbtyp
+     AND stufe = '00'.
+
+  SORT lt_vbfa BY vbelv  posnv.
+
+* Posiciones de entrega
+  SELECT  vbeln , posnr , uecha , kcmeng , lfimg
+    FROM lips
+    INTO TABLE @DATA(lt_lips)
+    FOR ALL ENTRIES IN @lt_vbfa
+    WHERE vbeln = @lt_vbfa-vbeln
+      AND posnr = @lt_vbfa-posnn.
+
+* Cabecera entrega.
+  SELECT  vbeln , erdat , wadat_ist , kodat , zzfpickingreal , erzet
+    FROM likp
+    INTO TABLE @DATA(lt_likp)
+    FOR ALL ENTRIES IN @lt_vbfa
+ WHERE vbeln = @lt_vbfa-vbeln.
+
+  SELECT vbeln , kostk ,  wbstk , trsta
+    FROM vbuk
+*INTO (l_listado_color-kostk, l_listado_color-wbstk,
+*l_listado_color-trsta)
+    INTO TABLE @DATA(lt_vbuk)
+    FOR ALL ENTRIES IN @lt_vbfa
+    WHERE vbeln = @lt_vbfa-vbeln.
+
+*<entregas_ventas> = lt_likp[].
+
+  LOOP AT gt_ped_entreg_ab_ventas INTO DATA(ls_datos_ini).
+    CLEAR l_cont.
+    LOOP AT lt_vbfa INTO DATA(ls_vbfa) WHERE vbelv = ls_datos_ini-vbeln AND posnv = ls_datos_ini-posnr.
+      APPEND INITIAL LINE TO gt_datos_ventas ASSIGNING FIELD-SYMBOL(<fs_ventas>).
+      <fs_ventas> = CORRESPONDING #( ls_datos_ini ).
+      <fs_ventas>-tp_pedido = 'V'.
+      <fs_ventas>-vbeln_ent = ls_vbfa-vbeln.
+      <fs_ventas>-posnr_ent = ls_vbfa-posnn.
+
+
+      TRY.
+          DATA(ls_vbuk) = lt_vbuk[ vbeln = <fs_ventas>-vbeln_ent ].
+          <fs_ventas>-kostk = ls_vbuk-kostk .
+          <fs_ventas>-wbstk = ls_vbuk-wbstk .
+          <fs_ventas>-trsta = ls_vbuk-trsta .
+        CATCH cx_root .
+      ENDTRY.
+
+      IF ls_vbfa-rfmng IS INITIAL.
+        TRY.
+            DATA(ls_lips) = lt_lips[ vbeln = ls_vbfa-vbeln
+                                     posnr = ls_vbfa-posnn ].
+            IF ls_lips-lfimg = 0.
+              <fs_ventas>-lfimg = ls_lips-kcmeng.
+            ELSE.
+              <fs_ventas>-lfimg = ls_lips-lfimg.
+            ENDIF.
+
+          CATCH cx_root .
+        ENDTRY.
+      ELSE.
+        <fs_ventas>-lfimg = ls_vbfa-rfmng.
+      ENDIF.
+
+* Obtener datos de cab.entrega (LIKP)
+      TRY.
+          <fs_ventas>-fcr_entrega = lt_likp[ vbeln = ls_vbfa-vbeln ]-erdat.
+          <fs_ventas>-wadat_ist   = lt_likp[ vbeln = ls_vbfa-vbeln ]-wadat_ist.
+          <fs_ventas>-kodat       = lt_likp[ vbeln = ls_vbfa-vbeln ]-kodat.
+*          <fs_ventas>-erdat       = lt_likp[ vbeln = ls_vbfa-vbeln ]-erdat.
+*          <fs_ventas>-kodat       = lt_likp[ vbeln = ls_vbfa-vbeln ]-kodat.
+        CATCH cx_root .
+      ENDTRY.
+
+
+      CASE <fs_ventas>-estado.
+        WHEN ''.
+          <fs_ventas>-ctd_ped_abierta = <fs_ventas>-kwmeng.
+*        WHEN 'ET' OR 'FT'.
+*          <fs_ventas>-ctd_ped_abierta = 0.
+        WHEN OTHERS.
+          DATA(l_ctd_entregada) = zcl_ped_sd=>get_cantidad_entregada( vbeln = <fs_ventas>-vbeln
+                                                                      posnr = <fs_ventas>-posnr ).
+          IF <fs_ventas>-kwmeng > 0.
+            <fs_ventas>-ctd_ped_abierta = <fs_ventas>-kwmeng - l_ctd_entregada.
+          ELSEIF <fs_ventas>-kwmeng = 0.
+            <fs_ventas>-ctd_ped_abierta = 0.
+          ENDIF.
+      ENDCASE.
+
+      IF <fs_ventas>-vbtyp = 'H' OR <fs_ventas>-vbtyp = 'K' .
+        "DEVOLUCIONES Y ABONOS * -1
+        <fs_ventas>-precio_final = <fs_ventas>-precio_final * -1.
+*      ls_datos_ventas-netwr        = ls_datos_ventas-netwr * -1.
+*      ls_datos_ventas-netwr        = ls_datos_ventas-netwr * -1.
+*      ls_datos_ventas-mwsbp        = ls_datos_ventas-mwsbp  * -1.
+        <fs_ventas>-transporte   = <fs_ventas>-transporte * -1.
+        <fs_ventas>-ctd_ped_abierta = <fs_ventas>-ctd_ped_abierta * -1.
+        <fs_ventas>-kwmeng       = <fs_ventas>-kwmeng * -1.
+*      l_ctd_entregada        = l_ctd_entregada  * -1.
+      ENDIF.
+      IF <fs_ventas>-vbtyp = 'H' OR <fs_ventas>-vbtyp = 'K' .
+        "DEVOLUCIONES Y ABONOS * -1
+        <fs_ventas>-lfimg = <fs_ventas>-lfimg * -1.
+        <fs_ventas>-pikmg = <fs_ventas>-pikmg * -1.
+      ENDIF.
+
+      DATA(l_semana) = zcl_ap_fechas=>get_semana( <fs_ventas>-kodat ).
+      <fs_ventas>-sem_picking = l_semana+4(2).
+
+      ADD 1 TO l_cont.
+      IF l_cont <> 1.
+        CLEAR: <fs_ventas>-kwmeng , <fs_ventas>-precio_final, <fs_ventas>-transporte,
+               <fs_ventas>-wemng  , <fs_ventas>-ctd_ped_abierta.
+      ENDIF.
+
+    ENDLOOP.
+* Si no hay entregas(todavia), volcamos registro sin entregas.
+    IF sy-subrc <> 0.
+      APPEND INITIAL LINE TO gt_datos_ventas ASSIGNING <fs_ventas>.
+      <fs_ventas> = CORRESPONDING #( ls_datos_ini ).
+      <fs_ventas>-tp_pedido = 'V'.
+    ENDIF.
+
+
+  ENDLOOP.
+
+*  ENDLOOP.
+
+*  DATA: l_vbeln_ant TYPE vbeln.
+*  DATA: l_posnr_ant TYPE posnr.
+*  DATA: l_no_borrar TYPE flag.
+*  CLEAR: l_vbeln_ant , l_posnr_ant , l_no_borrar.
+*
+*  SORT lt_ped_entrega BY vbeln posnr.
+*
+** Borrar pedidos cuyas entregas suma "Cantidad pedidos abiertos" = 0.
+*  LOOP AT lt_ped_entrega INTO DATA(ls_ped_entr). " WHERE cantidad_ab = 0 AND estado <> 'FT'.
+*
+*    IF l_vbeln_ant <> ls_ped_entr-vbeln AND
+*       l_posnr_ant <> ls_ped_entr-posnr AND
+*       l_vbeln_ant IS NOT INITIAL.
+*
+*      IF l_no_borrar = ' '.
+*        DELETE gt_datos_ventas WHERE vbeln = l_vbeln_ant AND posnr = l_posnr_ant.
+*      ENDIF.
+*
+*      CLEAR: l_no_borrar.
+*      l_vbeln_ant = ls_ped_entr-vbeln .
+*      l_posnr_ant = ls_ped_entr-posnr .
+*
+*    ENDIF.
+
+*    IF  ls_ped_entr-kostk  <> 'C' OR
+*        ls_ped_entr-wbstk  <> 'C' OR
+*        ls_ped_entr-trsta  <> 'C'.
+*      l_no_borrar    = 'X'.
+*    ENDIF.
+*
+*  ENDLOOP.
+*
+*  IF l_vbeln_ant IS NOT INITIAL AND l_no_borrar = ' '.
+*    DELETE gt_datos_ventas WHERE vbeln = l_vbeln_ant AND posnr = l_posnr_ant.
+*  ENDIF.
+
+ENDFORM.
+
+FORM obtener_datos_of USING p_cdad_abie "cantidad de pedido abierta
+                  CHANGING  p_reg TYPE zsd_estado_pedidos_n.
+
+  SELECT SINGLE aufnr
+    FROM aufk
+    INTO p_reg-aufnr
+     WHERE auart   = 'ZI02' "IN ('ZI02','ZI04')
+       AND autyp   = '40'
+       AND zzebeln1 = p_reg-vbeln
+       AND zzebelp1 = p_reg-posnr.
+
+  SELECT SINGLE wemng
+     FROM afpo
+     INTO p_reg-wemng
+    WHERE aufnr = p_reg-aufnr
+      AND posnr = '0001'.
+
+****
+  CASE p_reg-estado.
+    WHEN ''.
+      p_reg-ctd_ped_abierta = p_reg-kwmeng.
+    WHEN 'RE'.
+      p_reg-ctd_ped_abierta = 0.
+    WHEN 'ET' OR 'FT'.
+*          l_listado-ctd_ped_abierta = 0.
+    WHEN OTHERS.
+      DATA(l_ctd_entregada) = zcl_ped_sd=>get_cantidad_entregada( vbeln = p_reg-vbeln
+                                                                  posnr = p_reg-posnr ).
+      IF p_cdad_abie > 0.
+        p_reg-ctd_ped_abierta = p_cdad_abie - l_ctd_entregada.
+      ELSEIF p_cdad_abie = 0.
+        p_reg-ctd_ped_abierta = 0.
+      ENDIF.
+  ENDCASE.
+
+  p_reg-texto_interno = zcl_ped_sd=>get_texto_string( vbeln = p_reg-vbeln
+                                                      id    = 'Z001' ).
+  p_reg-texto_externo = zcl_ped_sd=>get_texto_string( vbeln = p_reg-vbeln
+                                                      id    = 'Z002' ).
+
+ENDFORM.
+
+FORM obtener_descripciones_ventas USING p_zlsch
+                                   p_prio
+                            CHANGING p_text1
+                                     p_bezei.
+  TRY.
+      p_text1 = gt_desc_zlsch[ zlsch = p_zlsch ]-text1.
+
+    CATCH cx_root .
+      SELECT SINGLE text1
+        FROM t042z
+        INTO @p_text1
+        WHERE land1 = 'ES'
+          AND zlsch = @p_zlsch.
+
+      IF sy-subrc = 0.
+        APPEND INITIAL LINE TO gt_desc_zlsch ASSIGNING FIELD-SYMBOL(<fs_zls>).
+        <fs_zls>-zlsch = p_zlsch.
+        <fs_zls>-text1 = p_text1.
+      ENDIF.
+
+  ENDTRY.
+
+  TRY.
+      p_bezei = gt_desc_lprio[ lprio = p_prio ]-bezei.
+
+    CATCH cx_root .
+      SELECT SINGLE bezei FROM  tprit
+      "Descripción de la Prioridad Pedido
+      INTO p_bezei
+      WHERE spras  = sy-langu
+      AND lprio  = p_prio.
+
+      IF sy-subrc = 0.
+        APPEND INITIAL LINE TO gt_desc_lprio ASSIGNING FIELD-SYMBOL(<fs_lprio>).
+        <fs_lprio>-lprio = p_prio.
+        <fs_lprio>-bezei = p_bezei.
+      ENDIF.
+
+  ENDTRY.
+
+ENDFORM.
+
+
+FORM get_estado_posicion_venta USING p_dat TYPE ty_ped_venta
+                        CHANGING p_ret TYPE zsd_estado_pedidos_n.
+* Si la posición está rechazada y no se ha entregado nada, se marca como RECHAZADA
+  IF p_dat-absta = 'C' AND ( p_dat-lfsta = 'A' OR p_dat-lfsta = '' ).
+    p_ret-estado = 'RE'.          "RECHAZADA...
+    EXIT.
+
+  ENDIF.
+
+  SELECT SINGLE k~aufnr , k~objnr , p~wemng , ko~igmng
+    FROM aufk AS k
+    INNER JOIN afpo AS p ON k~aufnr = p~aufnr
+    INNER JOIN afko AS ko ON ko~aufnr = k~aufnr
+    INTO @DATA(ls_aufk)
+     WHERE auart  = 'ZI02'
+       AND autyp   = '40'
+       AND
+    (
+      ( zzebeln1 = @p_dat-vbeln AND zzebelp1 = @p_dat-posnr AND zzurgt1 = @p_dat-etenr ) OR
+      ( zzebeln2 = @p_dat-vbeln AND zzebelp2 = @p_dat-posnr AND zzurgt2 = @p_dat-etenr ) OR
+      ( zzebeln3 = @p_dat-vbeln AND zzebelp3 = @p_dat-posnr AND zzurgt3 = @p_dat-etenr ) OR
+      ( zzebeln1 = @p_dat-vbeln AND zzebelp1 = @p_dat-posnr AND zzurgt1 = ' ' ) OR " para pedidos anteriores a implementar el reparto
+      ( zzebeln2 = @p_dat-vbeln AND zzebelp2 = @p_dat-posnr AND zzurgt2 = ' ' ) OR
+      ( zzebeln3 = @p_dat-vbeln AND zzebelp3 = @p_dat-posnr AND zzurgt3 = ' ' )
+
+    )   AND
+    p~posnr = '0001'.
+
+*  CON ESTOS DATOS COMPRUEBO EL STATUS DE LA ORDEN SI EXISTE:
+  SELECT SINGLE stat
+    FROM jest
+    INTO @DATA(l_est_ord)
+   WHERE objnr = @ls_aufk-objnr
+     AND inact = ' ' AND
+         stat IN ( @zcl_secuenciador=>gc_i0001_abierta ,
+                   @zcl_secuenciador=>gc_i0002_liberada ,
+                   @zcl_secuenciador=>gc_i0045_out , "CTEC
+                    'I0046' ). "CERR
+
+*    p_dat-gbsta = 'C'-->Tratado completamente
+
+  IF p_dat-gbsta <> 'C' AND l_est_ord = zcl_secuenciador=>gc_i0002_liberada.
+    p_ret-estado = 'MP'.         "EN FABRICACIÓN; ORDEN SE HA LANZADO A PRODUCCIÓN.
+
+  ELSEIF p_dat-gbsta <> 'C' AND l_est_ord = zcl_secuenciador=>gc_i0045_out  AND ls_aufk-igmng > 0.
+    p_ret-estado = 'MF'.            "FABRICADO; CIERRE TÉCNICO REALIZADO.
+
+  ELSEIF p_dat-gbsta <> 'C' AND l_est_ord = zcl_secuenciador=>gc_i0001_abierta.
+    p_ret-estado = ''.              "PEDIDO PENDIENTE DE FABRICAR.
+  ENDIF.
+
+  IF p_dat-gbsta = 'A'.
+    p_ret-estado = ''.
+  ELSE.
+
+    SELECT vbeln , posnn , vbtyp_n
+      FROM vbfa
+      INTO TABLE @DATA(lt_vbfa)
+      WHERE vbelv  = @p_dat-vbeln
+         AND posnv = @p_dat-posnr
+         AND posnn < '900000'
+         AND stufe = '00'.
+
+    DATA(l_mayor_stat) = '1'.
+
+    LOOP AT lt_vbfa INTO DATA(ls_vbfa) WHERE ( vbtyp_n = 'J' OR vbtyp_n = 'T' ).
+
+*      SELECT SINGLE * FROM vbup
+*        INTO data(ls_vbupf)
+*        WHERE vbeln = ls_vbfa-vbeln
+*          AND posnr = ls_vbfa-posnn.
+
+
+      IF p_dat-fksta <> 'C' AND
+         p_dat-wbsta <> 'C' AND
+         p_dat-kosta <> ''.
+
+
+
+        SELECT SINGLE kosta
+          INTO @DATA(l_kosta)
+*          INTO @DATA(l_kosta)
+          FROM lips
+          JOIN vbup ON lips~vbeln = vbup~vbeln AND lips~posnr = vbup~posnr
+          WHERE  lips~vbeln = @ls_vbfa-vbeln
+             AND uecha      = @ls_vbfa-posnn.
+*             AND kosta     IN ('B','C').
+        CASE l_kosta.
+          WHEN 'B' OR 'C'.
+*          	WHEN 'B' or 'C'.
+          WHEN OTHERS.
+        ENDCASE.
+*          IF l_kosta in .
+*
+*          ENDIF.
+
+      ENDIF.
+    ENDLOOP.
+
+  ENDIF.
+
+  p_ret-aufnr = ls_aufk-aufnr.
+  CASE l_est_ord.
+    WHEN zcl_secuenciador=>gc_i0001_abierta.
+      p_ret-estado_of = 'ABIE'.
+    WHEN zcl_secuenciador=>gc_i0002_liberada.
+      p_ret-estado_of = 'LIB'.
+    WHEN zcl_secuenciador=>gc_i0045_out.
+      p_ret-estado_of = 'CTEC'.
+    WHEN 'I0046'.
+      p_ret-estado_of = 'CERR'.
+    WHEN OTHERS.
+  ENDCASE.
+
+
+
+ENDFORM.
+
+FORM datos_centro USING p_werks
+                  CHANGING p_ret.
+
+  TRY.
+      p_ret = gt_centres[ werks = p_werks ]-descrip.
+
+    CATCH cx_root .
+
+      SELECT SINGLE *
+        INTO @DATA(lt_werk)
+        FROM tvkot
+        WHERE spras = @sy-langu AND
+              vkorg = @p_werks.
+
+      APPEND INITIAL LINE TO gt_centres ASSIGNING FIELD-SYMBOL(<fs_werk>).
+      <fs_werk>-werks = lt_werk-vkorg.
+      <fs_werk>-descrip = lt_werk-vtext.
+      p_ret = <fs_werk>-descrip.
+
+  ENDTRY.
+
+
+
+ENDFORM.
+
+FORM datos_prio USING p_prio
+                  CHANGING p_ret.
+  TRY.
+      p_ret = gt_prio[ lprio = p_prio ]-bezei.
+    CATCH cx_root .
+
+      SELECT SINGLE bezei FROM tprit INTO p_ret
+        WHERE lprio = p_prio
+          AND spras = sy-langu.
+
+      APPEND INITIAL LINE TO gt_prio ASSIGNING FIELD-SYMBOL(<fs_prio>).
+      <fs_prio>-lprio = p_prio.
+      <fs_prio>-lprio = p_ret.
+
+  ENDTRY.
+
+
+ENDFORM.
+
+
+*FORM datos_cliente USING p_kunnr
+*                         p_lifnr
+*                  CHANGING p_ret TYPE ty_cli.
+*
+*  TRY.
+*      p_ret = gt_cli[ kunnr = p_kunnr ].
+*
+*    CATCH cx_root .
+*
+*      SELECT SINGLE kunnr , name1 , pstlz , land1
+*        INTO CORRESPONDING FIELDS OF @p_ret
+*        FROM kna1
+*        WHERE kunnr = @p_kunnr.
+*
+*      SELECT SINGLE zwels
+*        INTO @p_ret-zlsch
+*        FROM knb1
+*        WHERE kunnr = @p_kunnr AND
+*              bukrs = @p_lifnr+1(4).
+*
+**      SELECT SINGLE text1 FROM t042z INTO p_ret-text1
+**        WHERE land1 = 'ES'
+**          AND zlsch = p_ret-zlsch.
+*
+*      APPEND INITIAL LINE TO gt_cli ASSIGNING FIELD-SYMBOL(<fs_cli>).
+*      <fs_cli>-kunnr  = p_ret-kunnr.
+*      <fs_cli>-name1  = p_ret-name1.
+*      <fs_cli>-pstlz  = p_ret-pstlz.
+*      <fs_cli>-land1  = p_ret-land1.
+*      p_ret = CORRESPONDING #( <fs_cli> ).
+**      <fs_cli>-zlsch  = p_ret-zlsch.
+*
+*  ENDTRY.
+*
+*ENDFORM.
+
+FORM datos_lifsk USING p_lifsk
+                  CHANGING p_lifsk_t.
+
+
+  TRY.
+      p_lifsk_t = gt_lifsk[ lifsk = p_lifsk ]-lifsk_t.
+    CATCH cx_root .
+
+
+      SELECT SINGLE vtext
+        FROM  tvlst
+        INTO p_lifsk_t
+       WHERE spras  = sy-langu
+         AND lifsp  = p_lifsk.
+
+      APPEND INITIAL LINE TO gt_lifsk ASSIGNING FIELD-SYMBOL(<fs_lifsk>).
+      <fs_lifsk>-lifsk   = p_lifsk.
+      <fs_lifsk>-lifsk_t = p_lifsk_t.
+
+  ENDTRY.
+
+ENDFORM.
+
+FORM crear_alv.
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = gr_alv
+        CHANGING
+          t_table      = gt_datos ).
+    CATCH cx_root .
+  ENDTRY.
+
+  PERFORM tunning_alv.
+
+  gr_alv->display( ).
+
+ENDFORM.
+
+FORM tunning_alv.
+
+
+  DATA: lr_functions  TYPE REF TO cl_salv_functions_list,
+        lo_selections TYPE REF TO cl_salv_selections,
+        l_text        TYPE string.
+  DATA: lv_key    TYPE salv_s_layout_key,  "To save ALV salv_table
+        lo_layout TYPE REF TO cl_salv_layout.
+  DATA: lr_columns  TYPE REF TO cl_salv_columns,
+        lr_column   TYPE REF TO cl_salv_column_table,
+        lr_cols_tab TYPE REF TO cl_salv_columns_table.
+
+  DATA: lr_events TYPE REF TO cl_salv_events_table.
+  lr_events = gr_alv->get_event( ).
+
+  lo_selections = gr_alv->get_selections( ).
+**  lo_selections->set_selection_mode( cl_salv_selections=>multiple ).
+  lo_selections->set_selection_mode( cl_salv_selections=>none ).
+
+  lv_key-report = sy-repid.
+  lo_layout = gr_alv->get_layout( ).
+  lo_layout->set_key( lv_key ).
+  lo_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  lo_layout->set_default( abap_true ).
+  IF p_lay06 IS NOT INITIAL.
+    lo_layout->set_initial_layout( p_lay06 ).
+  ENDIF.
+
+
+  gr_events = gr_alv->get_event( ).
+  CREATE OBJECT event_handler.
+  SET HANDLER event_handler->on_user_command FOR gr_events.
+  SET HANDLER event_handler->on_link_click FOR gr_events.
+
+  lr_functions = gr_alv->get_functions( ).
+  lr_functions->set_all( 'X' ).
+
+  lr_cols_tab = gr_alv->get_columns( ).
+  TRY.
+      lr_cols_tab->set_color_column( 'COLOR' ).
+    CATCH cx_salv_data_error.                           "#EC NO_HANDLER
+  ENDTRY.
+
+  event_handler->generar_cabecera( ).
+
+*  TRY.
+*      l_text = 'Stock'.
+*      lr_functions->add_function(
+*        name     = 'STOCK'
+**        icon     = '@0D@'
+*        icon     = '@3X@'
+*        text     = l_text
+*        tooltip  = l_text
+*        position = if_salv_c_function_position=>right_of_salv_functions ).
+*    CATCH cx_salv_wrong_call cx_salv_existing.
+*  ENDTRY.
+
+*  TRY.
+**      l_text = 'Imprimir etiqueta defectos'.
+*      l_text = 'Imprimir'.
+*      lr_functions->add_function(
+**      gr_funct->add_function(
+*        name     = 'IMPR'
+*        icon     = '@0X@'
+*        text     = l_text
+*        tooltip  = l_text
+*        position = if_salv_c_function_position=>right_of_salv_functions ).
+*    CATCH cx_salv_wrong_call cx_salv_existing.
+*
+*  ENDTRY.
+
+
+  lr_columns = gr_alv->get_columns( ).
+  lr_columns->set_optimize( 'X' ).
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'FECHA_ENT' ).
+      lr_column->set_short_text( value  = 'F.entrega' ).
+      lr_column->set_medium_text( value  = 'Fecha entrega' ).
+      lr_column->set_long_text( value  = 'Fecha entrega' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'FECHA_FAB' ).
+      lr_column->set_short_text( value  = 'F.fabric.' ).
+      lr_column->set_medium_text( value  = 'Fecha fabricación' ).
+      lr_column->set_long_text( value  = 'Fecha fabricación' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'ANCHO_BOB' ).
+      lr_column->set_short_text( value  = 'Ancho bob.' ).
+      lr_column->set_medium_text( value  = 'Ancho bobina' ).
+      lr_column->set_long_text( value  = 'Ancho bobina' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'VBELN' ).
+      lr_column->set_cell_type( if_salv_c_cell_type=>hotspot ).
+      lr_column->set_short_text( value  = 'Pedido' ).
+      lr_column->set_medium_text( value  = 'Pedido' ).
+      lr_column->set_long_text( value  = 'Pedido' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'VBELN_ENT' ).
+      lr_column->set_cell_type( if_salv_c_cell_type=>hotspot ).
+      lr_column->set_short_text( value  = 'Entrega' ).
+      lr_column->set_medium_text( value  = 'Entrega' ).
+      lr_column->set_long_text( value  = 'Entrega' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'ESTADO_OF' ).
+      lr_column->set_short_text( value  = 'Estado OF' ).
+      lr_column->set_medium_text( value  = 'Estado OF' ).
+      lr_column->set_long_text( value  = 'Estado OF' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'ESTADO' ).
+      lr_column->set_short_text( value  = 'Estado pos' ).
+      lr_column->set_medium_text( value  = 'Estado pos' ).
+      lr_column->set_long_text( value  = 'Estado pos' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'KUNNR' ).
+      lr_column->set_short_text( value  = 'Cliente' ).
+      lr_column->set_medium_text( value  = 'Cliente' ).
+      lr_column->set_long_text( value  = 'Cliente' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'KUNWE' ).
+      lr_column->set_short_text( value  = 'Dest.merc' ).
+      lr_column->set_medium_text( value  = 'Destin.mercancias' ).
+      lr_column->set_long_text( value  = 'Destin.mercancias' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'KWMENG' ).
+      lr_column->set_short_text( value  = 'Ctd.ped.' ).
+      lr_column->set_medium_text( value  = 'Cantidad pedido' ).
+      lr_column->set_long_text( value  = 'Cantidad pedido' ).
+      lr_column->set_sign( ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'LFIMG' ).
+      lr_column->set_short_text( value  = 'Ctd.entre.' ).
+      lr_column->set_medium_text( value  = 'Cantidad entregada' ).
+      lr_column->set_long_text( value  = 'Cantidad entregada' ).
+      lr_column->set_sign( ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'PIKMG' ).
+      lr_column->set_short_text( value  = 'Ctd. pick.' ).
+      lr_column->set_medium_text( value  = 'Cantidad picking' ).
+      lr_column->set_long_text( value  = 'Cantidad picking' ).
+      lr_column->set_sign( ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'TP_PEDIDO' ).
+      lr_column->set_short_text( value  = 'Tp.Ped C/V' ).
+      lr_column->set_medium_text( value  = 'Cantidad picking' ).
+      lr_column->set_long_text( value  = 'Cantidad picking' ).
+
+*      lr_column->set_visible( abap_false ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+* Pedido linkable
+*  TRY.
+*      CALL METHOD lr_column->set_cell_type
+*        EXPORTING
+*          value = if_salv_c_cell_type=>hotspot.
+*      .
+*    CATCH cx_salv_data_error .
+*  ENDTRY.
+
+
+* Tratamiento de color para columna.
+*      DATA: ls_color TYPE lvc_s_colo.
+*      CLEAR ls_color.
+*      ls_color-col = 3.
+*      ls_color-int = 0.
+*      ls_color-inv = 0.
+*
+*      lr_column->set_color( ls_color ).
+*
+*    CATCH cx_salv_not_found .
+*  ENDTRY.
+
+  DATA(lr_display) = gr_alv->get_display_settings( ).
+*CALL METHOD lcl_event_handler->SET_TOP_OF_PAGE
+*      CHANGING
+*        CO_ALV = O_ALV.
+
+ENDFORM.
+
+FORM colorear_celda_fila  USING p_columna  TYPE lvc_fname
+                               p_color    TYPE int1
+                     CHANGING ps_cellcolor TYPE lvc_s_scol.
+
+
+  CLEAR ps_cellcolor.
+  ps_cellcolor-fname = p_columna. "ls_mod_cells-fieldname.
+  ps_cellcolor-color-col = p_color. "'6' .
+  ps_cellcolor-color-int = '0'.
+
+ENDFORM.                    " COLORER_CELDA
+
+
+FORM buscar_variante  CHANGING p_vari TYPE disvariant-variant.
+
+  DATA: ls_variant TYPE disvariant,
+        l_exit     TYPE char1.
+
+  ls_variant-report = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant = ls_variant
+      i_save     = 'A'
+*     it_default_fieldcat =
+    IMPORTING
+      e_exit     = l_exit
+      es_variant = ls_variant
+    EXCEPTIONS
+      not_found  = 2.
+  IF sy-subrc = 2.
+    MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSE.
+    IF l_exit EQ space.
+      p_vari = ls_variant-variant.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " BUSCAR_VARIANTE

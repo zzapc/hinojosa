@@ -1,0 +1,128 @@
+REPORT Z_PPCON_124.
+*&---------------------------------------------------------------------*
+*& Report  Z_PPCON_124                                                 *
+*&---------------------------------------------------------------------*
+*& This report is the same as ZKORRESB from note 112542.               *
+*& The report reads the material documents for all reservations of an  *
+*& order and recalculates RESB-ENMNG and RESB-ENWRT.                   *
+*& If NOTEQZ is checked all reservations are corrected, if the flag is *
+*& empty only reservations with ENMNG = 0 are investigated             *
+*&                                                                     *
+*& Attention: The report does not lock the reservations!               *
+*&---------------------------------------------------------------------*
+
+
+TABLES: resb, caufv, mseg.                                   "#EC NEEDED
+
+DATA: BEGIN OF res_seltab OCCURS 0,
+        rsnum LIKE resb-rsnum.
+DATA: END OF res_seltab.
+
+DATA: BEGIN OF iresb OCCURS 0.
+        INCLUDE STRUCTURE resb.
+DATA: END OF iresb.
+
+DATA: BEGIN OF imseg OCCURS 0,
+        mblnr LIKE mseg-mblnr,
+        mjahr LIKE mseg-mjahr,
+        menge LIKE mseg-menge,
+        dmbtr LIKE mseg-dmbtr,
+        shkzg LIKE mseg-shkzg.
+DATA: END OF imseg.
+
+DATA: sollmenge LIKE mseg-menge,
+      sollwert  LIKE mseg-dmbtr,
+      null      LIKE resb-enmng.
+
+SELECT-OPTIONS: auftrag FOR caufv-aufnr,
+                aufttyp FOR caufv-autyp DEFAULT '10'.  "PPS-Aufträge
+PARAMETERS: update AS CHECKBOX,
+            noteqz AS CHECKBOX DEFAULT 'X'. "prüfe auch RESB-ENMNG <>0
+
+START-OF-SELECTION.
+* Auftragskopfdaten lesen
+  SELECT * FROM caufv INTO CORRESPONDING FIELDS OF TABLE res_seltab
+                     WHERE aufnr IN auftrag
+                     AND   autyp IN aufttyp.
+  IF res_seltab[] IS INITIAL.
+    WRITE :/ '  No reservations could be found.'.
+    EXIT.
+  ENDIF.
+* vorsichtshalber initialisieren
+  CLEAR iresb. REFRESH iresb.
+  SELECT * FROM resb INTO TABLE iresb FOR ALL ENTRIES IN res_seltab
+           WHERE rsnum = res_seltab-rsnum.
+  IF noteqz IS INITIAL.
+* nur Reservierungen mit ENMNG=0 behandeln, also Sätze mit
+* ENMNG <> 0 löschen
+    DELETE iresb WHERE enmng <> null.
+  ENDIF.
+  LOOP AT iresb.
+    CLEAR imseg. REFRESH imseg.
+* Materialbewegungen nachlesen
+    SELECT * FROM mseg INTO CORRESPONDING FIELDS OF TABLE imseg
+                       WHERE rsnum EQ iresb-rsnum
+                       AND   rspos EQ iresb-rspos
+                       AND   rsart EQ iresb-rsart.
+* keine Warenbewegungen zur Reservierungen => Reservierung wird
+* nicht geprüft
+    IF sy-subrc <> 0 AND
+       iresb-enmng IS INITIAL.
+      DELETE iresb.
+      CONTINUE.
+    ENDIF.
+* Warenbewegungen werden geprüft
+    CLEAR: sollmenge, sollwert.
+    LOOP AT imseg.
+      CASE imseg-shkzg.
+        WHEN 'H'.                                "Warenausgang
+          sollmenge = sollmenge + imseg-menge.   "Menge kumulieren
+          sollwert  = sollwert  + imseg-dmbtr.   "Wert kumulieren
+        WHEN 'S'.                                "Warenausgang Storno
+          sollmenge = sollmenge - imseg-menge.   "Menge kumulieren
+          sollwert  = sollwert  - imseg-dmbtr.   "Wert kumulieren
+      ENDCASE.
+    ENDLOOP.
+*  SHKZG berücksichtigen
+    IF iresb-shkzg = 'S'.
+      sollmenge = sollmenge * -1.
+      sollwert  = sollwert  * -1.
+    ENDIF.
+    IF sollmenge EQ iresb-enmng AND sollwert EQ iresb-enwrt.
+      DELETE iresb.
+    ELSE.
+      WRITE: /2 'RESB-RSNUM  RESB-RSPOS   RESB-MATNR',
+             /2 iresb-rsnum, '      ', iresb-rspos, ' ', iresb-matnr,
+             /2 '      ENMNG-SOLL         ENMNG-IST ',
+                '     ENWRT-SOLL          ENWRT-IST',
+             /2 sollmenge, iresb-enmng,                  "#EC UOM_IN_MES
+                sollwert, iresb-enwrt.                   "#EC UOM_IN_MES
+      SKIP.
+      iresb-enmng = sollmenge.
+      iresb-enwrt = sollwert.
+      MODIFY iresb.
+    ENDIF.
+  ENDLOOP.
+
+END-OF-SELECTION.
+* Update auf die RESB, sofern zu korrigierende Sätze gefunden werden
+* und Update-Kennzeichen gesetzt ist
+  READ TABLE iresb INDEX 1.
+  IF NOT sy-subrc IS INITIAL.
+    WRITE: /2 'No RESB entries to be updated'.
+  ENDIF.
+  IF NOT update IS INITIAL.
+    UPDATE resb FROM TABLE iresb.
+    IF NOT sy-subrc IS INITIAL.
+      WRITE: /2 'ERROR updating RESB'.
+    ELSE.
+      WRITE: /2 sy-dbcnt, 'entries RESB updated'.
+    ENDIF.
+  ENDIF.
+*&---------------------------------------------------------------------*
+*& Report  Z_PPCON_124
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*

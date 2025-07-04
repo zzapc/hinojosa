@@ -1,0 +1,680 @@
+*&---------------------------------------------------------------------*
+*& Report  ZSPP_CREAR_OF_PEDIDO
+*&
+*&---------------------------------------------------------------------*
+REPORT zspp_crear_of_pedido_subco.
+
+DATA it_log TYPE TABLE OF char255.
+
+CONSTANTS c_2003 TYPE werks_d VALUE '2003'.
+CONSTANTS c_2001 TYPE werks_d VALUE '2001'.
+CONSTANTS c_2000 TYPE werks_d VALUE '2000'.
+
+DATA: rg_semis TYPE RANGE OF mtart,
+      rg_pto   TYPE RANGE OF mtart.
+DATA it_pedipos TYPE TABLE OF zsppt_ofpedsubco.
+FREE: rg_semis, rg_pto.
+CONSTANTS: c_pto  TYPE rvari_vnam VALUE 'ZSPP_UPD_MTART_PTE',
+           c_semi TYPE rvari_vnam VALUE 'ZSPP_UPD_MTART_SEM'.
+
+PARAMETERS p_ebeln TYPE ebeln OBLIGATORY.
+PARAMETERS p_ebelp TYPE ebelp.
+PARAMETERS p_matnr TYPE matnr.
+
+START-OF-SELECTION.
+
+  DATA: srtfd TYPE indx-srtfd,
+        relid TYPE  indx-relid.
+  srtfd = sy-repid.
+  relid = 'ZZ'.
+
+  DATA(num_jobs) = zsmm_utils=>num_jobs( i_jobname = 'ZCREA_ORDEN_PRODUCCION_SUBCO' )."check_job( i_jobname = 'ZCREA_ORDEN_PRODUCCION_SUBCO' ).
+  IF num_jobs > 1.
+    APPEND INITIAL LINE TO it_log ASSIGNING FIELD-SYMBOL(<log>).
+    WRITE |Ya existe una ejecución en job del report ZSPP_CREAR_OF_PEDIDO_SUBCO.| TO <log>.
+    WRITE <log>.
+    SKIP.
+    APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+    WRITE |Se aborta la ejecución.| TO <log>.
+    WRITE <log>.
+    RETURN.
+
+  ENDIF.
+
+  DO 100 TIMES.
+    CALL FUNCTION 'ENQUEUE_ESINDX'
+      EXPORTING
+        mode_indx      = 'E'    " Lock mode for table INDX
+        mandt          = sy-mandt    " 01th enqueue argument
+        relid          = relid
+        srtfd          = srtfd
+*       srtf2          =     " 04th enqueue argument
+*       x_relid        = SPACE    " Fill argument 02 with initial value?
+*       x_srtfd        = SPACE    " Fill argument 03 with initial value?
+*       x_srtf2        = SPACE    " Fill argument 04 with initial value?
+*       _scope         = '2'
+*       _wait          = SPACE
+*       _collect       = ' '    " Initially only collect lock
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+    IF sy-subrc <> 0.
+*   MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+    IF sy-subrc = 0.
+      DATA(lv_locked) = abap_true.
+      EXIT.
+    ENDIF.
+  ENDDO.
+  IF lv_locked IS INITIAL.
+    APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+    WRITE |No se ha podido bloquear el report ZSPP_CREAR_OF_PEDIDO_SUBCO.| TO <log>.
+    WRITE <log>.
+    RETURN.
+  ENDIF.
+
+
+  FREE it_pedipos.
+  FREE: rg_pto, rg_semis.
+  SELECT sign, opti, low, high INTO TABLE @rg_pto FROM tvarvc WHERE name EQ @c_pto.
+  SELECT sign, opti, low, high INTO TABLE @rg_semis FROM tvarvc WHERE name EQ @c_semi.
+
+  IF p_ebeln IS NOT INITIAL AND p_ebelp IS NOT INITIAL AND p_matnr IS NOT INITIAL.
+    SELECT SINGLE * INTO @DATA(auxiliar) FROM zsppt_ofpedsubco WHERE ebeln = @p_ebeln AND ebelp = @p_ebelp AND matnr = @p_matnr.
+    IF sy-subrc = 0 AND auxiliar-aufnr IS NOT INITIAL.
+      SELECT SINGLE t1~aufnr
+        INTO @DATA(ok)
+        FROM aufk AS t1
+        WHERE loekz <> @space
+        AND aufnr = @auxiliar-aufnr.
+
+      IF sy-subrc = 0.
+        "La OF está borrada
+        APPEND INITIAL LINE TO it_pedipos ASSIGNING FIELD-SYMBOL(<z>).
+        <z>-ebeln = p_ebeln.
+        <z>-ebelp = p_ebelp.
+        <z>-matnr = p_matnr.
+
+        MODIFY zsppt_ofpedsubco FROM TABLE it_pedipos.
+        COMMIT WORK .
+      ENDIF.
+    ELSEIF sy-subrc <> 0.
+      "La posición a tratar no existe
+      APPEND INITIAL LINE TO it_pedipos ASSIGNING <z>.
+      <z>-ebeln = p_ebeln.
+      <z>-ebelp = p_ebelp.
+      <z>-matnr = p_matnr.
+
+      MODIFY zsppt_ofpedsubco FROM TABLE it_pedipos.
+      COMMIT WORK AND WAIT.
+    ENDIF.
+
+  ENDIF.
+*  DATA sal TYPE xfeld.
+*  CLEAR sal.
+*  DO.
+*    SELECT count( * ) INTO @DATA(lv_stat) FROM tbtco WHERE jobname = 'ZCREA_ORDEN_PRODUCCION_SUBCO' AND status = 'R'.
+*    IF lv_stat > 1.
+*      CONTINUE.
+*    ELSE.
+*      EXIT.
+*    ENDIF.
+*  ENDDO.
+
+
+  "Recuperamos también si había algun pendiente
+  SELECT * INTO TABLE @it_pedipos FROM zsppt_ofpedsubco
+        WHERE aufnr EQ @space.
+
+  LOOP AT it_pedipos ASSIGNING FIELD-SYMBOL(<pedpos>).
+    p_ebeln = <pedpos>-ebeln.
+    p_ebelp = <pedpos>-ebelp.
+    p_matnr = <pedpos>-matnr.
+
+    "Comprobamos si la pos del pedido se ha borrado a posteriori y continúa en tabla
+    SELECT SINGLE loekz
+      FROM ekpo
+      WHERE ebeln = @<pedpos>-ebeln
+      AND ebelp = @<pedpos>-ebelp
+      AND loekz IN ( 'L', 'X' )
+      INTO @DATA(lv_borrado).
+    IF sy-subrc = 0.
+      PERFORM descarta_necesidad USING <pedpos>-ebeln <pedpos>-ebelp <pedpos>-matnr.
+      CONTINUE.
+    ENDIF.
+
+    "Espera bloqueo reserva
+    DATA: lt_seqg3 TYPE TABLE OF seqg3 WITH HEADER LINE,
+          l_object TYPE char100.
+
+    "l_object = sy-mandt && lw_timetickets-orderid. "Bloqueo orden AUFK
+    l_object = sy-mandt && p_ebeln.
+
+    DO 5 TIMES.
+      CALL FUNCTION 'ENQUEUE_READ'
+        EXPORTING
+          gclient               = sy-mandt
+          guname                = ''
+        TABLES
+          enq                   = lt_seqg3
+        EXCEPTIONS
+          communication_failure = 1
+          system_failure        = 2
+          OTHERS                = 3.
+
+      READ TABLE lt_seqg3 WITH KEY gname = 'EKKO'
+                                           garg = l_object.
+      IF sy-subrc = 0.
+        WAIT UP TO 2 SECONDS.
+      ELSE.
+        EXIT.
+      ENDIF.
+    ENDDO.
+
+    CALL FUNCTION 'ENQUEUE_EMEKKOE'
+      EXPORTING
+*       mode_vbak      = 'E'    " Modo de bloqueo p. tabla VBAK
+        mandt          = sy-mandt    " 01. Argumento enqueue
+        ebeln          = p_ebeln  " 02. Argumento enqueue
+        ebelp          = p_ebelp
+*       x_vbeln        = SPACE    " ¿Cumplimentar argumento 02 con valor inicial?
+*       _scope         = '2'
+*       _wait          = SPACE
+*       _collect       = ' '    " Por lo pronto, juntar bloqueo
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+    IF sy-subrc <> 0.
+*   MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+    WRITE |Inicio proceso.| TO <log>.
+    WRITE <log>.
+
+    SKIP.
+    DO 5 TIMES.
+      APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+      WRITE |Buscando pedido relacionado: { p_ebeln ALPHA = OUT } posicion { p_ebelp ALPHA = OUT }.| TO <log>.
+      WRITE <log>.
+      SKIP.
+*  CASUÍSTICA 1: ENVÍO DE SEMITERMINADO DE XÀTIVA A PERIS VÍA PEDIDO DE SUBCONTRATISTA.
+*  CREACIÓN DE OF AUTOMÁTICAMENTE DE SEMITERMINADO ENVIADO COMO COMPONENTE DEL PEDIDO DE SUBCO,
+*  MEDIANTE ADAPTACIÓN DE PROGRAMA ZSPP_CREAR_OF_PEDIDO.
+*  OBTENER EL PEDIDO Y POSICIÓN DE VENTAS DEL QUE NACE ESTA NECESIDAD DESDE EKKN-VBELN Y EKKN-VBELP.
+*  METER ESOS VALORES A PIÑÓN FIJO COMO SI EMPUJASES ALL DAY ALL NIGHT EN LA AFPO-KDAUF Y AFPO-KDPOS.
+      SELECT SINGLE vbeln, vbelp, zzcrear_of
+        FROM ekkn AS t1 INNER JOIN ekpo AS t2 ON t1~ebeln EQ t2~ebeln
+        WHERE t1~ebeln = @p_ebeln
+        AND t1~ebelp = @p_ebelp
+        AND t2~loekz = @space
+        INTO @DATA(pedi_pos).
+      IF sy-subrc = 0 AND pedi_pos-vbeln IS NOT INITIAL AND pedi_pos-zzcrear_of EQ abap_true.
+        DATA(lv_found) = abap_true.
+        EXIT.
+      ELSE.
+        CLEAR lv_found.
+        WAIT UP TO '0.5' SECONDS.
+      ENDIF.
+
+    ENDDO.
+
+    IF lv_found EQ abap_false.
+*  CASUÍSTICA 2: ENVÍO DE PRODUCTO TERMINADO DE XÀTIVA A PERIS VÍA PEDIDO DE TRASLADO.
+*  AÑADIR UN FLAG A NIVEL DE POSICIÓN DE PEDIDO DE TRASLADO QUE SEA "CREAR OF". SE CREARÁ NUEVAMENTE
+*  "MEDIANTE ADAPTACIÓN DEL PROGRAMA ZSPP_CREAR_OF_PEDIDO.
+*  CREACIÓN DE CAMPO Z Nº PEDIDO DE CLIENTE EN POSICIÓN PEDIDO DE TRASLADO.
+*  CREACIÓN DE CAMPO Z EN LOTE LOGÍSTICO PARA EL MANTENIMIENTO DE Nº PEDIDO DE CLIENTE, QUE SE
+*  ALIMENTARÁ DEL CAMPO RELLENADO POR EL USUARIO EN LA POSICIÓN DEL PEDIDO DE TRASLADO.
+*  CREACIÓN DE CAMPO Z Nº PEDIDO DE CLIENTE EN OF. QUE SE ALIMENTARÁ DEL CAMPO RELLENADO POR EL
+*  USUARIO EN LA POSICIÓN DEL PEDIDO DE TRASLADO.
+*  CON LA CREACIÓN AUTOMÁTICA DE LA OF DEL PT SE INFORMARÁ EN LOS CAMPOS Z DE LA OF Y DEL LOTE, EL
+*  Nº DE PEDIDO DE CLIENTE.
+*  CON LA CREACIÓN DEL PEDIDO DE VENTA A CLIENTE DESDE EL MONITOR DE EXPEDICIONES, SE INFORMARÁ DEL
+*  Nº DE PEDIDO DE CLIENTE DEL LOTE SELECCIONADO.
+      SELECT SINGLE zzcrear_of, zzped_cliente, zzcliente, t1~matnr, t1~werks, t1~menge, CASE t3~mbdat WHEN '00000000' THEN t3~eindt ELSE t3~mbdat  END AS bdter
+         FROM ekpo AS t1 INNER JOIN ekko AS t2
+        ON t1~ebeln EQ t2~ebeln
+        INNER JOIN eket AS t3 ON t1~ebeln EQ t3~ebeln AND t1~ebelp EQ t3~ebelp
+        WHERE t1~ebeln = @p_ebeln
+        AND t1~ebelp = @p_ebelp
+        AND t1~loekz = @space
+        AND t3~etenr = ( SELECT MIN( etenr ) FROM eket WHERE eket~ebeln = t1~ebeln AND eket~ebelp = t1~ebelp )
+        INTO @DATA(crear_si).
+      IF sy-subrc = 0 AND crear_si-zzcrear_of EQ abap_true.
+        lv_found = abap_true.
+        DATA(lv_caso2) = abap_true.
+      ENDIF.
+
+
+***ESTA FUNCIONALIDAD AUTOMÁTICA (Nº PEDIDO DE CLIENTE) SOLO APLICARÍA EN EL CASO DE CREACIÓN AUTOMÁTICA
+*DE OF A PARTIR DEL PEDIDO DE TRASLADO.
+*
+*  CASUÍSTICA 3: ENVÍO DE PRODUCTO TERMINADO DE XÀTIVA A CENTRO DE MONTAJE VÍA PEDIDO DE TRASLADO.
+*  STOCK RESERVADO PARA CLIENTES (LOTE CAMPO Z CLIENTE): MATERIALES DE AGRICULTURA QUE PUEDEN SER ENVIADOS
+*  A X CLIENTES, PERO UNO EN ESPECÍFICO QUIERE STOCK RESERVADO PARA ÉL EN CM:
+*  CREACIÓN DE CAMPO Z CLIENTE EN POSICIÓN PEDIDO DE TRASLADO.
+*  CREACIÓN DE CAMPO Z EN LOTE PARA EL MANTENIMIENTO DE CLIENTE, QUE SE ALIMENTARÁ DEL CAMPO RELLENADO POR
+*  EL USUARIO EN LA POSICIÓN DEL PEDIDO DE TRASLADO.
+*  CREACIÓN DE CAMPO Z CLIENTE EN OF. QUE SE ALIMENTARÁ DEL CAMPO RELLENADO POR EL USUARIO EN LA POSICIÓN
+*  DEL PEDIDO DE TRASLADO.
+*  CON LA CREACIÓN AUTOMÁTICA DE LA OF DEL PT SE INFORMARÁ EN LOS CAMPOS Z DE LA OF Y DEL LOTE, EL CLIENTE
+*  PARA EL QUE SE RESERVA EL STOCK.
+      IF lv_found EQ space.
+        SELECT SINGLE zzcrear_of, zzped_cliente, zzcliente, t1~matnr, t1~werks, t1~menge, CASE t3~mbdat WHEN '00000000' THEN t3~eindt ELSE t3~mbdat  END AS bdter
+          FROM ekpo AS t1 INNER JOIN ekko AS t2
+          ON t1~ebeln EQ t2~ebeln
+        INNER JOIN eket AS t3 ON t1~ebeln EQ t3~ebeln AND t1~ebelp EQ t3~ebelp
+          WHERE t1~ebeln = @p_ebeln
+          AND t1~ebelp = @p_ebelp
+          AND t3~etenr = ( SELECT MIN( etenr ) FROM eket WHERE eket~ebeln = t1~ebeln AND eket~ebelp = t1~ebelp )
+          AND t1~loekz = @space
+          INTO @crear_si.
+        IF sy-subrc = 0 AND crear_si-zzcliente <> space AND crear_si-zzcrear_of EQ abap_true.
+          lv_found = abap_true.
+          DATA(lv_caso3) = abap_true.
+        ENDIF.
+      ENDIF.
+
+    ENDIF.
+
+
+    IF lv_found EQ abap_true.
+
+*      IF lv_caso2 IS INITIAL AND lv_caso3 IS INITIAL.
+      "Recuperamos aquellos que sean semis
+      SELECT t1~matnr, werks, bdmng, bdter, kzear INTO TABLE @DATA(it_semis)
+        FROM resb AS t1 INNER JOIN mara AS t2 ON t1~matnr EQ t2~matnr
+        WHERE ebeln = @p_ebeln
+        AND ebelp = @p_ebelp
+        AND t2~mtart IN @rg_semis.
+
+      IF sy-subrc <> 0 AND crear_si IS NOT INITIAL AND crear_si-matnr = p_matnr.
+
+        APPEND INITIAL LINE TO it_semis ASSIGNING FIELD-SYMBOL(<semi>).
+        <semi>-matnr = crear_si-matnr.
+        <semi>-werks = crear_si-werks.
+        <semi>-bdmng = crear_si-menge.
+        <semi>-bdter = crear_si-bdter.
+
+      ENDIF.
+
+      LOOP AT it_semis ASSIGNING <semi> WHERE kzear = space.
+
+        DATA wa_order TYPE  bapi_pp_order_create.
+        CLEAR wa_order.
+        DATA: wa_ret   TYPE bapiret2,
+              lv_aufnr TYPE aufnr,
+              lv_wrk02 TYPE werks_d.
+        CLEAR: wa_ret, lv_aufnr.
+
+        lv_wrk02 = <semi>-werks.
+
+        IF lv_wrk02 IS NOT INITIAL.
+          IF lv_caso2 IS INITIAL AND lv_caso3 IS INITIAL.
+            "Comprobamos si ya hay orden que no tenga PTBO
+            SELECT  SINGLE t1~aufnr INTO @DATA(check_aufnr_semi)
+                            FROM aufk AS t1
+              INNER JOIN afpo AS t2 ON t1~aufnr EQ t2~aufnr
+              AND t2~matnr EQ @<semi>-matnr
+*APC20241212 Hemos cambiado el pedido a un campo Z, pero tenemos que seguir buscando en al anterior por compatibilidad por lo ya existente
+*              AND t2~kdauf EQ @pedi_pos-vbeln
+*              AND t2~kdpos EQ @pedi_pos-vbelp
+              AND ( ( t2~kdauf EQ @pedi_pos-vbeln AND t2~kdpos EQ @pedi_pos-vbelp )
+               or   ( t1~zzvbeln EQ @pedi_pos-vbeln AND t2~posnr EQ @pedi_pos-vbelp ) )
+*APC20241212
+              AND zzsubco_ebeln = @p_ebeln
+              AND zzsubco_ebelp = @p_ebelp
+*              AND t2~matnr eq @p_matnr
+              WHERE loekz <> 'X'.
+
+          ELSE."IF lv_caso2 IS NOT INITIAL .
+
+            SELECT  SINGLE t1~aufnr INTO @check_aufnr_semi
+                                    FROM aufk AS t1
+                      INNER JOIN afpo AS t2 ON t1~aufnr EQ t2~aufnr
+                      AND t2~matnr EQ @<semi>-matnr
+                      "AND ( t1~zzped_cliente = @crear_si-zzped_cliente OR t1~zzcliente = @crear_si-zzcliente )
+                      AND zzsubco_ebeln = @p_ebeln
+                      AND zzsubco_ebelp = @p_ebelp
+*                      AND t2~matnr eq @p_matnr
+                      WHERE loekz <> 'X'.
+*          ELSEIF lv_caso3 IS NOT INITIAL.
+*            SELECT  SINGLE t1~aufnr INTO @check_aufnr_semi
+*                                    FROM aufk AS t1
+*                      INNER JOIN afpo AS t2 ON t1~aufnr EQ t2~aufnr
+*                      AND t2~matnr EQ @<semi>-matnr
+*                      AND t1~zzcliente = @crear_si-zzcliente
+*                      AND zzsubco_ebeln = @p_ebeln
+*                      AND zzsubco_ebelp = @p_ebelp
+*                      WHERE loekz <> 'X'.
+          ENDIF.
+          IF sy-subrc <> 0.
+            "Tenemos que crear la OF
+            wa_order-material = <semi>-matnr.
+*            wa_order-material_long = <semi>-matnr."SEIDOR Cambios S4
+            wa_order-plant = lv_wrk02.
+
+            SELECT SINGLE cuobj INTO @DATA(wa_cuobj)
+              FROM marc
+              WHERE werks EQ  @lv_wrk02
+              AND matnr EQ @<semi>-matnr.
+
+            "Le pasamos el CUOBJ a la Bapi
+            wa_order-configuration = wa_cuobj.
+
+            wa_order-planning_plant  = lv_wrk02.
+            wa_order-quantity = <semi>-bdmng.
+*            wa_order-sales_order = pedi_pos-vbeln.
+*            wa_order-sales_order_item = pedi_pos-vbelp.
+            SELECT SINGLE auart INTO wa_order-order_type FROM t399x WHERE werks EQ wa_order-plant AND auart LIKE 'Z___'.
+*            wa_order-basic_start_date =
+            wa_order-basic_end_date = <semi>-bdter.
+            wa_order-basic_end_time = '210000'.
+            APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+            WRITE |Tratando pedido: { p_ebeln ALPHA = OUT }, posición { p_ebelp ALPHA = OUT }.| TO <log>.
+            WRITE <log>.
+            SKIP.
+            APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+            WRITE |Creando orden para material semi: { <semi>-matnr ALPHA = OUT }| TO <log>.
+            WRITE <log>.
+            APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+            WRITE |cantidad { <semi>-bdmng }, centro { wa_order-plant }.| TO <log>.
+            WRITE <log>.
+            SKIP.
+
+            CLEAR: lv_aufnr, wa_ret.
+
+            CALL FUNCTION 'BAPI_PRODORD_CREATE'
+              EXPORTING
+                orderdata    = wa_order
+              IMPORTING
+                return       = wa_ret
+                order_number = lv_aufnr
+*               ORDER_TYPE   =
+              .
+
+            IF lv_aufnr IS NOT INITIAL.
+              COMMIT WORK.
+              APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+              WRITE |Orden de creada: { lv_aufnr ALPHA = OUT }.| TO <log>.
+              WRITE <log>.
+
+              DO 20 TIMES.
+                SELECT SINGLE aufnr INTO @DATA(l) FROM aufk WHERE aufnr = @lv_aufnr.
+                IF sy-subrc = 0.
+                  DATA(l_f) = abap_true.
+                  EXIT.
+                ELSE.
+                  WAIT UP TO 2 SECONDS.
+                ENDIF.
+              ENDDO.
+              IF l_f IS NOT INITIAL.
+                <pedpos>-aufnr = lv_aufnr.
+*                MODIFY zsppt_ofpedsubco FROM <pedpos>.
+                DATA lv_cambio TYPE xfeld.
+                CLEAR lv_cambio.
+*                WHILE lv_cambio = abap_false.
+                DO 20 TIMES.
+                  UPDATE zsppt_ofpedsubco SET aufnr = lv_aufnr
+                                  WHERE ebeln = p_ebeln
+                                  AND ebelp = p_ebelp
+                                  AND matnr = <semi>-matnr.
+                  COMMIT WORK .
+                  SELECT SINGLE aufnr INTO @DATA(ztab) FROM zsppt_ofpedsubco WHERE ebeln = @p_ebeln AND ebelp = @p_ebelp AND aufnr = @lv_aufnr AND matnr = @<semi>-matnr.
+                  IF sy-subrc = 0.
+                    lv_cambio = abap_true. WAIT UP TO '0.2' SECONDS.
+                    EXIT.
+                  ELSE.
+                    WAIT UP TO '2' SECONDS.
+                  ENDIF.
+                ENDDO.
+*                ENDWHILE.
+              ENDIF.
+
+              SKIP.
+              IF lv_caso2 IS INITIAL AND lv_caso3 IS INITIAL.
+                DO 10 TIMES.
+                  SELECT SINGLE * FROM afpo WHERE aufnr = @lv_aufnr INTO @DATA(lv_a).
+                  IF sy-subrc = 0.
+                    EXIT.
+                  ELSE.
+                    WAIT UP TO '2' SECONDS.
+                  ENDIF.
+                ENDDO.
+*                DATA lv_cambio TYPE xfeld.
+                CLEAR lv_cambio.
+*                WHILE lv_cambio = abap_false.
+                DO 20 TIMES.
+                  WAIT UP TO '0.1' SECONDS.
+*APC20241212 Cambiamos los campos donde alimentamos el pedido de cliente
+*                  UPDATE afpo SET kdauf = pedi_pos-vbeln
+*                                  kdpos = pedi_pos-vbelp
+                  UPDATE aufk SET zzvbeln = pedi_pos-vbeln
+                                  zzposnr = pedi_pos-vbelp
+                                  WHERE aufnr = lv_aufnr.
+                  COMMIT WORK AND WAIT.
+
+*APC20241212 Cambiamos los campos donde alimentamos el pedido de cliente
+*                  SELECT SINGLE kdauf, kdpos INTO @DATA(kdaufpos) FROM afpo WHERE aufnr = @lv_aufnr AND kdauf = @pedi_pos-vbeln AND kdpos = @pedi_pos-vbelp.
+                  SELECT SINGLE zzvbeln, zzposnr INTO @DATA(kdaufpos) FROM aufk WHERE aufnr = @lv_aufnr AND zzvbeln = @pedi_pos-vbeln AND zzposnr = @pedi_pos-vbelp.
+                  IF sy-subrc = 0.
+                    lv_cambio = abap_true. WAIT UP TO '0.2' SECONDS.
+                    EXIT.
+                  ELSE.
+                    WAIT UP TO 2 SECONDS.
+                  ENDIF.
+                ENDDO.
+*                ENDWHILE.
+              ENDIF.
+              DATA it_orders TYPE  zspp_tt_update_ordenes.
+              FREE it_orders.
+              APPEND INITIAL LINE TO it_orders ASSIGNING FIELD-SYMBOL(<auf>).
+              <auf>-aufnr = lv_aufnr.
+              APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+              WRITE |Enviando ORDERS para { lv_aufnr ALPHA = OUT }| TO <log>.
+              WRITE <log>.
+
+
+*              IF lv_caso2 EQ abap_true.
+*              SELECT SINGLE * INTO @DATA(aufk_upd) FROM aufk WHERE aufnr = @lv_aufnr.
+*              IF sy-subrc = 0.
+*                aufk_upd-zzped_cliente = crear_si-zzped_cliente.
+*                aufk_upd-zzsubco_ebeln = p_ebeln.
+*                aufk_upd-zzsubco_ebelp = p_ebelp.
+*                aufk_upd-zzcliente = crear_si-zzcliente.
+*                MODIFY aufk FROM aufk_upd.
+*                COMMIT WORK AND WAIT.
+              CLEAR lv_cambio.
+*              WHILE lv_cambio = abap_false.
+              DO.
+                WAIT UP TO '0.1' SECONDS.
+                UPDATE aufk SET zzped_cliente = crear_si-zzped_cliente
+                                zzsubco_ebeln = p_ebeln
+                                zzsubco_ebelp = p_ebelp
+                                zzcliente     = crear_si-zzcliente
+                          WHERE aufnr         = lv_aufnr.
+                COMMIT WORK AND WAIT.
+                SELECT SINGLE zzped_cliente, zzsubco_ebeln, zzsubco_ebelp, zzcliente INTO @DATA(aufk)
+                  FROM aufk
+                  WHERE aufnr = @lv_aufnr
+                  AND zzped_cliente = @crear_si-zzped_cliente
+                  AND zzsubco_ebelp = @p_ebelp
+                  AND zzsubco_ebeln = @p_ebeln
+                  AND zzcliente = @crear_si-zzcliente.
+                IF sy-subrc = 0.
+                  lv_cambio = abap_true. WAIT UP TO '0.2' SECONDS.
+                  EXIT.
+                ELSE.
+                  WAIT UP TO 2 SECONDS.
+                ENDIF.
+              ENDDO.
+*              ENDWHILE.
+
+*              ENDIF.
+
+*              SELECT SINGLE * INTO @DATA(ekpo_upd) FROM ekpo WHERE ebeln = @p_ebeln
+*              AND ebelp = @p_ebelp.
+*              IF sy-subrc = 0.
+*                ekpo_upd-zzaufnr = lv_aufnr.
+              CLEAR lv_cambio.
+*              WHILE lv_cambio = abap_false.
+              DO 20 TIMES.
+                WAIT UP TO '0.1' SECONDS.
+                UPDATE ekpo SET zzaufnr = lv_aufnr
+                          WHERE ebeln   = p_ebeln
+                            AND ebelp   = p_ebelp.
+                COMMIT WORK AND WAIT .
+                SELECT SINGLE zzaufnr INTO @DATA(aufnrcheck) FROM ekpo WHERE ebeln = @p_ebeln AND ebelp = @p_ebelp.
+                IF sy-subrc = 0.
+                  lv_cambio = abap_true. WAIT UP TO '0.2' SECONDS.
+                  EXIT.
+                ELSE.
+                  WAIT UP TO 2 SECONDS.
+                ENDIF.
+              ENDDO.
+*              ENDWHILE.
+
+              COMMIT WORK.
+*                MODIFY ekpo FROM ekpo_upd.
+*                COMMIT WORK AND WAIT.
+*              ENDIF.
+
+
+              CALL FUNCTION 'ZSPP_ENVIO_ORDERS_BACKGROUND' IN BACKGROUND TASK AS SEPARATE UNIT
+                EXPORTING
+                  it_aufnr = it_orders.
+*              ELSEIF lv_caso3 EQ abap_true.
+
+*                UPDATE aufk SET zzcliente = crear_si-zzcliente
+*                                zzsubco_ebeln = p_ebeln
+*                                zzsubco_ebelp = p_ebelp
+*                WHERE aufnr = lv_aufnr.
+
+*              ELSE.
+*
+*                UPDATE aufk SET zzsubco_ebeln = p_ebeln
+*                                zzsubco_ebelp = p_ebelp
+*                WHERE aufnr = lv_aufnr.
+
+*              ENDIF.
+
+            ELSE.
+
+              ROLLBACK WORK.
+              APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+              WRITE |ERROR AL CREAR ORDEN DE SEMI.| TO <log>.
+              WRITE <log>.
+              SKIP.
+
+              APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+              MESSAGE ID wa_ret-id TYPE wa_ret-type NUMBER wa_ret-number
+              WITH wa_ret-message_v1 wa_ret-message_v2 wa_ret-message_v3 wa_ret-message_v4 INTO <log>.
+              WRITE <log>.
+              SKIP.
+
+            ENDIF.
+          ELSE.
+            APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+            WRITE |Orden creada: { check_aufnr_semi ALPHA = OUT } para pedido/pos/material { p_ebeln ALPHA = OUT } / { p_ebelp ALPHA = OUT } { <semi>-matnr ALPHA = OUT }| TO <log>.
+            WRITE <log>.
+
+            CLEAR lv_cambio.
+*            WHILE lv_cambio = abap_false.
+            DO 20 TIMES.
+              UPDATE zsppt_ofpedsubco SET aufnr = check_aufnr_semi
+                              WHERE ebeln = p_ebeln
+                              AND ebelp = p_ebelp
+                              AND matnr = <semi>-matnr.
+              COMMIT WORK .
+              SELECT SINGLE aufnr INTO @DATA(ztab2) FROM zsppt_ofpedsubco WHERE ebeln = @p_ebeln AND ebelp = @p_ebelp AND aufnr = @check_aufnr_semi AND matnr = @<semi>-matnr.
+              IF sy-subrc = 0.
+                lv_cambio = abap_true. WAIT UP TO '0.2' SECONDS.
+                EXIT.
+              ELSE.
+                WAIT UP TO '0.2' SECONDS.
+              ENDIF.
+            ENDDO.
+*            ENDWHILE.
+            CLEAR lv_cambio.
+          ENDIF.
+        ENDIF.
+*      ENDIF.
+        CLEAR check_aufnr_semi.
+      ENDLOOP.
+      IF sy-subrc <> 0.
+        APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+        WRITE |No existen materiales susceptibles de fabricación para el pedido de subcontrat { p_ebeln ALPHA = OUT } / { p_ebelp ALPHA = OUT }| TO <log>.
+        WRITE <log>.
+        APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+        WRITE |Se excluye la creación en futuras ejecuciones| TO <log>.
+        WRITE / <log>.
+        PERFORM descarta_necesidad USING p_ebeln p_ebelp p_matnr.
+
+        SKIP.
+      ENDIF.
+
+    ELSE.
+      APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+      WRITE |No encontrado pedido de ventas para subcontrat { p_ebeln ALPHA = OUT } / { p_ebelp ALPHA = OUT }| TO <log>.
+      WRITE <log>.
+      APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+      WRITE |Se excluye la creación en futuras ejecuciones| TO <log>.
+      WRITE / <log>.
+      PERFORM descarta_necesidad USING p_ebeln p_ebelp p_matnr.
+
+      SKIP.
+    ENDIF.
+    CLEAR lv_found. FREE it_semis.
+    CLEAR crear_si.
+    CLEAR pedi_pos.
+    CLEAR: lv_caso2, lv_caso3.
+    CALL FUNCTION 'DEQUEUE_EMEKKOE'
+      EXPORTING
+        mandt = sy-mandt    " 01. Argumento enqueue
+        ebeln = p_ebeln   " 02. Argumento enqueue
+        ebelp = p_ebelp.   " 03. Argumento enqueue
+  ENDLOOP.
+
+  IF sy-subrc <> 0.
+    APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+    WRITE |No se han encontrado datos para crear OF a partir de pedido de compras o subco.| TO <log>.
+    WRITE <log>.
+    SKIP.
+  ENDIF.
+
+  CALL FUNCTION 'DEQUEUE_ESINDX'
+    EXPORTING
+      mode_indx = 'E'    " Lock mode for table INDX
+      mandt     = sy-mandt    " 01th enqueue argument
+      relid     = relid
+      srtfd     = srtfd
+*     srtf2     =     " 04th enqueue argument
+*     x_relid   = SPACE    " Fill argument 02 with initial value?
+*     x_srtfd   = SPACE    " Fill argument 03 with initial value?
+*     x_srtf2   = SPACE    " Fill argument 04 with initial value?
+*     _scope    = '3'
+*     _synchron = SPACE    " Synchonous unlock
+*     _collect  = ' '    " Initially only collect lock
+    .
+*&---------------------------------------------------------------------*
+*&      Form  DESCARTA_NECESIDAD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_<PEDPOS>_EBELN  text
+*      -->P_<PEDPOS>_EBELP  text
+*----------------------------------------------------------------------*
+FORM descarta_necesidad  USING    p_ebeln
+                                  p_ebelp
+                                  p_matnr .
+
+*  UPDATE zsppt_ofpedsubco SET aufnr = '-' WHERE ebeln = p_ebeln AND ebelp = p_ebelp.
+  DELETE FROM zsppt_ofpedsubco WHERE ebeln = p_ebeln AND ebelp = p_ebelp AND matnr = p_matnr.
+  COMMIT WORK AND WAIT.
+
+ENDFORM.

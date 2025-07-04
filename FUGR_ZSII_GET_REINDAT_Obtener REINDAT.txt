@@ -1,0 +1,404 @@
+FUNCTION zsii_get_reindat.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(PI_BKPF) TYPE  BKPF
+*"     REFERENCE(PI_BSEG) TYPE  BSEG_T
+*"  CHANGING
+*"     REFERENCE(PE_REINDAT) TYPE  REINDAT
+*"     REFERENCE(PE_VATDATE) TYPE  VATDATE
+*"     REFERENCE(PE_BLDAT) TYPE  BLDAT
+*"----------------------------------------------------------------------
+
+
+
+  DATA: lv_vbrk        TYPE string,
+        lv_vbrp        TYPE string,
+        lv_vbeln       TYPE string,
+        lv_bldat       TYPE string,
+        lv_rbkp        TYPE string,
+        lv_blart       TYPE bkpf-blart,
+        lv_land1       TYPE t001-land1,
+        lv_reindat_act TYPE idfivatt_def-reindat_act,
+        lv_inv_typerev TYPE fiessii_doctype-inv_typerev,
+        ls_bseg        TYPE bseg,
+        lv_kalsm       TYPE t005-kalsm,
+        lv_mwart       TYPE t007a-mwart,
+        lv_repdate_new TYPE fiessii_dateout-repdate_new,
+        lv_casuistica  TYPE zes_sii_cla_fac-casuistica,
+        lv_lcnt1       TYPE i,
+        lv_vbelv       TYPE vbelv,
+        lv_knumh       TYPE knumh,
+        lt_xvbrp       TYPE  STANDARD TABLE OF vbrpvb.
+
+
+
+
+  FIELD-SYMBOLS: <fs_vbrk> TYPE vbrk.
+  FIELD-SYMBOLS: <fs_vbrp>  TYPE ANY TABLE,
+                 <fs_vbeln> TYPE any.
+  FIELD-SYMBOLS: <fs_bldat> TYPE bldat,
+                 <fs_rbkp>  TYPE mrm_rbkpv.
+
+* Get Land
+  SELECT SINGLE land1 INTO lv_land1 FROM t001 WHERE bukrs = pi_bkpf-bukrs.
+
+* REINDAT is actived?
+  SELECT SINGLE  reindat_act FROM idfivatt_def INTO lv_reindat_act
+      WHERE tbukrs = pi_bkpf-bukrs.
+
+  CHECK lv_land1 = 'ES' AND
+        lv_reindat_act = 'X'.
+
+  pe_vatdate = pi_bkpf-budat.
+
+****************** Case FI **********************
+  CASE pi_bkpf-awtyp.
+
+    WHEN 'BKPF' OR 'BKPFF'.
+
+* En caso de anulación recalcular el campo VATDATE, BLDAT, REINDAT
+      IF sy-tcode = 'FB08'.
+
+**** Buscar el documento original
+        SELECT SINGLE vatdate bldat reindat blart
+          INTO (pe_vatdate, pe_bldat, pe_reindat, lv_blart)
+          FROM bkpf
+          WHERE bukrs = pi_bkpf-bukrs AND
+                belnr = pi_bkpf-stblg AND
+                gjahr = pi_bkpf-stjah.
+
+* Seleccionar si es soportado o repercutido
+        LOOP AT pi_bseg INTO ls_bseg WHERE ( mwskz IS NOT INITIAL AND mwskz NE '**' ).
+          EXIT.
+        ENDLOOP.
+* Obtener el esquema de impuestos
+        SELECT SINGLE kalsm INTO lv_kalsm
+          FROM t005 WHERE land1 = lv_land1.
+
+        SELECT SINGLE mwart INTO lv_mwart
+               FROM t007a WHERE  mwskz = ls_bseg-mwskz AND
+                                 kalsm = lv_kalsm.
+
+        IF lv_mwart = 'V'. "Soportado -- factura recibida
+*          pe_reindat  = pi_bkpf-bldat.
+        ELSEIF lv_mwart = 'A' . "Repercutido -- factura emitida
+          SELECT SINGLE inv_typerev INTO lv_inv_typerev
+             FROM fiessii_doctype  WHERE bukrs = pi_bkpf-bukrs AND
+                                         blart = lv_blart.
+
+          IF lv_inv_typerev NE 'A' AND lv_inv_typerev IS NOT INITIAL.
+            pe_reindat = pe_bldat = pe_vatdate = pi_bkpf-budat.
+          ENDIF.
+        ENDIF.
+
+      ELSE. "otro caso (no anulacion)
+
+        IF  pi_bkpf-reindat EQ '00000000'.
+* Seleccionar si es soportado o repercutido
+          LOOP AT pi_bseg INTO ls_bseg WHERE ( mwskz IS NOT INITIAL AND mwskz NE '**' ).
+            EXIT.
+          ENDLOOP.
+* Obtener el esquema de impuestos
+          SELECT SINGLE kalsm INTO lv_kalsm
+            FROM t005 WHERE land1 = lv_land1.
+
+          SELECT SINGLE mwart INTO lv_mwart
+                 FROM t007a WHERE  mwskz = ls_bseg-mwskz AND
+                                   kalsm = lv_kalsm.
+
+          IF lv_mwart = 'V'. "Soportado -- factura recibida
+            pe_reindat  = pi_bkpf-bldat.
+          ELSEIF lv_mwart = 'A' . "Repercutido -- factura emitida
+
+            SELECT SINGLE repdate_new
+              FROM fiessii_dateout
+              INTO lv_repdate_new
+              WHERE bukrs = pi_bkpf-bukrs.
+
+
+            CASE lv_repdate_new.
+              WHEN 'V'.
+                pe_reindat  = pi_bkpf-vatdate.
+              WHEN 'D'.
+                pe_reindat  = pi_bkpf-bldat.
+              WHEN ''.
+                pe_reindat  = pi_bkpf-budat.
+              WHEN OTHERS.
+            ENDCASE.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+****************** Case SD **********************
+    WHEN 'VBRK'.
+
+* Get invoice type
+      lv_vbrk = '(SAPLV60A)VBRK'.
+      lv_vbrp = '(SAPLV60A)XVBRP[]'.
+      lv_vbeln = '(SAPLV60A)VBRP-VBELN'.
+      ASSIGN (lv_vbrk) TO <fs_vbrk>.
+
+      IF <fs_vbrk> IS ASSIGNED.
+
+* Obtener casuistica
+        SELECT SINGLE casuistica INTO lv_casuistica
+          FROM zes_sii_cla_fac WHERE fkart = <fs_vbrk>-fkart.
+
+        CASE lv_casuistica.
+          WHEN '001' OR '002'.
+            ASSIGN (lv_vbeln) TO <fs_vbeln>.
+            ASSIGN (lv_vbrp) TO <fs_vbrp>.
+            IF <fs_vbrp> IS ASSIGNED.
+              lt_xvbrp[] =  <fs_vbrp>.
+              SORT  lt_xvbrp BY fbuda DESCENDING vgbel.
+              DELETE ADJACENT DUPLICATES  FROM lt_xvbrp COMPARING vbeln vgbel.
+              DELETE lt_xvbrp WHERE vbeln <> <fs_vbeln>.
+
+              " Si solo tiene 1
+              DESCRIBE TABLE lt_xvbrp LINES lv_lcnt1.
+              IF lv_lcnt1 = 1.
+                pe_reindat = <fs_vbrk>-fkdat.
+              ELSE.
+                READ TABLE lt_xvbrp ASSIGNING FIELD-SYMBOL(<ls_vbrp>) INDEX 1.
+                pe_reindat = <ls_vbrp>-fbuda.
+              ENDIF.
+
+              "83558. Error SII por fecha operación. Nunca puede ser posterior a la fecha de factura
+              IF pe_reindat > <fs_vbrk>-fkdat.
+                pe_reindat = <fs_vbrk>-fkdat.
+              ENDIF.
+            ENDIF.
+
+          WHEN '004'.
+            CLEAR pe_reindat.
+* Buscar los ped.de la factura tiene una factura anterior.
+            ASSIGN (lv_vbrp) TO <fs_vbrp>.
+            IF <fs_vbrp> IS ASSIGNED.
+              lt_xvbrp[] =  <fs_vbrp>.
+              SORT lt_xvbrp BY fbuda DESCENDING.
+
+              LOOP AT lt_xvbrp  ASSIGNING <ls_vbrp>.
+                CLEAR lv_vbelv.
+                SELECT SINGLE vbelv FROM vbfa INTO lv_vbelv
+                     WHERE vbeln = <ls_vbrp>-vgbel AND vbtyp_v = 'M'.
+
+                SELECT SINGLE reindat INTO
+                  pe_reindat
+                  FROM bkpf WHERE awtyp = 'VBRK' AND awkey = lv_vbelv AND bukrs = pi_bkpf-bukrs.
+                IF sy-subrc = 0.
+                  EXIT.
+                ENDIF.
+              ENDLOOP.
+
+              IF pe_reindat IS INITIAL.
+                pe_reindat = <fs_vbrk>-fkdat.
+              ENDIF.
+            ENDIF.
+          WHEN '005'.
+
+            ASSIGN (lv_vbrp) TO <fs_vbrp>.
+            IF <fs_vbrp> IS ASSIGNED.
+              lt_xvbrp[] =  <fs_vbrp>.
+              SORT lt_xvbrp BY fbuda DESCENDING.
+
+
+              LOOP AT lt_xvbrp ASSIGNING <ls_vbrp>.
+                SELECT SINGLE vbelv FROM vbfa INTO lv_vbelv
+                     WHERE vbeln = <ls_vbrp>-vgbel AND vbtyp_v = 'M'.
+
+                SELECT SINGLE reindat INTO
+                  pe_reindat
+                  FROM bkpf WHERE awtyp = 'VBRK' AND awkey = lv_vbelv AND bukrs = pi_bkpf-bukrs.
+                IF sy-subrc = 0.
+                  EXIT.
+                ENDIF.
+              ENDLOOP.
+            ENDIF.
+          WHEN '006'.
+            pe_reindat = <fs_vbrk>-fkdat.
+
+          WHEN '008' OR '007'.
+
+            SELECT SINGLE inv_typerev INTO lv_inv_typerev
+               FROM fiessii_doctype  WHERE bukrs = pi_bkpf-bukrs AND
+                                           blart = pi_bkpf-blart.
+
+            IF ( lv_inv_typerev = 'A' OR lv_inv_typerev IS INITIAL ) AND sy-subrc = 0.
+* Buscar el documento original
+              SELECT SINGLE vatdate bldat reindat
+                INTO (pe_vatdate, pe_bldat, pe_reindat)
+                FROM bkpf
+                WHERE bukrs = pi_bkpf-bukrs AND
+                      belnr = pi_bkpf-stblg AND
+                      gjahr = pi_bkpf-stjah.
+              IF pi_bkpf-stblg IS INITIAL.
+* Buscar el REINDAT del documento origen
+                SELECT SINGLE vatdate bldat reindat
+                  INTO (pe_vatdate, pe_bldat, pe_reindat)
+                  FROM bkpf
+                  WHERE awtyp = 'VBRK' AND
+                        awkey = <fs_vbrk>-kidno.
+              ENDIF.
+            ELSE.
+              pe_reindat = pe_bldat = pe_vatdate =  <fs_vbrk>-fkdat.
+            ENDIF.
+
+          WHEN '009'.
+
+* Acuerdos Rappel
+            SELECT knumh INTO TABLE @DATA(lt_konp) FROM konp WHERE knuma_bo = @<fs_vbrk>-knuma.
+            IF lt_konp[] IS NOT INITIAL.
+              SELECT koblnr INTO TABLE @DATA(lt_s136)
+                      FROM s136
+                FOR ALL ENTRIES IN @lt_konp WHERE knumh = @lt_konp-knumh.
+
+              IF lt_s136[] IS NOT INITIAL.
+
+                SELECT fkdat FROM vbrk
+                  INTO TABLE @DATA(lt_vbrk)
+                  FOR ALL ENTRIES IN @lt_s136
+                  WHERE vbeln = @lt_s136-koblnr AND
+                        fkdat <= @<fs_vbrk>-fkdat.
+                SORT lt_vbrk BY fkdat DESCENDING.
+                READ TABLE lt_vbrk INTO DATA(ls_vbrk) INDEX 1.
+                IF sy-subrc = 0.
+                  pe_reindat = ls_vbrk-fkdat.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+
+          WHEN '011'.
+            CLEAR pe_reindat.
+* Buscar los ped.de la factura tiene una factura anterior.
+            ASSIGN (lv_vbrp) TO <fs_vbrp>.
+            IF <fs_vbrp> IS ASSIGNED.
+              lt_xvbrp[] =  <fs_vbrp>.
+              SORT lt_xvbrp BY fbuda DESCENDING.
+
+              LOOP AT lt_xvbrp  ASSIGNING <ls_vbrp>.
+
+                CLEAR lv_vbelv.
+                SELECT SINGLE vbelv FROM vbfa INTO lv_vbelv
+                     WHERE vbeln = <ls_vbrp>-vgbel AND vbtyp_v = 'M'.
+
+                SELECT SINGLE fkdat INTO
+                  pe_reindat
+                  FROM vbrk WHERE vbeln =  lv_vbelv.
+                IF sy-subrc = 0.
+                  pe_bldat = pe_vatdate = pe_reindat.
+                  EXIT.
+                ENDIF.
+              ENDLOOP.
+
+              IF pe_reindat IS INITIAL.
+                pe_reindat = <fs_vbrk>-fkdat.
+              ENDIF.
+            ENDIF.
+          WHEN 'Z01'.
+            pe_reindat = <fs_vbrk>-fkdat.
+          WHEN OTHERS.
+            IF pi_bkpf-reindat EQ '00000000'.
+              pe_reindat = pi_bkpf-vatdate.
+            ENDIF.
+        ENDCASE.
+      ENDIF.
+
+****************** Case MM **********************
+    WHEN 'RMRP'.
+* En caso de anulación recalcular el campo VATDATE, BLDAT, REINDAT
+      DATA: lv_awkey TYPE awkey.
+      IF sy-tcode = 'MR8M' OR ( sy-tcode = 'MIR4' AND pi_bkpf-stgrd IS NOT INITIAL ).
+
+**** Buscar el documento original
+        lv_rbkp = '(SAPLMRMP)RBKPV'.
+        ASSIGN (lv_rbkp) TO <fs_rbkp>.
+        IF <fs_rbkp> IS ASSIGNED.
+          CONCATENATE <fs_rbkp>-stblg <fs_rbkp>-stjah INTO lv_awkey.
+
+          SELECT SINGLE vatdate bldat reindat
+            INTO (pe_vatdate, pe_bldat, pe_reindat)
+            FROM bkpf
+            WHERE awkey = lv_awkey AND
+                  awtyp = 'RMRP'.
+
+        ENDIF.
+      ELSE. " OTRO CASO (no anulacion)
+
+*       fecha de fatcura
+        IF  pi_bkpf-reindat EQ '00000000'.
+          lv_bldat = '(SAPLMR1M)RBKPV-BLDAT'.
+          ASSIGN (lv_bldat) TO <fs_bldat>.
+          IF <fs_bldat> IS ASSIGNED AND <fs_bldat> IS NOT INITIAL.
+            pe_reindat = <fs_bldat>.
+
+          ELSE.
+* Mirar si viene por IDOC
+            lv_rbkp = '(SAPLMRMP)RBKPV'.
+            ASSIGN (lv_rbkp) TO <fs_rbkp>.
+            IF <fs_rbkp> IS ASSIGNED.
+              IF <fs_rbkp>-ivtyp = '4'. "EDI
+* Obtener el acreedor
+                READ TABLE pi_bseg INTO ls_bseg WITH KEY koart = 'K'.
+                IF sy-subrc = 0.
+* Obtener sociedad
+                  SELECT SINGLE bukrs INTO @DATA(lv_bukrs)
+                     FROM t001k INNER JOIN t001w
+                  ON t001w~bwkey = t001k~bwkey
+                  WHERE lifnr = @ls_bseg-lifnr.
+                  IF sy-subrc <> 0.
+                    SELECT SINGLE bukrs FROM vbrk
+                      INTO lv_bukrs
+                      WHERE vbeln = pi_bkpf-xblnr.
+                  ENDIF.
+* Buscar el REINDAT del documento origen
+                  SELECT SINGLE reindat FROM bkpf INTO pe_reindat
+                    WHERE belnr = pi_bkpf-xblnr AND
+                          gjahr = pi_bkpf-gjahr AND
+                          bukrs = lv_bukrs.
+                ENDIF.
+              ENDIF.
+              IF pe_reindat IS INITIAL.
+                pe_reindat = <fs_rbkp>-bldat.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+* Factura Rappel Proveedores
+    WHEN 'WBRK'.
+      pe_reindat = pi_bkpf-bldat.
+
+
+* Case INTERCO
+    WHEN 'IBKPF'.
+
+* Obtener el acreedor
+      READ TABLE pi_bseg INTO ls_bseg WITH KEY koart = 'K'.
+      IF sy-subrc = 0.
+* Obtener sociedad
+        SELECT SINGLE bukrs INTO lv_bukrs
+           FROM t001k INNER JOIN t001w
+        ON t001w~bwkey = t001k~bwkey
+        WHERE lifnr = ls_bseg-lifnr.
+* Buscar el REINDAT del documento origen
+        SELECT SINGLE reindat FROM bkpf INTO pe_reindat
+          WHERE belnr = pi_bkpf-xblnr AND
+                gjahr = pi_bkpf-gjahr AND
+                bukrs = lv_bukrs.
+* Si no lo encuentra REINDAT será BLDAT
+        IF pe_reindat IS INITIAL.
+          pe_reindat = pi_bkpf-bldat.
+        ENDIF.
+
+      ENDIF.
+
+
+
+  ENDCASE.
+
+
+
+
+ENDFUNCTION.

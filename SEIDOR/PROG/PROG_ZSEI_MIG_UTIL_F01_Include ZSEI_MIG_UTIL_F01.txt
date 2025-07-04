@@ -1,0 +1,329 @@
+*&---------------------------------------------------------------------*
+*& Include          ZSEI_MIG_UTIL_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*& Form get_objects
+*&---------------------------------------------------------------------*
+FORM get_objects  CHANGING pc_t_objects     TYPE tyt_objects
+                           pc_t_objects_alv TYPE tyt_objects.
+* Recuperamos los objetos: Programas
+  SELECT programm, text, pgmid, object, obj_name
+    INTO TABLE @pc_t_objects
+    FROM zsei_util JOIN trdirt ON
+    trdirt~name EQ zsei_util~programm AND
+    trdirt~sprsl EQ @sy-langu
+    WHERE
+      programm IN @so_progn
+    ORDER BY programm.
+  IF sy-subrc EQ 0.
+    pc_t_objects_alv = pc_t_objects.
+    DELETE ADJACENT DUPLICATES FROM pc_t_objects_alv COMPARING programm.
+  ENDIF.
+
+* Recuperamos los objetos: Grupos de funciones
+  SELECT programm, areat as text, pgmid, object, obj_name
+    APPENDING TABLE @pc_t_objects
+    FROM zsei_util JOIN tlibt ON
+    tlibt~area  EQ zsei_util~programm AND
+    tlibt~spras EQ @sy-langu
+    WHERE
+      programm IN @so_progn
+    ORDER BY programm.
+  IF sy-subrc EQ 0.
+    pc_t_objects_alv = pc_t_objects.
+    DELETE ADJACENT DUPLICATES FROM pc_t_objects_alv COMPARING programm.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form show_alv
+*&---------------------------------------------------------------------*
+FORM show_alv  USING    pi_t_objects TYPE tyt_objects.
+* Refresco
+  DATA: xl_stbl_det TYPE lvc_s_stbl.
+* Catálogo de campos
+  DATA: tl_fieldcat TYPE lvc_t_fcat.
+* Layout
+  DATA: xl_layout   TYPE lvc_s_layo.
+* Selección de registros
+  DATA: tl_row_no   TYPE lvc_t_roid.
+
+
+  IF o_container  IS INITIAL.
+    CREATE OBJECT o_container
+      EXPORTING
+        container_name = 'OBJECT_CONTAINER'.
+  ENDIF.
+
+  IF o_alv IS INITIAL.
+    CREATE OBJECT o_alv EXPORTING i_parent = o_container.
+    CREATE OBJECT o_handler.
+*   Opciones ALV
+    SET HANDLER o_handler->handle_user_command FOR o_alv.
+    SET HANDLER o_handler->handle_toolbar      FOR o_alv.
+
+    PERFORM set_catalog   USING    'ZSEI_UTIL_ALV'
+                          CHANGING tl_fieldcat.
+    PERFORM set_layout    CHANGING xl_layout.
+
+    PERFORM set_selection USING    pi_t_objects
+                          CHANGING tl_row_no.
+
+    CALL METHOD o_alv->set_table_for_first_display
+      EXPORTING
+        is_layout       = xl_layout
+        i_save          = 'A'
+      CHANGING
+        it_outtab       = pi_t_objects
+        it_fieldcatalog = tl_fieldcat.
+
+    CALL METHOD o_alv->set_selected_rows
+      EXPORTING
+        it_row_no = tl_row_no.
+  ELSE.
+    xl_stbl_det-row = abap_true.
+    xl_stbl_det-col = abap_true.
+    CALL METHOD o_alv->refresh_table_display
+      EXPORTING
+        is_stable = xl_stbl_det.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form set_catalog
+*&---------------------------------------------------------------------*
+FORM set_catalog USING    pi_w_strn TYPE dd02l-tabname
+                 CHANGING pc_t_fcat TYPE lvc_t_fcat.
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = pi_w_strn
+    CHANGING
+      ct_fieldcat            = pc_t_fcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form set_layout
+*&---------------------------------------------------------------------*
+FORM set_layout CHANGING pc_x_layout TYPE lvc_s_layo.
+  pc_x_layout-zebra      = abap_true.
+  pc_x_layout-sel_mode   = 'A'.
+  pc_x_layout-cwidth_opt = abap_true.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form set_selection
+*&---------------------------------------------------------------------*
+FORM set_selection  USING    pi_t_objects TYPE tyt_objects
+                    CHANGING pc_t_row_no  TYPE lvc_t_roid.
+  DATA: wl_row_id TYPE int4.
+
+  DESCRIBE TABLE pi_t_objects LINES DATA(wl_lines).
+  DO wl_lines TIMES.
+    wl_row_id = wl_row_id + 1.
+    APPEND INITIAL LINE TO pc_t_row_no ASSIGNING FIELD-SYMBOL(<fs_row_no>).
+    <fs_row_no>-row_id = wl_row_id.
+  ENDDO.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form generar_orden
+*&---------------------------------------------------------------------*
+FORM generar_orden  USING    pi_t_objects     TYPE tyt_objects
+                             pi_t_objects_alv TYPE tyt_objects
+                    CHANGING pc_w_req_id      TYPE trkorr.
+* Campos PopUp
+  DATA: tl_fields         TYPE STANDARD TABLE OF sval.
+* Retorno PopUp
+  DATA: wl_returncode     TYPE                   c.
+* Info orden
+  DATA: wl_author         TYPE                   trexreqhd-author.
+  DATA: wl_text           TYPE                   trexreqhd-text.
+  DATA: tl_objects_ins    TYPE STANDARD TABLE OF trexreqob.
+  DATA: wl_msg            LIKE                   tr004-msgtext.
+  DATA: wl_exception      LIKE                   tr007-exception.
+
+  CLEAR: pc_w_req_id.
+* Recuperamos los registros seleccionados
+  CALL METHOD o_alv->get_selected_rows
+    IMPORTING
+      et_index_rows = DATA(tl_index_rows)
+      et_row_no     = DATA(tl_row_no).
+  IF tl_row_no IS INITIAL.
+    wl_msg = 'Seleccione algún objeto a incluir en la orden'(005).
+    MESSAGE wl_msg TYPE 'E'.
+    EXIT.
+  ENDIF.
+
+* Descripción Material
+  APPEND INITIAL LINE TO tl_fields ASSIGNING FIELD-SYMBOL(<fs_fields>).
+  <fs_fields>-tabname   = 'E07T'.
+  <fs_fields>-fieldname = 'AS4TEXT'.
+  <fs_fields>-field_obl = 'X'.
+  <fs_fields>-value     = |{ 'ABAP'(011) } { '-' } { sy-datum+6(2) }{ '.' }{ sy-datum+4(2) }{ '.' }{ sy-datum(4) } { '-' } { 'Utilidades migración'(012) }|.
+
+  CALL FUNCTION 'POPUP_GET_VALUES'
+    EXPORTING
+      popup_title     = 'Descripción orden'(002)
+    IMPORTING
+      returncode      = wl_returncode
+    TABLES
+      fields          = tl_fields
+    EXCEPTIONS
+      error_in_fields = 1
+      OTHERS          = 2.
+  CHECK wl_returncode NE 'A'.     "Cancelar
+
+* Recuperamos los valores introducidos en el popup
+  READ TABLE tl_fields ASSIGNING <fs_fields> WITH KEY fieldname = 'AS4TEXT'.
+  CHECK sy-subrc EQ 0.
+
+  wl_author = sy-uname.
+  wl_text   = <fs_fields>-value.
+* Creamos la orden
+  CALL FUNCTION 'TR_EXT_CREATE_REQUEST'
+    EXPORTING
+      iv_author = wl_author
+      iv_text   = wl_text
+    IMPORTING
+      es_req_id = pc_w_req_id.
+  IF pc_w_req_id IS INITIAL.
+    wl_msg = 'No ha sido posible generar la orden'(004).
+    MESSAGE wl_msg TYPE 'E'.
+    EXIT.
+  ENDIF.
+
+* Añadimos los objetos seleccionados
+  LOOP AT tl_row_no ASSIGNING FIELD-SYMBOL(<fs_row_no>).
+    READ TABLE pi_t_objects_alv ASSIGNING FIELD-SYMBOL(<fs_objects_alv>) INDEX <fs_row_no>-row_id.
+    CHECK sy-subrc EQ 0.
+    LOOP AT pi_t_objects ASSIGNING FIELD-SYMBOL(<fs_objects>) WHERE programm EQ <fs_objects_alv>-programm.
+      APPEND INITIAL LINE TO tl_objects_ins ASSIGNING FIELD-SYMBOL(<fs_objects_ins>).
+      <fs_objects_ins>-pgmid    = <fs_objects>-pgmid.
+      <fs_objects_ins>-object   = <fs_objects>-object.
+      <fs_objects_ins>-obj_name = <fs_objects>-obj_name.
+    ENDLOOP.
+  ENDLOOP.
+
+* Añadimos siempre el paquete de migración
+  APPEND INITIAL LINE TO tl_objects_ins ASSIGNING <fs_objects_ins>.
+  <fs_objects_ins>-pgmid    = 'R3TR'.
+  <fs_objects_ins>-object   = 'DEVC'.
+  <fs_objects_ins>-obj_name = 'ZMIG'.
+
+  CALL FUNCTION 'TR_EXT_INSERT_IN_REQUEST'
+    EXPORTING
+      iv_req_id    = pc_w_req_id
+    IMPORTING
+      ev_exception = wl_exception
+      es_msg       = wl_msg
+    TABLES
+      it_objects   = tl_objects_ins.
+  IF wl_exception IS NOT INITIAL.
+    wl_msg = 'No ha sido posible generar la orden'(004).
+    MESSAGE wl_msg TYPE 'E'.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form liberar_orden
+*&---------------------------------------------------------------------*
+FORM liberar_orden  USING    pi_w_req_id TYPE trkorr
+                    CHANGING pc_w_subrc  TYPE sy-subrc.
+* Respuesta
+  DATA: wl_answer TYPE c.
+* Mensaje
+  DATA: wl_msg    LIKE tr004-msgtext.
+
+  CHECK pi_w_req_id IS NOT INITIAL.
+
+  DATA(wl_text_question) = | { 'Se ha generado la orden'(003) } { pi_w_req_id } { '¿Desea liberarla?'(008) }|.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      text_question         = wl_text_question
+      text_button_1         = 'Si'(006)
+      icon_button_1         = 'ICON_OKAY'
+      text_button_2         = 'No'(007)
+      icon_button_2         = 'ICON_CANCEL'
+      display_cancel_button = ''
+    IMPORTING
+      answer                = wl_answer
+    EXCEPTIONS
+      text_not_found        = 1
+      OTHERS                = 2.
+  CASE wl_answer.
+    WHEN '1'.
+*     Liberamos la orden
+      CALL FUNCTION 'TR_RELEASE_REQUEST'
+        EXPORTING
+          iv_trkorr                  = pi_w_req_id
+          iv_dialog                  = ''
+        EXCEPTIONS
+          cts_initialization_failure = 1
+          enqueue_failed             = 2
+          no_authorization           = 3
+          invalid_request            = 4
+          request_already_released   = 5
+          repeat_too_early           = 6
+          error_in_export_methods    = 7
+          object_check_error         = 8
+          docu_missing               = 9
+          db_access_error            = 10
+          action_aborted_by_user     = 11
+          export_failed              = 12
+          OTHERS                     = 13.
+      IF sy-subrc NE 0.
+        pc_w_subrc = 4.
+*       No ha sido posible liberar la orden
+        wl_msg = |{ 'No ha sido posible liberar la orden'(009) } { pi_w_req_id }|.
+        MESSAGE wl_msg TYPE 'E'.
+      ELSE.
+        pc_w_subrc = 0.
+      ENDIF.
+    WHEN OTHERS.
+      pc_w_subrc = 4.
+*     Informamos
+      wl_msg = |{ 'Se ha generado la orden '(003) } { pi_w_req_id }|.
+      MESSAGE wl_msg TYPE 'S'.
+  ENDCASE.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*& Form descargar_orden
+*&---------------------------------------------------------------------*
+FORM descargar_orden  USING    pi_w_req_id TYPE trkorr
+                      CHANGING pc_w_subrc  TYPE sy-subrc.
+* Respuesta
+  DATA: wl_answer TYPE c.
+* Mensaje
+  DATA: wl_msg    LIKE tr004-msgtext.
+
+  CHECK pc_w_subrc EQ 0.
+
+  DATA(wl_text_question) = | { '¿Desea descargar la orden'(010) } { pi_w_req_id } { '?' }|.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      text_question         = wl_text_question
+      text_button_1         = 'Si'(006)
+      icon_button_1         = 'ICON_OKAY'
+      text_button_2         = 'No'(007)
+      icon_button_2         = 'ICON_CANCEL'
+      display_cancel_button = ''
+    IMPORTING
+      answer                = wl_answer
+    EXCEPTIONS
+      text_not_found        = 1
+      OTHERS                = 2.
+  CASE wl_answer.
+    WHEN '1'.
+*     Llamamos al programa de descarga de órdenes
+      SUBMIT zseim_download WITH p_tr = pi_w_req_id.
+    WHEN OTHERS.
+  ENDCASE.
+ENDFORM.

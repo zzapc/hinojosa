@@ -1,0 +1,646 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRFI0036
+*&
+*&---------------------------------------------------------------------*
+*& Automatización de contabilización de recuperación de IVA Concur
+*& Ticket 86427
+*& Javier Calás. 05.12.24
+*&---------------------------------------------------------------------*
+REPORT zrfi0036.
+
+
+**********************
+* Tipos de datos
+**********************
+TYPES: BEGIN OF st_lin_alv.
+         INCLUDE TYPE zrfi0036_s_alv.
+       TYPES END OF st_lin_alv.
+
+
+*********************
+* Constantes
+*********************
+CONSTANTS: cg_num_fila_excel_ini TYPE int4        VALUE 4,
+           cg_sociedad           TYPE t001-bukrs  VALUE '1000',
+           cg_blart_factura      TYPE bkpf-blart  VALUE 'KI',
+           cg_blart_compensa     TYPE bkpf-blart  VALUE 'KC'.
+
+
+**********************
+** Variables globales
+**********************
+DATA: tg_excel TYPE TABLE OF zrfi0036_s_excel.
+
+
+
+"""""""""""""""""
+" Includes
+"""""""""""""""""
+INCLUDE zseis_patron_alv.
+
+
+
+*********************
+* Pantalla de selección
+*********************
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-b01.
+PARAMETERS: p_path   TYPE localfile.
+SELECTION-SCREEN END OF BLOCK b01.
+
+
+SELECTION-SCREEN BEGIN OF BLOCK b02 WITH FRAME TITLE text-b02.
+PARAMETERS: cbx_test AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN END OF BLOCK b02.
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_path.
+  PERFORM f_f4_fichero USING p_path.
+
+
+AT SELECTION-SCREEN.
+  IF sy-ucomm = 'ONLI' AND p_path IS INITIAL.
+    MESSAGE 'Debe indicar fichero excel' TYPE 'E'.
+  ENDIF.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  f_initialization.
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_initialization.
+  vg_no_justif_cols   = 'X'.
+  vg_ventana_inicial  = '0100'.
+  PERFORM f_config_dynpro USING vg_ventana_inicial 'CC_ALV' 'T01' 'STA_100' space space.
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_F4_FICHERO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_PATH  text
+*----------------------------------------------------------------------*
+FORM f_f4_fichero  USING  p_path.
+  DATA: tl_file_table TYPE TABLE OF file_table,
+        vl_rc         TYPE i.
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      file_filter = 'Excel 2007-2021 (*.xlsx)|*.xlsx'
+    CHANGING
+      file_table  = tl_file_table
+      rc          = vl_rc.
+  READ TABLE tl_file_table ASSIGNING FIELD-SYMBOL(<fs_file_table>) INDEX 1.
+  IF sy-subrc = 0.
+    p_path = <fs_file_table>-filename.
+  ENDIF.
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_F4_FICHERO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_PATH  text
+*----------------------------------------------------------------------*
+FORM f_pbo_post TABLES it_alv USING vp_dynnr.
+  IF cbx_test = 'X'.
+    SET PF-STATUS 'STA_100' EXCLUDING 'CONTAB'.
+  ENDIF.
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_CREAR_CATALOGO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_crear_catalogo TABLES it_catalogo TYPE lvc_t_fcat USING vp_dynnr.
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = 'ZRFI0036_S_ALV'
+      i_bypassing_buffer     = 'X'
+    CHANGING
+      ct_fieldcat            = it_catalogo[]
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+
+  LOOP AT it_catalogo ASSIGNING FIELD-SYMBOL(<fs_catalogo>).
+    CASE <fs_catalogo>-fieldname.
+      WHEN 'SEMAFORO'.
+        <fs_catalogo>-icon = 'X'.
+      WHEN 'MENSAJE'.
+        <fs_catalogo>-outputlen = 60.
+
+    ENDCASE.
+  ENDLOOP.
+
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_LLENAR_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_llenar_datos TABLES tp_alv USING vp_dynpro.
+  PERFORM f_leer_excel USING p_path CHANGING tg_excel.
+  PERFORM f_preparar_alv USING tg_excel CHANGING tp_alv[].
+
+  IF cbx_test = space.
+    PERFORM f_contabilizar CHANGING tp_alv[] tg_excel.
+  ENDIF.
+ENDFORM.
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_LEER_EXCELs
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_PATH  text
+*      <--P_TL_EXCEL  text
+*----------------------------------------------------------------------*
+FORM f_leer_excel  USING    vp_path
+                   CHANGING tp_excel TYPE zrfi0036_t_excel.
+  CLEAR tp_excel.
+
+  DATA(tl_fieldcatalog) = zcl_excel_common=>get_fieldcatalog( tp_excel ).
+
+  DATA: vl_row        TYPE int4,
+        vl_column     TYPE int4,
+        vl_value      TYPE zexcel_cell_value,
+        vl_row_max    TYPE int4,
+        vl_column_max TYPE int4.
+
+  TRY.
+      DATA(rl_excel_reader) = NEW zcl_excel_reader_2007( ).
+      DATA(rl_excel)        = rl_excel_reader->zif_excel_reader~load_file( vp_path ).
+      DATA(rl_worksheet)    = rl_excel->get_active_worksheet( ).
+
+
+      vl_row        = cg_num_fila_excel_ini.
+      vl_row_max    = rl_worksheet->get_highest_row( ).
+      vl_column_max = rl_worksheet->get_highest_column( ).
+    CATCH zcx_excel INTO DATA(rl_zcx_excel).
+      MESSAGE rl_zcx_excel->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+  WHILE vl_row <= vl_row_max.
+    APPEND INITIAL LINE TO tp_excel ASSIGNING FIELD-SYMBOL(<fs_excel>).
+
+    vl_column = 1.
+    WHILE vl_column <= vl_column_max.
+      TRY.
+          rl_worksheet->get_cell( EXPORTING ip_column = vl_column
+                                            ip_row    = vl_row
+                                 IMPORTING ep_value = vl_value ).
+        CATCH zcx_excel INTO rl_zcx_excel.
+          MESSAGE rl_zcx_excel->get_text( ) TYPE 'E'.
+      ENDTRY.
+
+      READ TABLE tl_fieldcatalog ASSIGNING FIELD-SYMBOL(<fs_fieldcatalog>) INDEX vl_column.
+      IF sy-subrc = 0.
+        ASSIGN COMPONENT <fs_fieldcatalog>-fieldname OF STRUCTURE <fs_excel> TO FIELD-SYMBOL(<fs_campo>).
+      ENDIF.
+      IF sy-subrc = 0.
+        IF <fs_fieldcatalog>-abap_type = 'D'.
+          TRY.
+              <fs_campo> = zcl_excel_common=>excel_string_to_date( vl_value ).
+            CATCH zcx_excel INTO rl_zcx_excel.
+              "Probamos a tratar como formato externo dd.mm.yyyy
+              "Por si viene con / en lugar de .
+              REPLACE ALL OCCURRENCES OF '/' IN vl_value WITH '.'.
+
+              CALL FUNCTION 'CONVERT_DATE_TO_INTERNAL'
+                EXPORTING
+                  date_external            = vl_value
+                IMPORTING
+                  date_internal            = <fs_campo>
+                EXCEPTIONS
+                  date_external_is_invalid = 1
+                  OTHERS                   = 2.
+              IF sy-subrc <> 0.
+                CLEAR <fs_campo>.
+              ENDIF.
+          ENDTRY.
+        ELSE.
+          <fs_campo> = vl_value.
+        ENDIF.
+      ENDIF.
+
+      ADD 1 TO vl_column.
+    ENDWHILE.
+
+*    <fs_excel>-hkont  = |{ <fs_excel>-hkont ALPHA = IN }|.
+    <fs_excel>-kostl  = |{ <fs_excel>-kostl ALPHA = IN }|.
+    <fs_excel>-aufnr  = |{ <fs_excel>-aufnr ALPHA = IN }|.
+
+    vl_column = 1.
+    ADD 1 TO vl_row.
+  ENDWHILE.
+
+  DELETE tp_excel WHERE item IS INITIAL.
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  f_preparar_alv
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_TL_EXCEL  text
+*----------------------------------------------------------------------*
+FORM f_preparar_alv USING tp_excel TYPE zrfi0036_t_excel
+                    CHANGING tp_alv TYPE tt_lin_alv_patron.
+
+  CLEAR tp_alv.
+
+  "El fichero tiene que tener tantos ítems KI como ítems KC
+  DATA: BEGIN OF wl_item,
+          item  TYPE zrfi0036_s_excel-item,
+          blart TYPE zrfi0036_s_excel-blart,
+        END OF wl_item.
+  DATA: tl_items LIKE TABLE OF wl_item.
+
+
+  DATA wl_alv LIKE LINE OF tp_alv.
+  LOOP AT tp_excel ASSIGNING FIELD-SYMBOL(<fs_excel>).
+*    APPEND INITIAL LINE TO tp_alv ASSIGNING FIELD-SYMBOL(<fs_alv>).
+    CLEAR wl_alv.
+    wl_alv-item   = <fs_excel>-item.
+    wl_alv-bukrs  = <fs_excel>-bukrs.
+    wl_alv-semaforo = icon_led_inactive.
+    wl_alv-mensaje    = |El registro no contiene errores|.
+
+    IF <fs_excel>-bukrs <> cg_sociedad.
+      wl_alv-mensaje    = |La sociedad indicada difiere de la { cg_sociedad }|.
+      wl_alv-semaforo   = icon_led_red.
+      APPEND wl_alv TO tp_alv. CONTINUE.
+    ENDIF.
+
+    IF <fs_excel>-blart <> cg_blart_factura AND <fs_excel>-blart <> cg_blart_compensa.
+      wl_alv-mensaje    = |Clase de documento no admitida|.
+      wl_alv-semaforo   = icon_led_red.
+      APPEND wl_alv TO tp_alv. CONTINUE.
+    ENDIF.
+
+    DATA tl_bschl_rg TYPE RANGE OF bseg-bschl.
+    tl_bschl_rg = VALUE #( sign = 'I' option = 'EQ' ( low = '27' ) ( low = '31' )  ( low = '40' )  ( low = '50' )  ).
+    IF <fs_excel>-bschl NOT IN tl_bschl_rg.
+      wl_alv-mensaje    = |Clave de contabilización no válida|.
+      wl_alv-semaforo   = icon_led_red.
+      APPEND wl_alv TO tp_alv. CONTINUE.
+    ENDIF.
+
+    IF <fs_excel>-hkont IS INITIAL.
+      wl_alv-mensaje    = |El número de cuenta es obligatorio|.
+      wl_alv-semaforo   = icon_led_red.
+      APPEND wl_alv TO tp_alv. CONTINUE.
+    ENDIF.
+
+    IF <fs_excel>-dmbtr IS INITIAL.
+      wl_alv-mensaje    = |El importe es obligatorio|.
+      wl_alv-semaforo   = icon_led_red.
+      APPEND wl_alv TO tp_alv. CONTINUE.
+    ENDIF.
+
+    IF <fs_excel>-bschl = '31'.
+      IF <fs_excel>-name1 IS INITIAL.
+        wl_alv-mensaje    = |El nombre es obligatorio|.
+        wl_alv-semaforo   = icon_led_red.
+        APPEND wl_alv TO tp_alv. CONTINUE.
+      ENDIF.
+      IF <fs_excel>-stras IS INITIAL.
+        wl_alv-mensaje    = |La calle es obligatoria|.
+        wl_alv-semaforo   = icon_led_red.
+        APPEND wl_alv TO tp_alv. CONTINUE.
+      ENDIF.
+      IF <fs_excel>-ort01 IS INITIAL.
+        wl_alv-mensaje    = |La población es obligatoria|.
+        wl_alv-semaforo   = icon_led_red.
+        APPEND wl_alv TO tp_alv. CONTINUE.
+      ENDIF.
+      IF <fs_excel>-pstlz IS INITIAL.
+        wl_alv-mensaje    = |El código postal es obligatorio|.
+        wl_alv-semaforo   = icon_led_red.
+        APPEND wl_alv TO tp_alv. CONTINUE.
+      ENDIF.
+      IF <fs_excel>-land1 IS INITIAL.
+        wl_alv-mensaje    = |El país es obligatorio|.
+        wl_alv-semaforo   = icon_led_red.
+        APPEND wl_alv TO tp_alv. CONTINUE.
+      ENDIF.
+      IF <fs_excel>-stcd1 IS INITIAL.
+        wl_alv-mensaje    = |El NIF es obligatorio|.
+        wl_alv-semaforo   = icon_led_red.
+        APPEND wl_alv TO tp_alv. CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    CLEAR wl_item.
+    wl_item-item  = <fs_excel>-item.
+    wl_item-blart = <fs_excel>-blart.
+    COLLECT wl_item INTO tl_items.
+
+    IF NOT line_exists( tp_alv[ item = <fs_excel>-item ] ).
+      APPEND wl_alv TO tp_alv.
+    ENDIF.
+  ENDLOOP.
+
+
+  DATA: vl_num_items_factura  TYPE i,
+        vl_num_items_compensa TYPE i,
+        vl_num_items_otros    TYPE i.
+  LOOP AT tl_items ASSIGNING FIELD-SYMBOL(<fs_items>).
+    CASE <fs_items>-blart.
+      WHEN cg_blart_factura.
+        ADD 1 TO vl_num_items_factura.
+      WHEN cg_blart_compensa.
+        ADD 1 TO vl_num_items_compensa.
+      WHEN OTHERS.
+        ADD 1 TO vl_num_items_otros.
+    ENDCASE.
+  ENDLOOP.
+
+
+  DATA vl_msg_error LIKE wl_alv-mensaje.
+  IF vl_num_items_otros > 0.
+    vl_msg_error = 'En el fichero hay clases de contabilización no válidas'.
+  ELSEIF vl_num_items_factura <> vl_num_items_compensa.
+    vl_msg_error = 'El número de apuntes de factura es distinto al de compensaciones'.
+  ENDIF.
+
+  IF vl_msg_error IS NOT INITIAL.
+    LOOP AT tp_alv ASSIGNING FIELD-SYMBOL(<fs_alv>).
+      <fs_alv>-mensaje    = vl_msg_error.
+      <fs_alv>-semaforo   = icon_led_red.
+    ENDLOOP.
+    RETURN.
+  ENDIF.
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  f_user_command
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+FORM f_user_command USING vp_dynnr vp_okcode.
+  CASE vp_okcode.
+    WHEN 'CONTAB'.
+      PERFORM f_contabilizar CHANGING it_alv tg_excel.
+  ENDCASE.
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  f_contabilizar
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+FORM f_contabilizar CHANGING tp_alv   TYPE tt_lin_alv_patron
+                             tp_excel TYPE zrfi0036_t_excel.
+
+  IF tp_alv IS INITIAL.
+    MESSAGE 'No se han recuperado datos' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  READ TABLE tp_alv TRANSPORTING NO FIELDS WITH KEY semaforo = icon_led_red.
+  IF sy-subrc = 0.
+    MESSAGE 'Existen registros con error. Corrija los errores antes de continuar.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  """""""""""""""""""""""""""""""
+  " Contabilización
+  """""""""""""""""""""""""""""""
+
+  DATA vl_answer TYPE c.
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      text_question  = 'Se va a contabilizar el fichero seleccionado. ¿Desea continuar'
+    IMPORTING
+      answer         = vl_answer
+    EXCEPTIONS
+      text_not_found = 1
+      OTHERS         = 2.
+  IF vl_answer <> '1'.
+    RETURN.
+  ENDIF.
+
+
+
+  DATA: wl_documentheader    TYPE bapiache09,
+        wl_customercpd       TYPE bapiacpa09,
+        tl_accountgl         TYPE TABLE OF bapiacgl09,
+        tl_accountreceivable TYPE TABLE OF bapiacar09,
+        tl_accountpayable    TYPE TABLE OF bapiacap09,
+        tl_accounttax        TYPE TABLE OF bapiactx09,
+        tl_currencyamount    TYPE TABLE OF bapiaccr09,
+        tl_return            TYPE TABLE OF bapiret2,
+        tl_extension2        TYPE TABLE OF bapiparex,
+        vl_itemno_acc        TYPE int4,
+        vl_msg_error         TYPE string,
+        vl_tax_amt           TYPE bset-fwste.
+
+  LOOP AT tp_excel ASSIGNING FIELD-SYMBOL(<fs_excel>).
+    AT NEW item.
+      CLEAR: wl_documentheader, wl_customercpd, tl_accountgl, tl_accountreceivable, tl_accountpayable, tl_accounttax, tl_currencyamount, tl_return, tl_extension2.
+      CLEAR: vl_itemno_acc, vl_msg_error, vl_tax_amt.
+
+      wl_documentheader-comp_code   = <fs_excel>-bukrs.
+      wl_documentheader-doc_type    = <fs_excel>-blart.
+      wl_documentheader-doc_date    = <fs_excel>-bldat.
+      wl_documentheader-pstng_date  = <fs_excel>-budat.
+      wl_documentheader-ref_doc_no  = <fs_excel>-xblnr.
+      wl_documentheader-header_txt  = <fs_excel>-bktxt.
+      wl_documentheader-username    = sy-uname.
+
+      wl_customercpd-name       = <fs_excel>-name1.
+      wl_customercpd-street     = <fs_excel>-stras.
+      wl_customercpd-city       = <fs_excel>-ort01.
+      wl_customercpd-postl_code = <fs_excel>-pstlz.
+      wl_customercpd-country    = <fs_excel>-land1.
+      wl_customercpd-tax_no_1   = <fs_excel>-stcd1.
+    ENDAT.
+
+    ADD 10 TO vl_itemno_acc.
+
+    IF <fs_excel>-bschl = '31' OR <fs_excel>-bschl = '27'.
+      APPEND INITIAL LINE TO tl_accountpayable ASSIGNING FIELD-SYMBOL(<fs_accountpayable>).
+      <fs_accountpayable>-itemno_acc  = vl_itemno_acc.
+      <fs_accountpayable>-vendor_no   = |{ <fs_excel>-hkont ALPHA = IN }|.
+      <fs_accountpayable>-item_text   = <fs_excel>-sgtxt.
+      <fs_accountpayable>-pmnt_block  = <fs_excel>-zlspr.
+
+    ELSE.
+      APPEND INITIAL LINE TO tl_accountgl ASSIGNING FIELD-SYMBOL(<fs_accountgl>).
+      <fs_accountgl>-itemno_acc = vl_itemno_acc.
+      <fs_accountgl>-gl_account = |{ <fs_excel>-hkont ALPHA = IN }|.
+      <fs_accountgl>-item_text  = <fs_excel>-sgtxt.
+      <fs_accountgl>-orderid    = <fs_excel>-aufnr.
+      <fs_accountgl>-costcenter = <fs_excel>-kostl.
+      <fs_accountgl>-tax_code   = <fs_excel>-mwskz.
+      <fs_accountgl>-alloc_nmbr = <fs_excel>-zuonr.
+      <fs_accountgl>-bus_area   = <fs_excel>-gsber.
+      <fs_accountgl>-pstng_date = <fs_excel>-budat.
+    ENDIF.
+
+    APPEND INITIAL LINE TO tl_extension2 ASSIGNING FIELD-SYMBOL(<fs_extension2>).
+    <fs_extension2>-valuepart1      = vl_itemno_acc.
+    <fs_extension2>-structure       = 'POSTING_KEY'.
+    <fs_extension2>-valuepart2      = <fs_excel>-bschl.
+
+
+
+    APPEND INITIAL LINE TO tl_currencyamount ASSIGNING FIELD-SYMBOL(<fs_currencyamount>).
+    <fs_currencyamount>-itemno_acc  = vl_itemno_acc.
+    <fs_currencyamount>-amt_base    = <fs_excel>-dmbtr.
+    <fs_currencyamount>-currency    = <fs_excel>-waers.
+    IF <fs_excel>-bschl = '31' OR <fs_excel>-bschl = '50'.
+      MULTIPLY <fs_currencyamount>-amt_base BY -1.
+    ENDIF.
+
+    "Indicador impuestos
+    IF <fs_excel>-mwskz IS NOT INITIAL.
+      ADD 10 TO vl_itemno_acc.
+      APPEND INITIAL LINE TO tl_accounttax ASSIGNING FIELD-SYMBOL(<fs_accounttax>).
+      <fs_accounttax>-itemno_acc = vl_itemno_acc.
+      <fs_accounttax>-tax_code   = <fs_excel>-mwskz.
+
+      APPEND INITIAL LINE TO tl_currencyamount ASSIGNING <fs_currencyamount>.
+      <fs_currencyamount>-itemno_acc  = vl_itemno_acc.
+      <fs_currencyamount>-currency    = <fs_excel>-waers.
+
+      DATA: tl_mwdat TYPE TABLE OF rtax1u15.
+      CLEAR vl_tax_amt.
+      CALL FUNCTION 'CALCULATE_TAX_FROM_NET_AMOUNT'
+        EXPORTING
+          i_bukrs           = <fs_excel>-bukrs
+          i_mwskz           = <fs_excel>-mwskz
+          i_waers           = <fs_excel>-waers
+          i_wrbtr           = <fs_excel>-dmbtr
+        IMPORTING
+          e_fwste           = vl_tax_amt
+        TABLES
+          t_mwdat           = tl_mwdat
+        EXCEPTIONS
+          bukrs_not_found   = 1
+          country_not_found = 2
+          mwskz_not_defined = 3
+          mwskz_not_valid   = 4
+          ktosl_not_found   = 5
+          kalsm_not_found   = 6
+          parameter_error   = 7
+          knumh_not_found   = 8
+          kschl_not_found   = 9
+          unknown_error     = 10
+          account_not_found = 11
+          txjcd_not_valid   = 12
+          OTHERS            = 13.
+      IF sy-subrc = 0.
+*        <fs_currencyamount>-amt_doccur = vl_tax_amt.
+*        <fs_currencyamount>-amt_base   = <fs_excel>-dmbtr.
+*        <fs_currencyamount>-tax_amt
+
+        <fs_currencyamount>-amt_base   = <fs_excel>-dmbtr.
+        <fs_currencyamount>-tax_amt    = vl_tax_amt.
+        <fs_currencyamount>-amt_doccur = vl_tax_amt.
+
+      ENDIF.
+    ENDIF.
+
+
+
+    AT END OF item.
+      LOOP AT tl_currencyamount ASSIGNING <fs_currencyamount> WHERE amt_doccur IS INITIAL.
+        <fs_currencyamount>-amt_doccur = <fs_currencyamount>-amt_base + <fs_currencyamount>-tax_amt.
+      ENDLOOP.
+
+
+      DATA: vl_obj_type TYPE bapiache09-obj_type,
+            vl_obj_key  TYPE bapiache09-obj_key,
+            vl_obj_sys  TYPE bapiache09-obj_sys.
+
+      CALL FUNCTION 'BAPI_ACC_DOCUMENT_POST'
+        EXPORTING
+          documentheader    = wl_documentheader
+          customercpd       = wl_customercpd
+        IMPORTING
+          obj_type          = vl_obj_type
+          obj_key           = vl_obj_key
+          obj_sys           = vl_obj_sys
+        TABLES
+          accountgl         = tl_accountgl
+          accountreceivable = tl_accountreceivable
+          accountpayable    = tl_accountpayable
+          accounttax        = tl_accounttax
+          currencyamount    = tl_currencyamount
+          extension2        = tl_extension2
+          return            = tl_return.
+
+      LOOP AT tl_return ASSIGNING FIELD-SYMBOL(<fs_return>) WHERE type CA 'EA'.
+        IF <fs_return>-id <> 'RW' OR <fs_return>-number <> '609'. "Este mensaje no ayuda
+          vl_msg_error  = COND #( WHEN vl_msg_error IS INITIAL THEN <fs_return>-message ELSE |{ vl_msg_error }. { <fs_return>-message }| ).
+        ENDIF.
+      ENDLOOP.
+
+      LOOP AT tp_alv ASSIGNING FIELD-SYMBOL(<fs_alv>) WHERE bukrs = <fs_excel>-bukrs AND
+                                                            item  = <fs_excel>-item.
+        IF vl_msg_error IS INITIAL.
+          <fs_alv>-semaforo = icon_led_green.
+          <fs_alv>-mensaje  = 'Contabilización realizada correctamente'.
+          <fs_alv>-belnr  = vl_obj_key(10).
+          <fs_alv>-gjahr  = vl_obj_key+14(4).
+          "<fs_alv>-belnr_comp
+        ELSE.
+          <fs_alv>-semaforo = icon_led_red.
+          <fs_alv>-mensaje  = vl_msg_error.
+        ENDIF.
+      ENDLOOP.
+    ENDAT.
+
+  ENDLOOP.
+
+  READ TABLE tp_alv TRANSPORTING NO FIELDS WITH KEY semaforo = icon_led_red.
+  IF sy-subrc <> 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+  ENDIF.
+
+
+  IF r_alv IS BOUND.
+    r_alv->refresh_table_display( ).
+  ENDIF.
+  MESSAGE 'Contabilización terminada. Revise mensajes en la tabla' TYPE 'S'.
+
+ENDFORM.

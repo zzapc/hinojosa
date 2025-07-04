@@ -1,0 +1,247 @@
+*&---------------------------------------------------------------------*
+*&  Include           RVADOPFO_PDF
+*&---------------------------------------------------------------------*
+
+DATA: ls_itcpo       TYPE   itcpo,
+      lvf_device(30) TYPE   c,
+      lvf_dialog(1)  TYPE   c   VALUE ' ',
+      lvf_program    LIKE   sy-repid.
+
+* reset return code
+retcode = 0.
+*************************Start of Note changes 1503297*********************************
+* Check if the subroutine is called in update task.
+CALL METHOD cl_system_transaction_state=>get_in_update_task
+  RECEIVING
+    in_update_task = gv_inupd.
+* Check for external send
+IF nast-nacha EQ 5.
+*   ... use stratagy to get communication type
+  CALL FUNCTION 'ADDR_GET_NEXT_COMM_TYPE'
+    EXPORTING
+      strategy           = nast-tcode
+      address_number     = addr_key-addrnumber
+      person_number      = addr_key-persnumber
+    IMPORTING
+      comm_type          = gv_comm_type
+      comm_values        = gv_comm_values
+    EXCEPTIONS
+      address_not_exist  = 1
+      person_not_exist   = 2
+      no_comm_type_found = 3
+      internal_error     = 4
+      parameter_error    = 5
+      OTHERS             = 6.
+  IF sy-subrc <> 0.
+    CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+      EXPORTING
+        msg_arbgb = sy-msgid
+        msg_nr    = sy-msgno
+        msg_ty    = sy-msgty
+        msg_v1    = sy-msgv1
+        msg_v2    = sy-msgv2
+        msg_v3    = sy-msgv3
+        msg_v4    = sy-msgv4
+      EXCEPTIONS
+        OTHERS    = 1.
+    retcode = 1.
+    EXIT.
+  ENDIF.
+ENDIF.
+* convert communication data
+MOVE-CORRESPONDING nast TO gs_intnast.
+MOVE sy-repid           TO gv_xprogramm.
+CALL FUNCTION 'CONVERT_COMM_TYPE_DATA'
+  EXPORTING
+    pi_comm_type              = gv_comm_type
+    pi_comm_values            = gv_comm_values
+    pi_country                = us_country
+    pi_screen                 = us_screen
+    pi_repid                  = gv_xprogramm
+    pi_snast                  = gs_intnast
+  IMPORTING
+    pe_itcpo                  = ls_itcpo
+    pe_device                 = gv_fp_outputparams-device
+    pe_mail_recipient         = gs_recipient
+    pe_mail_sender            = gs_sender
+  EXCEPTIONS
+    comm_type_not_supported   = 1
+    recipient_creation_failed = 2
+    sender_creation_failed    = 3
+    OTHERS                    = 4.
+IF sy-subrc <> 0.
+  CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+    EXPORTING
+      msg_arbgb = sy-msgid
+      msg_nr    = sy-msgno
+      msg_ty    = sy-msgty
+      msg_v1    = sy-msgv1
+      msg_v2    = sy-msgv2
+      msg_v3    = sy-msgv3
+      msg_v4    = sy-msgv4
+    EXCEPTIONS
+      OTHERS    = 1.
+  retcode = 1.
+  EXIT.
+ENDIF.
+
+IF gv_fp_outputparams-device = 'MAIL'.
+  CALL FUNCTION 'SX_ADDRESS_TO_DEVTYPE'
+    EXPORTING
+      recipient_id      = gs_recipient
+      sender_id         = gs_sender
+    EXCEPTIONS
+      err_invalid_route = 1
+      err_system        = 2
+      OTHERS            = 3.
+  IF sy-subrc <> 0.
+    CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+      EXPORTING
+        msg_arbgb = sy-msgid
+        msg_nr    = sy-msgno
+        msg_ty    = sy-msgty
+        msg_v1    = sy-msgv1
+        msg_v2    = sy-msgv2
+        msg_v3    = sy-msgv3
+        msg_v4    = sy-msgv4
+      EXCEPTIONS
+        OTHERS    = 1.
+    retcode = 1.
+    EXIT.
+  ENDIF.
+ENDIF.
+
+CHECK retcode EQ 0.
+
+* if there is no communication type
+IF  gv_comm_type IS INITIAL.
+*   set device
+  CASE nast-nacha.
+    WHEN '1'.
+      gv_fp_outputparams-device = 'PRINTER'.
+      IF ls_itcpo-tdpreview EQ  'X'.                        "v_n_1639666
+        gv_fp_outputparams-nodialog =  'X'.
+      ENDIF.                                                "^_n_1639666
+    WHEN '2'.
+      gv_fp_outputparams-device = 'TELEFAX'.
+      ls_itcpo-tdtelenum = nast-telfx.
+      IF nast-tland IS INITIAL.
+        ls_itcpo-tdteleland = us_country.
+      ELSE.
+        ls_itcpo-tdteleland = nast-tland.
+      ENDIF.
+      ls_itcpo-tdsenddate = nast-vsdat.
+      ls_itcpo-tdsendtime = nast-vsura.
+      ls_itcpo-tdfaxuser  = nast-usnam.
+    WHEN '3'.
+      gv_fp_outputparams-device = 'TELETEX'.
+      ls_itcpo-tdtelenum = nast-teltx.
+      IF nast-tland IS INITIAL.
+        ls_itcpo-tdteleland = us_country.
+      ELSE.
+        ls_itcpo-tdteleland = nast-tland.
+      ENDIF.
+      ls_itcpo-tdsenddate = nast-vsdat.
+      ls_itcpo-tdsendtime = nast-vsura.
+    WHEN '4'.
+      gv_fp_outputparams-device = 'TELEX'.
+      ls_itcpo-tdtelenum = nast-telx1.
+      IF nast-tland IS INITIAL.
+        ls_itcpo-tdteleland = us_country.
+      ELSE.
+        ls_itcpo-tdteleland = nast-tland.
+      ENDIF.
+      ls_itcpo-tdsenddate = nast-vsdat.
+      ls_itcpo-tdsendtime = nast-vsura.
+    WHEN OTHERS.
+      gv_fp_outputparams-device = 'PRINTER'.
+  ENDCASE.
+ENDIF.
+* Setting to get the PDF string..
+IF us_screen IS INITIAL "In case of preview message should be displayed only
+  AND ( nast-nacha EQ 5 OR nast-tdarmod = 2 OR  nast-nacha EQ 2 ).
+* Setting output parameters only if communication type is fax or email.
+  IF nast-nacha EQ 5.
+    IF ( gv_comm_type EQ 'FAX' OR gv_comm_type EQ 'INT' ).
+      gv_fp_outputparams-getpdf = 'X'.
+    ENDIF.
+  ELSE.
+    gv_fp_outputparams-getpdf = 'X'.
+  ENDIF.
+* Specific setting for FAX
+  IF nast-nacha EQ 2.
+* Setting output parameters
+    IF nast-telfx EQ space.
+      gv_fp_outputparams-nodialog = ' '.
+    ELSE.
+      gv_fp_outputparams-nodialog = 'X'.
+    ENDIF.
+  ENDIF.
+ENDIF.
+
+************************End of note changes 1503297**********************************
+*APC20250218 Permitimos recuperar el PDF
+IF nast-sort1 = 'ZPDF'.
+  gv_fp_outputparams-getpdf = 'X'.
+ENDIF.
+
+*&--------------------------------------------------------------------*
+* fill all the print parameters for the form
+*---------------------------------------------------------------------*
+gv_fp_outputparams-preview    = ls_itcpo-tdpreview.
+gv_fp_outputparams-dest       = ls_itcpo-tddest.
+gv_fp_outputparams-reqnew     = ls_itcpo-tdnewid.
+gv_fp_outputparams-reqimm     = ls_itcpo-tdimmed.
+gv_fp_outputparams-reqdel     = ls_itcpo-tddelete.
+gv_fp_outputparams-reqfinal   = ls_itcpo-tdfinal.
+gv_fp_outputparams-senddate   = ls_itcpo-tdsenddate.
+gv_fp_outputparams-sendtime   = ls_itcpo-tdsendtime.
+gv_fp_outputparams-schedule   = ls_itcpo-tdschedule.
+gv_fp_outputparams-copies     = ls_itcpo-tdcopies.
+gv_fp_outputparams-dataset    = ls_itcpo-tddataset.
+gv_fp_outputparams-suffix1    = ls_itcpo-tdsuffix1.
+gv_fp_outputparams-suffix2    = ls_itcpo-tdsuffix2.
+gv_fp_outputparams-covtitle   = ls_itcpo-tdcovtitle.
+gv_fp_outputparams-cover      = ls_itcpo-tdcover.
+gv_fp_outputparams-receiver   = ls_itcpo-tdreceiver.
+gv_fp_outputparams-division   = ls_itcpo-tddivision.
+gv_fp_outputparams-lifetime   = ls_itcpo-tdlifetime.
+gv_fp_outputparams-authority  = ls_itcpo-tdautority.
+gv_fp_outputparams-rqposname  = ls_itcpo-rqposname.
+gv_fp_outputparams-arcmode    = ls_itcpo-tdarmod.
+gv_fp_outputparams-noarmch    = ls_itcpo-tdnoarmch.
+gv_fp_outputparams-title      = ls_itcpo-tdtitle.
+gv_fp_outputparams-nopreview  = ls_itcpo-tdnoprev.
+* GST - 20/03/2015 ->
+* Impresión no bloqueada:
+*gv_fp_outputparams-noprint    = ls_itcpo-tdnoprint.
+gv_fp_outputparams-noprint    = ' '.
+* GST - 20/03/2015 <-
+
+* Enhancements for web dynpro pdf output
+IF us_screen = 'W'.
+  gv_fp_outputparams-device   = ''.
+  gv_fp_outputparams-getpdf   = 'X'.
+ENDIF.
+
+"MTS: 13.02.2024 Impresión Centros Montaje
+CALL FUNCTION 'ZUI5_GET_CM_IMPRESION'
+  CHANGING
+    c_params = gv_fp_outputparams.
+"FIN MTS: 13.02.2024 Impresión Centro de Montaje.
+
+CALL FUNCTION 'FP_JOB_OPEN'
+  CHANGING
+    ie_outputparams = gv_fp_outputparams
+  EXCEPTIONS
+    cancel          = 1
+    usage_error     = 2
+    system_error    = 3
+    internal_error  = 4
+    OTHERS          = 5.
+IF sy-subrc <> 0.
+  MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+          WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+ENDIF.
+
+SET COUNTRY us_country.

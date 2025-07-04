@@ -1,0 +1,166 @@
+FUNCTION zui5_cm_desembalar_entrega_po.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_VBELN) TYPE  VBELN_VL
+*"  EXPORTING
+*"     VALUE(E_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+  CONSTANTS: v_veces TYPE i VALUE 5.
+  DATA: it_hus    TYPE  hum_exidv_t,
+        lt_return TYPE bapiret2_t.
+  DATA: lt_prot TYPE TABLE OF prott.
+  DATA: lv_error  TYPE xfeld.
+
+  DATA: header_data    TYPE  bapiobdlvhdrchg,
+        header_control TYPE  bapiobdlvhdrctrlchg,
+        delivery       TYPE  bapiobdlvhdrchg-deliv_numb,
+        item_data      TYPE TABLE OF  bapiobdlvitemchg,
+        item_control   TYPE TABLE OF  bapiobdlvitemctrlchg.
+  DATA: ls_vbkok     TYPE vbkok,
+        lt_vbpok_tab TYPE TABLE OF vbpok.
+
+
+  PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '035' i_vbeln '' '' ''CHANGING e_return.
+*      ls_vbkok-wadat_ist = sy-datum.
+  ls_vbkok-vbeln_vl  = i_vbeln.
+  ls_vbkok-vbeln  = i_vbeln.
+  ls_vbkok-komue = 'X'.
+
+  SELECT a~vbeln, b~posnr, b~lfimg, b~meins, b~werks, b~lgort, b~matnr, b~charg, a~vkorg, a~vbtyp, b~umvkz, b~umvkn, b~vgbel, b~vgpos
+  FROM likp AS a
+  INNER JOIN lips AS b ON b~vbeln = a~vbeln
+  INTO TABLE @DATA(lt_lips)
+  WHERE a~vbeln = @i_vbeln.
+  IF sy-subrc = 0.
+    LOOP AT lt_lips INTO DATA(ls_lips).
+      DATA(lv_tabix) = sy-tabix.
+      APPEND INITIAL LINE TO lt_vbpok_tab ASSIGNING FIELD-SYMBOL(<ls_vbpok>).
+      <ls_vbpok>-vbeln = ls_lips-vbeln.
+      <ls_vbpok>-posnn = ls_lips-posnr.
+      <ls_vbpok>-posnr_vl = ls_lips-posnr.
+      <ls_vbpok>-vbeln_vl = ls_lips-vbeln.
+      <ls_vbpok>-pikmg = 0.
+      <ls_vbpok>-lfimg = 0.
+      <ls_vbpok>-lfimg_flo = 0.
+      <ls_vbpok>-lgmng = 0.
+      <ls_vbpok>-lgmng_flo = 0.
+      <ls_vbpok>-meins = ls_lips-meins.
+      <ls_vbpok>-vrkme = ls_lips-meins.
+      <ls_vbpok>-vbtyp_n = 'Q'.
+      <ls_vbpok>-akmng = 'G'.
+      <ls_vbpok>-matnr = ls_lips-matnr.
+      <ls_vbpok>-werks = ls_lips-werks.
+      <ls_vbpok>-lgort = ls_lips-lgort.
+      <ls_vbpok>-umvkz = ls_lips-umvkz.
+      <ls_vbpok>-umvkn = ls_lips-umvkn.
+
+    ENDLOOP.
+
+    CALL FUNCTION 'LE_DELIVERY_REFRESH_BUFFER'
+      EXCEPTIONS
+        no_key_specified = 0
+        OTHERS           = 0.
+
+    CALL FUNCTION 'WS_DELIVERY_UPDATE_2'
+      EXPORTING
+        vbkok_wa               = ls_vbkok
+        delivery               = i_vbeln
+        update_picking         = 'X'
+        synchron               = 'X'
+        commit                 = 'X'
+        nicht_sperren_1        = 'X'
+        if_error_messages_send = 'X'
+      IMPORTING
+        ef_error_any           = lv_error
+      TABLES
+        vbpok_tab              = lt_vbpok_tab
+*       verko_tab              = verko_tab
+*       verpo_tab              = verpo_tab
+        prot                   = lt_prot
+      EXCEPTIONS
+        error_message          = 1
+        OTHERS                 = 2.
+
+**** CHECK RESULT AND SAVE
+    DATA(lv_subrc) = sy-subrc.
+    READ TABLE lt_prot INTO DATA(ls_prot) WITH KEY msgty = 'E'.
+    IF sy-subrc = 0 OR lv_subrc IS NOT INITIAL.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      APPEND INITIAL LINE TO e_return ASSIGNING FIELD-SYMBOL(<ls_return>).
+      <ls_return>-id = sy-msgid.
+      <ls_return>-type = sy-msgty.
+      <ls_return>-number = sy-msgno.
+      <ls_return>-message_v1 = sy-msgv1.
+      <ls_return>-message_v2 = sy-msgv2.
+      <ls_return>-message_v3 = sy-msgv3.
+      <ls_return>-message_v4 = sy-msgv4.
+
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+
+      PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '098' i_vbeln '' '' ''CHANGING e_return.
+      "Modificacomos la cantidad a cero de la entrega
+      LOOP AT lt_lips INTO ls_lips.
+        APPEND INITIAL LINE TO item_data ASSIGNING FIELD-SYMBOL(<ls_item>).
+        <ls_item>-deliv_numb = i_vbeln.
+        <ls_item>-deliv_item = ls_lips-posnr.
+        <ls_item>-dlv_qty = 0.
+        <ls_item>-batch = ls_lips-charg.
+
+
+        APPEND INITIAL LINE TO item_control ASSIGNING FIELD-SYMBOL(<ls_item_c>).
+        <ls_item_c>-deliv_numb = i_vbeln.
+        <ls_item_c>-deliv_item = ls_lips-posnr.
+        <ls_item_c>-chg_delqty = 'X'.
+
+
+      ENDLOOP.
+      CALL FUNCTION 'LE_DELIVERY_REFRESH_BUFFER'
+        EXCEPTIONS
+          no_key_specified = 0
+          OTHERS           = 0.
+
+      DO v_veces TIMES.
+        CLEAR lt_return.
+        CALL FUNCTION 'BAPI_OUTB_DELIVERY_CHANGE'
+          EXPORTING
+            header_data    = header_data
+            header_control = header_control
+            delivery       = i_vbeln
+          TABLES
+            item_data      = item_data
+            item_control   = item_control
+*           new_item_data  = new_item_data
+            return         = lt_return
+          EXCEPTIONS
+            error_message  = 1
+            OTHERS         = 2.
+
+        READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+        IF sy-subrc IS INITIAL.
+          CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+          WAIT UP TO 1 SECONDS.
+        ELSE.
+          EXIT.
+
+        ENDIF.
+      ENDDO.
+      APPEND LINES OF lt_return TO e_return.
+      READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc IS NOT INITIAL.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+
+      ENDIF.
+    ENDIF.
+
+  ENDIF.
+
+*  ENDIF.
+ENDFUNCTION.

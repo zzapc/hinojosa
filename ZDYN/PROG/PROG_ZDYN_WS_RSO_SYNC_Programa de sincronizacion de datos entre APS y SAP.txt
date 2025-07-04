@@ -1,0 +1,310 @@
+*&---------------------------------------------------------------------*
+*& Report  ZDYN_WS_RSO_SYNC
+*&
+*&---------------------------------------------------------------------*
+*&  Synchronize data between ReadSoft Online and SAP
+*&  Get output documents
+*&  Send master data and document data updates
+*&---------------------------------------------------------------------*
+REPORT zdyn_ws_rso_sync.
+
+INCLUDE zdyn_ws_rso_sync_top.
+INCLUDE zdyn_ws_rso_sync_sel.
+INCLUDE zdyn_ws_rso_sync_f01.
+
+INITIALIZATION.
+  gc_tcode = con_ta_main.
+  PERFORM authority_check.
+  CLEAR gc_tcode.
+
+  CREATE OBJECT go_file.
+
+
+START-OF-SELECTION.
+
+  CLEAR: gt_messages, gc_log_object, gc_log_subobject.
+
+* take care that there is only one combination of apikey, username and bukrs
+  SELECT SINGLE * FROM zdyn_rso_tgen INTO CORRESPONDING FIELDS OF gst_config
+                  WHERE sysid    = sy-sysid
+                    AND username = puser
+                    AND bukrs    = pbukrs.
+  IF sy-subrc = 0.
+    gs_key  = gst_config-apikey.
+    gs_user = gst_config-username.
+
+    gs_pw = gst_config-password.
+    gs_pw_clear = cl_http_utility=>if_http_utility~decode_base64( encoded = gs_pw ).
+*    CLEAR gst_config-password.
+  ELSE.
+    WRITE: 'Configuration missing'(cfg).
+    EXIT.
+  ENDIF.
+
+  gst_config-mark_as_del      = pdele.
+  gst_config-store_mail       = pmail.
+  gst_config-store_att        = porig.
+  gst_config-skip_http_test   = prt_http.
+  gst_config-skip_attach_add  = prt_satt.
+  gst_config-sel_all          = pall.
+
+* now dynamic class generation.
+  IF NOT gst_config-clsname IS INITIAL.
+    TRY.
+        CREATE OBJECT go_rso_rest TYPE (gst_config-clsname)
+          EXPORTING
+            ist_config = gst_config.
+    ENDTRY.
+  ENDIF.
+  IF go_rso_rest IS NOT BOUND.
+    CREATE OBJECT go_rso_rest
+      EXPORTING
+        ist_config = gst_config.
+  ENDIF.
+*{   REPLACE        HEDK933649                                        1
+*\
+*\  zdyn_lic_cl_checker=>check_license( EXPORTING ic_product       = con_lic_component
+*\                                      IMPORTING eb_license_valid = gb_ok
+*\                                      CHANGING  ct_messages      = gt_messages ).
+*\  IF gb_ok EQ abap_false.
+*\    gt_msg = go_rso_rest->map_bapiret2_to_bal( gt_messages ).
+*\
+*\    go_rso_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+*\                                       ic_log_subobject = gc_log_subobject
+*\                                       ic_extnumber     = 'License test'(lic)
+*\                                       it_msg           = gt_msg
+*\                               EXCEPTIONS OTHERS        = 0 ).
+*\    RETURN.
+*\  ENDIF.
+
+*  zdyn_lic_cl_checker=>check_license( EXPORTING ic_product       = con_lic_component
+*                                      IMPORTING eb_license_valid = gb_ok
+*                                      CHANGING  ct_messages      = gt_messages ).
+*  IF gb_ok EQ abap_false.
+*    gt_msg = go_rso_rest->map_bapiret2_to_bal( gt_messages ).
+*
+*    go_rso_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+*                                       ic_log_subobject = gc_log_subobject
+*                                       ic_extnumber     = 'License test'(lic)
+*                                       it_msg           = gt_msg
+*                               EXCEPTIONS OTHERS        = 0 ).
+*    RETURN.
+*  ENDIF.
+*}   REPLACE
+
+  IF pauth = abap_true OR prf_file = abap_false OR
+    ( prf_file = abap_true AND prt_http = abap_false ).
+    go_rso_rest->prepare_client( EXCEPTIONS OTHERS = 1 ).
+    IF sy-subrc <> 0.
+      go_rso_rest->log_write( EXPORTING  ic_log_object     = gc_log_object
+                                         ic_log_subobject  = gc_log_subobject
+                                         ic_extnumber      = 'Communication'(com)
+                                         ii_level          = pmsglv
+                              EXCEPTIONS OTHERS            = 0 ).
+      RETURN.
+    ENDIF.
+
+    gb_ok = go_rso_rest->authenticate( is_user     = gs_user
+                                       is_password = gs_pw_clear
+                                       ib_test     = pauth ).
+    IF pauth = abap_true OR gb_ok EQ abap_false.
+      go_rso_rest->log_write( EXPORTING  ic_log_object     = gc_log_object
+                                         ic_log_subobject  = gc_log_subobject
+                                         ic_extnumber      = 'Communication'(com)
+                                         ii_level          = pmsglv
+                              EXCEPTIONS OTHERS            = 0 ).
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+* Company codes used to select master data
+  go_rso_rest->set_company_codes( EXPORTING it_sel_comp_codes  = sel_comp[] ).
+
+
+********************************************************************************************
+  IF psap = abap_true.
+    CLEAR: gt_ebeln.
+*   Masterdata
+    gb_ok = go_rso_rest->mo_access_protection->set_for_master_data( ic_module = zdyn_if_product_info=>con_module_rso
+                                                                    ic_id     = pbukrs ).
+    IF gb_ok = abap_false.
+      PERFORM lock_msg.
+      RETURN.
+    ENDIF.
+
+    go_rso_rest->set_langu( sel_lang[] ).
+
+********************************************************************************************
+*   Buyer /Seller
+    IF NOT pcreateb IS INITIAL.
+      go_rso_rest->create_buyers( ).
+      go_rso_rest->add_confirmation_msg( EXPORTING ic_object = 'Buyer / Seller'(o05) ).
+    ENDIF.
+
+********************************************************************************************
+*   Currency
+    IF NOT pdelcurr IS INITIAL OR NOT sel_curr IS INITIAL.
+      go_rso_rest->set_currencies( EXPORTING ib_delete    = pdelcurr
+                                             it_sel_waers = sel_curr[] ).
+      go_rso_rest->add_confirmation_msg( EXPORTING ic_object = 'Currency'(o03) ).
+    ENDIF.
+
+********************************************************************************************
+*   Payment Terms
+    IF NOT sel_pt IS INITIAL.
+      go_rso_rest->set_paymentterms( EXPORTING ib_replace    = pdelpt
+                                               it_sel_zterm  = sel_pt[] ).
+      go_rso_rest->add_confirmation_msg( EXPORTING ic_object = 'Payment Terms'(o04) ).
+    ENDIF.
+
+********************************************************************************************
+*   Costcenter
+    IF NOT pdelkost IS INITIAL OR NOT sel_kost IS INITIAL.
+      go_rso_rest->set_costcenters( EXPORTING ib_delete     = pdelkost
+                                              it_sel_kostl  = sel_kost[] ).
+      go_rso_rest->add_confirmation_msg( EXPORTING ic_object = 'Cost Center'(o06) ).
+    ENDIF.
+
+********************************************************************************************
+*   Projects
+    IF NOT pdelpsp IS INITIAL OR NOT sel_psp IS INITIAL.
+      go_rso_rest->set_projects( EXPORTING ib_delete      = pdelpsp
+                                           it_sel_pspnr   = sel_psp[]
+                                           id_change_date = pchdatp ).
+      go_rso_rest->add_confirmation_msg( EXPORTING ic_object = 'Project (WBS element)'(o08) ).
+    ENDIF.
+
+********************************************************************************************
+*   Order (internal)
+    IF NOT pdelauf IS INITIAL OR NOT sel_auf IS INITIAL.
+      go_rso_rest->set_orders( EXPORTING it_sel_opt     = sel_auf[]
+                                         ib_delete      = pdelauf
+                                         id_change_date = pchdata ).
+      go_rso_rest->add_confirmation_msg( EXPORTING ic_object = 'Order'(o09) ).
+    ENDIF.
+
+********************************************************************************************
+*   GL Accounts
+    IF NOT pdelsak IS INITIAL OR NOT sel_sak IS INITIAL.
+      gs_glgrp = pglgrp.
+      go_rso_rest->set_glaccounts( EXPORTING ib_delete    = pdelsak
+                                             is_group     = gs_glgrp
+                                             it_sel_saknr = sel_sak[] ).
+      go_rso_rest->add_confirmation_msg( EXPORTING ic_object = 'G/L Accounts'(o07) ).
+    ENDIF.
+
+********************************************************************************************
+*   Suppliers
+    IF NOT pdellief IS INITIAL OR NOT sel_lief IS INITIAL.
+      IF pchdatl = sy-datlo.
+        pchdatl = sy-datlo - 1.
+      ENDIF.
+
+      go_rso_rest->set_suppliers( EXPORTING ib_delete     = pdellief
+                                            it_sel_lifnr  = sel_lief[]
+                                            id_date       = pchdatl
+                                            ib_delflg     = pdelsflg
+                                            ib_bankdata   = pbanks ).
+      go_rso_rest->add_confirmation_msg( EXPORTING ic_object = 'Supplier (Vendor)'(o10) ).
+    ENDIF.
+
+********************************************************************************************
+*   Purchase Orders
+    IF NOT selerdat IS INITIAL OR
+       NOT sel_po IS INITIAL OR
+       NOT pchdat IS INITIAL.
+      go_rso_rest->set_purchase_orders( EXPORTING ib_delete    = pdelpo
+                                                  it_sel_ebeln = sel_po[]
+                                                  it_sel_erdat = selerdat[]
+                                                  id_chg_date  = pchdat ).
+      go_rso_rest->add_confirmation_msg( EXPORTING ic_object = 'Purchase Orders'(o12) ).
+    ENDIF.
+
+********************************************************************************************
+*   Customers
+    IF NOT sel_debi IS INITIAL.
+      IF pchdatd = sy-datlo.
+        pchdatd = sy-datlo - 1.
+      ENDIF.
+      go_rso_rest->set_customers( EXPORTING ib_delete     = pdeldebi
+                                            ib_replace    = pdeldrpl
+                                            it_sel_kunnr  = sel_debi[]
+                                            ib_delflg     = pdeldflg
+                                            id_date       = pchdatd ).
+      go_rso_rest->add_confirmation_msg( EXPORTING ic_object = 'Customer'(o11) ).
+    ENDIF.
+
+********************************************************************************************
+*   Custom data
+    IF NOT pcust IS INITIAL.
+      SELECT SINGLE * FROM zdyn_rso_tcust INTO gs_tcust
+                    WHERE extname = pcust.
+      IF sy-subrc = 0.
+        gc_msgv1 = pcust.
+        go_rso_rest->set_custom_masterdata( EXPORTING ib_delete = pdelcu
+                                                      is_tcust  = gs_tcust ).
+        go_rso_rest->add_confirmation_msg( EXPORTING ic_object = gc_msgv1 ).
+      ENDIF.
+
+    ENDIF.
+
+********************************************************************************************
+*   Messages at the end of master data processing
+    gt_messages_full = zdyn_cl_msg=>get_messages_full( ib_skip_duplicates = abap_false
+                                                       ii_level           = pmsglv ).
+    IF NOT gt_messages_full IS INITIAL.
+      IF papplg = abap_true.
+        gc_log_object = con_log_object.
+        gc_log_subobject = con_log_subobject_master.
+      ENDIF.
+      go_rso_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+                                         ic_log_subobject = gc_log_subobject
+                                         ic_extnumber     = 'APS master data'(o18)
+                                         it_msg_full      = gt_messages_full
+                              EXCEPTIONS OTHERS           = 0 ).
+    ENDIF.
+
+********************************************************************************************
+
+  ENDIF. " end of master data processing
+
+********************************************************************************************
+* Output documents (Invoices)
+  IF prso = abap_true.
+
+    gb_ok = go_rso_rest->mo_access_protection->set_for_doc_receive( ic_module = zdyn_if_product_info=>con_module_rso
+                                                                    ic_id     = pbukrs ).
+    IF gb_ok = abap_false.
+      PERFORM lock_msg.
+      RETURN.
+    ENDIF.
+
+*   If the 'read from' file is selected, the data will be taken from that file and transferred to SAP.
+*   If the 'receive to' file is selected, the data will be received from RSO and stored in the local machine.
+    go_rso_rest->mo_file->set_doc_file_params( EXPORTING ib_doc_to_file  = prt_file
+                                                         is_doc_pathname = prt_path
+                                                         ib_file_to_doc  = prf_file
+                                                         is_doc_filename = prf_fnam ).
+    go_rso_rest->inbound_process( ic_xslt          = gst_config-xslt
+                                  ib_skip_feedback = prt_fdbk ).
+
+    gt_messages_full = zdyn_cl_msg=>get_messages_full( ib_skip_duplicates = abap_false
+                                                       ii_level           = pmsglv ).
+    IF NOT gt_messages_full IS INITIAL.
+      IF papplg = abap_true.
+        gc_log_object    = con_log_object.
+        gc_log_subobject = con_log_subobject_document.
+      ENDIF.
+      go_rso_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+                                         ic_log_subobject = gc_log_subobject
+                                         ic_extnumber     = 'APS output documents'(o19)
+                                         it_msg_full      = gt_messages_full
+                              EXCEPTIONS OTHERS           = 0 ).
+    ENDIF.
+  ENDIF.
+
+*********************************************************************************************
+
+  go_rso_rest->mo_access_protection->unset( ).
+
+*********************************************************************************************

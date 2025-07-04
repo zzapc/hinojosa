@@ -1,0 +1,114 @@
+FUNCTION z_wf_acciones_mod_entregas .
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(VBELN) TYPE  LIKP-VBELN
+*"----------------------------------------------------------------------
+  DATA: l_likp TYPE likp.
+  DATA: r_vbeln TYPE RANGE OF vbeln_va.
+
+*  zcl_ap_log=>set_log( proceso = 'WP_MOD_ENT' clave = vbeln p1 = 'log' ).
+
+  DATA(l_udate) = sy-datum.
+  DATA(l_utime) = sy-uzeit.
+
+* No queremos que haya dos WF con el mismo pedido a la vez
+  IF zcl_ap_utils=>bloquear_programa( cprog = 'WF_MOD_ENT-' && vbeln intentos = 1 espera = 0 ).
+*    RETURN.
+    DATA(l_bloqueo) = 'X'.
+  ENDIF.
+
+* Recuperamos datos de reparto para forzar actualización de tabla ZVBEP
+  DATA(o_sd) = NEW zhcl_sd_core( ).
+
+* Esperamos a grabado por si acaso es creación
+  IF NOT sy-batch IS INITIAL OR sy-tcode IS INITIAL.
+* Como mucho sólo los últimos 30 segundos
+    l_utime = l_utime - 30.
+
+    WAIT UP TO 5 SECONDS.
+  ELSE.
+    CLEAR l_utime.
+  ENDIF.
+  DO 5 TIMES.
+    SELECT SINGLE * FROM likp
+      INTO CORRESPONDING FIELDS OF l_likp
+     WHERE vbeln = vbeln.
+    IF sy-subrc NE 0.
+      WAIT UP TO 1 SECONDS.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDDO.
+
+* Si se ha borrado la entrega, busco si nos hemos guardado pedidos origen para recalcular estados
+  SELECT DISTINCT valor1 FROM ztemp
+    INTO TABLE @DATA(i_origen)
+   WHERE clave = 'LIKP_DEL'
+     AND subclave = @vbeln.
+  IF sy-subrc = 0.
+    LOOP AT i_origen ASSIGNING FIELD-SYMBOL(<origen>).
+      zcl_ap_log=>set_log( proceso = 'WP_MOD_ENT' clave = vbeln p1 = 'Posición borrada Se van a actualizar estados de pedido:' p2 = <origen> msgty = 'I' ).
+      APPEND VALUE #( option = 'EQ' sign = 'I' low = <origen> ) TO r_vbeln.
+    ENDLOOP.
+    SELECT SINGLE vbeln FROM vbak
+      INTO @DATA(l_vbeln)
+     WHERE vbeln IN @r_vbeln.
+    IF sy-subrc = 0.
+      DATA(l_ventas) = 'X'.
+    ENDIF.
+
+    SELECT SINGLE ebeln FROM ekko
+      INTO @l_vbeln
+     WHERE ebeln IN @r_vbeln.
+    IF sy-subrc = 0.
+      DATA(l_compras) = 'X'.
+    ENDIF.
+
+    o_sd->get_repartos( r_vbeln     = r_vbeln
+                        historico = 'X'
+                        add_pedidos_traslado = l_compras
+                        add_pedidos_ventas = l_ventas
+                        datos_medidas = ''
+                        datos_interlocutores = ''
+                        datos_stocks = 'X'
+                        origen = 'WF_ENTREGAS' ).
+    IF l_likp IS INITIAL.
+      zcl_ap_log=>set_log( proceso = 'WP_MOD_ENT' clave = vbeln p1 = 'No existe entrega. salimos' ).
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+
+
+  SELECT lips~vgbel FROM lips JOIN vbak ON lips~vgbel = vbak~vbeln
+    INTO TABLE @DATA(i_vgbel)
+   WHERE lips~vbeln = @vbeln.
+  IF sy-subrc = 0.
+    l_ventas = 'X'.
+  ENDIF.
+  SELECT vgbel FROM lips JOIN ekko ON lips~vgbel = ekko~ebeln
+    APPENDING CORRESPONDING FIELDS OF TABLE i_vgbel
+   WHERE vbeln = vbeln.
+  IF sy-subrc = 0.
+    l_compras = 'X'.
+  ENDIF.
+  IF NOT i_vgbel IS INITIAL.
+    LOOP AT i_vgbel ASSIGNING FIELD-SYMBOL(<vgbel>).
+      zcl_ap_log=>set_log( proceso = 'WP_MOD_ENT' clave = vbeln p1 = 'Se van a actualizar estados de pedido:' p2 = <vgbel>-vgbel msgty = 'I' ).
+      APPEND VALUE #( option = 'EQ' sign = 'I' low = <vgbel>-vgbel ) TO r_vbeln.
+    ENDLOOP.
+    DATA(i_rep) = o_sd->get_repartos( r_vbeln     = r_vbeln
+                                      historico = 'X'
+                                      add_pedidos_traslado = l_compras
+                                      add_pedidos_ventas = l_ventas
+                                      datos_medidas = ''
+                                      datos_interlocutores = ''
+                                      datos_stocks = 'X'
+                                      origen = 'WF_ENTREGAS' ).
+  ENDIF.
+
+  zcl_ap_utils=>desbloquear_programa( cprog = 'WF_MOD_ENT-' && vbeln  ).
+
+
+ENDFUNCTION.

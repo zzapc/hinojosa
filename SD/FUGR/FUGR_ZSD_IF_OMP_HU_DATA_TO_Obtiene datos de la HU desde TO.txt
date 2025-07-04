@@ -1,0 +1,330 @@
+FUNCTION zsd_if_omp_hu_data_to.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(VP_LGNUM) TYPE  LGNUM
+*"     REFERENCE(VP_TANUM) TYPE  TANUM
+*"     VALUE(WP_LTAK) TYPE  LTAK_VB
+*"  TABLES
+*"      TP_LTAP STRUCTURE  LTAP_VB
+*"----------------------------------------------------------------------
+  DATA: wl_data TYPE  zcchandlinguniteventdata.
+  DATA: vl_fecha TYPE sy-datum,
+        vl_hora  TYPE sy-uzeit.
+
+  "
+  " Configuración criterios selección.
+  "
+  DATA: wl_config_omp  TYPE zssd_if_omp_cfg,
+        rl_range_mtart TYPE efg_tab_ranges.
+  CALL FUNCTION 'ZSD_IF_OMP_TRANS_GET_CONFG'
+    EXPORTING
+      vp_lgnum       = vp_lgnum
+    IMPORTING
+      wp_config      = wl_config_omp
+      tp_range_mtart = rl_range_mtart
+    EXCEPTIONS
+      no_config      = 1
+      OTHERS         = 2.
+  CHECK sy-subrc = 0.
+
+  IF wp_ltak IS INITIAL.
+    SELECT SINGLE *
+      FROM ltak
+      INTO CORRESPONDING FIELDS OF wp_ltak
+      WHERE lgnum = vp_lgnum AND
+            tanum = vp_tanum.
+  ENDIF.
+  IF tp_ltap IS INITIAL.
+    SELECT *
+      FROM ltap
+      INTO CORRESPONDING FIELDS OF TABLE tp_ltap
+      WHERE lgnum = vp_lgnum AND
+            tanum = vp_tanum.
+  ENDIF.
+  CHECK wp_ltak IS NOT INITIAL.
+  CHECK tp_ltap[] IS NOT INITIAL.
+
+  "
+  " Para los traspasos, me quedo con las posiciones que tienen UA destino.
+  "
+  IF wp_ltak-trart = 'U'.
+    DELETE tp_ltap WHERE nlenr = ''.
+  ENDIF.
+  "
+  " PAra las salidas, ignoramos el tipo de almacén destino 916,
+  " Se informara por Trip Events.
+  "
+  IF wp_ltak-trart = 'A'.
+*    DELETE tp_ltap WHERE nltyp = '916'.
+    LOOP AT tp_ltap ASSIGNING FIELD-SYMBOL(<fs_ltap_salidas>) WHERE nltyp = '916'.
+      SELECT SINGLE *
+        FROM zssd_if_omp_tp_d
+        INTO @DATA(wl_if_omp_tp_d)
+        WHERE vbeln = @<fs_ltap_salidas>-nlpla AND
+              borrado = ''.
+      IF sy-subrc = 0.
+        DELETE tp_ltap.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  "
+  " Para las entradas o anulaciones de entradas, buscamos la posible orden de fabricación.
+  "
+  DATA: wl_mseg_of TYPE mseg,
+        wl_aufk    TYPE aufk.
+  CLEAR: wl_mseg_of, wl_aufk.
+  IF ( wp_ltak-trart = 'E' OR wp_ltak-trart = 'A' ) AND wp_ltak-betyp = 'F' .
+    SELECT SINGLE *
+      FROM mseg
+      INTO CORRESPONDING FIELDS OF wl_mseg_of
+      WHERE mblnr = wp_ltak-mblnr AND
+            mjahr = wp_ltak-mjahr AND
+            aufnr > 0.
+    IF sy-subrc <> 0.
+      CLEAR wl_mseg_of.
+    ENDIF.
+
+    IF wl_mseg_of-aufnr IS NOT INITIAL.
+      SELECT SINGLE *
+        FROM aufk
+        INTO CORRESPONDING FIELDS OF wl_aufk
+        WHERE aufnr = wl_mseg_of-aufnr.
+      IF sy-subrc <> 0.
+        CLEAR wl_aufk.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+  LOOP AT tp_ltap ASSIGNING FIELD-SYMBOL(<fs_ltap>).
+    CHECK <fs_ltap>-pquit = 'X'.
+
+    SELECT SINGLE *
+      FROM mara
+      INTO @DATA(wl_mara)
+      WHERE matnr = @<fs_ltap>-matnr AND
+            mtart IN @rl_range_mtart.
+    CHECK sy-subrc = 0.
+
+    CLEAR wl_data.
+    "
+    " Obtener datos del material
+    "
+    SELECT SINGLE cuobj
+      INTO @DATA(vl_cuobj)
+      FROM marc
+      WHERE matnr EQ @<fs_ltap>-matnr AND
+            werks EQ @<fs_ltap>-werks.
+
+    IF sy-subrc <> 0.
+      CLEAR vl_cuobj.
+    ENDIF.
+
+    SELECT SINGLE *
+      INTO @DATA(wl_yhp_idx_td151)
+      FROM yhp_idx_td151
+      WHERE cuobj = @vl_cuobj AND
+            shuty = 'UNIT'.
+    IF sy-subrc <> 0.
+      CLEAR wl_yhp_idx_td151.
+    ENDIF.
+
+    "
+    " Completamos datos para el IDOC
+    "
+    CLEAR wl_data-comments.
+    CLEAR wl_data-endcreation.
+    CLEAR wl_data-endeff.
+***wl_data-ERPHANDLINGUNITID
+    IF wp_ltak-trart = 'A'.
+      CALL FUNCTION 'CONVERSION_EXIT_LENUM_OUTPUT'
+        EXPORTING
+          input           = <fs_ltap>-vlenr
+        IMPORTING
+          output          = wl_data-erphandlingunitid
+        EXCEPTIONS
+          t344_get_failed = 1
+          OTHERS          = 2.
+    ELSE.
+
+      CALL FUNCTION 'CONVERSION_EXIT_LENUM_OUTPUT'
+        EXPORTING
+          input           = <fs_ltap>-nlenr
+        IMPORTING
+          output          = wl_data-erphandlingunitid
+        EXCEPTIONS
+          t344_get_failed = 1
+          OTHERS          = 2.
+    ENDIF.
+    IF sy-subrc <> 0.
+      CLEAR wl_data-erphandlingunitid.
+    ENDIF.
+    wl_data-event = 'Confirmed'.
+    IF wp_ltak-trart = 'A'. " Salida de stocks.
+      wl_data-event = 'Scrapped'.
+    ENDIF.
+
+    IF wp_ltak-trart = 'E' AND <fs_ltap>-bestq <> space. " Entrada distinta de libre utilización
+      wl_data-event = 'OnHold'.
+    ENDIF.
+
+    IF wp_ltak-trart = 'U' AND <fs_ltap>-bestq <> space.
+      " Traspaso. Hay que hacer tratamiento especial y solo se debería tener la posición de ubicación final.
+      wl_data-event = 'OnHold'.
+    ENDIF.
+
+    IF wp_ltak-trart = 'X'.
+      " Creación manual de ajuste. Hay que analizar cada caso.
+      IF <fs_ltap>-vlenr = <fs_ltap>-nlenr.
+        " si es la UA origen y destino son las mismas, es una reubicación y no hay que informar.
+        CONTINUE.
+      ENDIF.
+      IF <fs_ltap>-bestq <> space.
+        wl_data-event = 'OnHold'.
+      ENDIF.
+      IF <fs_ltap>-nlenr IS INITIAL.
+        " Si al final no hay UA destino, significa destrucción.
+        wl_data-event = 'Scrapped'.
+
+        CALL FUNCTION 'CONVERSION_EXIT_LENUM_OUTPUT'
+          EXPORTING
+            input           = <fs_ltap>-vlenr
+          IMPORTING
+            output          = wl_data-erphandlingunitid
+          EXCEPTIONS
+            t344_get_failed = 1
+            OTHERS          = 2.
+
+        " Si queda algo en el cuanto, entonces es una modificación.
+        SELECT SINGLE *
+          FROM lqua
+          INTO @DATA(wl_lqua)
+          WHERE lgnum = @<fs_ltap>-lgnum AND
+                lenum = @<fs_ltap>-vlenr.
+        IF sy-subrc = 0 AND wl_lqua-gesme <> 0.
+          IF wl_lqua-bestq IS INITIAL.
+            wl_data-event = 'Confirmed'.
+          ELSE.
+            wl_data-event = 'OnHold'.
+          ENDIF.
+          " Modifico la cantidad
+          <fs_ltap>-nistm = wl_lqua-gesme.
+          <fs_ltap>-brgew = wl_lqua-mgewi.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+
+    vl_fecha = <fs_ltap>-qdatu.
+    vl_hora = <fs_ltap>-qzeit.
+    CALL FUNCTION 'ZSD_IF_OMP_COMP_DATETIME'
+      EXPORTING
+        vp_fecha    = vl_fecha
+        vp_hora     = vl_hora
+      IMPORTING
+        vp_datetime = wl_data-eventdate.
+
+*    wl_data-eventdate = |{ vl_fecha+6(2) }/{ vl_fecha+4(2) }/{ vl_fecha(4) },{ vl_hora(2) }:{ vl_hora+2(2) }:{ vl_hora+4(2) }|.
+***wl_data-EVENTDATESEQNR
+    wl_data-footprintlength = wl_yhp_idx_td151-length.
+    CALL FUNCTION 'ZSD_IF_OMP_GET_UM'
+      EXPORTING
+        vp_meins = wl_yhp_idx_td151-length_uom
+      IMPORTING
+        vp_mseh6 = wl_data-footprintlength_uom.
+
+    wl_data-footprintwidth = wl_yhp_idx_td151-width.
+    CALL FUNCTION 'ZSD_IF_OMP_GET_UM'
+      EXPORTING
+        vp_meins = wl_yhp_idx_td151-width_uom
+      IMPORTING
+        vp_mseh6 = wl_data-footprintwidth_uom.
+
+    wl_data-goodsid = <fs_ltap>-matnr.
+    wl_data-grossheight = wl_yhp_idx_td151-height.
+
+    CALL FUNCTION 'ZSD_IF_OMP_GET_UM'
+      EXPORTING
+        vp_meins = wl_yhp_idx_td151-height_uom
+      IMPORTING
+        vp_mseh6 = wl_data-grossheight_uom.
+
+    wl_data-grossweight = <fs_ltap>-brgew." Unidad es GEWEI.
+    CALL FUNCTION 'ZSD_IF_OMP_GET_UM'
+      EXPORTING
+        vp_meins = <fs_ltap>-gewei
+      IMPORTING
+        vp_mseh6 = wl_data-grossweight_uom.
+
+    wl_data-handlingunitquantity = <fs_ltap>-nistm.
+    CALL FUNCTION 'ZSD_IF_OMP_GET_UM'
+      EXPORTING
+        vp_meins = <fs_ltap>-meins
+      IMPORTING
+        vp_mseh6 = wl_data-handlingunitquantity_uom.
+
+***wl_data-NETWEIGHT
+    IF wl_aufk-kdauf IS NOT INITIAL.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = wl_aufk-kdauf
+        IMPORTING
+          output = wl_data-orderid.
+
+    ENDIF.
+    IF wl_mseg_of-aufnr IS NOT INITIAL.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = wl_mseg_of-aufnr
+        IMPORTING
+          output = wl_data-runid.
+
+    ENDIF.
+
+    CLEAR wl_data-startcreation.
+    CLEAR wl_data-starteff.
+    CLEAR wl_data-stepid.
+    CLEAR wl_data-storageposition.
+    wl_data-transportlocationid = wl_config_omp-transportlocationid.
+    wl_data-whid = vp_lgnum.
+
+    "
+    " Mejor usar un rango
+    "
+    DATA: wl_if_omp_hu  TYPE zssd_if_omp_hu,
+          wl_returncode LIKE  inri-returncode.
+    CLEAR wl_if_omp_hu.
+*    SELECT MAX( num_envio )
+*      INTO wl_if_omp_hu-num_envio
+*      FROM zssd_if_omp_hu.
+
+
+    CALL FUNCTION 'NUMBER_GET_NEXT'
+      EXPORTING
+        object                  = 'ZIF_OMP_HU'
+        nr_range_nr             = '01'
+      IMPORTING
+        number                  = wl_if_omp_hu-num_envio
+        returncode              = wl_returncode
+      EXCEPTIONS
+        interval_not_found      = 01
+        number_range_not_intern = 02
+        object_not_found        = 03.
+
+
+    wl_if_omp_hu-usucre = sy-uname.
+    wl_if_omp_hu-erdat = sy-datum.
+    wl_if_omp_hu-erzet = sy-uzeit.
+    wl_if_omp_hu-lgnum = vp_lgnum.
+    wl_if_omp_hu-tanum = vp_tanum.
+
+    MOVE-CORRESPONDING wl_data TO wl_if_omp_hu.
+
+    INSERT zssd_if_omp_hu FROM wl_if_omp_hu.
+
+  ENDLOOP.
+
+
+ENDFUNCTION.

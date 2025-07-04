@@ -1,0 +1,282 @@
+
+class ZCL_VCXI_PXM_CAD_STP_S003 definition
+  public
+  inheriting from ZCL_VCXI_PXM_CAD_STP_S000
+  create public .
+
+public section.
+
+  methods EXECUTE
+    redefinition .
+protected section.
+
+  methods CHECK_CADPS
+    importing
+      !IR_SVC type ref to /VCXI/CL_VKSRA_SVC
+    returning
+      value(RF_CONTINUE) type ABAP_BOOL
+    raising
+      /VCXI/CX_CKX .
+  methods BUILD_IDAT
+    importing
+      !IR_BOB_MAT type ref to ZCL_VCXI_XCI_BOB_MAT
+      !IT_LEVEL type /VCXI/VKSR_TT_LEVEL
+    raising
+      /VCXI/CX_CKX .
+  methods COLLECT_LEVEL
+    importing
+      !IR_SVC type ref to /VCXI/CL_VKSRA_SVC
+    returning
+      value(RT_LEVEL) type /VCXI/VKSR_TT_LEVEL
+    raising
+      /VCXI/CX_CKX .
+  methods UPDATE_SVC
+    importing
+      !IR_SVC type ref to /VCXI/CL_VKSRA_SVC
+    raising
+      /VCXI/CX_CKX .
+  methods GET_BOB_MAT
+    importing
+      !IF_MATNR type MATNR
+      !IF_WERKS type WERKS_D
+    returning
+      value(RR_BOB_MAT) type ref to ZCL_VCXI_XCI_BOB_MAT
+    raising
+      /VCXI/CX_CKX .
+  methods GET_EA_CADIF_PRJ
+    importing
+      !IR_SVC type ref to /VCXI/CL_VKSRA_SVC
+    returning
+      value(RR_EA_CADIF_PRJ) type ref to ZCL_VCXI_PXSS_EA_CADIF_PRJ
+    raising
+      /VCXI/CX_CKX .
+private section.
+endclass. "ZCL_VCXI_PXM_CAD_STP_S003 definition
+class ZCL_VCXI_PXM_CAD_STP_S003 implementation.
+  method BUILD_IDAT.
+
+    data: LS_SVCEL    type ZVCXI_XCI_S_SVCEL.
+    data: LT_SVCEL    type ZVCXI_XCI_TT_SVCEL.
+    data: LR_SVC      type ref to /VCXI/CL_VKSRA_SVC,
+          LR_IDAT_SVC type ref to ZCL_VCXI_XCI_IDAT_SVC.
+
+
+***------------------------------------------------------------------------------------------------
+*** Get SmartVC API Instance
+    LR_SVC = IR_BOB_MAT->GET_SVC( ).
+
+*** Build Integration Data Service
+    LR_IDAT_SVC = ZCL_VCXI_XCI_IDAT_SVC=>CREATE( IS_CMPRK = LR_SVC->S_CMPRK
+                                                 IF_IEALI = 'X_IDATSPV' ).
+
+*** Fill by SmartVC
+    LR_IDAT_SVC->FILL_BY_SVC( IR_SVC        = LR_SVC
+                              IF_WITH_LEVEL = ABAP_TRUE ).
+
+*** Remove Level of new Elements
+    loop at LR_IDAT_SVC->T_SVCEL into LS_SVCEL.
+      if not LINE_EXISTS( IT_LEVEL[ TABLE_LINE = LS_SVCEL-LEVEL ] ).
+        clear LS_SVCEL-LEVEL.
+        append LS_SVCEL to LT_SVCEL.
+      endif.
+    endloop.
+    loop at LT_SVCEL into LS_SVCEL.
+      LR_IDAT_SVC->UPDATE_SVCEL( LS_SVCEL ).
+    endloop.
+
+*** Mark deleted Elements through their Level
+    loop at IT_LEVEL into data(LF_LEVEL).
+      if not LINE_EXISTS( LR_IDAT_SVC->T_SVCEL[ LEVEL = LF_LEVEL ] ).
+        clear LS_SVCEL.
+        LS_SVCEL-CSELF = LR_IDAT_SVC->ADD_SVCEL( IF_ISELF = LS_SVCEL-ISELF ).
+        LS_SVCEL-LEVEL = LF_LEVEL.
+        LS_SVCEL-UPDKZ = ZCL_VCXI_XCI_IDAT_SVC=>C_UPDKZ_DELETE.
+        LR_IDAT_SVC->UPDATE_SVCEL( LS_SVCEL ).
+      endif.
+    endloop.
+
+***------------------------------------------------------------------------------------------------
+*** Save Integration Data if requested
+    if ME->R_DCO_INPUT->F_FSIDA eq ABAP_TRUE.
+      LR_IDAT_SVC->/VCXI/IF_CKX_OBJECT_ACTION~HANDLE_ACTION( IF_FCODE = ZCL_VCXI_XCI_IDAT_SVC=>C_FCODE_SAVE ).
+***   Integration Data & was saved.
+      ME->R_RPSEG->R_MSG->ADD_MESSAGE( IF_MSGID = 'ZVCXI_XCIU'
+                                       IF_MSGTY = 'S'
+                                       IF_MSGNO = '101'
+                                       IF_MSGV1 = LR_IDAT_SVC->/VCXI/IF_CKX_OBJECT~GET_GUID( ) ).
+    endif.
+
+*** Set Integradion Data Number to Buffer for later processing
+    call function 'ZVCXI_XCC_IDAT_SET_NIDAT'
+      exporting
+        IF_NIDAT = conv ZVCXI_XCI_NIDAT( LR_IDAT_SVC->/VCXI/IF_CKX_OBJECT~GET_GUID( ) ).
+
+  endmethod.
+  method CHECK_CADPS.
+
+*** Get Reference to CAD Integration - Project
+    data(LR_EA_CADIF_PRJ) = ME->GET_EA_CADIF_PRJ( IR_SVC = IR_SVC ).
+    check LR_EA_CADIF_PRJ is bound.
+
+*** Set Next Status
+    case LR_EA_CADIF_PRJ->GET_CADPS(  ).
+      when 'CLS'.
+***     Project already closed.
+        ME->R_RPSEG->R_MSG->ADD_MESSAGE( IF_MSGID = 'ZVCXI_PXM_CAD'
+                                         IF_MSGTY = 'I'
+                                         IF_MSGNO = '001' ).
+
+***     Set Status to CANCELED
+        ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_CANCELED ).
+        return.
+
+      when others.
+        RF_CONTINUE = ABAP_TRUE.
+    endcase.
+
+  endmethod.
+  method COLLECT_LEVEL.
+
+    data: LT_SVCEL type /VCXI/CKX_TT_OBJECT.
+    data: LR_OBJECT   type ref to /VCXI/IF_CKX_OBJECT.
+
+
+    append lines of ZCL_VCXI_XCI_IDAT_SVC=>GET_ROOT_SVCEL( IR_SVC   = IR_SVC
+                                                           IF_IEALI = 'X_IDATSPV' ) to LT_SVCEL.
+    loop at LT_SVCEL into LR_OBJECT.
+      if cast /VCXI/CL_VKSRA_SVC_ELEMENT( LR_OBJECT )->GET_CLSEA( ) is instance of ZCL_VCXI_XCSR_EA_RTESPV.
+        continue.
+      endif.
+      insert cast /VCXI/CL_VKSRA_SVC_ELEMENT( LR_OBJECT )->GET_LEVEL( ) into table RT_LEVEL.
+      append lines of cast /VCXI/CL_VKSRA_SVC_ELEMENT( LR_OBJECT )->/VCXI/IF_CKX_OBJECT_H~GET_CHILDREN( ) to LT_SVCEL.
+    endloop.
+
+  endmethod.
+  method EXECUTE.
+
+    data: LF_MATNR type MATNR,
+          LF_WERKS type WERKS_D.
+    data: LT_LEVEL type /VCXI/VKSR_TT_LEVEL.
+    data: LR_BOB_MAT type ref to ZCL_VCXI_XCI_BOB_MAT,
+          LR_SVC     type ref to /VCXI/CL_VKSRA_SVC.
+
+    try.
+***     Save Status
+        ME->R_RPSEG->SAVE_AND_COMMIT( ).
+
+***--------------------------------------------------------------------------------------
+***     Check Project Owner is a Material
+        if ME->R_DCO_INPUT->F_CADPO np 'MARC*'.
+***       Set Status to CANCELED
+          ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_CANCELED ).
+          return.
+        endif.
+
+***     Deserialize Owner
+        LF_MATNR = ME->R_DCO_INPUT->F_CADPO+4(18).
+        LF_WERKS = ME->R_DCO_INPUT->F_CADPO+22(4).
+
+***     Get Business Object and try to lock it
+        LR_BOB_MAT = ME->GET_BOB_MAT( IF_MATNR = LF_MATNR
+                                      IF_WERKS = LF_WERKS ).
+        LR_BOB_MAT->ENQUEUE( ).
+
+***--------------------------------------------------------------------------------------
+***     Run Configuration of Material
+        LR_BOB_MAT->RUN_CONFIG( IF_LOCKED = ABAP_TRUE ).
+
+***     Get SmartVC API Instance
+        LR_SVC = LR_BOB_MAT->GET_SVC( ).
+
+***     Check Project Status
+        check ME->CHECK_CADPS( IR_SVC = LR_SVC ).
+
+***     Collect all Levels for later comparison to identify delete element in Update Mode of Integration Data
+        LT_LEVEL = ME->COLLECT_LEVEL( IR_SVC = LR_SVC ).
+
+***     Update SmartVC based on Inbound Information
+        ME->UPDATE_SVC( IR_SVC = LR_SVC ).
+
+***     Run Configuration afterwards to ensure Routing Supervisor gets executed
+        LR_SVC->UPDATE_DC( ).
+
+***     Process Configuration (Lock VC if inconsistent)
+        LR_BOB_MAT->RUN_CONFIG( IF_LOCKED = ABAP_TRUE ).
+
+***------------------------------------------------------------------------------------------------
+***     Create Integration Data for SmartVC
+        ME->BUILD_IDAT( IR_BOB_MAT = LR_BOB_MAT
+                        IT_LEVEL   = LT_LEVEL ).
+
+***     Change Material Configuration
+        LR_BOB_MAT->CHANGE_CONFIG( IF_COMMIT  = ABAP_FALSE
+                                   IF_ENQUEUE = ABAP_TRUE ).
+
+***--------------------------------------------------------------------------------------
+***     Get SmartVC Messages
+        LR_SVC = LR_BOB_MAT->GET_SVC( ).
+        if LR_SVC is bound.
+***       Add filtered SmartVC Messages to Process Segment
+          LR_SVC->GET_STATUS_MSG( II_MSGTY   = value #( ( SIGN = 'E' OPTION = 'EQ' LOW = 'S' ) )
+                                  IR_MESSAGE = ME->R_RPSEG->R_MSG ).
+        endif.
+
+***--------------------------------------------------------------------------------------
+***     Material Configuration successfully updated.
+        ME->R_RPSEG->R_MSG->ADD_MESSAGE( IF_MSGID = 'ZVCXI_PXM_CAD'
+                                         IF_MSGTY = 'S'
+                                         IF_MSGNO = '031' ).
+***     Set Status to Complete
+        ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_COMPLETED ).
+
+      catch /VCXI/CX_CKX into data(LR_CX_CKX).
+***     Set Status to Error
+        ME->R_RPSEG->SET_SRPSG( IF_SRPSG = switch #( LR_CX_CKX->F_TEMP when ABAP_TRUE then /VCXI/CL_CKMR_RPSEG=>C_SRPSG_ERROR_TMP
+                                                                                      else /VCXI/CL_CKMR_RPSEG=>C_SRPSG_ERROR ) ).
+
+***     Add Message to Message Log
+        ME->R_RPSEG->R_MSG->ADD_MESSAGE_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+    endtry.
+
+*** Perform Save and Commit
+    ME->R_RPSEG->SAVE_AND_COMMIT( ).
+
+  endmethod.
+  method GET_BOB_MAT.
+
+***------------------------------------------------------------------------------------------------
+*** Create a new Material Business Object Instance
+    RR_BOB_MAT = new #( ).
+
+*** Load Material
+    RR_BOB_MAT->INIT_FROM_DB( IF_MATNR = IF_MATNR
+                              IF_WERKS = IF_WERKS ).
+
+  endmethod.
+  method GET_EA_CADIF_PRJ.
+
+    data: LT_SVCEL       type /VCXI/CKX_TT_OBJECT.
+
+
+*** Get Reference to CAD Integration - Project
+    LT_SVCEL = IR_SVC->GET_SVC_ELEMENTS( IF_ID = 'CADIF_PRJ' ).
+    check LT_SVCEL is not initial.
+
+    RR_EA_CADIF_PRJ ?= cast /VCXI/CL_VKSRA_SVC_ELEMENT( LT_SVCEL[ 1 ] )->GET_CLSEA( ).
+
+  endmethod.
+  method UPDATE_SVC.
+
+*** Get Reference to CAD Integration - Project
+    data(LR_EA_CADIF_PRJ) = ME->GET_EA_CADIF_PRJ( IR_SVC = IR_SVC ).
+    check LR_EA_CADIF_PRJ is bound.
+
+*** Set Full XML
+    LR_EA_CADIF_PRJ->SET_XML( IF_XXML = ME->R_DCO_INPUT->F_XXML ).
+
+*** For Debugging
+    if 1 eq 2.
+      IR_SVC->START_UI( ).
+    endif.
+
+  endmethod.

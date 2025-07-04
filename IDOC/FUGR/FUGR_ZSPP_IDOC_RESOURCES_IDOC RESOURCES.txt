@@ -1,0 +1,270 @@
+FUNCTION zspp_idoc_resources.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(IT_MATNR) TYPE  ZSPP_TT_MATNR
+*"----------------------------------------------------------------------
+
+CHECK 1 = 2.
+
+  DATA: ls_idoc_header       TYPE edidc,
+        lt_idoc_comm_control TYPE TABLE OF edidc,
+        ls_idoc_comm_control TYPE edidc,
+        lt_return            TYPE bapiret2_t,
+        ls_return            TYPE bapiret2,
+        ls_return1           TYPE bapiret1,
+        t_edidd              TYPE edidd_tt,
+        t_edidd_aux          TYPE edidd_tt,
+        l_resource           TYPE zresourcelocation,
+        l_resourcedata       TYPE zresourcelocationdata.
+
+  DATA rg_matnr TYPE RANGE OF matnr.
+
+*  •  En cuanto a “Resources” (útiles y clichés) necesitamos saber qué codificación van a  tener los clichés y útiles y la lógica que se va a seguir para nosotros poder pasar la info correspondiente a OMP. Hemos visto que ya hay algunos cliches creados
+*  con una codificación alfanumérica como estos:
+*
+*  O  UC2001E000001
+*  O  UT2001B000001A
+*
+*  Por favor, decidnos qué lógica se ha seguido para definir la máscara y así
+*
+*  La mascara se DEFINE de la siguiente forma:
+*
+*  O  U: constante para todos los útiles.
+*  O  C ó T: C para clichés, T para troqueles
+*  O  2001: Planta
+*  O  X Letra que sale de la tabla ZTMM0033 y se corresponde con la máquina donde se va a usar
+*  O  000001 Contador secuencial
+*  O  A: para troqueles la última letra es secuencial y se usa para saber si hay mas de un troquel igual. Me explico. Tooling portal NO soporta dos unidades de un mismo material. Lo que hemos hecho para solventar esta deficiencia es incluir esta letra
+*  secuencial de tal manera que dos unidades del mismo útil se diferencian por esa letra.
+*  1 – Tenemos 2 útiles UT2001B000001A y UT2001B000001B, ambos son del mismo modelo, con fechas de disponibilidad 3 de marzo y 20 de marzo, y ejecutamos el idoc a día de hoy, 23 de marzo, al ser fecha a pasado se entiende que ambos están disponibles y
+*  enviamos la información del siguiente modo en el idoc/xml a omp, 1 único útil del modelo y con cantidad 2 y fecha de disponibilidad la más cercana a la fecha de ejecución:
+*  Resourceid UT2001B000001
+*  Quantity 2
+*  Startdate 20/03/2022 Esta opción parece la más adecuada. En cualquier caso, tal y como hemos comentado esta mañana internamente, previo al envío de la fecha deberíamos chequear el status del material (tenemos pendiente definir los status acorde al
+*  tooling portal). la idea sería: chequeo status de material: ¿es disponible? no # chequeo fechas y envío disponibilidad. si # no chequeo fechas ya que están disponibles.
+*
+*  ¿O por el contrario deberíamos enviar la información así, una vez por código de material/útil?
+*  Resourceid UT2001B000001A
+*  Quantity 1
+*  Startdate 03/03/2022
+*
+*  Resourceid UT2001B000001B
+*  Quantity 1
+*  Startdate 20/03/2022
+*
+*  2 – Tenemos 2 útiles UT2001B000001A y UT2001B000001B del mismo modelo, con fechas de disponibilidad 3 de marzo y 30 de marzo, y ejecutamos el idoc a día de hoy, 23 de marzo, al tener uno a fecha pasado y otro a fecha futuro, entendemos que sólo hay
+*  disponibles 1 unidad a fecha 3 de marzo, por lo que enviamos la información así.
+*  Resourceid UT2001B000001
+*  Quantity 1
+*  Startdate 03/03/2022 Esta opción parece la más adecuada. Misma lógica…previamente chequeo status de ambos.
+*
+*  ¿O por el contrario enviamos ambos útiles con la letra y sus fechas de disponibilidad como en el primer caso?
+*
+*  3 – Tenemos 2 útiles UT2001B000001A y UT2001B000001B del mismo modelo, con fechas de disponibilidad 31 de marzo y 30 de marzo, y ejecutamos el idoc a día de hoy, 23 de marzo, al tener ambos a fecha futuro, entendemos que NO hay disponibles a fecha de
+*  ejecución, por lo que no enviamos ese útil. ¿o enviamos ambos con sus fechas de disponibilidad como en el primer caso? enviamos ut2001b000001 con la fecha de disponibilidad más próxima. misma lógica…previamente chequeo status de ambos.
+*
+*  4 – Tenemos un útil SIN fecha de disponibilidad ¿Enviamos este útil a OMP SIN fecha de disponibilidad y OMP ya gestionará si eso es correcto O incorrecto? ¿u obviamos ese útil? Misma lógica…previamente chequeo status de ambos. Si NO tiene fecha está
+*  disponible.
+*
+*  Entiendo que con los comentarios, lo que nos queda es decirte…que status es disponible. Por favor, lo apuntamos como punto abierto por nuestra parte y te contesto cuando lo aclare con Catalina.
+
+  LOOP AT it_matnr ASSIGNING FIELD-SYMBOL(<matnr>).
+    APPEND INITIAL LINE TO rg_matnr ASSIGNING FIELD-SYMBOL(<rg>).
+    <rg>-sign = 'I'.
+    <rg>-option = 'EQ'.
+    <rg>-low = <matnr>.
+  ENDLOOP.
+
+  DATA lv_obj TYPE inob-cuobj.
+  DATA it_config TYPE TABLE OF conf_out.
+
+  SELECT mara~matnr, maktx, 1 AS cantidad, @sy-datum AS f_dispo, cuobj INTO TABLE @DATA(it_utiles)
+    FROM mara INNER JOIN makt ON mara~matnr EQ makt~matnr AND makt~spras EQ 'S'
+    INNER JOIN marc ON mara~matnr EQ marc~matnr
+    WHERE mtart IN ('ZTRO', 'ZCLI')
+    AND ( mara~matnr LIKE 'UT___________' OR mara~matnr LIKE 'UT____________' OR mara~matnr LIKE 'UC___________' )
+    AND mara~matnr IN @rg_matnr.
+  IF sy-subrc = 0.
+    DATA lv_matnr TYPE matnr.
+    LOOP AT it_utiles ASSIGNING FIELD-SYMBOL(<util>).
+      "Obtenemos la configuración de cada uno para determinar la disponibilidad
+      DATA(lv_indice) = sy-tabix.
+      lv_matnr = <util>-matnr.
+      IF strlen( <util>-matnr ) EQ 14.
+        <util>-matnr = <util>-matnr(13).
+      ENDIF.
+      lv_obj = <util>-cuobj.
+      REFRESH it_config.
+
+      CALL FUNCTION 'VC_I_GET_CONFIGURATION'
+        EXPORTING
+          instance            = lv_obj
+*         BUSINESS_OBJECT     =
+*         LANGUAGE            = SY-LANGU
+*         PRINT_SALES         = ' '
+*         PRINT_PURCHASE      = ' '
+*         PRINT_ENGINEERING   = ' '
+*         IDOC_MODE           = ' '
+*         ANW_SICHT           = ' '
+*         EXCL_IND            = ' '
+*         IV_INVALID_POSSIBLE = ' '
+*         IV_MAX_MASSPROCESSING       = 0
+*         IV_EXPLICIT_ORGAREA = ' '
+*         IV_NO_DESCRIPTION   = ' '
+*         IV_USER             = ' '
+*         IV_NO_VALUE_CHECK   = 'X'
+*         IV_NO_DIALOG        = ' '
+*         IV_DISPLAY_WARNING  = ' '
+        TABLES
+          configuration       = it_config
+*         CONFIGURATION_IDOC  =
+        EXCEPTIONS
+          instance_not_found  = 1
+          internal_error      = 2
+          no_class_allocation = 3
+          instance_not_valid  = 4
+          OTHERS              = 5.
+      IF sy-subrc <> 0.
+        "Si no tiene configuración se entiende que no deberá ser válido
+        DELETE it_utiles INDEX lv_indice.
+        CONTINUE.
+      ENDIF.
+
+*      READ TABLE it_config WITH KEY atnam = 'HP_DAAVL' ASSIGNING FIELD-SYMBOL(<fs_dispo>).
+*      IF sy-subrc <> 0.
+*        "Está disponible, fecha de disponibilidad no se modifica de la obtenida en la select,
+*        "por defecto tendrá fecha de disponibilidad la del día
+*      ELSE.
+*        <util>-f_dispo = <fs_dispo>-atwrt+6(4) && <fs_dispo>-atwrt+3(2) && <fs_dispo>-atwrt(2).
+*        IF <util>-f_dispo > sy-datum.
+*          "Si la fecha de disponibilidad es superior a la fecha actual debemos marcar cantidad = 0.
+*          <util>-cantidad = 0.
+*        ENDIF.
+*      ENDIF.
+      DATA lv_fecha TYPE datum.
+      CLEAR lv_fecha.
+      CALL FUNCTION 'ZSPP_GET_FECHA_DISPO'
+        EXPORTING
+          i_matnr  = lv_matnr
+        IMPORTING
+          o_fdispo = lv_fecha
+*         O_HDISPO =
+        .
+      <util>-f_dispo = lv_fecha.
+      IF <util>-f_dispo > sy-datum.
+        "Si la fecha de disponibilidad es superior a la fecha actual debemos marcar cantidad = 0.
+        <util>-cantidad = 0.
+      ENDIF.
+    ENDLOOP.
+  ELSE.
+    "No hay nada que enviar
+    RETURN.
+  ENDIF.
+
+  "Eliminamos aquellos que no están disponibles
+  DELETE it_utiles WHERE cantidad = 0.
+
+  SORT it_utiles BY matnr f_dispo DESCENDING.
+  DATA(it_aux) = it_utiles[].
+  CLEAR: it_aux, it_aux[].
+  LOOP AT it_utiles ASSIGNING <util> GROUP BY <util>-matnr.
+    "Agrupamos los del mismo modelo y modificamos la fecha de disponibilidad a la más cercana a la fecha de ejecución
+    LOOP AT GROUP <util> ASSIGNING FIELD-SYMBOL(<util2>).
+      <util2>-f_dispo = <util>-f_dispo.
+    ENDLOOP.
+  ENDLOOP.
+  LOOP AT it_utiles ASSIGNING <util>.
+    READ TABLE it_aux WITH KEY matnr = <util>-matnr ASSIGNING FIELD-SYMBOL(<aux>).
+    IF sy-subrc = 0.
+      <aux>-cantidad = <aux>-cantidad + <util>-cantidad.
+    ELSE.
+      APPEND <util> TO it_aux.
+    ENDIF.
+  ENDLOOP.
+
+  it_utiles[] = it_aux[].
+
+* //RESOURCES
+  REFRESH: t_edidd_aux.
+  LOOP AT it_utiles INTO DATA(wa_util).
+    CLEAR: l_edidd.
+    l_resource-operation = 'Replace'.
+
+    l_edidd-sdata = l_resource.
+    l_edidd-segnam = c_resource.
+    APPEND l_edidd TO t_edidd.
+
+    CLEAR: l_edidd.
+    l_resourcedata-comments = ''.
+    l_resourcedata-enddate = ''.
+*    Ubicación donde estará almacenado el útil. MLGT-LGPLA entrando por MATNR, LGTYP = "800"
+    SELECT SINGLE lgpla INTO @l_resourcedata-locationcomments FROM mlgt WHERE lgtyp EQ '800' AND matnr EQ @wa_util-matnr.
+    l_resourcedata-quantity = wa_util-cantidad.
+    l_resourcedata-resourceid = wa_util-matnr.
+    l_resourcedata-resourcelocationid = wa_util-matnr.
+    WRITE wa_util-f_dispo TO l_resourcedata-startdate DD/MM/YYYY LEFT-JUSTIFIED .
+*    T301T-LTYPT entrando por LGTYP = 800 y SPRAS = 'S'
+    SELECT SINGLE ltypt INTO l_resourcedata-warehouseid FROM t301t WHERE lgtyp EQ '800' AND spras EQ 'S'.
+
+    l_edidd-sdata = l_resourcedata.
+    l_edidd-segnam = c_resourcedata.
+    APPEND l_edidd TO t_edidd.
+  ENDLOOP.
+
+  ls_idoc_header-mandt  = sy-mandt.
+  ls_idoc_header-direct = '1'.
+  ls_idoc_header-rcvpor = c_edi_extern.
+  ls_idoc_header-rcvprt = c_ls_d.
+  ls_idoc_header-rcvprn = c_rcvprn.
+  ls_idoc_header-sndprt = c_ls_r.
+  ls_idoc_header-sndprn = sy-uname.
+  ls_idoc_header-mestyp = c_zmsg_resource.
+  ls_idoc_header-idoctp = c_zstpm_resource.
+
+
+  CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE' "IN UPDATE TASK
+    EXPORTING
+      master_idoc_control            = ls_idoc_header
+    TABLES
+      communication_idoc_control     = lt_idoc_comm_control
+      master_idoc_data               = t_edidd
+    EXCEPTIONS
+      error_in_idoc_control          = 1
+      error_writing_idoc_status      = 2
+      error_in_idoc_data             = 3
+      sending_logical_system_unknown = 4
+      OTHERS                         = 5.
+  IF sy-subrc <> 0.
+    "KO
+    ls_return-type        = sy-msgty.
+    ls_return-number      = sy-msgno.
+    ls_return-id          = sy-msgid.
+    ls_return-message_v1  = sy-msgv1.
+    ls_return-message_v2  = sy-msgv2.
+    ls_return-message_v3  = sy-msgv3.
+    ls_return-message_v4  = sy-msgv4.
+    APPEND ls_return TO lt_return.
+  ELSE.
+    "OK
+    READ TABLE lt_idoc_comm_control INTO DATA(ls_control_record_out) INDEX 1.
+    CHECK sy-subrc = 0.
+    DATA(docnum) = ls_control_record_out-docnum.
+    ls_return-type        = 'S'.
+    ls_return-number      = '398'.
+    ls_return-id          = '00'.
+    ls_return-message_v1  = docnum.
+    APPEND ls_return TO lt_return.
+  ENDIF.
+
+* Hacemos un COMMIT para el Idoc
+*  CALL FUNCTION 'DEQUEUE_ALL'.
+*  COMMIT WORK AND WAIT.
+  CALL FUNCTION 'DB_COMMIT'.
+  CALL FUNCTION 'DEQUEUE_ALL'.
+*  COMMIT WORK.
+
+
+
+
+ENDFUNCTION.

@@ -1,0 +1,376 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZXV50QU01
+*&---------------------------------------------------------------------*
+
+*"----------------------------------------------------------------------
+*"*"Lokale Schnittstelle:
+*"  IMPORTING
+*"     VALUE(IF_FLAG_INBOUND) TYPE  CHAR1
+*"     VALUE(IF_PROCTYPE) TYPE  CHAR1
+*"  TABLES
+*"      CT_POSTAB STRUCTURE  LIPOV
+*"----------------------------------------------------------------------
+
+
+DATA: v_kwmeng LIKE vbap-kwmeng.
+FIELD-SYMBOLS <fs> LIKE LINE OF ct_postab.
+
+DATA: lt_seg_cal TYPE HASHED TABLE OF ztsd0004 WITH UNIQUE KEY zzsegal
+                                                               spras,
+      ls_seg_cal LIKE LINE OF lt_seg_cal.
+
+SELECT * FROM ztsd0004 INTO TABLE lt_seg_cal WHERE spras = sy-langu.
+
+IF ct_postab[] IS NOT INITIAL.
+  SELECT vttp~tknum, vttp~vbeln, vttk~tdlnr, lfa1~name1
+    INTO TABLE @DATA(tl_vttp)
+    FROM vttp INNER JOIN vttk LEFT OUTER JOIN lfa1 ON lfa1~lifnr = vttk~tdlnr
+              ON vttk~tknum = vttp~tknum
+    FOR ALL ENTRIES IN @ct_postab
+    WHERE vbeln = @ct_postab-vbeln.
+
+  SELECT vbeln, posnr, zzmontaje, cuobj
+    INTO TABLE @DATA(tl_lips)
+    FROM lips
+    FOR ALL ENTRIES IN @ct_postab
+    WHERE vbeln = @ct_postab-vbeln AND
+          posnr = @ct_postab-posnr.
+*  IF tl_lips IS NOT INITIAL.
+*    SELECT yhp_idx_td100~cuobj, yhp_idx_td100~sblar
+*      INTO TABLE @DATA(tl_td100_lips)
+*      FROM yhp_idx_td100
+*      FOR ALL ENTRIES IN @tl_lips
+*      WHERE yhp_idx_td100~cuobj = @tl_lips-cuobj.
+*  ENDIF.
+
+
+
+  SELECT marc~matnr, marc~werks, marc~cuobj, yhp_idx_td100~fscty
+    INTO TABLE @DATA(tl_td100)
+    FROM yhp_idx_td100 INNER JOIN marc ON marc~cuobj = yhp_idx_td100~cuobj
+    FOR ALL ENTRIES IN @ct_postab
+    WHERE marc~matnr = @ct_postab-matnr AND
+          marc~werks = @ct_postab-werks.
+
+  SELECT *
+    INTO TABLE @DATA(tl_calendar)
+    FROM zssdt016calendar
+    FOR ALL ENTRIES IN @ct_postab
+    WHERE vkorg = @ct_postab-vkorg AND
+          kunwe = @ct_postab-kunnr.
+
+  SELECT *
+    INTO TABLE @DATA(tl_knva)
+    FROM knva
+    FOR ALL ENTRIES IN @ct_postab
+    WHERE kunnr = @ct_postab-kunnr.
+
+  SELECT vbelv, vbeln
+    INTO TABLE @DATA(tl_vbfa)
+    FROM vbfa
+    FOR ALL ENTRIES IN @ct_postab
+    WHERE vbeln     = @ct_postab-vbeln AND
+          vbtyp_v   = 'C'.
+  IF tl_vbfa IS NOT INITIAL.
+    SELECT vbeln, vdatu
+      INTO TABLE @DATA(tl_vbak)
+      FROM vbak
+      FOR ALL ENTRIES IN @tl_vbfa
+      WHERE vbeln     = @tl_vbfa-vbelv.
+  ENDIF.
+
+
+ENDIF.
+
+
+TYPES: tt_indices TYPE TABLE OF sy-index WITH DEFAULT KEY.
+DATA: BEGIN OF wl_horarios,
+        dias      TYPE text20,
+        intervalo TYPE text40,
+      END OF wl_horarios.
+DATA: tl_horarios LIKE TABLE OF wl_horarios.
+
+
+LOOP AT ct_postab ASSIGNING <fs>.
+
+  IF <fs>-zzsegcal IS NOT INITIAL.
+    READ TABLE lt_seg_cal INTO ls_seg_cal WITH TABLE KEY zzsegal = <fs>-zzsegcal
+                                                         spras   = sy-langu.
+    IF sy-subrc EQ 0.
+      <fs>-zzsegcal_desc = ls_seg_cal-texto.
+    ENDIF.
+  ENDIF.
+
+
+
+
+*  CONVERSION DE STOCK A M2
+*
+*
+*  CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+*    EXPORTING
+*      i_matnr              = <fs>-matnr
+*      i_in_me              = <fs>-vrkme
+*      i_out_me             = 'M2'
+*      i_menge              = <fs>-lfimg
+*    IMPORTING
+*      e_menge              = <fs>-zzlfimg_m2
+*    EXCEPTIONS
+*      error_in_application = 1
+*      error                = 2
+*      OTHERS               = 3.
+*  IF sy-subrc = 0.
+*    <fs>-zzm2 = 'M2'.
+*  ELSE.
+*    CLEAR: <fs>-zzlfimg_m2,<fs>-zzm2.
+*  ENDIF.
+
+
+  "83560 - M2 EXPEDIDOS TIENE QUE SER AREA BRUTA COMO LOS QUE SALEN EN LOS PEDIDOS
+  "En LIPS – CUOBJ tenemos la configuración y debemos de entrar en la tabla YHP_IDX_TD100 con ese CUOBJ y obtener el valor de SBLAR que es el área bruta.
+  "A partir de ahí la formula es
+  "Cantidad en M2 = LIPS – LFIMG * YHP_IDX_TD100 – SBLAR / 1000000
+
+*  CLEAR: <fs>-zzlfimg_m2,<fs>-zzm2.
+*  READ TABLE tl_lips ASSIGNING FIELD-SYMBOL(<fs_lips>) WITH KEY vbeln = <fs>-vbeln
+*                                                                posnr = <fs>-posnr.
+*  IF sy-subrc = 0.
+*    <fs>-zzmontaje = <fs_lips>-zzmontaje.
+*    READ TABLE tl_td100_lips ASSIGNING FIELD-SYMBOL(<fs_td100_lips>) WITH KEY cuobj = <fs_lips>-cuobj.
+*    IF sy-subrc = 0.
+*      <fs>-zzlfimg_m2 = <fs>-lfimg * <fs_td100_lips>-sblar / 1000000.
+*      <fs>-zzm2       = 'M2'.
+*    ENDIF.
+*  ENDIF.
+
+
+
+
+
+
+  IF  <fs>-s_vgbel NE '' AND <fs>-s_vgpos NE '' AND  <fs>-s_vgtyp EQ 'V'.
+    SELECT SINGLE  menge INTO  <fs>-zzmenge
+      FROM ekpo
+      WHERE ebeln EQ <fs>-s_vgbel AND
+      ebelp EQ <fs>-s_vgpos.
+  ENDIF.
+
+
+  READ TABLE tl_vttp ASSIGNING FIELD-SYMBOL(<fs_vttp>) WITH KEY vbeln = <fs>-vbeln.
+  IF sy-subrc = 0.
+    <fs>-zztknum = <fs_vttp>-tknum.
+    IF <fs>-spdnr IS INITIAL.
+      <fs>-spdnr    = <fs_vttp>-tdlnr.
+      <fs>-name_sp  = <fs_vttp>-name1.
+    ENDIF.
+  ENDIF.
+
+  READ TABLE tl_td100 ASSIGNING FIELD-SYMBOL(<fs_td100>) WITH KEY matnr = <fs>-matnr
+                                                                  werks = <fs>-werks.
+  IF sy-subrc = 0.
+    <fs>-zzfscty = <fs_td100>-fscty.
+  ENDIF.
+
+
+
+  READ TABLE tl_vbfa ASSIGNING FIELD-SYMBOL(<fs_vbfa>) WITH KEY vbeln = <fs>-vbeln.
+  IF sy-subrc = 0.
+    READ TABLE tl_vbak ASSIGNING FIELD-SYMBOL(<fs_vbak>) WITH KEY vbeln = <fs_vbfa>-vbelv.
+  ENDIF.
+  IF sy-subrc = 0.
+    <fs>-zzvdatu = <fs_vbak>-vdatu.
+  ENDIF.
+
+
+
+  READ TABLE tl_calendar ASSIGNING FIELD-SYMBOL(<fs_calendar>) WITH KEY vkorg = <fs>-vkorg
+                                                                        kunwe = <fs>-kunnr.
+  IF sy-subrc = 0.
+    DATA vl_adatu TYPE text10.
+    DATA vl_bdatu TYPE text10.
+
+    WRITE <fs_calendar>-adatu TO vl_adatu DD/MM/YYYY.
+    WRITE <fs_calendar>-bdatu TO vl_bdatu DD/MM/YYYY.
+    <fs>-zzfestivo_destinatario = |{ vl_adatu }-{ vl_bdatu }|.
+  ENDIF.
+
+
+  "Horario destinatario
+  CLEAR tl_horarios.
+  READ TABLE tl_knva ASSIGNING FIELD-SYMBOL(<fs_knva>) WITH KEY kunnr = <fs>-kunnr.
+  IF sy-subrc = 0.
+
+    "L – V: 08.00 – 13.00
+    "L – J: 08.00 – 13.00 / V: 08.00 – 12.00
+    "L – M – J – V: 08.00 – 13.00 / X: 08.00 – 12.00
+
+    "lunes mañana de- mañana a- tarde de - tarde a-
+    "Lunes
+    CLEAR wl_horarios.
+    DATA: vl_hora1_ini TYPE tims,
+          vl_hora1_fin TYPE tims,
+          vl_hora2_ini TYPE tims,
+          vl_hora2_fin TYPE tims,
+          vl_dia       TYPE c.
+
+    DATA: vl_hora_ini_c TYPE text10,
+          vl_hora_fin_c TYPE text10,
+          vl_index      TYPE n.
+
+    DO 7 TIMES.
+      CLEAR: wl_horarios.
+      vl_index = sy-index.
+      CASE vl_index.
+        WHEN 1.
+          vl_hora1_ini    = <fs_knva>-moab1.
+          vl_hora1_fin    = <fs_knva>-mobi1.
+          vl_hora2_ini    = <fs_knva>-moab2.
+          vl_hora2_fin    = <fs_knva>-mobi2.
+        WHEN 2.
+          vl_hora1_ini = <fs_knva>-diab1.
+          vl_hora1_fin = <fs_knva>-dibi1.
+          vl_hora2_ini = <fs_knva>-diab2.
+          vl_hora2_fin = <fs_knva>-dibi2.
+        WHEN 3.
+          vl_hora1_ini = <fs_knva>-miab1.
+          vl_hora1_fin = <fs_knva>-mibi1.
+          vl_hora2_ini = <fs_knva>-miab2.
+          vl_hora2_fin = <fs_knva>-mibi2.
+        WHEN 4.
+          vl_hora1_ini = <fs_knva>-doab1.
+          vl_hora1_fin = <fs_knva>-dobi1.
+          vl_hora2_ini = <fs_knva>-doab2.
+          vl_hora2_fin = <fs_knva>-dobi2.
+        WHEN 5.
+          vl_hora1_ini = <fs_knva>-frab1.
+          vl_hora1_fin = <fs_knva>-frbi1.
+          vl_hora2_ini = <fs_knva>-frab2.
+          vl_hora2_fin = <fs_knva>-frbi2.
+        WHEN 6.
+          vl_hora1_ini = <fs_knva>-saab1.
+          vl_hora1_fin = <fs_knva>-sabi1.
+          vl_hora2_ini = <fs_knva>-saab2.
+          vl_hora2_fin = <fs_knva>-sabi2.
+        WHEN 7.
+          vl_hora1_ini = <fs_knva>-soab1.
+          vl_hora1_fin = <fs_knva>-sobi1.
+          vl_hora2_ini = <fs_knva>-soab2.
+          vl_hora2_fin = <fs_knva>-sobi2.
+      ENDCASE.
+      CHECK vl_hora1_ini IS NOT INITIAL.
+
+      WRITE vl_hora1_ini TO vl_hora_ini_c.
+      WRITE vl_hora1_fin TO vl_hora_fin_c.
+      wl_horarios-intervalo = |{ vl_hora_ini_c(5) } - { vl_hora_fin_c(5) }|.
+      IF vl_hora2_ini IS NOT INITIAL.
+        WRITE vl_hora2_ini TO vl_hora_ini_c.
+        WRITE vl_hora2_fin TO vl_hora_fin_c.
+        wl_horarios-intervalo = |{ wl_horarios-intervalo }; { vl_hora_ini_c(5) } - { vl_hora_fin_c(5) }|.
+      ENDIF.
+
+      READ TABLE tl_horarios ASSIGNING FIELD-SYMBOL(<fs_horarios>) WITH KEY intervalo = wl_horarios-intervalo.
+      IF sy-subrc <> 0.
+        wl_horarios-dias = vl_index.
+        APPEND wl_horarios TO tl_horarios.
+      ELSE.
+        <fs_horarios>-dias =  <fs_horarios>-dias && vl_index.
+      ENDIF.
+    ENDDO.
+  ENDIF.
+
+  DATA: vl_dias_aux TYPE text40,
+        vl_num_ant  TYPE i,
+        vl_num_sig  TYPE i,
+        vl_num      TYPE i.
+  LOOP AT tl_horarios ASSIGNING <fs_horarios>.
+    CLEAR: vl_dias_aux, vl_num_ant, vl_num_sig.
+
+    vl_num_ant = -1.
+    DATA(vl_grabar) = space.
+    WHILE <fs_horarios>-dias IS NOT INITIAL.
+      vl_num = <fs_horarios>-dias(1).
+      IF strlen( <fs_horarios>-dias ) < 2.
+        vl_grabar = 'X'.
+      ELSEIF vl_num_ant <> vl_num - 1.
+        vl_grabar = 'X'.
+      ELSE.
+        vl_num_sig = <fs_horarios>-dias+1(1).
+        IF vl_num_sig <> vl_num + 1.
+          vl_grabar = 'X'.
+        ENDIF.
+      ENDIF.
+
+      IF vl_grabar = 'X'.
+        vl_dia = vl_num.
+        TRANSLATE vl_dia USING '1L2M3X4J5V6S7D'.
+        IF vl_dias_aux IS INITIAL.
+          vl_dias_aux = vl_dia.
+        ELSE.
+          vl_dias_aux = |{ vl_dias_aux } - { vl_dia }|.
+        ENDIF.
+      ENDIF.
+
+      <fs_horarios>-dias = <fs_horarios>-dias+1.
+      vl_num_ant         = vl_num.
+    ENDWHILE.
+    <fs_horarios>-dias = vl_dias_aux.
+
+  ENDLOOP.
+
+
+  DATA vl_dia_y_horario TYPE text80.
+  LOOP AT tl_horarios ASSIGNING <fs_horarios>.
+    vl_dia_y_horario = |{ <fs_horarios>-dias }: { <fs_horarios>-intervalo }|.
+    IF <fs>-zzhorario_destinatario IS INITIAL.
+      <fs>-zzhorario_destinatario = vl_dia_y_horario.
+    ELSE.
+      <fs>-zzhorario_destinatario = |{ <fs>-zzhorario_destinatario } / { vl_dia_y_horario }|.
+    ENDIF.
+  ENDLOOP.
+ENDLOOP.
+
+
+
+LOOP AT ct_postab WHERE vbeln NE ''
+                AND posnr NE ''.
+* Se saca la ctd de entrega
+
+
+
+  SELECT SINGLE uecha INTO ct_postab-zzuecha
+    FROM lips
+    WHERE vbeln EQ ct_postab-vbeln AND
+    posnr EQ ct_postab-posnr.
+
+
+  IF ct_postab-zzuecha IS INITIAL AND ct_postab-lfimg IS NOT INITIAL.
+    ct_postab-zzkcmeng = ct_postab-lfimg.
+  ENDIF.
+
+  IF ct_postab-zzuecha IS INITIAL AND ct_postab-lfimg IS INITIAL.
+
+    SELECT SINGLE kcmeng INTO ct_postab-zzkcmeng
+      FROM lips
+      WHERE vbeln EQ ct_postab-vbeln
+      AND posnr EQ ct_postab-posnr.
+
+
+  ENDIF.
+
+  IF ct_postab-zzkcmeng IS NOT INITIAL.
+    SELECT SINGLE netwr kwmeng
+    INTO ( ct_postab-zznetwr, v_kwmeng )
+    FROM vbap
+      WHERE vbeln EQ ct_postab-s_vgbel AND
+      posnr EQ ct_postab-s_vgpos.
+
+    IF ct_postab-zznetwr NE 0 AND ct_postab-zzkcmeng NE 0.
+      ct_postab-zznetwr = ( ct_postab-zznetwr / v_kwmeng  ) * ct_postab-zzkcmeng.
+    ELSE.
+      ct_postab-zznetwr = 0.
+    ENDIF.
+
+  ENDIF.
+  MODIFY ct_postab.
+
+ENDLOOP.

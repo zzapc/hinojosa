@@ -1,0 +1,281 @@
+FUNCTION z_wm_rf_em_ubicar_w_vbeln.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_VBELN) TYPE  VBELN_VL
+*"  EXCEPTIONS
+*"      ERROR_IMPORT_DATA
+*"      ERROR_NO_RF_DATA
+*"      ERROR_NO_VBFA_DATA
+*"      ERROR_NO_MSEG_DATA
+*"      ERROR_UTILS_WM
+*"      OT_NO_CREADA
+*"----------------------------------------------------------------------
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+**** Tipos
+
+  TYPES: BEGIN OF ty_ot_data,
+           lgnum TYPE mseg-lgnum,
+           tbnum TYPE mseg-tbnum,
+           matnr TYPE matnr.
+           INCLUDE TYPE l03b_trite.
+         TYPES: END OF ty_ot_data.
+
+**** Parametros
+
+  DATA: lo_wm_utils TYPE REF TO zcl_utils_wm.
+
+  DATA: lt_ot_data TYPE TABLE OF ty_ot_data,
+        lt_trite   TYPE l03b_trite_t.
+
+  DATA: ls_ot_data  LIKE LINE OF lt_ot_data,
+        ls_rf_em_ot TYPE zwm_rf_em_ot,
+        ls_trite    LIKE LINE OF lt_trite.
+
+  DATA: lv_tanum TYPE ltak-tanum,
+        lv_zeile TYPE mblpo.
+
+  DATA: lv_qvcode TYPE qvcode,
+        lv_memoria(30).
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**** IMPORT DATA FILLED
+
+  IF ( i_vbeln IS INITIAL ).
+    RAISE error_import_data.
+  ENDIF.
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** Recuperamos lecturas
+
+  SELECT *
+    FROM zwm_rf_em_lect
+    INTO TABLE @DATA(lt_zwm_rf_em_lect)
+   WHERE vbeln_em EQ @i_vbeln.
+
+  IF ( sy-subrc NE 0 ).
+    RAISE error_no_rf_data.
+  ENDIF.
+
+**** Recuperamos movimientos de mercancías de la entrega
+
+  SELECT *
+    INTO TABLE @DATA(lt_vbfa)
+    FROM vbfa
+   WHERE vbelv    EQ @i_vbeln
+     AND vbtyp_n  EQ 'R'.
+
+  IF ( sy-subrc NE 0 ).
+    RAISE error_no_vbfa_data.
+  ENDIF.
+
+**** Recorremos movimientos de mercancías
+
+  LOOP AT lt_vbfa ASSIGNING FIELD-SYMBOL(<fs_vbfa>).
+
+*** Obtengo documento de material
+
+    CLEAR: lv_zeile.
+
+    MOVE <fs_vbfa>-posnn TO lv_zeile.
+
+    SELECT SINGLE *
+      INTO @DATA(ls_mseg)
+      FROM mseg
+     WHERE mblnr EQ @<fs_vbfa>-vbeln
+       AND mjahr EQ @<fs_vbfa>-mjahr
+       AND zeile EQ @lv_zeile
+       AND lgnum NE @space
+       AND tbnum NE @space.
+
+    IF ( sy-subrc NE 0 ).
+      CONTINUE.
+    ENDIF.
+
+*** Obtengo registro de tabla de lectura
+
+    READ TABLE lt_zwm_rf_em_lect
+    ASSIGNING FIELD-SYMBOL(<fs_lectura>)
+    WITH KEY ebeln      = ls_mseg-ebeln
+             ebelp      = ls_mseg-ebelp
+             matnr      = ls_mseg-matnr
+*             charg      = ls_mseg-charg
+             werks      = ls_mseg-werks
+             lgort      = ls_mseg-lgort
+             vbeln_em   = ls_mseg-vbeln_im
+             posnr_em   = ls_mseg-vbelp_im.
+
+    IF ( sy-subrc NE 0 ).
+      RAISE error_no_rf_data.
+    ENDIF.
+
+*** Monto OT
+
+** Borro estructura
+
+    CLEAR: ls_ot_data.
+
+** Asigno datos
+
+* UA
+
+    IF ( <fs_lectura>-bobina IS NOT INITIAL ).
+      MOVE <fs_lectura>-bobina TO ls_ot_data-vlenr.
+    ENDIF.
+
+* Convertimos cantidad
+
+    CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+      EXPORTING
+        i_matnr              = <fs_lectura>-matnr
+        i_in_me              = <fs_lectura>-meins
+        i_out_me             = ls_mseg-meins
+        i_menge              = <fs_lectura>-menge_input
+      IMPORTING
+        e_menge              = ls_ot_data-anfme
+      exceptions
+        error_in_application = 1
+        error                = 2
+        OTHERS               = 3.
+
+    IF ( sy-subrc NE 0 ).
+      CLEAR ls_ot_data-anfme.
+    ENDIF.
+
+* Generamos posición para la OT
+
+    SELECT SINGLE *
+      FROM mara
+      INTO @DATA(ls_mara)
+     WHERE matnr EQ @ls_mseg-matnr
+       AND zzlargo GT 0.
+
+    IF sy-subrc EQ 0.
+      ls_ot_data-letyp =  'PL'.
+    ELSE.
+      ls_ot_data-letyp =  'BB'.
+    ENDIF.
+
+* Movemos UA desde 902 a ...
+
+    IF <fs_lectura>-nlpla IS NOT INITIAL.
+      MOVE <fs_lectura>-nltyp TO ls_ot_data-nltyp.
+      MOVE <fs_lectura>-nlpla TO ls_ot_data-nlpla.
+      MOVE ls_ot_data-vlenr TO ls_ot_data-nlenr.
+      CLEAR: ls_ot_data-vlenr.
+    ELSE.
+      MOVE '010'    TO ls_ot_data-nltyp.
+      MOVE 'PLAYA'  TO ls_ot_data-nlpla.
+      MOVE ls_ot_data-vlenr TO ls_ot_data-nlenr.
+      CLEAR: ls_ot_data-vlenr.
+    ENDIF.
+
+* Obtenemos área de almacenamiento.
+
+    SELECT SINGLE lgber
+      INTO @ls_ot_data-nlber
+      FROM lagp
+     WHERE lgnum EQ @ls_mseg-lgnum
+       AND lgtyp EQ @ls_ot_data-nltyp
+       AND lgpla EQ @ls_ot_data-nlpla.
+
+* Otros
+
+    ls_ot_data-tbpos = ls_mseg-tbpos.
+*        wl_datos_ot-anfme = ls_mseg-menge.
+    ls_ot_data-altme = ls_mseg-meins.
+    ls_ot_data-lgnum = ls_mseg-lgnum.
+    ls_ot_data-tbnum = ls_mseg-tbnum.
+    ls_ot_data-matnr = ls_mseg-matnr.
+    ls_ot_data-charg = ls_mseg-charg.
+
+* Añadimos línea
+
+    APPEND ls_ot_data TO lt_ot_data.
+
+* Tratamos SEGUNDAS
+
+    CLEAR: lv_qvcode, lv_memoria.
+
+    PERFORM caract_lote in PROGRAM SAPMZ_WM_RF USING ls_mseg-matnr ls_mseg-charg CHANGING lv_qvcode.
+
+    CONCATENATE 'CERTIFICADO' ls_mseg-charg INTO lv_memoria.
+
+    IF ( lv_qvcode EQ 'DE R' ).
+      EXPORT p1 = 'SEGUNDA' TO MEMORY ID lv_memoria.
+    ENDIF.
+
+  ENDLOOP.
+
+**** Ordenamos datos por NA, NT
+
+  SORT lt_ot_data BY lgnum tbnum.
+
+
+**** Instanciamos clase ZCL_WM_UTILS
+
+*** Obtenemos centro almacen
+
+  SELECT SINGLE werks, lgort
+    FROM lips
+    INTO (@DATA(lv_werks), @DATA(lv_lgort))
+   WHERE vbeln EQ @i_vbeln.
+
+  TRY .
+    lo_wm_utils = NEW zcl_utils_wm( i_werks = lv_werks i_lgort = lv_lgort ).
+  CATCH zcx_wm_exception zcx_mm_exception.
+    RAISE error_utils_wm.
+  ENDTRY.
+
+**** Creamos OT por cada NT
+
+  LOOP AT lt_ot_data INTO ls_ot_data.
+
+** En cada nueva NT borramos LT_TRITE
+
+    AT NEW tbnum.
+      CLEAR: ls_rf_em_ot, lv_tanum, lt_trite.
+    ENDAT.
+
+** Movemos datos de posición de NT a LS_TRITE
+
+    MOVE-CORRESPONDING ls_ot_data TO ls_trite.
+    APPEND ls_trite TO lt_trite.
+
+    AT END OF tbnum.
+
+** Al final de cada NT creamos OT
+
+      IF ( lo_wm_utils IS BOUND ).
+        lv_tanum = lo_wm_utils->create_to_4_tr( i_tbnum = ls_ot_data-tbnum i_t_trite = lt_trite ).
+      ENDIF.
+
+* Si tenemos OT almacenamos registro en ZWM_RF_EM_OT.
+
+      IF ( lv_tanum IS NOT INITIAL ).
+        ls_rf_em_ot-vbeln_em = i_vbeln.
+        ls_rf_em_ot-lgnum = lo_wm_utils->_lgnum.
+        ls_rf_em_ot-tanum = lv_tanum.
+        ls_rf_em_ot-ernam = sy-uname.
+        ls_rf_em_ot-erdat = sy-datum.
+        ls_rf_em_ot-erzet = sy-uzeit.
+        INSERT zwm_rf_em_ot FROM ls_rf_em_ot.
+      ELSE.
+        RAISE ot_no_creada.
+      ENDIF.
+
+    ENDAT.
+
+  ENDLOOP.
+
+ENDFUNCTION.

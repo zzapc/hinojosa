@@ -1,0 +1,93 @@
+*&---------------------------------------------------------------------*
+*& Report  ZREPARAR_DATOS_ADIC_INTF_BHS
+*&
+*&---------------------------------------------------------------------*
+*& ticket 65717
+*&
+*& Autor: Carlos Vivó
+*& Contexto: tras el arranque de UI5 CB nos damos cuenta de que no se están
+*&  informando los campos de stock y consumo en ZWM_INTF_BHS. Pensábamos
+*&  que estaban en desuso, resulta que no. Actualizamos datos perdidos
+*&
+*&---------------------------------------------------------------------*
+REPORT zreparar_datos_adic_intf_bhs.
+
+START-OF-SELECTION.
+  DATA: quant TYPE bstmg.
+
+  SELECT * FROM zwm_intf_bhs
+    WHERE mblnr NE @space
+      AND contabilizado NE @space
+      AND procesado NE @space
+      AND cant_consumo_kg EQ 0
+    INTO TABLE @DATA(t_bhs).
+
+  LOOP AT t_bhs ASSIGNING FIELD-SYMBOL(<bhs>).
+    SELECT SINGLE menge FROM mseg
+      INTO <bhs>-cant_consumo_kg
+      WHERE meins EQ 'KG' " los consumos deberían ser siempre en KG, partimos de esa premisa
+        AND werks EQ <bhs>-werks
+        AND bwart EQ '291'
+        AND mblnr EQ <bhs>-mblnr
+        AND mjahr EQ <bhs>-mjahr.
+
+    <bhs>-cant_dif_kg = <bhs>-cant_consumo_kg.
+
+*   Convertimos de KG a la unidad de medida que corresponda
+    SELECT matnr, meinh INTO TABLE @DATA(lt_marm)
+          FROM marm
+          WHERE matnr = @<bhs>-matnr.
+
+    READ TABLE lt_marm INTO DATA(ls_marm) WITH KEY meinh = 'M'.
+    IF sy-subrc = 0.
+      <bhs>-meinh = ls_marm-meinh.
+    ELSE.
+      CLEAR: ls_marm.
+      READ TABLE lt_marm INTO ls_marm WITH KEY meinh = 'ST'.
+      IF sy-subrc = 0.
+        <bhs>-meinh = ls_marm-meinh.
+      ELSE.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+      EXPORTING
+        i_matnr              = <bhs>-matnr
+        i_in_me              = 'KG'
+        i_out_me             = <bhs>-meinh
+        i_menge              = <bhs>-cant_consumo_kg
+      IMPORTING
+        e_menge              = <bhs>-cant_consumo
+      EXCEPTIONS
+        error_in_application = 1
+        error                = 2
+        OTHERS               = 3.
+
+    <bhs>-cant_dif = <bhs>-cant_consumo.
+    <bhs>-stock_sap = <bhs>-cant_consumo + <bhs>-metros_restantes.
+
+    DATA l_restantes_kg LIKE quant.
+    CLEAR l_restantes_kg.
+
+    MOVE <bhs>-metros_restantes TO quant.
+
+    CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+      EXPORTING
+        i_matnr              = <bhs>-matnr
+        i_in_me              = <bhs>-meinh
+        i_out_me             = 'KG'
+        i_menge              = quant
+      IMPORTING
+        e_menge              = l_restantes_kg
+      EXCEPTIONS
+        error_in_application = 1
+        error                = 2
+        OTHERS               = 3.
+
+    <bhs>-stock_sap_kg = l_restantes_kg + <bhs>-cant_consumo_kg.
+
+    MODIFY zwm_intf_bhs FROM <bhs>.
+
+    COMMIT WORK AND WAIT.
+  ENDLOOP.

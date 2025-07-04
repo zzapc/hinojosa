@@ -1,0 +1,430 @@
+FUNCTION zsd006_check_stock_libre.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(IT_VBAP) TYPE  VA_VBAPVB_T
+*"     REFERENCE(POSNR) TYPE  VBAP-POSNR OPTIONAL
+*"     REFERENCE(I_VBAK) TYPE  VBAK OPTIONAL
+*"     REFERENCE(I_NO_SHOW_POPUP) TYPE  XFELD OPTIONAL
+*"  EXPORTING
+*"     REFERENCE(E_CONTINUE_SAVE) TYPE  FLAG
+*"  TABLES
+*"      OT_OUTPUT STRUCTURE  ZSSD006_S_STOCK_LIBRE_ALV OPTIONAL
+*"----------------------------------------------------------------------
+  DATA: lv_labst      TYPE labst,
+        l_labst_s     TYPE labst,
+        lt_clas_stock TYPE  ckmcso_bedae_t,
+        lt_clas_todas TYPE  ckmcso_bedae_t,
+        l_cant        TYPE labst.
+
+*
+  CLEAR: gt_output[], gs_output, lv_labst.
+
+  gv_continue_save = 'X'.
+
+  DATA(lt_vbap) = it_vbap.
+
+  DATA(lt_vbap_stock) = it_vbap.
+
+  DELETE lt_vbap WHERE abgru <> space.
+  DELETE lt_vbap_stock WHERE abgru <> space.
+
+  "Recuperamos los datos de la tabla de Parametrización BEDAE
+  CALL FUNCTION 'ZSSD_BEDAE_RANGO'
+    IMPORTING
+*     E_CLAS_PEDIDO       =
+      e_clas_stock = lt_clas_stock
+      e_clas_todas = lt_clas_todas.
+
+
+  "Nos quedamos las posiciones/materiales  que tienen necesidad de fabricación contra pedido
+  DELETE lt_vbap WHERE updkz EQ 'D' OR bedae NOT IN lt_clas_todas.
+  "OR ( bedae NE 'ZKE' AND  bedae NE 'ZKEC' AND  bedae NE 'ZKE1' AND  bedae NE 'ZKE2' AND  bedae NE 'ZKE3' AND  bedae NE 'ZKE4' AND  bedae NE 'ZYE' AND bedae NE 'KSV'  AND  bedae NE '011' AND  bedae NE 'ZKER').
+
+  "Nos quedamos las posiciones/materiales  que tienen necesidad de fabricación contra stock
+  DELETE lt_vbap_stock WHERE updkz EQ 'D'
+                          OR bedae NOT IN lt_clas_stock
+*                          OR ( bedae NE 'KSV'  AND  bedae NE '011' AND  bedae NE 'ZKER' )
+                          OR sobkz <> space.
+
+  READ TABLE it_vbap INTO DATA(l_vbap_aux) WITH KEY posnr = posnr.
+
+
+  SELECT a~vbeln, a~posnr, a~kwmeng, a~abgru, b~lfsta, c~vbeln AS vbeln_vl, c~posnr AS posnr_vl, b~gbsta
+    INTO TABLE @DATA(t_vbap) FROM vbap AS a
+    INNER JOIN vbup AS b ON a~vbeln = b~vbeln AND a~posnr = b~posnr
+     LEFT OUTER JOIN lips AS c ON a~vbeln = c~vgbel AND a~posnr = c~vgpos
+    WHERE a~bedae IN @lt_clas_stock " ('KSV','011','ZKER') Modificamos para utilizar la tabla de parametrización
+      AND a~matnr = @l_vbap_aux-matnr
+      AND a~werks = @l_vbap_aux-werks
+      AND a~abgru IN ('')
+      AND a~vbeln <> @l_vbap_aux-vbeln.
+
+
+  DATA(t_vbap_e) = t_vbap.
+
+  DELETE t_vbap_e WHERE lfsta = 'A'.
+  DELETE t_vbap WHERE lfsta <> 'A'.
+
+  IF t_vbap_e IS NOT INITIAL.
+
+    SELECT a~vbeln, a~posnr, a~lfimg, b~wbsta, a~vgbel, a~vgpos
+      INTO TABLE @DATA(t_lips)
+      FROM lips AS a
+      INNER JOIN vbup AS b ON a~vbeln = b~vbeln AND a~posnr = b~posnr
+      FOR ALL ENTRIES IN @t_vbap_e
+      WHERE a~vbeln = @t_vbap_e-vbeln_vl
+        AND a~posnr = @t_vbap_e-posnr_vl.
+  ENDIF.
+
+  SORT t_vbap_e BY vbeln posnr.
+
+  DELETE ADJACENT DUPLICATES FROM t_vbap_e COMPARING vbeln posnr.
+
+
+  LOOP AT t_vbap INTO DATA(l_vbap_s).
+
+    IF l_vbap_s-gbsta <> 'C'.
+      l_cant = l_cant + l_vbap_s-kwmeng.
+    ENDIF.
+
+  ENDLOOP.
+
+
+  LOOP AT t_lips INTO DATA(l_lips).
+*    READ TABLE
+    LOOP AT t_vbap_e ASSIGNING FIELD-SYMBOL(<vbap>) WHERE vbeln = l_lips-vgbel AND posnr = l_lips-vgpos.
+*    IF sy-subrc = 0.
+
+      CASE l_lips-wbsta.
+        WHEN 'C'.
+          <vbap>-kwmeng = <vbap>-kwmeng - l_lips-lfimg.
+        WHEN OTHERS.
+      ENDCASE.
+*    ENDIF.
+    ENDLOOP.
+
+  ENDLOOP.
+
+
+  LOOP AT t_vbap_e INTO DATA(l_vbap_e) WHERE kwmeng > 0.
+
+    IF l_vbap_e-gbsta <> 'C'.
+      l_cant = l_cant + l_vbap_e-kwmeng.
+    ENDIF.
+
+  ENDLOOP.
+
+
+
+  LOOP AT lt_vbap_stock INTO DATA(l_stock) WHERE matnr = l_vbap_aux-matnr AND charg = l_vbap_aux-charg AND werks = l_vbap_aux-werks.
+    l_labst_s = l_labst_s + l_stock-kwmeng.
+  ENDLOOP.
+
+  l_labst_s = l_labst_s + l_cant.
+
+  "Buscamos stock de libre utlización para esas posiciones
+  IF lt_vbap[] IS NOT INITIAL.
+    SELECT matnr, werks, lgort, labst
+      FROM mard
+      INTO TABLE @DATA(lt_mard)
+      FOR ALL ENTRIES IN @lt_vbap[]
+      WHERE matnr = @lt_vbap-matnr
+        AND werks = @lt_vbap-werks
+        AND labst > @lv_labst.
+  ENDIF.
+
+  LOOP AT lt_vbap INTO DATA(ls_vbap).
+    LOOP AT lt_mard INTO DATA(ls_mard) WHERE matnr = ls_vbap-matnr
+                                         AND werks = ls_vbap-werks.
+*      IF sy-subrc = 0.
+      CLEAR gs_output.
+      gs_output-posnr = ls_vbap-posnr.
+      gs_output-matnr = ls_vbap-matnr.
+      gs_output-arktx = ls_vbap-arktx.
+      gs_output-labst = ls_mard-labst - l_labst_s.
+      IF gs_output-labst < 0.
+        CLEAR: gs_output-labst.
+      ENDIF.
+      gs_output-werks = ls_mard-werks.
+      gs_output-lgort = ls_mard-lgort.
+      APPEND gs_output TO gt_output.
+*      ENDIF.
+    ENDLOOP.
+    IF ls_vbap-pstyv EQ 'ZT0R'."Si es rellocated consideramos además la cantidad en otros centros
+      DATA lv_werks_otr TYPE werks_d.
+      IF ls_vbap-werks EQ '2001'.
+        lv_werks_otr = '2003'.
+      ELSE.
+        lv_werks_otr = '2001'.
+      ENDIF.
+      SELECT matnr, werks, lgort, labst
+        FROM mard
+        INTO TABLE @DATA(lt_mard_otro)
+        WHERE matnr = @ls_vbap-matnr
+          AND werks = @lv_werks_otr
+          AND labst > 0.
+      IF sy-subrc = 0.
+
+        PERFORM get_cantidad_otro TABLES lt_clas_stock USING ls_vbap lv_werks_otr lt_vbap_stock CHANGING lv_labst.
+
+        LOOP AT lt_mard_otro ASSIGNING FIELD-SYMBOL(<otr>).
+          CLEAR gs_output.
+          gs_output-posnr = ls_vbap-posnr.
+          gs_output-matnr = ls_vbap-matnr.
+          gs_output-arktx = ls_vbap-arktx.
+          gs_output-labst = <otr>-labst - lv_labst.
+          gs_output-werks = <otr>-werks.
+          gs_output-lgort = <otr>-lgort.
+          IF gs_output-labst < 0.
+            gs_output-labst = 0.
+          ENDIF.
+          APPEND gs_output TO gt_output.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+* add jtm 31.08.2022
+  IF  posnr IS NOT INITIAL.
+    DELETE gt_output WHERE posnr NE posnr.
+  ENDIF.
+* fin de add jtm 31.08.2022
+*IF gt_output IS NOT INITIAL.
+*       CALL SCREEN '2000' STARTING AT 3 10.
+*    ENDIF.
+
+
+
+
+*  IF gt_output[] IS NOT INITIAL.
+
+  "JVM - añadimos la cantidad en pedidos de cliente
+  SELECT t1~vbeln, t2~posnr, t2~werks, t2~matnr, t2~lgort, t2~abgru, t2~kwmeng, t2~pstyv, edatu
+    INTO TABLE @DATA(it_pedidos)
+    FROM vbak AS t1 INNER JOIN vbap AS t2 ON t1~vbeln EQ t2~vbeln
+    INNER JOIN vbep AS t3 ON t2~vbeln EQ t3~vbeln AND t3~posnr EQ t2~posnr AND etenr EQ 1
+    INNER JOIN vbup AS t4 ON t1~vbeln EQ t4~vbeln AND t2~posnr EQ t4~posnr AND t4~lfsta <> 'C'
+    WHERE matnr EQ @l_vbap_aux-matnr
+*      FOR ALL ENTRIES IN @gt_output
+*      WHERE matnr  EQ @gt_output-matnr
+*      AND werks EQ @gt_output-werks
+**      AND lgort EQ @gt_output-lgort
+    AND vbtyp EQ 'C'
+    AND auart IN ( SELECT auart FROM zssdt000_cond WHERE vkorg = @i_vbak-vkorg
+                                                             AND vtweg = @i_vbak-vtweg
+                                                             AND auart = @i_vbak-auart AND active = 1 )
+    AND kunnr EQ @i_vbak-kunnr.
+
+  IF sy-subrc = 0.
+    SELECT kalab, werks, lgort, matnr, vbeln, posnr, charg
+          INTO TABLE @DATA(it_pedcli)
+          FROM mska
+          FOR ALL ENTRIES IN @it_pedidos
+          WHERE matnr EQ @it_pedidos-matnr
+          AND werks EQ @it_pedidos-werks
+*            AND lgort EQ @it_pedidos-lgort
+          AND kalab > 0.
+
+    LOOP AT it_pedidos INTO DATA(wa_p).
+      READ TABLE it_pedcli TRANSPORTING NO FIELDS WITH KEY vbeln = wa_p-vbeln posnr = wa_p-posnr.
+      IF sy-subrc <> 0.
+        DELETE it_pedidos WHERE vbeln = wa_p-vbeln AND posnr = wa_p-posnr.
+        CONTINUE.
+      ENDIF.
+    ENDLOOP.
+
+  ENDIF.
+
+  LOOP AT it_pedidos ASSIGNING FIELD-SYMBOL(<pedidos>).
+    LOOP AT it_pedcli ASSIGNING FIELD-SYMBOL(<fs>) WHERE vbeln = <pedidos>-vbeln AND posnr = <pedidos>-posnr.
+      EXIT.
+    ENDLOOP.
+    IF <pedidos>-abgru IS NOT INITIAL AND sy-subrc <> 0.
+      "El pedido está rechazado y no tiene stock
+      CONTINUE.
+    ENDIF.
+    APPEND INITIAL LINE TO gt_output ASSIGNING FIELD-SYMBOL(<out>).
+    <out>-vbeln_cli = <pedidos>-vbeln.
+    <out>-posnr_cli = <pedidos>-posnr.
+    <out>-labst_pedido = <pedidos>-kwmeng.
+    LOOP AT it_pedcli ASSIGNING FIELD-SYMBOL(<pedcli>) WHERE vbeln = <pedidos>-vbeln AND posnr = <pedidos>-posnr.
+      <out>-labst_pedido = <pedcli>-kalab.
+    ENDLOOP.
+    <out>-matnr = l_vbap_aux-matnr.
+    <out>-arktx = l_vbap_aux-arktx.
+    <out>-werks = <pedidos>-werks.
+    <out>-lgort = <pedidos>-lgort.
+    <out>-eindt = <pedidos>-edatu.
+    IF <pedidos>-abgru IS NOT INITIAL.
+      LOOP AT it_pedcli ASSIGNING FIELD-SYMBOL(<fs2>) WHERE vbeln = <pedidos>-vbeln AND posnr = <pedidos>-posnr.
+        <out>-labst_pedido_sa = <fs2>-kalab.
+        <out>-labst_pedido = 0.
+      ENDLOOP.
+    ENDIF.
+
+  ENDLOOP.
+
+  "JVM - añadimos las cantidades de ordenes
+  SELECT t1~aufnr, gamng, werks, stat, inact, kdauf, kdpos
+    INTO TABLE @DATA(it_ofs)
+    FROM aufk AS t1 INNER JOIN afko AS t2 ON t1~aufnr EQ t2~aufnr
+    LEFT OUTER JOIN jest ON t1~objnr EQ jest~objnr AND ( ( stat EQ 'I0045' AND inact EQ @space ) OR ( stat EQ 'I0076' AND inact EQ @space ) )
+    WHERE igmng = 0
+    AND plnbez EQ @l_vbap_aux-matnr.
+*      AND stat IN ( 'I0045', 'I0076' ).
+*      AND NOT EXISTS ( SELECT stat FROM jest WHERE ( stat EQ 'I0045' AND inact EQ @space ) OR ( stat EQ 'I0076' AND inact EQ @space )  AND objnr EQ t1~objnr ).
+  LOOP AT it_ofs INTO DATA(wa_of) WHERE inact = space AND ( stat EQ 'I0045' OR stat EQ 'I0076' ).
+    DELETE it_ofs WHERE aufnr EQ wa_of-aufnr.
+    CONTINUE.
+  ENDLOOP.
+  SORT it_ofs BY aufnr ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM it_ofs COMPARING aufnr.
+  LOOP AT it_ofs ASSIGNING FIELD-SYMBOL(<fs_ofs>).
+    LOOP AT gt_output ASSIGNING <out> WHERE werks = <fs_ofs>-werks AND vbeln_cli IS INITIAL.
+      ADD <fs_ofs>-gamng TO <out>-labst_ofs .
+    ENDLOOP.
+    IF sy-subrc <> 0.
+      APPEND INITIAL LINE TO gt_output ASSIGNING <out>.
+*      <out>-vbeln_cli = <pedidos>-vbeln.
+*      <out>-posnr_cli = <pedidos>-posnr.
+*      <out>-labst_pedido = <pedidos>-kwmeng.
+      <out>-matnr = l_vbap_aux-matnr.
+      <out>-arktx = l_vbap_aux-arktx.
+      <out>-werks = <fs_ofs>-werks.
+*      <out>-lgort = <fs_ofs>-lgort.
+      <out>-labst_ofs = <fs_ofs>-gamng.
+*      <out>-eindt = <pedidos>-edatu.
+    ENDIF.
+  ENDLOOP.
+
+  "JVM - añadimos la cantidad en libre en almacén
+  DATA: cantidad_desguace_na TYPE menge_d, " cantidad desguace no asignada
+        cantidad_desguace_as TYPE menge_d. " cantidad desguace asignada
+  SELECT labst, werks, lgort, matnr
+   INTO TABLE @DATA(it_libre)
+   FROM mard
+*   FOR ALL ENTRIES IN @gt_output
+*   WHERE matnr EQ @gt_output-matnr
+*    AND werks EQ @gt_output-werks
+*    AND lgort EQ @gt_output-lgort
+    WHERE matnr EQ @l_vbap_aux-matnr
+    AND werks EQ @l_vbap_aux-werks
+    AND labst > 0.
+
+  SELECT kalab, werks, lgort, matnr
+    APPENDING TABLE @it_libre
+    FROM mska
+      WHERE matnr EQ @l_vbap_aux-matnr
+    AND werks EQ @l_vbap_aux-werks
+    AND kalab > 0.
+
+    "INI JVM - 30/11/2022
+    "Si se encuentra stock libre pero no hay entradas en GT_OUTPUT no lo mostrará
+    IF gt_output[] IS INITIAL AND it_libre[] IS NOT INITIAL.
+      APPEND INITIAL LINE TO gt_output ASSIGNING <out>.
+      <out>-matnr = l_vbap_aux-matnr.
+      <out>-werks = l_vbap_aux-werks.
+      <out>-arktx = l_vbap_aux-arktx.
+      <out>-posnr = l_vbap_aux-posnr.
+    ENDIF.
+    "FJVM - 30/11/2022
+
+  LOOP AT gt_output ASSIGNING <out> .
+    "Comprobamos que tenga stock en centro/almacen si lgort no está vacio
+    LOOP AT it_libre ASSIGNING FIELD-SYMBOL(<libre>) WHERE werks = <out>-werks
+                                          AND lgort = <out>-lgort.
+      <out>-labst_libre = <out>-labst_libre + <libre>-labst.
+    ENDLOOP.
+    IF sy-subrc NE 0.
+      "En caso de estar vacío el almacen recuperamos todo el stock del centro.
+      LOOP AT it_libre ASSIGNING <libre> WHERE werks = <out>-werks.
+        <out>-labst_libre = <out>-labst_libre + <libre>-labst.
+      ENDLOOP.
+    ENDIF.
+*   add jtm calculo stock  WM
+*    DATA: cantidad_desguace_na TYPE menge_d, " cantidad desguace no asignada
+*          cantidad_desguace_as TYPE menge_d. " cantidad desguace asignada
+
+    IF  <out>-vbeln_cli IS NOT INITIAL
+    AND <out>-posnr_cli IS NOT INITIAL.
+      CALL FUNCTION 'ZSWM_STOCK_A_RESTAR'
+        EXPORTING
+*         LGNUM    =
+          matnr    = <out>-matnr
+          werks    = <out>-werks
+*         lgort    = <outp>-lgort
+*         CHARG    =
+          vbeln    = <out>-vbeln_cli
+          posnr    = <out>-posnr
+*         NO_ASIGNADO       = abap_true
+          asignado = abap_true
+        IMPORTING
+          cantidad = cantidad_desguace_as.
+      IF cantidad_desguace_as <> 0.
+        IF cantidad_desguace_as > <out>-labst_pedido.
+          CLEAR <out>-labst_pedido.
+        ELSE.
+          <out>-labst_pedido = <out>-labst_pedido - cantidad_desguace_as .
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    CALL FUNCTION 'ZSWM_STOCK_A_RESTAR'
+      EXPORTING
+*       LGNUM       =
+        matnr       = <out>-matnr
+        werks       = <out>-werks
+*       lgort       = <outp>-lgort
+*       CHARG       =
+*       VBELN       =
+*       POSNR       =
+        no_asignado = abap_true
+      IMPORTING
+        cantidad    = cantidad_desguace_na.
+    IF cantidad_desguace_na <> 0.
+      IF  cantidad_desguace_na  > <out>-labst_libre.
+        CLEAR <out>-labst_libre.
+      ELSE.
+        <out>-labst_libre = <out>-labst_libre - cantidad_desguace_na .
+      ENDIF.
+    ENDIF.
+
+    CALL FUNCTION 'ZSWM_STOCK_A_RESTAR'
+      EXPORTING
+*       LGNUM    =
+        matnr    = <out>-matnr
+        werks    = <out>-werks
+*       lgort    = <outp>-lgort
+*       CHARG    =
+*       VBELN    =
+*       POSNR    =
+        asignado = abap_true
+      IMPORTING
+        cantidad = cantidad_desguace_na.
+    IF cantidad_desguace_na <> 0.
+      IF   cantidad_desguace_na  > <out>-labst.
+        CLEAR <out>-labst.
+      ELSE.
+        <out>-labst       = <out>-labst       - cantidad_desguace_na .
+      ENDIF.
+    ENDIF.
+
+*   fin de calculo stock WM
+  ENDLOOP.
+
+*  ENDIF.
+
+
+  LOOP AT gt_output TRANSPORTING NO FIELDS WHERE labst > 0 OR labst_pedido_sa > 0 OR labst_libre > 0 OR labst_ofs > 0 OR labst_pedido > 0.
+    EXIT.
+  ENDLOOP.
+  IF sy-subrc = 0 AND i_no_show_popup IS INITIAL.
+
+    CALL SCREEN '2000' STARTING AT 3 5.
+  ENDIF.
+
+  e_continue_save = gv_continue_save.
+
+  ot_output[] = gt_output[].
+
+ENDFUNCTION.

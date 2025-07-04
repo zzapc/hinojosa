@@ -1,0 +1,548 @@
+FUNCTION zspp_idoc_orders_fechas_lib.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  TABLES
+*"      OT_IDOC TYPE  EDIDD_TT OPTIONAL
+*"      IT_HEADER STRUCTURE  CAUFVDB
+*"      IT_ITEM STRUCTURE  AFPOB
+*"      IT_COMPONENT STRUCTURE  RESBB
+*"----------------------------------------------------------------------
+
+  DATA: ls_idoc_header       TYPE edidc,
+        lt_idoc_comm_control TYPE TABLE OF edidc,
+        ls_idoc_comm_control TYPE edidc,
+        lt_return            TYPE bapiret2_t,
+        ls_return            TYPE bapiret2,
+        ls_return1           TYPE bapiret1,
+        t_edidd              TYPE edidd_tt,
+        t_edidd_aux          TYPE edidd_tt,
+        wa_order             TYPE zccorder,
+        wa_orderdata         TYPE zccorderdata,
+        lv_number            LIKE  bapi_order_key-order_number,
+        i_aufnr              TYPE aufnr.
+
+  TRY.
+      i_aufnr = it_header[ 1 ]-aufnr.
+      CHECK it_header[ 1 ]-autyp EQ '10' AND ( it_header[ 1 ]-werks EQ '2001' OR it_header[ 1 ]-werks EQ '2003'
+      OR it_header[ 1 ]-werks = '2000' )."JVM - ADD 11/05/2023 Adaptaciones para Xátiva
+    CATCH cx_root.
+      RETURN.
+  ENDTRY.
+
+
+  DO 15 TIMES.
+    SELECT SINGLE aufnr INTO @DATA(lv_aufnr) FROM aufk WHERE aufnr EQ @i_aufnr.
+    IF sy-subrc <> 0.
+      WAIT UP TO 1 SECONDS.
+      DATA(lv_encontrada_of) = ''.
+    ELSE.
+      lv_encontrada_of = 'X'.
+      EXIT.
+    ENDIF.
+  ENDDO.
+
+  CHECK lv_encontrada_of = 'X'.
+
+  "Solo se envía este ORDERS si hay cambios de fechas
+  DATA lv_fecha_envio TYPE datum.
+*  lv_fecha_envio = it_header[ 1 ]-gltrp - it_header[ 1 ]-sichz."JMV - 29/04/2024 enviar fecha fin extrema
+  lv_fecha_envio = it_header[ 1 ]-gltrs.
+
+  SELECT SINGLE gltrp, gstrp, gltrs, sichz INTO @DATA(wa_fechas)
+    FROM afko
+    WHERE aufnr EQ @i_aufnr.
+
+*  IF NOT ( wa_fechas-gltrp <> it_header[ 1 ]-gltrp OR wa_fechas-gstrp <> it_header[ 1 ]-gstrp ).
+*  IF NOT ( wa_fechas-gltrs <> it_header[ 1 ]-gltrs OR wa_fechas-gltrs <> it_header[ 1 ]-gltrs ).
+  DATA lv_fecha_compara TYPE datum.
+  lv_fecha_compara = wa_fechas-gltrs.
+  IF NOT ( lv_fecha_compara <> lv_fecha_envio OR lv_fecha_compara <> lv_fecha_envio  ). "JMV - 29/04/2024 enviar fecha fin extrema
+    RETURN.
+  ENDIF.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = i_aufnr
+    IMPORTING
+      output = lv_number.
+
+  IF it_component[] IS INITIAL.
+
+    SELECT * INTO TABLE @DATA(it_resbd) FROM resb WHERE aufnr EQ @i_aufnr AND xloek EQ @space.
+    it_component[] = CORRESPONDING #( it_resbd[] ).
+
+  ENDIF.
+
+  DATA: lv_werks TYPE werks_d,
+        lv_lgort TYPE lgort_d,
+        lv_matnr TYPE matnr.
+  lv_werks = it_item[ 1 ]-dwerk.""prod_plant.
+  lv_lgort = it_item[ 1 ]-lgort."storage_location.
+  lv_matnr = it_item[ 1 ]-matnr."material.
+
+  DATA: lv_vbeln TYPE vbeln_va,
+        lv_posnr TYPE posnr.
+
+
+  lv_vbeln = it_item[ 1 ]-kdauf."sales_order.
+  lv_posnr = it_item[ 1 ]-kdpos."sales_order_item.
+  IF lv_vbeln IS INITIAL.
+    "Recuperar de la vista Z
+    SELECT SINGLE kdauf kdpos
+    INTO ( lv_vbeln, lv_posnr )
+    FROM zpp0002
+    WHERE aufnr EQ lv_number.
+  ENDIF.
+
+  DATA lv_matnr_head TYPE matnr.
+  lv_matnr_head = it_header[ 1 ]-plnbez.
+  SELECT SINGLE mtart INTO @DATA(lv_mtart_head) FROM mara WHERE matnr EQ @lv_matnr_head.
+  "excluir status 0045 y 0046 en ordenes de PT para assemblyid
+  IF lv_vbeln IS NOT INITIAL.
+    SELECT SINGLE * INTO @DATA(wa_kit) FROM vbap WHERE vbeln EQ @lv_vbeln AND posnr EQ @lv_posnr AND abgru EQ @space.
+    IF sy-subrc = 0 AND wa_kit-uepos IS NOT INITIAL.
+      DATA(lv_es_kit) = 'X'.
+      "Es un KIT
+      "Buscamos las piezas que conforman el kit
+      SELECT * INTO TABLE @DATA(it_kits) FROM vbap WHERE vbeln EQ @lv_vbeln AND uepos EQ @wa_kit-uepos AND abgru EQ @space.
+      SELECT SINGLE kwmeng INTO @DATA(lv_num_kits) FROM vbap WHERE vbeln EQ @lv_vbeln AND posnr EQ @wa_kit-uepos AND abgru EQ @space.
+
+      DATA lv_componentes TYPE menge_d.
+      CLEAR lv_componentes.
+      DATA lv_part TYPE menge_d.
+      CLEAR lv_part.
+
+      LOOP AT it_kits INTO DATA(wa_kits).
+        "Obtenemos el total de componentes
+*        lv_componentes  = lv_componentes  + ( wa_kits-kwmeng / lv_num_kits ).
+        IF wa_kits-posnr EQ lv_posnr.
+          "Obtenemos el total de componente que estamos tratando
+          lv_part = wa_kits-kwmeng / lv_num_kits.
+        ENDIF.
+      ENDLOOP.
+
+    ELSEIF sy-subrc = 0 AND wa_kit-uepos IS INITIAL.
+
+      "No es un KIT
+      "buscamos en AUFK todas las OFs con el mismo KDAUF y KDPOS
+      SELECT aufk~aufnr, aufk~auart, plnbez, jest~stat, jest~inact, mtart
+        INTO TABLE @DATA(it_no_kits)
+        FROM aufk INNER JOIN afko ON aufk~aufnr EQ afko~aufnr
+        INNER JOIN mara ON afko~plnbez EQ mara~matnr
+        LEFT OUTER JOIN jest ON aufk~objnr EQ jest~objnr
+        WHERE kdauf EQ @lv_vbeln AND kdpos EQ @lv_posnr.
+      IF sy-subrc = 0.
+        "Eliminamos OFs cerradas o Ctec
+        LOOP AT it_no_kits INTO DATA(wa_no_kits) WHERE inact EQ space AND ( stat EQ 'I0045' OR stat EQ 'I0046' ).
+          DELETE it_no_kits WHERE aufnr EQ wa_no_kits-aufnr.
+        ENDLOOP.
+        "Si estamos en creación de OF, no habremos recuperado de BBDD todavía la orden en curso
+        READ TABLE it_no_kits WITH KEY aufnr = lv_number TRANSPORTING NO FIELDS.
+        IF sy-subrc <> 0.
+          APPEND INITIAL LINE TO it_no_kits ASSIGNING FIELD-SYMBOL(<no_kit>).
+          <no_kit>-aufnr = lv_number.
+          SELECT SINGLE mtart INTO <no_kit>-mtart
+            FROM mara WHERE matnr EQ lv_matnr_head.
+          <no_kit>-plnbez = lv_matnr_head.
+        ENDIF.
+
+        SORT it_no_kits.
+        DELETE ADJACENT DUPLICATES FROM it_no_kits COMPARING aufnr.
+        DESCRIBE TABLE it_no_kits LINES DATA(lv_num_no_kits).
+        IF lv_num_no_kits >= 2.
+
+          READ TABLE it_no_kits INTO wa_no_kits WITH KEY aufnr = lv_number.
+          IF sy-subrc = 0.
+            "Si estamos en la OF del PT tenemos que pasar en assembly la OF del Semi, si estamos
+            "en el Semi, la del PT
+            SELECT SINGLE mtart INTO @DATA(lv_mtart_assembly) FROM mara WHERE matnr EQ @wa_no_kits-plnbez.
+            IF sy-subrc = 0.
+              LOOP AT it_no_kits INTO wa_no_kits WHERE mtart <> lv_mtart_assembly AND aufnr <> lv_number.
+                EXIT.
+              ENDLOOP.
+              IF sy-subrc = 0.
+
+                DATA(lv_assembly) = 'X'.
+                DATA lv_of_assembly TYPE aufnr.
+                CLEAR lv_of_assembly.
+                lv_of_assembly = lv_vbeln."wa_no_kits-aufnr.
+              ENDIF.
+            ENDIF.
+*          "Buscamos la OF de PTE para pasarla en el assembly id
+*          SELECT SINGLE aufnr INTO @DATA(lv_of_assembly)
+*            FROM afko AS t1 INNER JOIN mara AS t2 ON t1~plnbez EQ t2~matnr
+*            AND mtart LIKE 'ZPRT'.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      "para la OF del PT si tiene semi como componente con MTART ZPSE que
+      "tenga MARC-SOBSL = 40 es un cross plant y tenemos que apsarle assembly
+
+      IF lv_mtart_head EQ 'ZPTO' AND lv_of_assembly IS INITIAL.
+        "Identificamos si tiene algún componente tipo ZPSE
+        IF it_component[] IS NOT INITIAL.
+          SELECT DISTINCT mtart, matnr INTO TABLE @DATA(it_zpse)
+            FROM mara
+            FOR ALL ENTRIES IN @it_component
+            WHERE matnr EQ @it_component-matnr
+            AND mtart EQ 'ZPSE'.
+          IF sy-subrc = 0.
+            READ TABLE it_zpse INTO DATA(wa_zpse) INDEX 1.
+            "Si tiene componente ZPSE, verificamos si tiene SOBSL = 40 en el centro de la OF que estamos tratando
+            SELECT SINGLE sobsl INTO @DATA(lv_sobsl_pse)
+              FROM marc
+              WHERE matnr EQ @wa_zpse-matnr
+              AND werks EQ @lv_werks
+              AND sobsl EQ '40'.
+            IF sy-subrc = 0.
+              lv_assembly = 'X'.
+              lv_of_assembly = lv_vbeln.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+      ELSEIF lv_mtart_head EQ 'ZPSE' AND lv_of_assembly IS INITIAL.
+
+        IF lv_vbeln IS NOT INITIAL.
+
+          lv_assembly = 'X'.
+          lv_of_assembly = lv_vbeln.
+
+        ELSE.
+
+          READ TABLE it_item INTO DATA(ls_item) WITH KEY aufnr = lv_number.
+          IF sy-subrc = 0.
+            DATA: lv_edelnr TYPE del12,
+                  lt_mdrq   TYPE TABLE OF mdrq.
+            CLEAR: lv_edelnr, lt_mdrq, lt_mdrq[].
+            lv_edelnr = ls_item-plnum.
+            "Recuperamos la OP que genera la OF/OP del semiterminado
+            CALL FUNCTION 'MD_PEGGING_NODIALOG'
+              EXPORTING
+                edelet                = '0000'
+                edelkz                = 'PA'
+                edelnr                = lv_edelnr
+                edelps                = '000000'
+                eplscn                = '000'
+                ematnr                = lv_matnr_head
+                ewerks                = lv_werks
+                eplaab                = '00'
+              TABLES
+                imdrqx                = lt_mdrq[]
+              EXCEPTIONS
+                error                 = 1
+                no_requirements_found = 2
+                order_not_found       = 3
+                OTHERS                = 4.
+            IF sy-subrc <> 0.
+* Implement suitable error handling here
+            ENDIF.
+
+            READ TABLE lt_mdrq INTO DATA(lw_mdrq) WITH KEY delkz = 'VC'.
+            IF sy-subrc = 0.
+              lv_vbeln = lw_mdrq-delnr.
+              lv_of_assembly = lv_vbeln.
+              lv_assembly = 'X'.
+            ENDIF.
+
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ELSE.
+
+    IF lv_mtart_head EQ 'ZPTO' AND lv_of_assembly IS INITIAL.
+      "Identificamos si tiene algún componente tipo ZPSE
+      IF it_component[] IS NOT INITIAL.
+        SELECT DISTINCT mtart, matnr INTO TABLE @it_zpse
+              FROM mara
+              FOR ALL ENTRIES IN @it_component
+              WHERE matnr EQ @it_component-matnr
+              AND mtart EQ 'ZPSE'.
+        IF sy-subrc = 0.
+          READ TABLE it_zpse INTO wa_zpse INDEX 1.
+          "Si tiene componente ZPSE, verificamos si tiene SOBSL = 40 en el centro de la OF que estamos tratando
+          SELECT SINGLE sobsl INTO @lv_sobsl_pse
+                FROM marc
+                WHERE matnr EQ @wa_zpse-matnr
+                AND werks EQ @lv_werks
+                AND sobsl EQ '40'.
+          IF sy-subrc = 0.
+            lv_assembly = 'X'.
+            IF lv_vbeln IS INITIAL.
+
+              READ TABLE it_item INTO ls_item WITH KEY aufnr = lv_number.
+              IF sy-subrc = 0.
+                CLEAR: lv_edelnr, lt_mdrq, lt_mdrq[].
+                lv_edelnr = ls_item-plnum.
+                "Recuperamos la OP que genera la OF/OP del semiterminado
+                CALL FUNCTION 'MD_PEGGING_NODIALOG'
+                  EXPORTING
+                    edelet                = '0000'
+                    edelkz                = 'PA'
+                    edelnr                = lv_edelnr
+                    edelps                = '000000'
+                    eplscn                = '000'
+                    ematnr                = lv_matnr_head
+                    ewerks                = lv_werks
+                    eplaab                = '00'
+                  TABLES
+                    imdrqx                = lt_mdrq[]
+                  EXCEPTIONS
+                    error                 = 1
+                    no_requirements_found = 2
+                    order_not_found       = 3
+                    OTHERS                = 4.
+                IF sy-subrc <> 0.
+* Implement suitable error handling here
+                ENDIF.
+
+                READ TABLE lt_mdrq INTO lw_mdrq WITH KEY delkz = 'VC'.
+                IF sy-subrc = 0.
+                  lv_vbeln = lw_mdrq-delnr.
+                  lv_of_assembly = lv_vbeln.
+                  lv_assembly = 'X'.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+            lv_of_assembly = lv_vbeln.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+    ELSEIF lv_mtart_head EQ 'ZPSE' AND lv_of_assembly IS INITIAL.
+
+      IF lv_vbeln IS NOT INITIAL.
+
+        lv_assembly = 'X'.
+        lv_of_assembly = lv_vbeln.
+
+      ELSE.
+
+        READ TABLE it_item INTO ls_item WITH KEY aufnr = lv_number.
+        IF sy-subrc = 0.
+*          DATA: lv_edelnr TYPE del12,
+*                lt_mdrq   TYPE TABLE OF mdrq.
+          CLEAR: lv_edelnr, lt_mdrq, lt_mdrq[].
+          lv_edelnr = ls_item-plnum.
+          "Recuperamos la OP que genera la OF/OP del semiterminado
+          CALL FUNCTION 'MD_PEGGING_NODIALOG'
+            EXPORTING
+              edelet                = '0000'
+              edelkz                = 'PA'
+              edelnr                = lv_edelnr
+              edelps                = '000000'
+              eplscn                = '000'
+              ematnr                = lv_matnr_head
+              ewerks                = lv_werks
+              eplaab                = '00'
+            TABLES
+              imdrqx                = lt_mdrq[]
+            EXCEPTIONS
+              error                 = 1
+              no_requirements_found = 2
+              order_not_found       = 3
+              OTHERS                = 4.
+          IF sy-subrc <> 0.
+* Implement suitable error handling here
+          ENDIF.
+
+          READ TABLE lt_mdrq INTO lw_mdrq WITH KEY delkz = 'VC'.
+          IF sy-subrc = 0.
+            lv_vbeln = lw_mdrq-delnr.
+            lv_of_assembly = lv_vbeln.
+            lv_assembly = 'X'.
+          ENDIF.
+
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  IF lv_vbeln IS NOT INITIAL.
+    SELECT SINGLE * INTO @DATA(wa_vbak) FROM vbak WHERE vbeln EQ @lv_vbeln.
+    SELECT SINGLE * INTO @DATA(wa_vbap) FROM vbap WHERE vbeln EQ @lv_vbeln AND posnr EQ @lv_posnr.
+    SELECT SINGLE * INTO @DATA(wa_vbkd) FROM vbkd WHERE vbeln EQ @lv_vbeln.
+    SELECT SINGLE * INTO @DATA(wa_knvv) FROM knvv WHERE kunnr EQ @wa_vbak-kunnr
+          AND vkorg EQ @wa_vbak-vkorg
+          AND vtweg EQ @wa_vbak-vtweg
+          AND spart EQ @wa_vbak-spart.
+    SELECT * INTO TABLE @DATA(it_vbpa) FROM vbpa WHERE vbeln EQ @lv_vbeln.
+
+    SELECT SINGLE * INTO @DATA(wa_vbep) FROM vbep WHERE vbeln EQ @lv_vbeln
+          AND posnr EQ @lv_posnr
+          AND etenr EQ 1.
+
+  ENDIF.
+
+  REFRESH: t_edidd_aux.
+
+  DATA lv_auxlevel TYPE edi_segnum.
+  lv_auxlevel = 1.
+  wa_order-operation = c_replace.
+
+  l_edidd-sdata = wa_order.
+  l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_order )->get_relative_name( ).
+  l_edidd-segnum = lv_auxlevel.
+  lv_auxlevel = lv_auxlevel + 1.
+  APPEND l_edidd TO t_edidd.
+
+*  CLEAR: l_edidd, wa_orderdata.
+*  IF wa_kit-uepos IS NOT INITIAL.
+**    WRITE lv_vbeln TO wa_orderdata-assemblyid LEFT-JUSTIFIED.
+*    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+*      EXPORTING
+*        input  = lv_vbeln
+*      IMPORTING
+*        output = lv_vbeln.
+*
+*    wa_orderdata-assemblyid = lv_vbeln." TO LEFT-JUSTIFIED.
+*    CONDENSE wa_orderdata-assemblyid.
+**    IF lv_part IS NOT INITIAL.
+*    IF wa_kit-posnr IS NOT INITIAL.
+**      WRITE lv_part TO wa_orderdata-assemblyqtypart  DECIMALS 0 LEFT-JUSTIFIED.
+*      WRITE wa_kit-posnr TO wa_orderdata-assemblyqtypart DECIMALS 0 LEFT-JUSTIFIED NO-ZERO.
+*      REPLACE ALL OCCURRENCES OF '.' IN wa_orderdata-assemblyqtypart WITH ''.
+*      CONDENSE wa_orderdata-assemblyqtypart NO-GAPS.
+*    ENDIF.
+*    CONCATENATE wa_orderdata-assemblyid wa_orderdata-assemblyqtypart INTO wa_orderdata-assemblyid SEPARATED BY '_'.
+**    IF lv_componentes IS NOT INITIAL.
+**      WRITE lv_componentes TO wa_orderdata-assemblytotalparts  DECIMALS 0 LEFT-JUSTIFIED.
+**      REPLACE ALL OCCURRENCES OF '.' IN wa_orderdata-assemblytotalparts WITH ''.
+**    ENDIF.
+*    IF lv_part IS NOT INITIAL.
+*      WRITE lv_part TO wa_orderdata-assemblytotalparts  DECIMALS 0 LEFT-JUSTIFIED.
+*      REPLACE ALL OCCURRENCES OF '.' IN wa_orderdata-assemblytotalparts WITH ''.
+*      CONDENSE wa_orderdata-assemblyqtypart NO-GAPS.
+*    ENDIF.
+*  ELSEIF lv_assembly EQ abap_true.
+*
+*    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+*      EXPORTING
+*        input  = lv_of_assembly
+*      IMPORTING
+*        output = lv_of_assembly.
+*
+*    wa_orderdata-assemblyid = lv_of_assembly." TO LEFT-JUSTIFIED .
+*    CONDENSE wa_orderdata-assemblyid.
+*    lv_part = 1.
+*    IF lv_part IS NOT INITIAL.
+*      WRITE lv_part TO wa_orderdata-assemblyqtypart  DECIMALS 0 LEFT-JUSTIFIED.
+*      REPLACE ALL OCCURRENCES OF '.' IN wa_orderdata-assemblyqtypart WITH ''.
+*    ENDIF.
+*    lv_componentes = 1.
+*    IF lv_componentes IS NOT INITIAL.
+*      WRITE lv_componentes TO wa_orderdata-assemblytotalparts  DECIMALS 0 LEFT-JUSTIFIED.
+*      REPLACE ALL OCCURRENCES OF '.' IN wa_orderdata-assemblytotalparts WITH ''.
+*    ENDIF.
+*  ENDIF.
+  wa_orderdata-ccordertype = it_header[ 1 ]-auart."order_type.
+  SELECT SINGLE t1~kdmat INTO @DATA(lv_cus_mat)
+        FROM knmt AS t1 INNER JOIN vbak AS t2 ON t1~kunnr EQ t2~kunnr
+        INNER JOIN vbap AS t3 ON t1~matnr EQ t3~matnr AND t2~vbeln EQ t3~vbeln
+        WHERE t2~vbeln EQ @lv_vbeln
+        AND posnr EQ @lv_posnr.
+  IF sy-subrc <> 0 OR lv_cus_mat IS INITIAL.
+    lv_cus_mat = wa_vbap-matnr.
+    IF lv_cus_mat IS INITIAL.
+      lv_cus_mat = it_header[ 1 ]-plnbez."material.
+    ENDIF.
+  ENDIF.
+  wa_orderdata-cusarticlenr = lv_cus_mat.
+  wa_orderdata-cusorderref = wa_vbkd-bstkd.
+
+  READ TABLE it_vbpa INTO DATA(wa_vbpa) WITH KEY parvw = 'Y0'.
+  IF sy-subrc = 0.
+    SELECT SINGLE name1, name2 INTO @DATA(wa_name) FROM lfa1 WHERE lifnr EQ @wa_vbpa-lifnr.
+  ENDIF.
+
+  CONCATENATE wa_name-name1 wa_name-name2 INTO wa_orderdata-cussalesrep SEPARATED BY space.
+  CONDENSE wa_orderdata-cussalesrep.
+
+  wa_orderdata-customerid = wa_vbak-kunnr.
+
+  READ TABLE it_vbpa WITH KEY parvw = 'WE' INTO wa_vbpa.
+  IF sy-subrc = 0.
+    wa_orderdata-deliveryid = wa_vbpa-kunnr.
+  ENDIF.
+
+
+  IF wa_vbep-mbdat IS INITIAL.
+    wa_vbep-mbdat = sy-datum.
+  ENDIF.
+
+  wa_orderdata-erpplantid = it_header[ 1 ]-werks."production_plant.
+
+*  wa_orderdata-latestpromiseddispdate = wa_orderdata-earliestpromiseddispdate = |{ it_header[ 1 ]-gltrs+6(2) }/{ it_header[ 1 ]-gltrs+4(2) }/{ it_header[ 1 ]-gltrs+(4) },21:00:00|."JVM - Modif, nos piden pasar el MBDAT - 29/11/2022
+  wa_orderdata-latestpromiseddispdate = wa_orderdata-earliestpromiseddispdate = |{ lv_fecha_envio+6(2) }/{ lv_fecha_envio+4(2) }/{ lv_fecha_envio+(4) },21:00:00|."JMV - 29/04/2024 enviar fecha fin extrema
+*  wa_orderdata-orderid = it_header[ 1 ]-aufnr."order_number.
+  IF ( it_header[ 1 ]-auart EQ 'ZPAC' AND it_header[ 1 ]-aufnr < 40024195 ) OR ( it_header[ 1 ]-auart EQ 'ZSAR' AND it_header[ 1 ]-aufnr < 50006649 ).
+    wa_orderdata-orderid = it_header[ 1 ]-aufnr."order_number.
+  ELSE.
+    wa_orderdata-orderid = |{ it_header[ 1 ]-aufnr ALPHA = OUT }|."order_number.
+  ENDIF.
+  wa_orderdata-productid = it_header[ 1 ]-plnbez."material.
+  l_edidd-sdata = wa_orderdata.
+  l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_orderdata )->get_relative_name( ).
+  l_edidd-segnum = lv_auxlevel.
+  lv_auxlevel = lv_auxlevel + 1.
+  APPEND l_edidd TO t_edidd.
+
+
+
+  ls_idoc_header-mandt  = sy-mandt.
+  ls_idoc_header-direct = '1'.
+  ls_idoc_header-rcvpor = c_edi_extern.
+  ls_idoc_header-rcvprt = c_ls_d.
+  ls_idoc_header-rcvprn = c_rcvprn.
+  ls_idoc_header-sndprt = c_ls_r.
+  ls_idoc_header-sndprn = sy-uname.
+  ls_idoc_header-mestyp = c_zmsg_order.
+  ls_idoc_header-idoctp = c_zstpm_order.
+
+  SORT t_edidd BY segnum ASCENDING.
+
+
+  CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE' "IN UPDATE TASK
+    EXPORTING
+      master_idoc_control            = ls_idoc_header
+    TABLES
+      communication_idoc_control     = lt_idoc_comm_control
+      master_idoc_data               = t_edidd
+    EXCEPTIONS
+      error_in_idoc_control          = 1
+      error_writing_idoc_status      = 2
+      error_in_idoc_data             = 3
+      sending_logical_system_unknown = 4
+      OTHERS                         = 5.
+  IF sy-subrc <> 0.
+    "KO
+    ls_return-type        = sy-msgty.
+    ls_return-number      = sy-msgno.
+    ls_return-id          = sy-msgid.
+    ls_return-message_v1  = sy-msgv1.
+    ls_return-message_v2  = sy-msgv2.
+    ls_return-message_v3  = sy-msgv3.
+    ls_return-message_v4  = sy-msgv4.
+    APPEND ls_return TO lt_return.
+  ELSE.
+    "OK
+    READ TABLE lt_idoc_comm_control INTO DATA(ls_control_record_out) INDEX 1.
+    CHECK sy-subrc = 0.
+    DATA(docnum) = ls_control_record_out-docnum.
+    ls_return-type        = 'S'.
+    ls_return-number      = '398'.
+    ls_return-id          = '00'.
+    ls_return-message_v1  = docnum.
+    APPEND ls_return TO lt_return.
+  ENDIF.
+
+* Hacemos un COMMIT para el Idoc
+*  CALL FUNCTION 'DEQUEUE_ALL'.
+*  COMMIT WORK AND WAIT.
+  CALL FUNCTION 'DB_COMMIT'.
+  CALL FUNCTION 'DEQUEUE_ALL'.
+*  COMMIT WORK.
+
+ENDFUNCTION.

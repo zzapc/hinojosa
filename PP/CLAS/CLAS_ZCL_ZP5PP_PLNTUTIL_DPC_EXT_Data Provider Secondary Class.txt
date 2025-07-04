@@ -1,0 +1,734 @@
+
+INCLUDE zmacros_ap_segw.
+CLASS zcl_zp5pp_plntutil_dpc_ext DEFINITION
+  PUBLIC
+  INHERITING FROM zcl_zp5pp_plntutil_dpc
+  CREATE PUBLIC.
+
+  PUBLIC SECTION.
+    DATA o_segw TYPE REF TO zcl_ap_segw.
+
+    METHODS constructor.
+    METHODS get_headers.
+
+    METHODS envio_mail
+      IMPORTING datos            TYPE string
+      RETURNING VALUE(respuesta) TYPE zap_sapui5_accion.
+
+    METHODS set_datos_tool
+      IMPORTING matnr          TYPE matnr
+                werks          TYPE werks_d
+                comentario     TYPE string
+      RETURNING VALUE(message) TYPE bapi_msg.
+
+    METHODS /iwbep/if_mgw_appl_srv_runtime~execute_action REDEFINITION.
+
+  PROTECTED SECTION.
+    METHODS mafset_get_entityset   REDEFINITION.
+    METHODS ordenset_get_entity    REDEFINITION.
+    METHODS ordenset_get_entityset REDEFINITION.
+
+private section.
+
+  data ARBPL type ARBPL .
+  data DIAS type INT4 .
+  data UTIL type MATNR .
+  data WERKS type WERKS_D .
+endclass. "ZCL_ZP5PP_PLNTUTIL_DPC_EXT definition
+class ZCL_ZP5PP_PLNTUTIL_DPC_EXT implementation.
+  METHOD /iwbep/if_mgw_appl_srv_runtime~execute_action.
+    DATA: l_accion           TYPE string,
+          l_datos            TYPE string,
+          l_clave            TYPE string,
+          l_otros            TYPE string,
+          l_matnr            TYPE matnr,
+          l_respuesta_accion TYPE zap_sapui5_accion,
+          l_bapireturn       TYPE bapireturn,
+          ls_parameter       TYPE /iwbep/s_mgw_name_value_pair,
+          l_parametro        TYPE string,
+          l_message          TYPE bapi_msg.
+
+    o_segw->v_log = 'EXECUTE_ACTION'.
+
+    o_segw->set_log( p1 = 'Acción=' p2 = iv_action_name type = 'I' ).
+    get_headers( ).
+
+    CASE iv_action_name.
+      WHEN 'setDatos'.
+        get_valor_parametro: 'accion' l_accion,
+                             'datos'  l_datos,
+                             'clave'  l_clave,
+                             'otros'  l_otros.
+
+        CASE l_accion.
+          WHEN 'getMat'.
+            l_matnr = l_clave.
+            __formatear_material l_matnr.
+            l_respuesta_accion-respuesta = zcl_ap_material=>get_descripcion( l_matnr ).
+          WHEN 'envio'.
+            l_respuesta_accion = envio_mail( datos = l_datos ).
+          WHEN 'getPuestos'.
+            SELECT arbpl, ktext FROM crhd
+                 JOIN crtx ON  crtx~objty = crhd~objty
+                                AND crtx~objid = crhd~objid
+                                AND crtx~spras = @sy-langu
+              INTO TABLE @DATA(i_puestos)
+             WHERE werks = @werks
+               AND crhd~objty = 'A'
+             ORDER BY arbpl.
+            insert value #( arbpl = '*' ktext = 'Todos' ) into i_puestos index 1.
+            o_segw->tabla2json( EXPORTING tabla   = i_puestos
+                                IMPORTING json    = l_respuesta_accion-respuesta
+                                          message = l_respuesta_accion-message ).
+            IF NOT l_respuesta_accion-message IS INITIAL.
+              l_respuesta_accion-type = 'E'.
+            ENDIF.
+
+        ENDCASE.
+
+        copy_data_to_ref( EXPORTING is_data = l_respuesta_accion
+                          CHANGING  cr_data = er_data ).
+
+        IF l_respuesta_accion-type = 'E'.
+          o_segw->set_log( p1 = 'Error ejecutando acción' p2 = l_accion p3 = l_clave type = 'E' ).
+          o_segw->set_log( p1 = l_respuesta_accion-message type = 'E' ).
+        ELSE.
+          o_segw->set_log( p1 = 'Se ha generado accion' p2 = l_accion p3 = l_clave p4 = l_respuesta_accion-type type = 'S' ).
+          IF NOT l_respuesta_accion-message IS INITIAL.
+            o_segw->set_log( p1 = l_respuesta_accion-message type = 'S' ).
+          ENDIF.
+        ENDIF.
+
+      WHEN OTHERS.
+        o_segw->set_log( p1 = |FunctionImport { iv_action_name  } no definido| type = 'E' ).
+        o_segw->raise_message( io_context = me->mo_context message = |FunctionImport { iv_action_name  } no definido| ).
+    ENDCASE.
+  ENDMETHOD.
+  METHOD constructor.
+    super->constructor( ).
+
+    o_segw = NEW #(
+        nombre_odata = 'ZP5PP_PLNTUTIL'
+        o_clase      = me ).
+  ENDMETHOD.
+  METHOD envio_mail.
+    TYPES: BEGIN OF t_datos,
+             orden           TYPE aufnr,
+             maf_orden       TYPE matnr,
+             maf_nuevo       TYPE matnr,
+             orden_terminada TYPE abap_bool,
+             comentarios     TYPE string,
+             maquinista      TYPE string,
+             idptotrabajo    TYPE string,
+             ptotrabajo      TYPE string,
+           END OF t_datos.
+
+    DATA: l_datos           TYPE t_datos,
+          l_caufv           TYPE caufv,
+          l_mensaje         TYPE string,
+          l_orden_terminada TYPE string,
+          i_var             TYPE apb_lpd_t_key_value,
+          l_pto_trabajo     TYPE string.
+    DATA: l_codigo  TYPE zap_textos_mail-codigo,
+          l_destino TYPE zap_textos_mail-destino.
+
+    o_segw->set_json( EXPORTING json    = datos
+                IMPORTING datos   = l_datos
+    message = respuesta-message ).
+    IF NOT respuesta-message IS INITIAL.
+      respuesta-type = 'E'.
+      RETURN.
+    ENDIF.
+
+    __poner_ceros l_datos-orden.
+    SELECT SINGLE werks plnbez kdauf FROM caufv
+      INTO CORRESPONDING FIELDS OF l_caufv
+     WHERE aufnr = l_datos-orden.
+    IF sy-subrc <> 0.
+      respuesta-type    = 'E'.
+      respuesta-message = 'Orden errónea'.
+      RETURN.
+    ENDIF.
+
+    __formatear_material: l_datos-maf_orden, l_datos-maf_nuevo.
+
+    SELECT SINGLE * FROM mara
+      INTO @DATA(l_mara)
+     WHERE matnr = @l_datos-maf_nuevo.
+    IF sy-subrc <> 0.
+      respuesta-type    = 'E'.
+      respuesta-message = 'Nuevo útil es incorrecto'.
+      RETURN.
+    ENDIF.
+
+    IF NOT l_caufv-werks IS INITIAL.
+      SELECT SINGLE * FROM marc
+        INTO @DATA(l_marc)
+       WHERE matnr = @l_datos-maf_nuevo
+         AND werks = @l_caufv-werks.
+      IF sy-subrc <> 0.
+        respuesta-message = |El material { l_datos-maf_nuevo ALPHA = OUT } no se ha creado en centro { l_caufv-werks }|.
+        respuesta-type    = 'E'.
+        RETURN.
+      ENDIF.
+    ENDIF.
+
+    l_mensaje = set_datos_tool( matnr = l_datos-maf_nuevo
+                                werks = l_caufv-werks
+                                comentario = l_datos-comentarios ).
+
+* Ahora si queremos que para si hay error.
+    IF NOT l_mensaje IS INITIAL.
+*      respuesta-message = l_mensaje.
+*      respuesta-type = 'E'.
+*      RETURN.
+    ELSE.
+      DATA(l_damaged) = 'X'.
+    ENDIF.
+
+    IF l_mara-mstae <> '03' OR l_marc-mmsta <> '03'.
+      o_segw->set_log( p1 = 'Se va intentar modificar el estado material centro' p2 = l_datos-maf_nuevo p3 = l_caufv-werks type = 'I' ).
+      COMMIT WORK AND WAIT.
+      DATA(o_mat) = NEW zcl_ap_material( ).
+      o_mat->ini_update( matnr = l_datos-maf_nuevo ).
+      IF l_mara-mstae <> '03'.
+        l_mara-mstae = '03'.
+        o_mat->add_datos_basicos( mara = l_mara ).
+      ENDIF.
+      IF l_marc-mmsta <> '03'.
+        l_marc-mmsta = '03'.
+        o_mat->add_datos_centro( marc = l_marc compras = 'X' ).
+      ENDIF.
+
+* Por si hay bloqueos lo intentamos 3 veces
+      DO 3 TIMES.
+        o_mat->update( ).
+
+        DATA(l_salir) = 'X'.
+        ASSIGN o_mat->messages[ type = 'E' ] TO FIELD-SYMBOL(<mess>).
+        IF sy-subrc = 0.
+          IF <mess>-message CS 'bloq'.
+            CLEAR l_salir.
+          ENDIF.
+        ENDIF.
+        IF l_salir IS INITIAL.
+          WAIT UP TO 1 SECONDS.
+        ELSE.
+          EXIT.
+        ENDIF.
+      ENDDO.
+      ASSIGN o_mat->messages[ type = 'E' ] TO <mess>.
+      IF sy-subrc = 0.
+        respuesta-message = |Error modificando material { <mess>-message }|.
+        respuesta-type    = 'E'.
+        RETURN.
+      ELSE.
+        o_segw->set_log( p1 = 'Se ha modificado el estado material centro' p2 = l_datos-maf_nuevo p3 = l_caufv-werks type = 'I' ).
+        DATA(l_mat_bloqueado) = 'X'.
+      ENDIF.
+    ENDIF.
+
+    IF l_datos-orden_terminada = 'X'.
+      l_orden_terminada = 'ORDEN_TERMINADA'.
+    ENDIF.
+
+    IF NOT l_caufv-kdauf IS INITIAL.
+      SELECT SINGLE kunnr FROM vbak
+        INTO @DATA(l_solicitante)
+       WHERE vbeln = @l_caufv-kdauf.
+      IF sy-subrc = 0.
+        SELECT SINGLE name1 FROM kna1
+          INTO @DATA(l_nombre_solicitante)
+         WHERE kunnr = @l_solicitante.
+      ENDIF.
+    ENDIF.
+
+    SELECT SINGLE cuobj FROM marc
+      INTO @DATA(l_cuobj)
+     WHERE matnr = @l_datos-maf_orden
+       AND werks = @l_caufv-werks.
+    IF sy-subrc = 0 AND NOT l_cuobj IS INITIAL.
+      DATA(i_car) = NEW zhcl_ai_core( )->get_caracteristicas( l_cuobj ).
+      ASSIGN i_car[ charact = 'HP_WAHO1' ] TO FIELD-SYMBOL(<waho1>).
+      IF sy-subrc = 0.
+        DATA(l_ubicacion_util) = <waho1>-value.
+        SPLIT l_ubicacion_util AT '/' INTO DATA(l_aux) l_ubicacion_util.
+        REPLACE ALL OCCURRENCES OF '/' IN l_ubicacion_util WITH ` `.
+      ENDIF.
+    ENDIF.
+
+
+    DATA l_util_complementario TYPE string.
+    SELECT caufv~aufnr, caufv~gstrp, caufv~plnbez,
+           afvc~vornr,
+           crhd~arbpl,
+           afvc~aufpl,
+           crvm_a~matnr AS maf,
+           makt_maf~maktx AS maktx_maf,
+           mara_maf~mtart AS mtart_maf
+      FROM caufv INNER JOIN afvc ON afvc~aufpl = caufv~aufpl
+                 INNER JOIN crhd ON crhd~objid = afvc~arbid
+                 INNER JOIN affh ON  affh~aufpl = afvc~aufpl
+                                 AND affh~aplzl = afvc~aplzl
+                 INNER JOIN crvm_a ON  crvm_a~objty = affh~objty
+                                        AND crvm_a~objid = affh~objid
+                 LEFT OUTER JOIN makt AS makt_maf ON  makt_maf~matnr = crvm_a~matnr
+                                                  AND makt_maf~spras = @sy-langu
+                 JOIN mara AS mara_maf ON  mara_maf~matnr = crvm_a~matnr
+      INTO TABLE @DATA(i_maf)
+     WHERE caufv~aufnr  = @l_datos-orden
+       AND ( mara_maf~matnr = 'ZCLI' OR mara_maf~mtart = 'ZTRO' )
+       AND mara_maf~matnr NE @l_datos-maf_orden
+     ORDER BY caufv~gstrp DESCENDING, caufv~aufnr, afvc~vornr, maf.
+    LOOP AT i_maf ASSIGNING FIELD-SYMBOL(<maf>).
+      __add_lista_no0 l_util_complementario <maf>-maf.
+    ENDLOOP.
+
+    l_pto_trabajo = |{ l_datos-idptotrabajo } { l_datos-ptotrabajo }|.
+    IF NOT arbpl IS INITIAL AND arbpl NE l_datos-idptotrabajo.
+      l_pto_trabajo = |{ arbpl } ( Cambiada de { l_datos-idptotrabajo })|.
+    ENDIF.
+
+    i_var = VALUE #( ( key = '{ORDEN}' value = condense( |{ l_datos-orden ALPHA = OUT }| ) )
+                     ( key = '{UTIL_ORDEN}' value = condense( |{ l_datos-maf_nuevo ALPHA = OUT }| ) )
+                     ( key = '{UTIL_NUEVO}' value = condense( |{ l_datos-maf_orden ALPHA = OUT }| ) )
+                     ( key = '{UBICACIÓN_UTIL_DAÑADO}' value = l_ubicacion_util )
+                     ( key = '{UTIL_COMPLEMENTARIO}' value = l_util_complementario )
+                     ( key = '{ORDEN_TERMINADA}' value = l_orden_terminada )
+                     ( key = '{COMENTARIOS}' value = |{ l_datos-comentarios ALPHA = OUT }| )
+                     ( key = '{MENSAJE_ERROR}' value = l_mensaje  )
+                     ( key = '{MAQUINISTA}' value = l_datos-maquinista  )
+                     ( key = '{PUESTO_TRABAJO}' value = l_pto_trabajo )
+                     ( key = '{PTO_TRABAJO}' value = l_pto_trabajo )
+                     ( key = '{CENTRO}' value = l_caufv-werks  )
+                     ( key = '{MATNR_ORDEN}' value = l_caufv-plnbez  )
+                     ( key = '{CLIENTE}' value = condense( |{ l_solicitante ALPHA = OUT } { l_nombre_solicitante }| ) ) ).
+
+    IF l_mensaje IS INITIAL.
+      l_codigo = |AVISO_{ l_caufv-werks }|.
+      SELECT codigo, destino
+        FROM zap_textos_mail
+        WHERE grupo = 'UTILES'
+          AND codigo = @l_codigo
+        ORDER BY PRIMARY KEY
+        INTO (@l_codigo, @l_destino)
+        UP TO 1 ROWS.
+      ENDSELECT.
+      IF sy-subrc <> 0.
+        l_codigo = 'AVISO'.
+        SELECT SINGLE destino FROM zap_textos_mail
+          INTO l_destino
+          WHERE grupo = 'UTILES'
+            AND codigo = l_codigo.
+      ENDIF.
+
+      zcl_ap_envio_mail=>mail( EXPORTING grupo = 'UTILES'
+                               codigo = l_codigo
+                               variables = i_var
+                               parar_en_error = ''
+                               IMPORTING message = respuesta-message ).
+      IF respuesta-message IS INITIAL.
+        o_segw->set_log( p1 = 'Se envía mail' p2 = l_codigo p3 = 'a' p4 = l_destino type = 'I' ).
+      else.
+        o_segw->set_log( p1 = 'Error enviando mail' p2 = l_codigo p3 = respuesta-message p4 = 'a' p5 = l_destino type = 'E' ).
+      ENDIF.
+    ELSE.
+      l_codigo = |ERROR_{ l_caufv-werks }|.
+      SELECT codigo, destino
+        FROM zap_textos_mail
+        WHERE grupo = 'UTILES'
+          AND codigo = @l_codigo
+        ORDER BY PRIMARY KEY
+        INTO (@l_codigo, @l_destino)
+        UP TO 1 ROWS.
+      ENDSELECT.
+      IF sy-subrc <> 0.
+        l_codigo = 'AVISO_ERROR'.
+        SELECT SINGLE destino FROM zap_textos_mail
+          INTO l_destino
+          WHERE grupo = 'UTILES'
+            AND codigo = l_codigo.
+      ENDIF.
+      zcl_ap_envio_mail=>mail( EXPORTING grupo = 'UTILES'
+                               codigo = l_codigo
+                               variables = i_var
+                               parar_en_error = ''
+                               IMPORTING message = respuesta-message ).
+      IF respuesta-message IS INITIAL.
+        o_segw->set_log( p1 = 'Se envía mail' p2 = l_codigo p3 = 'a' p4 = l_destino type = 'I' ).
+      else.
+        o_segw->set_log( p1 = 'Error enviando mail' p2 = l_codigo p3 = respuesta-message p4 = 'a' p5 = l_destino type = 'E' ).
+      ENDIF.
+    ENDIF.
+    IF NOT respuesta-message IS INITIAL.
+      respuesta-type = 'E'.
+      RETURN.
+    ENDIF.
+
+    IF l_datos-orden_terminada IS INITIAL.
+      l_codigo = |OF_NO_TERM_{ l_caufv-werks }|.
+      SELECT codigo, destino
+        FROM zap_textos_mail
+        WHERE grupo = 'UTILES'
+          AND codigo = @l_codigo
+        ORDER BY PRIMARY KEY
+        INTO (@l_codigo, @l_destino)
+        UP TO 1 ROWS.
+      ENDSELECT.
+      IF sy-subrc <> 0.
+        l_codigo = 'ORDEN_NO_TERM'.
+        SELECT SINGLE destino FROM zap_textos_mail
+          INTO l_destino
+          WHERE grupo = 'UTILES'
+            AND codigo = l_codigo.
+      ENDIF.
+
+      zcl_ap_envio_mail=>mail( EXPORTING grupo = 'UTILES'
+                               codigo = l_codigo
+                               variables = i_var
+                                parar_en_error = ''
+                               IMPORTING message = respuesta-message ).
+      IF respuesta-message IS INITIAL.
+        o_segw->set_log( p1 = 'Se envía mail' p2 = l_codigo p3 = 'a' p4 = l_destino type = 'I' ).
+      ENDIF.
+
+      IF NOT respuesta-message IS INITIAL.
+        respuesta-type = 'E'.
+        RETURN.
+      ENDIF.
+    ENDIF.
+
+    respuesta-type    = 'S'.
+    respuesta-message = 'Se ha enviado mail'.
+
+    IF l_mat_bloqueado = 'X'.
+      respuesta-message = |{ respuesta-message } y bloqueado el material|.
+    ENDIF.
+
+    IF l_damaged = 'X'.
+      respuesta-message = |{ respuesta-message } y marcado como dañado|.
+    ELSEIF NOT l_mensaje IS INITIAL.
+      respuesta-message = |{ respuesta-message } pero falló marcando como dañado { l_mensaje }|.
+    ENDIF.
+
+    o_segw->set_log( p1 = respuesta-message type = respuesta-type ).
+  ENDMETHOD.
+  METHOD get_headers.
+    arbpl = o_segw->get_valor_header( 'ptotrabajo' ).
+    IF NOT arbpl IS INITIAL.
+      SELECT SINGLE werks FROM crhd
+        INTO werks
+       WHERE objty = 'A'
+         AND arbpl = arbpl.
+    ENDIF.
+    util = o_segw->get_valor_header( 'util' ).
+    __formatear_material util.
+
+    TRY.
+        DATA(dias_st) = o_segw->get_valor_header( 'dias' ).
+        IF dias_st CO '0123456789 '.
+          dias = dias_st.
+        ELSE.
+          o_segw->raise_message( io_context = mo_context message = 'Error en parámetro días' ).
+        ENDIF.
+
+      CATCH cx_root INTO DATA(o_root).
+        o_segw->raise_message( io_context = mo_context message = 'Error en parámetro días' ).
+    ENDTRY.
+
+    IF dias = 0.
+      IF sy-sysid = zcl_c=>entorno_desarrollo.
+        dias = 60.
+      ELSE.
+        dias = 3.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+  METHOD mafset_get_entityset.
+    DATA: l_aufnr TYPE aufnr,
+          r_aufnr TYPE RANGE OF aufnr,
+          l_vornr TYPE vornr,
+          r_vornr TYPE RANGE OF vornr.
+
+    get_headers( ).
+    ini_metodo_set.
+
+    IF it_key_tab IS INITIAL.
+      IF util IS INITIAL.
+        o_segw->raise_message( io_context = me->mo_context message = 'Debe informar claves' ).
+      ELSE.
+        DATA(l_mat) = util.
+        DATA(l_long) = strlen( l_mat ).
+        l_long = l_long - 1.
+        l_mat+l_long(1) = '%'.
+        SELECT mara~matnr AS maf, maktx AS maktx_maf FROM mara
+                 LEFT OUTER JOIN makt ON  makt~matnr = mara~matnr
+                                      AND makt~spras = @sy-langu
+          INTO CORRESPONDING FIELDS OF TABLE @et_entityset
+          WHERE mara~matnr LIKE @l_mat.
+        RETURN.
+      ENDIF.
+    ELSE.
+      ASSIGN it_key_tab[ name = 'IdOrden' ] TO FIELD-SYMBOL(<key>).
+      IF sy-subrc = 0.
+        l_aufnr = <key>-value.
+        __poner_ceros l_aufnr.
+        r_aufnr = VALUE #( ( option = 'EQ' sign = 'I' low = l_aufnr ) ).
+      ENDIF.
+      ASSIGN it_key_tab[ name = 'IdOperacion' ] TO <key>.
+      IF sy-subrc = 0.
+        l_vornr = <key>-value.
+        __poner_ceros l_vornr.
+        r_vornr = VALUE #( ( option = 'EQ' sign = 'I' low = l_vornr ) ).
+      ENDIF.
+    ENDIF.
+
+    SELECT caufv~aufnr,
+           afvc~vornr,
+           crvm_a~matnr AS maf,
+           makt~maktx AS maktx_maf
+      FROM caufv INNER JOIN afvc ON afvc~aufpl = caufv~aufpl
+                 JOIN affh ON  affh~aufpl = afvc~aufpl
+                           AND affh~aplzl = afvc~aplzl
+                 JOIN crvm_a ON  crvm_a~objty = affh~objty
+                             AND crvm_a~objid = affh~objid
+                 JOIN mara ON  mara~matnr = crvm_a~matnr
+                 LEFT OUTER JOIN makt ON  makt~matnr = crvm_a~matnr
+                                      AND makt~spras = @sy-langu
+      INTO CORRESPONDING FIELDS OF TABLE @et_entityset
+     WHERE caufv~aufnr IN @r_aufnr
+       AND afvc~vornr  IN @r_vornr
+        AND ( mtart = 'ZCLI' OR mtart = 'ZTRO' )
+     ORDER BY caufv~aufnr, afvc~vornr, maf.
+  ENDMETHOD.
+  METHOD ordenset_get_entity.
+    DATA: l_aufnr TYPE aufnr,
+          l_vornr TYPE vornr.
+
+    ini_metodo_entity.
+    get_key: l_aufnr 'IdOrden',
+             l_vornr 'IdOperacion'.
+    __poner_ceros l_aufnr.
+
+    TRY.
+        ordenset_get_entityset( EXPORTING iv_entity_name           = iv_entity_name
+                                          iv_entity_set_name       = iv_entity_set_name
+                                          iv_source_name           = iv_source_name
+                                          it_filter_select_options = VALUE #( )
+                                          is_paging                = VALUE #( )
+                                          it_navigation_path       = VALUE #( )
+                                          it_order                 = VALUE #( )
+                                          iv_filter_string         = VALUE #( )
+                                          iv_search_string         = VALUE #( )
+                                          it_key_tab               = VALUE #( ( name = 'IdOrden' value = l_aufnr )
+                                                                              ( name = 'IdOperacion' value = l_vornr ) )
+                                IMPORTING et_entityset             = DATA(et_entityset) ).
+        IF et_entityset IS INITIAL.
+          o_segw->raise_message( io_context = me->mo_context message = 'No existe la orden' ).
+        ELSE.
+          READ TABLE et_entityset INTO er_entity INDEX 1.
+        ENDIF.
+      CATCH /iwbep/cx_mgw_busi_exception.
+        o_segw->raise_message( io_context = me->mo_context message = 'No existe la orden' ).
+      CATCH /iwbep/cx_mgw_tech_exception.
+        o_segw->raise_message( io_context = me->mo_context message = 'No existe la orden' ).
+    ENDTRY.
+  ENDMETHOD.
+  METHOD ordenset_get_entityset.
+    DATA: l_fecha_desde TYPE dats,
+          l_fecha_hasta TYPE dats.
+
+    ini_metodo_set.
+
+    get_headers( ).
+
+    IF it_key_tab IS INITIAL.
+      DATA(l_so) = io_tech_request_context->get_filter( )->get_filter_select_options( ).
+      get_rango_so: aufnr, arbpl, gstrp, plnbez, vornr.
+    ELSE.
+      ASSIGN it_key_tab[ name = 'IdOrden' ] TO FIELD-SYMBOL(<key>).
+      IF sy-subrc = 0.
+        r_aufnr = VALUE #( ( option = 'EQ' sign = 'I' low = <key>-value ) ).
+      ENDIF.
+      ASSIGN it_key_tab[ name = 'IdOperacion' ] TO <key>.
+      IF sy-subrc = 0.
+        r_vornr = VALUE #( ( option = 'EQ' sign = 'I' low = <key>-value ) ).
+      ENDIF.
+    ENDIF.
+*    r_aufnr = VALUE #( ( option = 'EQ' sign = 'I' low = '000060000313' ) ).
+
+    IF r_gstrp IS INITIAL.
+      l_fecha_desde = sy-datum - dias.
+      l_fecha_hasta = sy-datum + 3.
+      r_gstrp = VALUE #( ( option = 'BT' sign = 'I' low = l_fecha_desde
+                                                    high = l_fecha_hasta ) ).
+    ENDIF.
+
+    IF NOT r_aufnr IS INITIAL.
+      IF NOT werks IS INITIAL.
+        DATA r_werks TYPE RANGE OF werks_d.
+        r_werks = VALUE #( ( option = 'EQ' sign = 'I' low = werks ) ).
+      ENDIF.
+      clear r_gstrp.
+    ELSE.
+      IF r_arbpl IS INITIAL.
+        IF arbpl IS INITIAL.
+          o_segw->raise_message( io_context = me->mo_context message = 'Debe de informar puesto de trabajo' ).
+        ELSE.
+          r_arbpl = VALUE #( ( option = 'EQ' sign = 'I' low = arbpl ) ).
+        ENDIF.
+      ELSEIF lines( r_arbpl ) = 1.
+        IF r_arbpl[ 1 ]-low = '*'.
+          CLEAR r_arbpl.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+
+
+
+    SELECT caufv~aufnr, caufv~gstrp, caufv~plnbez,
+           afvc~vornr,
+           crhd~arbpl,
+           makt~maktx,
+           mara~mtart,
+           afvc~aufpl,
+           crvm_a~matnr AS maf,
+           makt_maf~maktx AS maktx_maf,
+           mara_maf~mtart AS mtart_maf
+      FROM caufv INNER JOIN afvc ON afvc~aufpl = caufv~aufpl
+                 INNER JOIN crhd ON crhd~objid = afvc~arbid
+                 INNER JOIN affh ON  affh~aufpl = afvc~aufpl
+                                 AND affh~aplzl = afvc~aplzl
+                 LEFT OUTER JOIN crvm_a ON  crvm_a~objty = affh~objty
+                                        AND crvm_a~objid = affh~objid
+                 INNER JOIN jest ON  jest~objnr = caufv~objnr
+                                 AND jest~stat  = 'I0002'              " Liberada
+                                 AND jest~inact = ''
+                 LEFT OUTER JOIN crtx ON  crtx~objty = crhd~objty
+                                      AND crtx~objid = crhd~objid
+                                      AND crtx~spras = @sy-langu
+                 LEFT OUTER JOIN mara ON mara~matnr = caufv~plnbez
+                 LEFT OUTER JOIN makt ON  makt~matnr = caufv~plnbez
+                                      AND makt~spras = @sy-langu
+                 LEFT OUTER JOIN makt AS makt_maf ON  makt_maf~matnr = crvm_a~matnr
+                                                  AND makt_maf~spras = @sy-langu
+                 LEFT OUTER JOIN mara AS mara_maf ON  mara_maf~matnr = crvm_a~matnr
+      INTO CORRESPONDING FIELDS OF TABLE @et_entityset
+     WHERE caufv~aufnr  IN @r_aufnr
+       AND caufv~gstrp  IN @r_gstrp
+       AND caufv~plnbez IN @r_plnbez
+       AND caufv~werks  IN @r_werks
+       AND crhd~arbpl   IN @r_arbpl
+       AND afvc~vornr   IN @r_vornr
+     ORDER BY caufv~gstrp DESCENDING, caufv~aufnr, afvc~vornr, maf.
+
+    DATA(i_aux) = et_entityset.
+    LOOP AT et_entityset ASSIGNING FIELD-SYMBOL(<entity>).
+      DATA(l_new) = ''.
+      AT NEW vornr.
+        l_new = 'X'.
+      ENDAT.
+      IF l_new IS INITIAL.
+        DELETE et_entityset. "EC *
+      ENDIF.
+    ENDLOOP.
+
+    LOOP AT et_entityset ASSIGNING <entity>.
+      LOOP AT i_aux ASSIGNING FIELD-SYMBOL(<aux>) WHERE aufnr = <entity>-aufnr AND vornr = <entity>-vornr AND maf <> '' AND ( mtart_maf = 'ZCLI' OR mtart_maf = 'ZTRO' ).
+        <entity>-n_maf = <entity>-n_maf + 1.
+        __quitar_ceros <aux>-maf.
+        IF NOT <entity>-lista_maf CS <aux>-maf.
+          DATA(l_maf) = condense( |{ <aux>-maf ALPHA = OUT } { <aux>-maktx_maf }| ).
+          IF <entity>-lista_maf IS INITIAL.
+            <entity>-lista_maf = l_maf.
+          ELSE.
+            <entity>-lista_maf = <entity>-lista_maf && cl_abap_char_utilities=>cr_lf && l_maf.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+      SELECT cpudt_mkpf AS cpudt cputm_mkpf AS cputm FROM mseg
+        INTO CORRESPONDING FIELDS OF <entity>
+        UP TO 1 ROWS
+        WHERE aufnr = <entity>-aufnr
+       ORDER BY cpudt_mkpf DESCENDING cputm_mkpf DESCENDING.
+      ENDSELECT.
+*      IF <entity>-n_maf > 1.
+*        <entity>-maf = |( { <entity>-n_maf } )|.
+*        CONDENSE <entity>-maf NO-GAPS.
+*      ENDIF.
+    ENDLOOP.
+
+    SORT et_entityset BY cpudt DESCENDING cputm DESCENDING.
+    READ TABLE et_entityset ASSIGNING <entity> INDEX 1.
+    IF sy-subrc = 0.
+      <entity>-activa = 'X'.
+    ENDIF.
+
+
+    SORT et_entityset BY gstrp DESCENDING aufnr ASCENDING vornr ASCENDING maf ASCENDING.
+
+  ENDMETHOD.
+  METHOD set_datos_tool.
+    CLEAR message.
+
+    o_segw->set_log( p1 = 'Se va intentar modificar el estado del util' p2 = matnr p3 = werks type = 'I' ).
+    COMMIT WORK AND WAIT.
+
+    TRY.
+        DATA(lr_tool) = ycl_rf_tpm_tool=>get_instance_by_matnr( if_matnr = matnr
+                                                                if_werks = werks ).
+
+        IF sy-subrc <> 0.
+          message = |No se encuentra tool relevante para el util|.
+          o_segw->set_log( p1 = message type = 'E' ).
+          RETURN.
+        ENDIF.
+
+        IF NOT comentario IS INITIAL.
+          o_segw->set_log( p1 = 'Se actualiza comentario' p2 = comentario type = 'I' ).
+
+          DATA(l_text) = lr_tool->s_td100-comad.
+          IF NOT l_text IS INITIAL.
+            CONCATENATE l_text comentario INTO l_text SEPARATED BY cl_abap_char_utilities=>cr_lf.
+          ENDIF.
+          lr_tool->set_comad( if_comad = l_text ).
+
+*Actualizo texto por si fallara la actualización posterior del estado
+          DATA(lr_message) = lr_tool->update_material_master( if_black = abap_false ).
+          o_segw->set_log( p1 = 'Actualización comentario OK' type = 'I' ).
+          COMMIT WORK AND WAIT.
+        ENDIF.
+
+        DATA(l_status) = lr_tool->get_tosta( ).
+        IF l_status = ycl_rf_tpm_tool=>c_proce_dam.
+          o_segw->set_log( p1 = 'Util ya estaba en estado' p2 = l_status p3 = 'no lo modificadmos' type = 'I' ).
+        ELSE.
+          o_segw->set_log( p1 = 'Util estaba en estado' p2 = l_status type = 'I' ).
+          lr_tool->set_status( if_werks = werks
+                               if_matnr = matnr
+                               if_proce = ycl_rf_tpm_tool=>c_proce_dam ).
+
+          lr_message = lr_tool->update_material_master( if_black = abap_false ).
+          o_segw->set_log( p1 = 'Actualización status OK' type = 'I' ).
+        ENDIF.
+
+
+      CATCH /vcxi/cx_ckx INTO DATA(lr_cx_ckx).
+        message = |Error marcando tool como dañada { lr_cx_ckx->get_text( ) }|.
+
+* APC20250210 Lanzo evento de modificación de material en caso de error
+        CALL FUNCTION 'ZSPP_IDOC_ORDERS_STOPCODES' "IN BACKGROUND TASK DESTINATION 'NONE'
+          EXPORTING
+            i_matnr  = matnr
+            i_status = 'BLOQ'.
+
+      CATCH cx_root INTO DATA(o_root).
+        message = |Error root marcando tool como dañada { o_root->get_text( ) }|.
+    ENDTRY.
+
+    IF NOT message IS INITIAL.
+      o_segw->set_log( p1 = message type = 'E' ).
+    ENDIF.
+
+  ENDMETHOD.

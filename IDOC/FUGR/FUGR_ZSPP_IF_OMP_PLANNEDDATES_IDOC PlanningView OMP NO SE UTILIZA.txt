@@ -1,0 +1,642 @@
+FUNCTION zspp_if_omp_planneddates.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(INPUT_METHOD) LIKE  BDWFAP_PAR-INPUTMETHD
+*"     VALUE(MASS_PROCESSING) LIKE  BDWFAP_PAR-MASS_PROC
+*"  EXPORTING
+*"     VALUE(WORKFLOW_RESULT) LIKE  BDWF_PARAM-RESULT
+*"     VALUE(APPLICATION_VARIABLE) LIKE  BDWF_PARAM-APPL_VAR
+*"     VALUE(IN_UPDATE_TASK) LIKE  BDWFAP_PAR-UPDATETASK
+*"     VALUE(CALL_TRANSACTION_DONE) LIKE  BDWFAP_PAR-CALLTRANS
+*"  TABLES
+*"      IDOC_CONTRL STRUCTURE  EDIDC
+*"      IDOC_DATA STRUCTURE  EDIDD
+*"      IDOC_STATUS STRUCTURE  BDIDOCSTAT
+*"      RETURN_VARIABLES STRUCTURE  BDWFRETVAR
+*"      SERIALIZATION_INFO STRUCTURE  BDI_SER
+*"  EXCEPTIONS
+*"      WRONG_FUNCTION_CALLED
+*"----------------------------------------------------------------------
+
+*  CONSTANTS: c_processed_idocs(15) VALUE 'Processed_IDOCs',
+*             c_appl_objects(12)    VALUE 'Appl_Objects'.
+*
+*  DATA: wa_head TYPE zspp_order_head,
+*        wa_oper TYPE zspp_order_oper,
+*        it_oper TYPE TABLE OF zspp_order_oper,
+*        wa_comp TYPE zspp_order_compo,
+*        it_comp TYPE TABLE OF zspp_order_compo.
+*  DATA num_heads TYPE i.
+*  CLEAR num_heads.
+*
+*  "Por la forma en que nos enviará la información OMP puede venir en varios STEPS que corresponden a la misma operación
+*  "y por tanto tener varios CI_NUMBER para las OF y operaciones de la misma, así como distintas fechas para los pasos de
+*  "máquina, de modo que debemos recorrer la infomración y quedarnos con las fechas que corresponan de más temprana
+*  "y más tardía
+*  LOOP AT idoc_data INTO DATA(wa_data_head) WHERE segnam EQ 'ZSPP_ORDER_HEAD'.
+*    wa_head = wa_data_head-sdata.
+*    LOOP AT idoc_data INTO DATA(wa_data) WHERE segnam EQ 'ZSPP_ORDER_OPER' AND docnum EQ wa_data_head-docnum.
+*      wa_oper = wa_data-sdata.
+*      wa_oper-operacion = |{ wa_oper-operacion ALPHA = IN }|.
+*      IF wa_head-fini_prog > wa_oper-fini_oper.
+*        wa_head-fini_prog = wa_oper-fini_oper.
+*      ENDIF.
+*      IF wa_head-ffin_prog < wa_oper-ffin_oper.
+*        wa_head-ffin_prog = wa_oper-ffin_oper.
+*      ENDIF.
+*      APPEND wa_oper TO it_oper.
+*    ENDLOOP.
+*    LOOP AT idoc_data INTO wa_data WHERE segnam EQ 'ZSPP_ORDER_COMPO' AND docnum EQ wa_data_head-docnum.
+*      wa_comp = wa_data-sdata.
+*      APPEND wa_comp TO it_comp.
+*    ENDLOOP.
+*    num_heads = num_heads + 1.
+*  ENDLOOP.
+*
+*  IF num_heads > 1.
+*    workflow_result = '99999'.
+*    CLEAR idoc_status.
+*    idoc_status-msgty    = 'E'.
+*    idoc_status-msgid    = '00'.
+*    idoc_status-msgno    = '398'.
+*    idoc_status-msgv1    = 'Se ha enviado más de una cabecera'.
+*    idoc_status-msgv2    = ''.
+*    idoc_status-msgv3    = ''.
+*    idoc_status-msgv4    = ''.
+*    idoc_status-status   = '51'.
+*    idoc_status-repid    = sy-repid.
+*    CLEAR return_variables.
+*    return_variables-wf_param = 'Error_IDOCs'.
+*    LOOP AT idoc_contrl.
+*      idoc_status-docnum = idoc_contrl-docnum.
+*      APPEND idoc_status.
+*      return_variables-doc_number = idoc_contrl-docnum.
+*      APPEND return_variables.
+*    ENDLOOP.
+*
+*    RETURN.
+*  ELSEIF num_heads = 0.
+*    workflow_result = '99999'.
+*    CLEAR idoc_status.
+*    idoc_status-msgty    = 'E'.
+*    idoc_status-msgid    = '00'.
+*    idoc_status-msgno    = '398'.
+*    idoc_status-msgv1    = 'No se ha enviado ninguna cabecera'.
+*    idoc_status-msgv2    = ''.
+*    idoc_status-msgv3    = ''.
+*    idoc_status-msgv4    = ''.
+*    idoc_status-status   = '51'.
+*    idoc_status-repid    = sy-repid.
+*    CLEAR return_variables.
+*    return_variables-wf_param = 'Error_IDOCs'.
+*    LOOP AT idoc_contrl.
+*      idoc_status-docnum = idoc_contrl-docnum.
+*      APPEND idoc_status.
+*      return_variables-doc_number = idoc_contrl-docnum.
+*      APPEND return_variables.
+*    ENDLOOP.
+*
+*    RETURN.
+*  ENDIF.
+*
+*  "Ordenamos por operacion/fecha/hora y ajustamos
+*  SORT it_oper BY operacion fini_oper hini_oper ASCENDING.
+*
+*  LOOP AT it_oper ASSIGNING FIELD-SYMBOL(<fs_oper>).
+*    LOOP AT it_oper ASSIGNING FIELD-SYMBOL(<fs_oper2>) WHERE operacion = <fs_oper>-operacion.
+*      "La fecha inicio operacion siempre será la más baja
+*      <fs_oper2>-fini_oper = <fs_oper>-fini_oper.
+*      <fs_oper2>-hini_oper = <fs_oper>-hini_oper.
+*      "La fecha inicio preparacion siempre será la más baja
+*      <fs_oper2>-fini_prep = <fs_oper>-fini_oper.
+*      <fs_oper2>-hini_prep = <fs_oper>-hini_oper.
+*      "La fecha inicio ejecución siempre será la más baja
+*      <fs_oper2>-fini_ejec = <fs_oper>-fini_ejec.
+*      <fs_oper2>-hini_ejec = <fs_oper>-hini_ejec.
+*
+*      "La fecha inicio desmontaje será la más alta
+*      IF ( ( <fs_oper2>-fini_desmont < <fs_oper>-ffin_oper ) OR
+*           ( <fs_oper2>-fini_desmont = <fs_oper>-ffin_oper AND <fs_oper2>-hini_desmont < <fs_oper>-hfin_oper ) ).
+*        <fs_oper2>-fini_desmont = <fs_oper>-ffin_oper.
+*        <fs_oper2>-hini_desmont = <fs_oper>-hfin_oper.
+*      ENDIF.
+*      IF <fs_oper2>-ffin_oper < <fs_oper>-ffin_oper OR
+*        ( <fs_oper2>-ffin_oper = <fs_oper>-ffin_oper AND <fs_oper2>-hfin_oper < <fs_oper>-hfin_oper ).
+*        <fs_oper2>-ffin_oper = <fs_oper>-ffin_oper.
+*        <fs_oper2>-hfin_oper = <fs_oper>-hfin_oper.
+*      ENDIF.
+*    ENDLOOP.
+*  ENDLOOP.
+*
+*  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+*    EXPORTING
+*      input  = wa_head-orden
+*    IMPORTING
+*      output = wa_head-orden.
+*  DATA: lv_number        LIKE  bapi_order_key-order_number,
+*        lv_order_objects LIKE  bapi_pp_order_objects,
+*        wa_return        LIKE  bapiret2,
+*        it_header        TYPE TABLE OF bapi_order_header1,
+*        it_position      TYPE TABLE OF  bapi_order_item,
+*        it_sequence      TYPE TABLE OF  bapi_order_sequence,
+*        it_operation     TYPE TABLE OF  bapi_order_operation1,
+*        it_trigger_point TYPE TABLE OF  bapi_order_trigger_point,
+*        it_component     TYPE TABLE OF  bapi_order_component,
+*        it_prod_rel_tool TYPE TABLE OF  bapi_order_prod_rel_tools.
+*
+*  lv_number = wa_head-orden.
+*  lv_order_objects = 'XXXXXXXX'.
+*  CLEAR wa_return.
+*
+*  CALL FUNCTION 'BAPI_PRODORD_GET_DETAIL'
+*    EXPORTING
+*      number        = lv_number
+**     COLLECTIVE_ORDER       =
+*      order_objects = lv_order_objects
+*    IMPORTING
+*      return        = wa_return
+*    TABLES
+*      header        = it_header
+*      position      = it_position
+*      sequence      = it_sequence
+*      operation     = it_operation
+*      trigger_point = it_trigger_point
+*      component     = it_component
+*      prod_rel_tool = it_prod_rel_tool.
+*
+*  CASE wa_return-type.
+*    WHEN 'E' OR 'A' OR 'X'.
+*      workflow_result = '99999'.
+*      CLEAR idoc_status.
+*      idoc_status-msgty    = wa_return-type.
+*      idoc_status-msgid    = wa_return-id.
+*      idoc_status-msgno    = wa_return-number.
+*      idoc_status-msgv1    = wa_return-message_v1.
+*      idoc_status-msgv2    = wa_return-message_v2.
+*      idoc_status-msgv3    = wa_return-message_v3.
+*      idoc_status-msgv4    = wa_return-message_v4.
+*      idoc_status-status   = '51'.
+*      idoc_status-repid    = sy-repid.
+*      CLEAR return_variables.
+*      return_variables-wf_param = 'Error_IDOCs'.
+*      LOOP AT idoc_contrl.
+*        idoc_status-docnum = idoc_contrl-docnum.
+*        APPEND idoc_status.
+*        return_variables-doc_number = idoc_contrl-docnum.
+*        APPEND return_variables.
+*      ENDLOOP.
+*
+*      RETURN.
+*  ENDCASE.
+*
+*  "Si se envía el status PLANNED lo activamos.
+*  DATA lv_objnr TYPE jsto-objnr.
+*  DATA it_stat TYPE TABLE OF jstat.
+*  REFRESH it_stat.
+*  SELECT SINGLE objnr INTO @lv_objnr FROM aufk WHERE aufnr EQ @wa_head-orden.
+*  IF ( wa_head-status EQ 'PLANNED' OR wa_head-status EQ 'planned' ) AND NOT ( it_header[ 1 ]-system_status CS 'PLAN' ).
+*    "Comprobamos si la OF está con status PLANNED
+*    APPEND INITIAL LINE TO it_stat ASSIGNING FIELD-SYMBOL(<stat>).
+*    <stat>-inact = ' '.
+*    <stat>-stat = 'I0513'.
+*
+*    CALL FUNCTION 'STATUS_CHANGE_INTERN'
+*      EXPORTING
+**       CHECK_ONLY          = ' '
+**       CLIENT              = SY-MANDT
+*        objnr               = lv_objnr
+**       ZEILE               = ' '
+**       SET_CHGKZ           =
+**    IMPORTING
+**       ERROR_OCCURRED      =
+**       OBJECT_NOT_FOUND    =
+**       STATUS_INCONSISTENT =
+**       STATUS_NOT_ALLOWED  =
+*      TABLES
+*        status              = it_stat
+*      EXCEPTIONS
+*        object_not_found    = 1
+*        status_inconsistent = 2
+*        status_not_allowed  = 3
+*        OTHERS              = 4.
+*    IF sy-subrc <> 0.
+** Implement suitable error handling here
+*      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+**      IMPORTING
+**        return =     " Return Messages
+*        .
+*    ENDIF.
+**
+**    IF sy-tcode EQ 'SE37'.
+*    COMMIT WORK AND WAIT.
+**    ENDIF.
+*
+**    workflow_result = '99999'.
+*    CLEAR idoc_status.
+*    idoc_status-msgty    = 'I'.
+*    idoc_status-msgid    = '00'.
+*    idoc_status-msgno    = '398'.
+*    idoc_status-msgv1    = |Se ha activado status PLAN|.
+*    idoc_status-msgv2    = |para la orden { wa_head-orden ALPHA = OUT }|.
+*    idoc_status-msgv3    = ''.
+*    idoc_status-msgv4    = ''.
+*    idoc_status-status   = ''.
+*    idoc_status-repid    = sy-repid.
+*    CLEAR return_variables.
+*    return_variables-wf_param = 'Log IDOCs'.
+*    LOOP AT idoc_contrl.
+*      idoc_status-docnum = idoc_contrl-docnum.
+*      APPEND idoc_status.
+*      return_variables-doc_number = idoc_contrl-docnum.
+*      APPEND return_variables.
+*    ENDLOOP.
+*
+*  ELSEIF ( wa_head-status EQ 'UNPLANNED' OR wa_head-status EQ 'unplanned' ) AND ( it_header[ 1 ]-system_status CS 'PLAN' ).
+**unplanned
+*    APPEND INITIAL LINE TO it_stat ASSIGNING <stat>.
+*    <stat>-inact = 'X'.
+*    <stat>-stat = 'I0513'.
+*
+*    CALL FUNCTION 'STATUS_CHANGE_INTERN'
+*      EXPORTING
+**       CHECK_ONLY          = ' '
+**       CLIENT              = SY-MANDT
+*        objnr               = lv_objnr
+**       ZEILE               = ' '
+**       SET_CHGKZ           =
+**    IMPORTING
+**       ERROR_OCCURRED      =
+**       OBJECT_NOT_FOUND    =
+**       STATUS_INCONSISTENT =
+**       STATUS_NOT_ALLOWED  =
+*      TABLES
+*        status              = it_stat
+*      EXCEPTIONS
+*        object_not_found    = 1
+*        status_inconsistent = 2
+*        status_not_allowed  = 3
+*        OTHERS              = 4.
+*    IF sy-subrc <> 0.
+** Implement suitable error handling here
+*      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+**      IMPORTING
+**        return =     " Return Messages
+*        .
+*    ENDIF.
+*    COMMIT WORK AND WAIT.
+*    CLEAR idoc_status.
+*    idoc_status-msgty    = 'I'.
+*    idoc_status-msgid    = '00'.
+*    idoc_status-msgno    = '398'.
+*    idoc_status-msgv1    = |Se ha desactivado status PLAN|.
+*    idoc_status-msgv2    = |para la orden { wa_head-orden ALPHA = OUT }|.
+*    idoc_status-msgv3    = ''.
+*    idoc_status-msgv4    = ''.
+*    idoc_status-status   = ''.
+*    idoc_status-repid    = sy-repid.
+*    CLEAR return_variables.
+*    return_variables-wf_param = 'Log IDOCs'.
+*    LOOP AT idoc_contrl.
+*      idoc_status-docnum = idoc_contrl-docnum.
+*      APPEND idoc_status.
+*      return_variables-doc_number = idoc_contrl-docnum.
+*      APPEND return_variables.
+*    ENDLOOP.
+*  ENDIF.
+*
+*  "Modificamos las fechas de cabecera de la OF, pueden verse afectadas posteriormente por las fechas de operaciones
+*  IF ( it_header[ 1 ]-sched_fin_time <> wa_head-hfin_prog OR
+*     it_header[ 1 ]-sched_start_time <> wa_head-hini_prog OR
+*     it_header[ 1 ]-production_finish_date <> wa_head-ffin_prog OR
+*     it_header[ 1 ]-production_start_date <> wa_head-fini_prog ) AND
+* NOT ( it_header[ 1 ]-system_status CS 'NOTI' OR it_header[ 1 ]-system_status CS 'CTEC' OR it_header[ 1 ]-system_status CS 'CERR' ).
+*
+*    DATA: wa_orderdata  LIKE  bapi_pp_order_change,
+*          wa_orderdatax LIKE  bapi_pp_order_changex.
+*
+*    IF wa_head-ffin_prog IS NOT INITIAL.
+*      wa_orderdata-basic_end_date = wa_head-ffin_prog.
+*      IF wa_head-hfin_prog IS NOT INITIAL.
+*        wa_orderdata-basic_end_time = wa_head-hfin_prog.
+*      ENDIF.
+*      wa_orderdatax-basic_end_date = 'X'.
+*    ENDIF.
+*    IF wa_head-hini_prog IS NOT INITIAL.
+*
+*      wa_orderdata-basic_start_date = wa_head-fini_prog.
+*      IF wa_head-hini_prog IS NOT INITIAL.
+*        wa_orderdata-basic_start_time = wa_head-hini_prog.
+*      ENDIF.
+*      wa_orderdatax-basic_start_date = 'X'.
+*    ENDIF.
+*    IF wa_orderdatax IS NOT INITIAL.
+*      CLEAR wa_return.
+*      CALL FUNCTION 'BAPI_PRODORD_CHANGE'
+*        EXPORTING
+*          number     = lv_number
+*          orderdata  = wa_orderdata
+*          orderdatax = wa_orderdatax
+*        IMPORTING
+*          return     = wa_return
+**         ORDER_TYPE =
+**         ORDER_STATUS           =
+**         MASTER_DATA_READ       =
+*        .
+*
+*      CASE wa_return-type.
+*        WHEN 'A' OR 'E' OR 'X'.
+*          workflow_result = '99999'.
+*          CLEAR idoc_status.
+*          idoc_status-msgty    = wa_return-type.
+*          idoc_status-msgid    = wa_return-id.
+*          idoc_status-msgno    = wa_return-number.
+*          idoc_status-msgv1    = wa_return-message_v1.
+*          idoc_status-msgv2    = wa_return-message_v2.
+*          idoc_status-msgv3    = wa_return-message_v3.
+*          idoc_status-msgv4    = wa_return-message_v4.
+*          idoc_status-status   = '51'.
+*          idoc_status-repid    = sy-repid.
+*          CLEAR return_variables.
+*          return_variables-wf_param = 'Error_IDOCs'.
+*          LOOP AT idoc_contrl.
+*            idoc_status-docnum = idoc_contrl-docnum.
+*            APPEND idoc_status.
+*            return_variables-doc_number = idoc_contrl-docnum.
+*            APPEND return_variables.
+*          ENDLOOP.
+*
+*          RETURN.
+*        WHEN OTHERS.
+*          CLEAR idoc_status.
+*          idoc_status-msgty    = wa_return-type.
+*          idoc_status-msgid    = wa_return-id.
+*          idoc_status-msgno    = wa_return-number.
+*          idoc_status-msgv1    = wa_return-message_v1.
+*          idoc_status-msgv2    = wa_return-message_v2.
+*          idoc_status-msgv3    = wa_return-message_v3.
+*          idoc_status-msgv4    = wa_return-message_v4.
+*          idoc_status-status   = ''.
+*          idoc_status-repid    = sy-repid.
+*          CLEAR return_variables.
+*          return_variables-wf_param = 'Log IDOCs'.
+*          LOOP AT idoc_contrl.
+*            idoc_status-docnum = idoc_contrl-docnum.
+*            APPEND idoc_status.
+*            return_variables-doc_number = idoc_contrl-docnum.
+*            APPEND return_variables.
+*          ENDLOOP.
+*      ENDCASE.
+*
+*    ENDIF.
+*
+*    COMMIT WORK AND WAIT.
+*
+*  ENDIF.
+*
+*
+*  IF it_header[ 1 ]-system_status CS 'PLAN' OR it_header[ 1 ]-system_status CS 'ABIE'.
+*    "Modificamos los CI_NUMBERS
+*    DATA wa_cinums TYPE zsppt_cinumbers.
+*    DATA it_cinums TYPE TABLE OF zsppt_cinumbers.
+*
+**    LOOP AT it_oper INTO DATA(cinumbers).
+**      DELETE FROM zsppt_cinumbers WHERE aufnr EQ lv_number AND vornr EQ cinumbers-operacion.
+**      COMMIT WORK AND WAIT.
+**      wa_cinums-aufnr = lv_number.
+**      wa_cinums-vornr = cinumbers-operacion.
+**      wa_cinums-ci_number = cinumbers-userfield01.
+***      MANDT
+***      AUFNR
+***      VORNR
+***      MATNR
+***      CI_NUMBER
+***      STEPNR
+***      ESTACION
+***      CANT_STEP
+***      FECHA_INI
+***      HORA_INI
+***      FECHA_FIN
+***      HORA_FIN
+***      CANAL
+***      CALIDAD
+**      CONDENSE wa_cinums-ci_number NO-GAPS.
+**      wa_cinums-erdat  = wa_cinums-aedat  = sy-datum.
+**      wa_cinums-erzeit = wa_cinums-aezeit = sy-uzeit.
+**      wa_cinums-ernam  = wa_cinums-aenam  = sy-uname.
+**      APPEND wa_cinums TO it_cinums.
+**    ENDLOOP.
+*    LOOP AT it_oper INTO DATA(cinumbers).
+*      DELETE FROM zsppt_cinumbers WHERE aufnr EQ lv_number AND vornr EQ cinumbers-operacion.
+*      COMMIT WORK AND WAIT.
+*      wa_cinums-aufnr = lv_number.
+*      wa_cinums-vornr = cinumbers-operacion.
+*      wa_cinums-ci_number = cinumbers-userfield01.
+*      wa_cinums-matnr = it_header[ 1 ]-material.
+*      wa_cinums-stepnr = cinumbers-userfield02.
+*      wa_cinums-estacion = cinumbers-userfield03.
+*      wa_cinums-cant_step = cinumbers-cant_base_op.
+*      wa_cinums-fecha_ini = cinumbers-fini_oper.
+*      wa_cinums-hora_ini = cinumbers-hini_oper.
+*      wa_cinums-fecha_fin = cinumbers-ffin_oper.
+*      wa_cinums-hora_fin = cinumbers-hfin_oper.
+*      wa_cinums-canal = cinumbers-userfield05.
+*      wa_cinums-calidad = cinumbers-userfield04.
+*      CONDENSE wa_cinums-ci_number NO-GAPS.
+*      wa_cinums-erdat  = wa_cinums-aedat  = sy-datum.
+*      wa_cinums-erzeit = wa_cinums-aezeit = sy-uzeit.
+*      wa_cinums-ernam  = wa_cinums-aenam  = sy-uname.
+*      APPEND wa_cinums TO it_cinums.
+*    ENDLOOP.
+*    IF it_cinums[] IS NOT INITIAL.
+*      MODIFY zsppt_cinumbers FROM TABLE it_cinums.
+*      COMMIT WORK AND WAIT.
+*    ENDIF.
+*  ENDIF.
+*
+*  "Si no está NOTI ni CTEC ni CERR, se puede hacer cambios de fechas
+*  IF NOT ( it_header[ 1 ]-system_status CS 'NOTI' OR it_header[ 1 ]-system_status CS 'CTEC' OR it_header[ 1 ]-system_status CS 'CERR' ).
+*
+*    DATA lv_update TYPE xfeld.
+*    CLEAR lv_update.
+*    SELECT SINGLE aufpl INTO @DATA(lv_aufpl) FROM afko WHERE aufnr EQ @lv_number.
+*    LOOP AT it_oper ASSIGNING FIELD-SYMBOL(<oper>).
+*      SELECT * INTO TABLE @DATA(it_afvc) FROM afvc WHERE aufpl EQ @lv_aufpl AND loekz EQ @space AND vornr EQ @<oper>-operacion.
+*      IF sy-subrc = 0.
+*        SELECT * INTO TABLE @DATA(it_afvv) FROM afvv FOR ALL ENTRIES IN @it_afvc WHERE aufpl EQ @lv_aufpl AND aplzl EQ @it_afvc-aplzl.
+*
+*        LOOP AT it_afvv ASSIGNING FIELD-SYMBOL(<afvv>).
+*          IF <oper>-fini_prep IS NOT INITIAL.
+*            <afvv>-ssavd =  <afvv>-fsavd = <oper>-fini_prep."Finiprep
+*            <afvv>-ssavz = <afvv>-fsavz = <oper>-hini_prep."hiniprep
+*            DATA(lv_modif) = 'X'.
+*          ENDIF.
+*          IF <oper>-fini_ejec IS NOT INITIAL.
+**         FSSLD FSELD
+*            <afvv>-sssbd = <afvv>-fssbd = <oper>-fini_ejec. "finiejec
+*            <afvv>-sssbz = <afvv>-fssbz = <oper>-hini_ejec."hiniejec
+*            lv_modif = 'X'.
+*          ENDIF.
+*          IF <oper>-fini_desmont IS NOT INITIAL.
+*            <afvv>-ssedd = <afvv>-sseld = <afvv>-sssad = <afvv>-fssad = <oper>-fini_desmont."Finidesmont
+*            <afvv>-sssld = <afvv>-ssedd = <afvv>-fsedd = <oper>-fini_desmont."Ffindesmont
+*            <afvv>-sssaz = <afvv>-fssaz = <oper>-hini_desmont."hinidesmont
+*            <afvv>-ssedz = <afvv>-fsedz = <oper>-hini_desmont."hfindesmont
+*            lv_modif = 'X'.
+*            <afvv>-fssld = <afvv>-fseld = <afvv>-sssld = <afvv>-sseld = <oper>-fini_desmont.
+*            <afvv>-fsslz = <afvv>-fselz = <afvv>-ssslz = <afvv>-sselz = <oper>-hini_desmont.
+*          ENDIF.
+*
+*          IF <afvv>-epanf IS NOT INITIAL.
+*            <afvv>-epanf = <oper>-fini_oper.
+*            <afvv>-epanz = <oper>-hini_oper.
+*            lv_modif = 'X'.
+*          ENDIF.
+*          IF <afvv>-epend IS NOT INITIAL.
+*            <afvv>-epend = <oper>-ffin_oper.
+*            <afvv>-epenz = <oper>-hfin_oper.
+*            lv_modif = 'X'.
+*          ENDIF.
+*
+*
+*          IF lv_modif = 'X'.
+*            MODIFY afvv FROM <afvv>.
+*            lv_update = 'X'.
+*          ENDIF.
+*          CLEAR lv_modif.
+*        ENDLOOP.
+*
+*      ENDIF.
+*    ENDLOOP.
+*
+*    IF lv_update = 'X'.
+*      COMMIT WORK AND WAIT.
+*      DATA it_aufnr TYPE TABLE OF bapi_order_key.
+*      DATA it_return TYPE TABLE OF bapi_order_return.
+*      CLEAR: it_aufnr, it_aufnr[], it_return[], it_return.
+*      APPEND INITIAL LINE TO it_aufnr ASSIGNING FIELD-SYMBOL(<orden>).
+*      <orden>-order_number = lv_number.
+*      CALL FUNCTION 'BAPI_PRODORD_SCHEDULE'
+** EXPORTING
+**   SCHED_TYPE               =
+**   FWD_DLV_ORIGIN           =
+**   FWD_DLV_DATE             =
+**   FWD_DLV_TIME             =
+**   FWD_DLV_OFFSET           =
+**   FWD_DLV_UNIT             =
+**   FWD_BEG_ORIGIN           =
+**   FWD_BEG_DATE             =
+**   FWD_BEG_TIME             =
+**   FWD_BEG_OFFSET           =
+**   FWD_BEG_UNIT             =
+**   BCK_DLV_ORIGIN           =
+**   BCK_DLV_DATE             =
+**   BCK_DLV_TIME             =
+**   BCK_DLV_OFFSET           =
+**   BCK_DLV_UNIT             =
+**   BCK_BEG_ORIGIN           =
+**   BCK_BEG_DATE             =
+**   BCK_BEG_TIME             =
+**   BCK_BEG_OFFSET           =
+**   BCK_BEG_UNIT             =
+**   WORK_PROCESS_GROUP       = 'COWORK_BAPI'
+**   WORK_PROCESS_MAX         = 99
+** IMPORTING
+**   RETURN                   =
+*        TABLES
+*          orders        = it_aufnr
+*          detail_return = it_return
+**         APPLICATION_LOG          =
+*        .
+*
+*    ENDIF.
+*  ENDIF.
+*
+*  IF it_comp[] IS NOT INITIAL.
+*
+*    DATA lv_lgort TYPE lgort_d.
+*    SELECT SINGLE werks INTO @DATA(lv_werks) FROM aufk WHERE aufnr EQ @lv_number.
+*
+*    SELECT t1~* INTO TABLE @DATA(it_resb)
+*          FROM resb AS t1 INNER JOIN mara AS t2 ON t1~matnr EQ t2~matnr
+*          WHERE aufnr EQ @lv_number AND mtart EQ 'ZPAP'.
+*    LOOP AT it_resb INTO DATA(wa_resb).
+*      wa_resb-xloek = 'X'.
+*      MODIFY resb FROM wa_resb.
+*      lv_lgort = wa_resb-lgort.
+*    ENDLOOP.
+*    COMMIT WORK AND WAIT.
+*  ENDIF.
+*
+*  DATA lv_meins TYPE meins.
+*  DATA lv_menge TYPE menge_d.
+*
+*  LOOP AT it_comp INTO DATA(wa_compo).
+*
+*    CLEAR: lv_meins, lv_menge.
+*
+*    CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+*      EXPORTING
+*        input  = wa_compo-material
+*      IMPORTING
+*        output = wa_compo-material
+**     EXCEPTIONS
+**       LENGTH_ERROR       = 1
+**       OTHERS = 2
+*      .
+*    IF sy-subrc <> 0.
+** Implement suitable error handling here
+*    ENDIF.
+*
+*    SELECT SINGLE meins INTO lv_meins FROM mara WHERE matnr EQ wa_compo-material.
+*    IF lv_meins EQ 'KG'.
+*      lv_menge = wa_compo-cantidad_kg.
+*    ELSE.
+*      lv_menge = wa_compo-cantidad_m.
+*    ENDIF.
+*
+*    DATA lt_return TYPE  bapiret2_tab.
+*    REFRESH lt_return.
+*
+*    CALL FUNCTION 'ZSPP_ADD_RESB'
+*      EXPORTING
+*        i_aufnr  = lv_number
+*        i_matnr  = wa_compo-material
+*        i_werks  = lv_werks
+*        i_lgort  = lv_lgort
+*        i_menge  = lv_menge
+*        i_meins  = lv_meins
+*        i_charg  = ''
+*        i_vornr  = wa_compo-asig_oper
+*      IMPORTING
+*        o_return = lt_return.
+*
+*
+*  ENDLOOP.
+*
+**  IF it_operation_mod[] IS NOT INITIAL.
+*  workflow_result = '99999'.
+*  CLEAR idoc_status.
+*  idoc_status-msgty    = 'S'."wa_return-type.
+*  idoc_status-msgid    = '00'."wa_return-id.
+*  idoc_status-msgno    = '398'."wa_return-number.
+*  idoc_status-msgv1    = 'IDOC contabilizado correctamente'."wa_return-message_v1.
+*  idoc_status-msgv2    = |para OF { lv_number ALPHA = OUT }| .
+*  idoc_status-msgv3    = ''.
+*  idoc_status-msgv4    = ''.
+*  idoc_status-status   = '52'.
+*  idoc_status-repid    = sy-repid.
+*  CLEAR return_variables.
+*  return_variables-wf_param = 'PROCESS_IDOCs'.
+*  LOOP AT idoc_contrl.
+*    idoc_status-docnum = idoc_contrl-docnum.
+*    APPEND idoc_status.
+*    return_variables-doc_number = idoc_contrl-docnum.
+*    APPEND return_variables.
+*  ENDLOOP.
+*
+**  ENDIF.
+*
+*  COMMIT WORK AND WAIT.
+
+ENDFUNCTION.

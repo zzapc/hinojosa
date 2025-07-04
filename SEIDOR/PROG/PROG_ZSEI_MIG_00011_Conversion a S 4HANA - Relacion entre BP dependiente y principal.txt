@@ -1,0 +1,522 @@
+*---------------------------------------------------------------------*
+* Report ZSEI_MIG_00011
+*---------------------------------------------------------------------*
+REPORT zsei_mig_00011.
+
+******************
+** FICHERO EXCEL QUE CONTENGA CABECERA + REGISTROS
+** Número de cliente dependiente | Número de cliente principal | Segmento de crédito
+** 0000101410                    | XXX                         | 1000
+** 0000101411                    | XXX                         | 2000
+***
+SELECTION-SCREEN BEGIN OF BLOCK va1 WITH FRAME TITLE TEXT-001.
+  PARAMETERS: p_file   LIKE file_table-filename      OBLIGATORY.
+  PARAMETERS: p_cr     TYPE ukmbp_cms-check_rule     OBLIGATORY.
+  PARAMETERS: p_rc     TYPE ukm_s_bp_cms-risk_class.
+SELECTION-SCREEN END OF BLOCK va1.
+
+SELECTION-SCREEN BEGIN OF BLOCK va2 WITH FRAME TITLE TEXT-000.
+  PARAMETERS:
+    p_create TYPE c  AS CHECKBOX DEFAULT 'X',
+    p_rel    TYPE c  AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN END OF BLOCK va2.
+
+TYPES:
+  BEGIN OF ty_excel,
+    p_bp2   TYPE ibupacustomer-customer,
+    p_bp1   TYPE ibupacustomer-customer,
+    p_sgmnt TYPE ukmbp_cms_sgm-credit_sgmnt,
+  END   OF ty_excel.
+
+DATA:
+  ls_ukmbp_cms_sgm   TYPE ukmbp_cms_sgm,
+  ls_ukmbp_cms       TYPE ukmbp_cms,
+  lt_filetable       TYPE filetable,
+  ls_filetable       LIKE LINE OF lt_filetable,
+  lv_rc              TYPE i,
+  lt_excel           TYPE TABLE OF ty_excel,
+  ls_excel           LIKE LINE OF lt_excel,
+  lt_data            TYPE cvis_ei_extern_t,
+  ls_data            LIKE LINE OF lt_data,
+  ls_role            TYPE bus_ei_bupa_roles,
+  ls_return_map      TYPE mdg_bs_bp_msgmap_t,
+  lt_return          TYPE bapiretm,
+  ls_return          TYPE bapireti,
+  xl_error           TYPE bapiret2,
+  i_data             TYPE cvis_ei_extern_t,
+  s_data             LIKE LINE OF i_data,
+  partner_relation   TYPE burs_ei_extern_t,
+  s_partner_relation LIKE LINE OF partner_relation,
+  e_return           TYPE bapiretm,
+  lt_log             TYPE STANDARD TABLE OF bapiret2,
+  ls_log             TYPE bapiret2.
+
+CONSTANTS:
+  c_update TYPE c VALUE 'M',
+  c_insert TYPE c VALUE 'I',
+  c_delete TYPE c VALUE 'D'.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+  PERFORM file_open.
+
+START-OF-SELECTION.
+
+  PERFORM refresh_log TABLES lt_log.
+
+  IF p_file IS NOT INITIAL.
+    PERFORM upload_excel.
+  ENDIF.
+
+  LOOP AT lt_excel INTO ls_excel.
+
+*   Cliente dependiente
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = ls_excel-p_bp2
+      IMPORTING
+        output = ls_excel-p_bp2.
+
+    SELECT SINGLE *
+      INTO @DATA(ls_bu_partner_bp2)
+      FROM ibupacustomer
+     WHERE customer EQ @ls_excel-p_bp2.
+
+*   Cliente principal
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = ls_excel-p_bp1
+      IMPORTING
+        output = ls_excel-p_bp1.
+
+    SELECT SINGLE *
+      INTO @DATA(ls_bu_partner_bp1)
+      FROM ibupacustomer
+     WHERE customer EQ @ls_excel-p_bp1.
+
+    PERFORM add_message TABLES lt_log USING 'S' 'ZMIG_LOG' '000' ls_excel-p_bp1 ls_excel-p_bp2 '' ''.
+
+    IF p_create IS NOT INITIAL.
+
+      PERFORM add_message TABLES lt_log USING 'S' 'ZMIG_LOG' '001' ls_excel-p_bp2 '' '' ''.
+
+*     Comprobar si tiene función IC UKM
+      CLEAR: ls_ukmbp_cms_sgm.
+      SELECT SINGLE *
+        INTO ls_ukmbp_cms_sgm
+        FROM ukmbp_cms_sgm
+       WHERE partner      EQ ls_bu_partner_bp2-businesspartner
+         AND credit_sgmnt EQ ls_excel-p_sgmnt.
+      IF sy-subrc EQ 0.
+
+        PERFORM add_message TABLES lt_log USING 'W' 'ZMIG_LOG' '003' ls_excel-p_bp2 '' '' ''.
+
+      ELSE.
+
+        REFRESH: lt_data, ls_data-partner-central_data-role-roles.
+        CLEAR:   ls_data.
+
+******************************Modify customer**********************
+        ls_data-partner-header-object_task = c_update.
+
+        ls_data-partner-header-object_instance-bpartnerguid = ls_bu_partner_bp2-businesspartneruuid.
+        ls_data-partner-header-object_instance-bpartner     = ls_bu_partner_bp2-businesspartner.
+
+        CLEAR: ls_role.
+
+        SELECT SINGLE *
+          INTO ls_ukmbp_cms
+          FROM ukmbp_cms
+         WHERE partner EQ ls_bu_partner_bp2-businesspartner.
+        IF sy-subrc NE 0.
+          ls_role-task              = c_insert.
+        ELSE.
+          ls_role-task              = c_update.
+        ENDIF.
+
+        ls_role-data_key          = 'UKM000'.
+        ls_role-data-rolecategory = 'UKM000'.
+        ls_role-data-valid_from   = sy-datum.
+        ls_role-data-valid_to     = '99991231'.
+        ls_role-currently_valid   = abap_true.
+
+        ls_role-datax-valid_from  = abap_true.
+        ls_role-datax-valid_to    = abap_true.
+        APPEND ls_role TO ls_data-partner-central_data-role-roles.
+
+        "Si se pone a TRUE   substituye lo que hay en el sistemas por lo que se le informa
+        "Si se pone a FALSE  agrega los que se les pase al sistema
+        ls_data-partner-central_data-role-current_state = abap_false.
+
+        APPEND INITIAL LINE TO ls_data-partner-ukmbp_data-segments-segments ASSIGNING FIELD-SYMBOL(<fs_segment>).
+        IF <fs_segment> IS ASSIGNED.
+          <fs_segment>-task                   = c_insert.
+          <fs_segment>-data_key-credit_sgmnt  = ls_excel-p_sgmnt.
+          <fs_segment>-datax-credit_limit     = abap_true.
+          <fs_segment>-data-credit_limit      = '0'.
+          <fs_segment>-data-x_limit_zero      = 'X'.
+          <fs_segment>-datax-x_limit_zero     = abap_true.
+        ENDIF.
+
+        "Si se pone a TRUE   substituye lo que hay en el sistemas por lo que se le informa
+        "Si se pone a FALSE  agrega lo que se le pase al sistema
+        ls_data-partner-ukmbp_data-segments-current_state   = abap_false.
+
+        IF p_rc IS NOT INITIAL.
+          ls_data-partner-ukmbp_data-profile-data-risk_class      = p_rc.
+          ls_data-partner-ukmbp_data-profile-datax-risk_class     = abap_true.
+        ENDIF.
+
+        ls_data-partner-ukmbp_data-profile-data-check_rule      = p_cr.
+        ls_data-partner-ukmbp_data-profile-datax-check_rule     = abap_true.
+        ls_data-partner-ukmbp_data-profile-data-limit_rule      = 'MIG'.
+        ls_data-partner-ukmbp_data-profile-datax-limit_rule     = 'X'.
+
+*****************Finally fill the main data structure**************
+
+        APPEND ls_data TO lt_data.
+
+************************** validating BP data ********************
+
+        CLEAR: ls_return_map.
+        CALL METHOD cl_md_bp_maintain=>validate_single
+          EXPORTING
+            iv_test_run_mode = ''
+            i_data           = ls_data
+          IMPORTING
+            et_return_map    = ls_return_map.
+
+        READ TABLE ls_return_map ASSIGNING FIELD-SYMBOL(<fs_errora>) WITH KEY type = 'A'.
+        IF sy-subrc IS NOT INITIAL.
+
+          READ TABLE ls_return_map ASSIGNING FIELD-SYMBOL(<fs_error>) WITH KEY type = 'E'.
+          IF  sy-subrc IS NOT INITIAL.
+
+            REFRESH: lt_return.
+            CALL METHOD cl_md_bp_maintain=>maintain
+              EXPORTING
+                i_test_run = ''
+                i_data     = lt_data
+              IMPORTING
+                e_return   = lt_return.
+
+            CLEAR: xl_error.
+            LOOP AT lt_return ASSIGNING FIELD-SYMBOL(<fs_return>).
+              READ TABLE <fs_return>-object_msg ASSIGNING FIELD-SYMBOL(<fs_returne>) WITH KEY type = 'E'.
+              IF <fs_returne> IS ASSIGNED.
+                MOVE-CORRESPONDING <fs_returne> TO xl_error.
+                PERFORM add_message TABLES lt_log USING xl_error-type xl_error-id xl_error-number xl_error-message_v1 xl_error-message_v2 xl_error-message_v3 xl_error-message_v4.
+                EXIT.
+              ENDIF.
+
+              READ TABLE <fs_return>-object_msg ASSIGNING FIELD-SYMBOL(<fs_returna>) WITH KEY type = 'A'.
+              IF <fs_returna> IS ASSIGNED.
+                MOVE-CORRESPONDING <fs_returna> TO xl_error.
+                PERFORM add_message TABLES lt_log USING xl_error-type xl_error-id xl_error-number xl_error-message_v1 xl_error-message_v2 xl_error-message_v3 xl_error-message_v4.
+                EXIT.
+              ENDIF.
+              UNASSIGN <fs_returna>.
+            ENDLOOP.
+
+            IF xl_error IS INITIAL.
+
+***************************** Commit BAPI *************************
+              CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                EXPORTING
+                  wait = abap_true.
+
+            ENDIF.
+
+          ELSE.
+
+            PERFORM add_message TABLES lt_log USING <fs_error>-type <fs_error>-id <fs_error>-number <fs_error>-message_v1 <fs_error>-message_v2 <fs_error>-message_v3 <fs_error>-message_v4.
+
+          ENDIF.
+
+        ELSE.
+
+          PERFORM add_message TABLES lt_log USING <fs_errora>-type <fs_errora>-id <fs_errora>-number <fs_errora>-message_v1 <fs_errora>-message_v2 <fs_errora>-message_v3 <fs_errora>-message_v4.
+
+        ENDIF.
+
+      ENDIF.
+
+    ENDIF.
+
+    IF p_rel IS NOT INITIAL.
+
+      REFRESH: partner_relation,  i_data.
+
+      PERFORM add_message TABLES lt_log USING 'S' 'ZMIG_LOG' '002' ls_excel-p_bp1 ls_excel-p_bp2 '' ''.
+
+* Rol Persona de contacto
+      CLEAR: s_data.
+      s_data-partner-header-object_instance-bpartnerguid              = ls_bu_partner_bp1-businesspartneruuid.
+      s_data-partner-header-object_instance-bpartner                  = ls_bu_partner_bp1-businesspartner.
+      s_data-partner-header-object_task                               = c_update.
+
+* Relacion Crédito
+      CLEAR: s_partner_relation.
+      s_partner_relation-header-object_task                                   = c_insert.
+      s_partner_relation-header-object_instance-relat_category                = 'UKM001'.
+
+      s_partner_relation-header-object_instance-partner1-bpartner             = ls_bu_partner_bp1-businesspartner.
+      s_partner_relation-header-object_instance-partner1-bpartnerguid         = ls_bu_partner_bp1-businesspartneruuid.
+      s_partner_relation-header-object_instance-partner2-bpartner             = ls_bu_partner_bp2-businesspartner.
+      s_partner_relation-header-object_instance-partner2-bpartnerguid         = ls_bu_partner_bp2-businesspartneruuid.
+      s_partner_relation-header-object_instance-difftypevalue                 = ls_excel-p_sgmnt.
+
+      s_partner_relation-central_data-main-task                               = c_insert.
+      s_partner_relation-central_data-main-data-date_from                     = sy-datlo.
+      s_partner_relation-central_data-main-data-date_to_new                   = sy-datlo.
+      s_partner_relation-central_data-main-datax-date_from                    = 'X'.
+      s_partner_relation-central_data-main-datax-date_to_new                  = 'X'.
+      APPEND s_partner_relation TO partner_relation.
+
+      s_data-partner_relation = partner_relation.
+      APPEND s_data TO i_data.
+
+      CLEAR: ls_return_map.
+      CALL METHOD cl_md_bp_maintain=>validate_single
+        EXPORTING
+          iv_test_run_mode = ''
+          i_data           = s_data
+        IMPORTING
+          et_return_map    = ls_return_map.
+
+
+      CLEAR: xl_error.
+      READ TABLE ls_return_map ASSIGNING FIELD-SYMBOL(<fs_errora2>) WITH KEY type = 'A'.
+      IF sy-subrc IS NOT INITIAL.
+
+        READ TABLE ls_return_map ASSIGNING FIELD-SYMBOL(<fs_error2>) WITH KEY type = 'E'.
+        IF  sy-subrc IS NOT INITIAL.
+
+          REFRESH: e_return.
+          CALL METHOD cl_md_bp_maintain=>maintain
+            EXPORTING
+              i_data   = i_data
+            IMPORTING
+              e_return = e_return.
+
+          LOOP AT e_return ASSIGNING FIELD-SYMBOL(<fs_return2>).
+            READ TABLE <fs_return2>-object_msg ASSIGNING FIELD-SYMBOL(<fs_returne2>) WITH KEY type = 'E'.
+            IF <fs_returne2> IS ASSIGNED.
+              MOVE-CORRESPONDING <fs_returne2> TO xl_error.
+              PERFORM add_message TABLES lt_log USING xl_error-type xl_error-id xl_error-number xl_error-message_v1 xl_error-message_v2 xl_error-message_v3 xl_error-message_v4.
+              EXIT.
+            ENDIF.
+
+            READ TABLE <fs_return2>-object_msg ASSIGNING FIELD-SYMBOL(<fs_returna2>) WITH KEY type = 'A'.
+            IF <fs_returna2> IS ASSIGNED.
+              MOVE-CORRESPONDING <fs_returna2> TO xl_error.
+              PERFORM add_message TABLES lt_log USING xl_error-type xl_error-id xl_error-number xl_error-message_v1 xl_error-message_v2 xl_error-message_v3 xl_error-message_v4.
+              EXIT.
+            ENDIF.
+            UNASSIGN <fs_returna2>.
+          ENDLOOP.
+
+          IF xl_error IS INITIAL.
+
+***************************** Commit BAPI *************************
+            CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+              EXPORTING
+                wait = abap_true.
+
+          ENDIF.
+
+        ELSE.
+
+          PERFORM add_message TABLES lt_log USING <fs_error2>-type <fs_error2>-id <fs_error2>-number <fs_error2>-message_v1 <fs_error2>-message_v2 <fs_error2>-message_v3 <fs_error2>-message_v4.
+
+        ENDIF.
+
+      ELSE.
+
+        PERFORM add_message TABLES lt_log USING <fs_errora2>-type <fs_errora2>-id <fs_errora2>-number <fs_errora2>-message_v1 <fs_errora2>-message_v2 <fs_errora2>-message_v3 <fs_errora2>-message_v4.
+
+      ENDIF.
+
+    ENDIF.
+
+  ENDLOOP.
+
+  PERFORM show_error_log USING 'ZMIG_LOG' 'ZMIG_LOG' '' 'X'.
+
+*---------------------------------------------------------------------*
+* Form refresh_log
+*---------------------------------------------------------------------*
+FORM refresh_log  TABLES lt_result STRUCTURE bapiret2.
+
+  REFRESH: lt_result.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Form ADD_MESSAGE
+*---------------------------------------------------------------------*
+FORM add_message  TABLES lt_result STRUCTURE bapiret2 USING p_msgty p_msgid p_msgno p_msgv1 p_msgv2 p_msgv3 p_msgv4.
+
+  DATA:
+    ls_result LIKE LINE OF lt_result.
+
+  CLEAR: ls_result.
+  ls_result-type       = p_msgty.
+  ls_result-id         = p_msgid.
+  ls_result-number     = p_msgno.
+  ls_result-message_v1 = p_msgv1.
+  ls_result-message_v2 = p_msgv2.
+  ls_result-message_v3 = p_msgv3.
+  ls_result-message_v4 = p_msgv4.
+  APPEND ls_result TO lt_result.
+
+ENDFORM.
+
+*--------------------------- ------------------------------------------*
+* Form SHOW_ERROR_LOG
+*---------------------------------------------------------------------*
+FORM show_error_log USING object subobject popup save.
+
+  DATA:
+    lt_log_handle       TYPE bal_t_logh,
+    l_s_display_profile TYPE bal_s_prof,
+    gv_log_handle       TYPE balloghndl,
+    l_s_log             TYPE bal_s_log,
+    l_s_msg             TYPE bal_s_msg.
+
+  CLEAR: sy-batch.
+
+* Define some header data of this log
+  l_s_log-extnumber  = 'Log'.
+  l_s_log-object     = object.
+  l_s_log-subobject  = subobject.
+  l_s_log-aldate     = sy-datum.
+  l_s_log-altime     = sy-uzeit.
+  l_s_log-aluser     = sy-uname.
+  l_s_log-alprog     = sy-repid.
+  l_s_log-del_before = 'X'.
+  l_s_log-aldate_del = sy-datum + '00000014'.
+
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log                 = l_s_log
+    IMPORTING
+      e_log_handle            = gv_log_handle
+    EXCEPTIONS
+      log_header_inconsistent = 1
+      OTHERS                  = 2.
+
+  APPEND gv_log_handle TO lt_log_handle.
+
+  LOOP AT lt_log INTO ls_log.
+
+    l_s_msg-msgty     = ls_log-type.
+    l_s_msg-msgid     = ls_log-id.
+    l_s_msg-msgno     = ls_log-number.
+    l_s_msg-msgv1     = ls_log-message_v1.
+    l_s_msg-msgv2     = ls_log-message_v2.
+    l_s_msg-msgv3     = ls_log-message_v3.
+    l_s_msg-msgv4     = ls_log-message_v4.
+
+    CALL FUNCTION 'BAL_LOG_MSG_ADD'
+      EXPORTING
+        i_log_handle     = gv_log_handle
+        i_s_msg          = l_s_msg
+      EXCEPTIONS
+        log_not_found    = 1
+        msg_inconsistent = 2
+        log_is_full      = 3
+        OTHERS           = 4.
+
+  ENDLOOP.
+
+* Get a prepared profile
+  IF popup IS NOT INITIAL.
+    CALL FUNCTION 'BAL_DSP_PROFILE_POPUP_GET'
+      IMPORTING
+        e_s_display_profile = l_s_display_profile.
+  ELSE.
+    CALL FUNCTION 'BAL_DSP_PROFILE_NO_TREE_GET'
+      IMPORTING
+        e_s_display_profile = l_s_display_profile.
+  ENDIF.
+
+  l_s_display_profile-use_grid   = 'X'.
+  l_s_display_profile-cwidth_opt = 'X'.
+
+  IF save IS NOT INITIAL.
+    CALL FUNCTION 'BAL_DB_SAVE'
+      EXPORTING
+        i_save_all       = 'X'
+      EXCEPTIONS
+        log_not_found    = 1
+        save_not_allowed = 2
+        numbering_error  = 3
+        OTHERS           = 4.
+  ENDIF.
+
+  CALL FUNCTION 'BAL_DSP_LOG_DISPLAY'
+    EXPORTING
+      i_s_display_profile  = l_s_display_profile
+      i_t_log_handle       = lt_log_handle
+    EXCEPTIONS
+      profile_inconsistent = 1
+      internal_error       = 2
+      no_data_available    = 3
+      no_authority         = 4
+      OTHERS               = 5.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Form file_open
+*---------------------------------------------------------------------*
+FORM file_open.
+
+  cl_gui_frontend_services=>file_open_dialog(
+    EXPORTING
+      window_title            = 'Seleccione el fichero'
+    CHANGING
+      file_table              = lt_filetable
+      rc                      = lv_rc
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5 ).
+  IF sy-subrc EQ 0.
+    IF lv_rc EQ 1.
+      READ TABLE lt_filetable INTO ls_filetable INDEX 1.
+      IF sy-subrc EQ 0.
+        p_file = ls_filetable-filename.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Form upload_excel
+*---------------------------------------------------------------------*
+FORM upload_excel.
+
+  DATA:
+    lt_raw     TYPE truxs_t_text_data,
+    i_filename TYPE rlgrap-filename.
+
+  i_filename = p_file.
+
+  CALL FUNCTION 'TEXT_CONVERT_XLS_TO_SAP'
+    EXPORTING
+      i_line_header        = 'X'
+      i_tab_raw_data       = lt_raw
+      i_filename           = i_filename
+    TABLES
+      i_tab_converted_data = lt_excel[]
+    EXCEPTIONS
+      conversion_failed    = 1
+      OTHERS               = 2.
+
+ENDFORM.

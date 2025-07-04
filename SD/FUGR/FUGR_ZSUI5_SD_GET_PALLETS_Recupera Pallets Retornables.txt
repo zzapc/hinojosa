@@ -1,0 +1,172 @@
+FUNCTION zsui5_sd_get_pallets.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_KUNNR) TYPE  KUNNR OPTIONAL
+*"     VALUE(I_EJERCICIO) TYPE  MJAHR OPTIONAL
+*"     VALUE(I_BACKOFFICE) TYPE  LIFNR OPTIONAL
+*"     VALUE(I_REGIO) TYPE  REGIO OPTIONAL
+*"     VALUE(I_CP) TYPE  PSTLZ OPTIONAL
+*"     VALUE(I_HISTORICO) TYPE  FLAG OPTIONAL
+*"     VALUE(IR_VKORG) TYPE  RSELOPTION OPTIONAL
+*"  EXPORTING
+*"     VALUE(E_RETURN) TYPE  BAPIRET2_T
+*"     VALUE(E_PALLETS) TYPE  ZSUI5TT_SD_PALLETS
+*"----------------------------------------------------------------------
+  DATA: ls_return    TYPE bapiret2,
+        ls_pallet    TYPE zsui5s_sd_pallets,
+        lv_datum_ini TYPE sy-datum,
+        lv_datum_fin TYPE sy-datum.
+  DATA:
+    r_kunnr  TYPE RANGE OF kunnr,
+    lt_kunnr TYPE RANGE OF kunnr,
+    r_regio  TYPE RANGE OF regio,
+    r_cp     TYPE RANGE OF pstlz.
+
+  TYPES tt_list_stock   TYPE STANDARD TABLE OF zssd038_alv2.
+
+  DATA: r_vkorg     TYPE sd_vkorg_ranges.
+  DATA: gt_list_stock   TYPE tt_list_stock.
+
+  DATA: r_back_ofiice TYPE RANGE OF lifnr.
+  IF i_backoffice IS NOT INITIAL.
+    r_back_ofiice = VALUE #( ( sign = 'I' option = 'EQ' low = i_backoffice ) ) .
+  ENDIF.
+
+  IF i_kunnr IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_kunnr ASSIGNING FIELD-SYMBOL(<ls_kunnr>).
+    <ls_kunnr>-option = 'EQ'.
+    <ls_kunnr>-sign = 'I'.
+    <ls_kunnr>-low = i_kunnr.
+  ENDIF.
+
+  IF i_cp IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_cp ASSIGNING FIELD-SYMBOL(<ls_cp>).
+    <ls_cp>-option = 'EQ'.
+    <ls_cp>-sign = 'I'.
+    <ls_cp>-low = i_cp.
+  ENDIF.
+
+  IF i_regio IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_regio ASSIGNING FIELD-SYMBOL(<ls_regio>).
+    <ls_regio>-option = 'EQ'.
+    <ls_regio>-sign = 'I'.
+    <ls_regio>-low = i_regio.
+  ENDIF.
+
+  "Obtenemos los VKORG del usuario
+  CALL FUNCTION 'ZSUI5_SD_GET_VKORG'
+* EXPORTING
+*   I_OBJCT        =
+    IMPORTING
+      et_vkorg = r_vkorg.
+  IF r_vkorg IS INITIAL.
+    APPEND INITIAL LINE TO r_vkorg ASSIGNING FIELD-SYMBOL(<ls_vkorg>).
+    <ls_vkorg>-sign = 'I'.
+    <ls_vkorg>-option = 'EQ'.
+    <ls_vkorg>-low = '2000'.
+  ENDIF.
+
+  IF i_ejercicio IS NOT INITIAL.
+    lv_datum_fin = i_ejercicio && '12' && '31'.
+    lv_datum_ini = i_ejercicio && '01' && '01'.
+  ELSE.
+    lv_datum_fin = sy-datum(4) && '12' && '31'.
+    lv_datum_ini = sy-datum(4) && '01' && '01'.
+  ENDIF.
+  "Obtenemos el Stock inicial y la fecha desde donde buscar los datos.
+  SELECT 'I' AS sign, 'EQ' AS option,  ka~kunnr AS low
+    FROM knvp AS vp
+    INNER JOIN kna1 AS ka ON ka~kunnr = vp~kunnr
+*     INNER JOIN kna1 AS k2 ON ka~kunnr = vp~kunn2
+    INTO TABLE @lt_kunnr
+    WHERE vp~lifnr IN @r_back_ofiice AND vp~parvw = 'A1'
+    AND ka~regio IN @r_regio
+    AND ka~pstlz IN @r_cp
+    AND ka~kunnr IN @r_kunnr
+    ORDER BY ka~kunnr DESCENDING.
+  IF sy-subrc = 0.
+    DELETE ADJACENT DUPLICATES FROM lt_kunnr COMPARING low.
+  ENDIF.
+  IF lt_kunnr IS NOT INITIAL.
+    SELECT DISTINCT 'I' AS sign, 'EQ' AS option,  vp~vkorg AS low
+    FROM knvp AS vp
+    INNER JOIN kna1 AS ka ON ka~kunnr = vp~kunnr
+       INNER JOIN kna1 AS k2 ON ka~kunnr = vp~kunn2
+    INTO TABLE @r_vkorg
+    WHERE vp~lifnr IN @r_back_ofiice AND vp~parvw = 'A1'
+    AND ka~regio IN @r_regio
+    AND k2~pstlz IN @r_cp
+    AND ka~kunnr IN @r_kunnr.
+
+    SELECT 'I' AS sign, 'EQ' AS option,  ka~kunnr AS low
+      FROM knvp AS vp
+      INNER JOIN kna1 AS ka ON ka~kunnr = vp~kunnr
+      APPENDING TABLE @lt_kunnr
+      WHERE vp~parvw = 'DM'
+      AND vp~vkorg IN @r_vkorg
+      ORDER BY ka~kunnr DESCENDING.
+
+*    SUBMIT zssdd038  AND RETURN
+*      WITH so_vkorg  IN r_vkorg
+*      WITH so_kunwe IN lt_kunnr
+*      WITH pa_list1 = ''
+*      WITH pa_list2 = 'X'
+*      WITH pa_360 = 'X'.
+*
+*    IMPORT gt_list_stock FROM MEMORY ID 'ZSSD_PALLETS'.
+
+    "Obtenemos la ruta para el WebGUI de la Tx XD02
+    DATA: lv_hostname TYPE string,
+          lv_port     TYPE string.
+    CALL FUNCTION 'TH_GET_VIRT_HOST_DATA'
+      EXPORTING
+        protocol       = 0
+        virt_idx       = 0
+*       LOCAL          = 1
+      IMPORTING
+        hostname       = lv_hostname
+        port           = lv_port
+      EXCEPTIONS
+        not_found      = 1
+        internal_error = 2
+        OTHERS         = 3.
+    IF sy-subrc = 0.
+      "Recuperamos la Gestion de Pallet
+      SELECT a~vkorg, a~matnr, a~mvgr1, b~bezei
+        FROM mvke AS a
+        INNER JOIN tvm1t AS b ON b~mvgr1 = a~mvgr1 AND b~spras = @sy-langu
+        INTO TABLE @DATA(lt_mvke)
+        FOR ALL ENTRIES IN @gt_list_stock
+        WHERE a~vkorg = @gt_list_stock-vkorg
+        AND a~matnr = @gt_list_stock-matnr
+        AND a~vtweg = '10'.
+
+      LOOP AT gt_list_stock INTO DATA(ls_data).
+        MOVE-CORRESPONDING ls_data TO ls_pallet.
+        ls_pallet-arktx = ls_data-maktx.
+
+        READ TABLE lt_mvke INTO DATA(ls_mvke) WITH KEY vkorg = ls_data-vkorg matnr = ls_data-matnr mvgr1 = ls_data-mvgr1.
+        IF sy-subrc = 0.
+          ls_pallet-mvgr1_txt = ls_mvke-bezei.
+        ENDIF.
+
+        ls_pallet-url_kunnr = 'http://'&& lv_hostname && ':' && lv_port && '/sap/bc/gui/sap/its/webgui?~transaction=*XD03%20RF02D-KUNNR=' && ls_pallet-kunnr .
+        ls_pallet-url_informe = 'http://'&& lv_hostname && ':' && lv_port && '/sap/bc/gui/sap/its/webgui?~transaction=*ZSSD038%20SO_VKORG-LOW=' && ls_data-vkorg && ';SO_KUNWE-LOW=' && ls_pallet-kunnr .
+
+        APPEND ls_pallet TO e_pallets.
+      ENDLOOP.
+      SORT e_pallets BY kunnr DESCENDING.
+    ENDIF.
+
+  ELSE.
+    CLEAR ls_return.
+    ls_return-id = 'ZSSD_UI5'.
+    ls_return-type = 'E'.
+    ls_return-number = '001'.
+    ls_return-message_v1 = |{ i_backoffice ALPHA = OUT }|.
+    APPEND ls_return TO e_return.
+  ENDIF.
+
+
+ENDFUNCTION.

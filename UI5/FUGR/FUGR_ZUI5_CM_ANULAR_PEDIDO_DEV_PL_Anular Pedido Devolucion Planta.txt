@@ -1,0 +1,97 @@
+FUNCTION ZUI5_CM_ANULAR_PEDIDO_DEV_PL.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_PEDIDO_POS) TYPE  ZSCMS_PEDIDOS_TRASLADO OPTIONAL
+*"  EXPORTING
+*"     VALUE(E_PEDIDO_POS) TYPE  ZSCMS_PEDIDOS_TRASLADO
+*"     VALUE(E_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+  DATA: lt_return      TYPE bapiret2_t,
+        header_data    TYPE  bapiibdlvhdrchg,
+        header_control TYPE  bapiibdlvhdrctrlchg,
+        delivery       TYPE  bapiibdlvhdrchg-deliv_numb,
+        t_mesg         TYPE TABLE OF  mesg.
+  DATA: purchaseorder LIKE  bapimepoheader-po_number,
+        poitem        TYPE TABLE OF bapimepoitem,
+        poitemx	      TYPE TABLE OF	bapimepoitemx.
+
+  PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '055' i_pedido_pos-ebeln  i_pedido_pos-ebelp '' ''CHANGING e_return.
+
+  IF i_pedido_pos-estado_ent_entrante = 'A'.
+*1.Borrar Entrega Entrante generada (BAPI_INB_DELIVERY_CHANGE)
+    PERFORM borrar_entrega_entrante USING i_pedido_pos-entrega_entrante CHANGING lt_return.
+
+    APPEND LINES OF lt_return TO e_return.
+    READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+      SELECT SINGLE wbstk
+        FROM vbuk
+        INTO @DATA(lv_estado)
+        WHERE vbeln = @i_pedido_pos-entrega_salida.
+      IF lv_estado = 'C'. "comprobamos que este contabilizada la SM para anular
+
+        PERFORM anular_salida_mercancias USING i_pedido_pos-entrega_salida
+                                               'J'
+                                         CHANGING lt_return.
+      ELSE.
+        PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '040' i_pedido_pos-entrega_salida '' '' ''CHANGING e_return.
+      ENDIF.
+      APPEND LINES OF lt_return TO e_return.
+      READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc NE 0.
+        "3. Quitar Status de Transporte ?????
+        SELECT SINGLE tknum FROM vttp INTO @DATA(lv_transporte) WHERE vbeln = @i_pedido_pos-entrega_salida.
+        IF sy-subrc = 0.
+          PERFORM borrar_status_trans  USING    lv_transporte
+                                   CHANGING lt_return.
+          APPEND LINES OF lt_return TO e_return.
+
+          PERFORM borrar_asig_ent_trans USING i_pedido_pos-entrega_salida lv_transporte CHANGING lt_return.
+          APPEND LINES OF lt_return TO e_return.
+
+        ENDIF.
+
+        READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+        IF sy-subrc NE 0.
+          "Desembalar entrega
+          PERFORM desembalar_entrega USING i_pedido_pos-entrega_salida
+                                     CHANGING lt_return.
+
+          APPEND LINES OF lt_return TO e_return.
+
+          READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+          IF sy-subrc NE 0.
+            "Borrar entrega
+
+            PERFORM borrar_entrega USING i_pedido_pos-entrega_salida
+                                   CHANGING lt_return.
+
+            APPEND LINES OF lt_return TO e_return.
+          ENDIF.
+
+          READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+          IF sy-subrc NE 0.
+            "5.Borrar pedido de compras. (BAPI_PO_CHANGE) -> EKPO-LOEKZ=L
+            PERFORM borrar_pedido_po USING i_pedido_pos-ebeln i_pedido_pos-ebelp CHANGING lt_return.
+            APPEND LINES OF lt_return TO e_return.
+
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ELSE.
+    APPEND INITIAL LINE TO e_return ASSIGNING FIELD-SYMBOL(<ls_return>).
+    <ls_return>-id = 'ZUI5_CM'.
+    <ls_return>-type = 'E'.
+    <ls_return>-number = '014'.
+    <ls_return>-message_v1 = |{ i_pedido_pos-ebeln ALPHA = OUT }|.
+    <ls_return>-message_v2 = |{ i_pedido_pos-entrega_entrante ALPHA = OUT }|.
+
+  ENDIF.
+
+  e_pedido_pos = i_pedido_pos.
+
+  PERFORM guardar_log_traslado USING i_pedido_pos-ebeln e_return.
+
+ENDFUNCTION.

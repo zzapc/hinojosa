@@ -1,0 +1,118 @@
+FUNCTION zspp_upd_fserv_idocs.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_AUFNR)
+*"----------------------------------------------------------------------
+
+  "Cuando sean grafos de órdenes la fecha de confirmación tiene que ser la de la OF superior
+  "fecha confirmada de la OF + el tiempo en tránsito.
+  DATA lv_fecha_conf TYPE datum.
+  SELECT SINGLE kdauf, kdpos, gstrp, prodnet, maufnr, sichz FROM caufv WHERE aufnr = @i_aufnr "ARA(SE)-77337 Modificaciones ZSSD032 W(01) - Cambio campo gltrp (Fecha Fin OF) por gstrp (Fecha Inicio OF) y añadir SICHZ
+     AND kdauf <> @space INTO (@DATA(lv_vbeln), @DATA(lv_posnr), @lv_fecha_conf, @DATA(es_grafo), @DATA(of_superior), @DATA(lv_seg) )."ARA(SE)-77337 Modificaciones ZSSD032 W(01) - añadir SICHZ
+
+  IF sy-subrc <> 0.
+    SELECT SINGLE kdauf, kdpos
+      FROM afpo
+      WHERE aufnr = @i_aufnr
+        AND kdauf <> @space
+      INTO (@lv_vbeln, @lv_posnr).
+    IF sy-subrc = 0.
+      SELECT SINGLE gstrp, prodnet, maufnr, sichz
+        FROM caufv
+        WHERE aufnr = @i_aufnr
+        INTO (@lv_fecha_conf, @es_grafo, @of_superior, @lv_seg).
+    ENDIF.
+  ENDIF.
+
+  IF sy-subrc = 0.
+*            SELECT SINGLE
+    IF ( es_grafo EQ abap_true AND of_superior EQ space ) OR es_grafo EQ abap_false.
+      SELECT SINGLE traztd FROM tvro AS t1 INNER JOIN vbap AS t2 ON t1~route EQ t2~route
+        WHERE vbeln = @lv_vbeln AND posnr = @lv_posnr
+        INTO @DATA(lv_transito).
+      IF lv_transito <> 0.
+        DATA lv_dias TYPE char10.
+        CALL FUNCTION 'CONVERSION_EXIT_TSTRG_OUTPUT'
+          EXPORTING
+            input  = lv_transito
+          IMPORTING
+            output = lv_dias.
+
+        DATA lv_dias2 TYPE char10.
+        DATA lv_descarte TYPE char10.
+        SPLIT lv_dias AT ',' INTO lv_dias2 lv_descarte.
+        REPLACE ALL OCCURRENCES OF ',' IN lv_dias2 WITH ''.
+        CONDENSE lv_dias2.
+        DATA lv_dias3 TYPE i.
+        lv_dias3 = lv_dias2.
+
+        "EMP: 12.09.24 Los días tienen que ser laborables
+*          Calendario de festivos asociado a calendario de fábrica: TFACD-HOCID
+*        lv_fecha_conf = lv_fecha_conf + lv_dias3.
+
+        SELECT SINGLE t001w~fabkl
+          INTO @DATA(l_fabkl)
+          FROM vbap
+            INNER JOIN t001w ON vbap~werks = t001w~werks
+          WHERE vbeln = @lv_vbeln
+            AND posnr = @lv_posnr.
+
+        DATA: l_subrc TYPE sy-subrc.
+        CLEAR: l_subrc.
+        CALL FUNCTION 'BKK_ADD_WORKINGDAY'
+          EXPORTING
+            i_date      = lv_fecha_conf
+            i_days      = lv_dias3
+            i_calendar1 = l_fabkl
+*           I_CALENDAR2 =
+          IMPORTING
+            e_date      = lv_fecha_conf
+            e_return    = l_subrc.
+
+        "INI ARA(SE) - 77337 Correcciones ZSSD032 W(02) - No hay que quitar el chequeo del tipo de posición. Sólo debo sumar la holgura si es Peris, es decir, si el tipo de posición es ZSC1.
+        "EMP: 13.09.24 Quitamos validacion tipo posición
+        "INI ARA(SE)-77337 Modificaciones ZSSD032 W(01) - Para Subcos la fecha de confirmación de servicio debe sumar, ademas, el tiempo de seguridad de la OF.
+        SELECT SINGLE pstyv INTO @DATA(lv_tipo)
+          FROM vbap
+          WHERE vbeln = @lv_vbeln
+          AND posnr = @lv_posnr.
+        IF lv_tipo = 'ZSC1'.
+        "FIN ARA(SE) - 77337 Correcciones ZSSD032 W(02) - No hay que quitar el chequeo del tipo de posición. Sólo debo sumar la holgura si es Peris, es decir, si el tipo de posición es ZSC1.
+*          lv_fecha_conf = lv_fecha_conf + lv_seg.
+        DATA l_aufnr TYPE aufnr.
+        l_aufnr = i_aufnr.
+        CALL METHOD zspp_utils=>determina_fecha_fin_sichz
+          EXPORTING
+            i_fecha_fin = lv_fecha_conf
+            i_aufnr     = l_aufnr
+          RECEIVING
+            o_fecha     = lv_fecha_conf.
+
+*          CLEAR: l_subrc.
+*          lv_dias3 = lv_seg.
+*          CALL FUNCTION 'BKK_ADD_WORKINGDAY'
+*            EXPORTING
+*              i_date      = lv_fecha_conf
+*              i_days      = lv_dias3
+*              i_calendar1 = l_fabkl
+**             I_CALENDAR2 =
+*            IMPORTING
+*              e_date      = lv_fecha_conf
+*              e_return    = l_subrc.
+        ENDIF.
+        "FIN EMP: 12.09.24 Los días tienen que ser laborables
+
+        "FIN ARA(SE)-77337 Modificaciones ZSSD032 W(01)
+        "FIN ARA(SE) - 77337 Correcciones ZSSD032 W(02) - No hay que quitar el chequeo del tipo de posición. Sólo debo sumar la holgura si es Peris, es decir, si el tipo de posición es ZSC1.
+      ENDIF.
+      CALL FUNCTION 'ZSSD_UPD_FSERV'
+        EXPORTING
+          i_fconfs = lv_fecha_conf
+          i_vbeln  = lv_vbeln
+          i_posnr  = lv_posnr.
+    ENDIF.
+
+  ENDIF.
+
+ENDFUNCTION.

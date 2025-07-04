@@ -1,0 +1,243 @@
+FUNCTION zmm_correo_primera_entrada.
+*"----------------------------------------------------------------------
+*"*"Módulo funciones actualiz.
+*"
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(T_MSEG) TYPE  TY_T_MSEG
+*"----------------------------------------------------------------------
+* ini 24.04.2018 - cvivo - 45314 Avisar Calidad en primera EM proveedor-material
+
+  DATA: li_addr        TYPE bcsy_smtpa,
+        lcl_send_email TYPE REF TO cl_bcs,
+        li_message     TYPE t_soli_t,
+        lw_message     LIKE LINE OF li_message,
+        lv_subject     TYPE so_obj_des,
+        lcl_document   TYPE REF TO cl_document_bcs,
+        lcl_recipient  TYPE REF TO if_recipient_bcs,
+        lv_sent_to_all TYPE os_boolean,
+        lcl_sender     TYPE REF TO cl_cam_address_bcs,
+        lv_sender      TYPE adr6-smtp_addr,
+        lw_ztmm0025    TYPE ztmm0025,
+        ls_mseg        LIKE LINE OF t_mseg.
+  FIELD-SYMBOLS: <fs_addr> LIKE LINE OF li_addr.
+
+  SORT t_mseg BY werks lifnr matnr.
+
+* Recoge los emails y los añade a la tabla de destinatario
+  LOOP AT t_mseg INTO ls_mseg WHERE bwart EQ '101'
+                                AND lifnr NE space
+                                AND ebeln NE space.
+
+    SELECT SINGLE @abap_true
+      FROM mara
+      WHERE ( mtart EQ 'ZPAP' OR " si es papel
+              mtart EQ 'ZCAB' OR
+              mtart EQ 'ZCAH' OR
+              mtart EQ 'ZCAR' )
+        AND matnr EQ @ls_mseg-matnr
+        INTO @DATA(result3).
+
+    IF sy-subrc EQ 0.
+      AT NEW werks.
+        SELECT SINGLE * FROM ztmm0025
+          INTO lw_ztmm0025
+          WHERE werks EQ ls_mseg-werks
+          AND proceso EQ '1'.
+
+        IF sy-subrc NE 0.
+          CLEAR lw_ztmm0025. " si no hay entrada para el centro lo limpiamos
+        ENDIF.
+      ENDAT.
+
+      IF lw_ztmm0025 IS NOT INITIAL.
+        READ TABLE t_enviado WITH KEY lifnr = ls_mseg-lifnr
+                                      werks = ls_mseg-werks.
+        IF sy-subrc EQ 0.
+          sy-subrc = 0. " ya tratada, saltamos al segundo select
+        ELSE.
+          SELECT SINGLE @abap_true " ¿hay entradas para este proveedor?
+            FROM mseg
+            WHERE lifnr EQ @ls_mseg-lifnr
+              AND werks EQ @ls_mseg-werks
+              AND bwart EQ '101'
+              AND mblnr NE @ls_mseg-mblnr
+              INTO @DATA(result).
+        ENDIF.
+
+        IF sy-subrc NE 0.
+          IF lw_ztmm0025-email1 NE space.
+            APPEND lw_ztmm0025-email1 TO li_addr.
+          ENDIF.
+          IF lw_ztmm0025-email2 NE space.
+            APPEND lw_ztmm0025-email2 TO li_addr.
+          ENDIF.
+          IF lw_ztmm0025-email3 NE space.
+            APPEND lw_ztmm0025-email3 TO li_addr.
+          ENDIF.
+          IF lw_ztmm0025-email4 NE space.
+            APPEND lw_ztmm0025-email4 TO li_addr.
+          ENDIF.
+
+          PERFORM envio_correo USING lv_subject
+                                     li_message[]
+                                     li_addr[]
+                                     lw_ztmm0025-lista
+                                     ls_mseg-lifnr
+                                     ls_mseg-xblnr_mkpf
+                                     ls_mseg-matnr
+                                     ls_mseg-mblnr
+                                     ls_mseg-werks.
+        ELSE.
+
+          READ TABLE t_enviado WITH KEY lifnr = ls_mseg-lifnr
+                                        werks = ls_mseg-werks
+                                        matnr = ls_mseg-matnr.
+
+          IF sy-subrc EQ 0.
+            sy-subrc = 0. " ya tratada, no hacemos nada
+          ELSE.
+            SELECT SINGLE @abap_true " ¿hay entradas para este proveedor/material?
+              FROM mseg
+              WHERE lifnr EQ @ls_mseg-lifnr
+                AND werks EQ @ls_mseg-werks
+                AND bwart EQ '101'
+                AND matnr EQ @ls_mseg-matnr
+                AND mblnr NE @ls_mseg-mblnr
+                INTO @DATA(result2).
+
+            IF sy-subrc NE 0.
+              IF lw_ztmm0025-email1 NE space.
+                APPEND lw_ztmm0025-email1 TO li_addr.
+              ENDIF.
+              IF lw_ztmm0025-email2 NE space.
+                APPEND lw_ztmm0025-email2 TO li_addr.
+              ENDIF.
+              IF lw_ztmm0025-email3 NE space.
+                APPEND lw_ztmm0025-email3 TO li_addr.
+              ENDIF.
+              IF lw_ztmm0025-email4 NE space.
+                APPEND lw_ztmm0025-email4 TO li_addr.
+              ENDIF.
+
+              PERFORM envio_correo USING lv_subject
+                                         li_message[]
+                                         li_addr[]
+                                         lw_ztmm0025-lista
+                                         ls_mseg-lifnr
+                                         ls_mseg-xblnr_mkpf
+                                         ls_mseg-matnr
+                                         ls_mseg-mblnr
+                                         ls_mseg-werks.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+      REFRESH li_addr.
+    ENDIF.
+  ENDLOOP.
+
+* fin 24.04.2018 - cvivo - 45314
+ENDFUNCTION.
+FORM envio_correo USING lv_subject  TYPE so_obj_des
+                        li_message  TYPE t_soli_t
+                        li_addr     TYPE bcsy_smtpa
+                        li_lista    LIKE ztmm0025-lista
+                        lifnr       TYPE elifn
+                        albaran     TYPE xblnr
+                        matnr       TYPE matnr
+                        mblnr       TYPE mblnr
+                        werks       TYPE werks_d.
+
+  DATA: lcl_send_email TYPE REF TO cl_bcs,
+        lcl_document   TYPE REF TO cl_document_bcs,
+        lcl_recipient  TYPE REF TO if_recipient_bcs,
+        lv_sent_to_all TYPE os_boolean,
+        lcl_sender     TYPE REF TO cl_cam_address_bcs,
+        lv_sender      TYPE adr6-smtp_addr,
+        lw_message     TYPE soli,
+        nombre_prov    TYPE name1_gp,
+        text1          TYPE so_text255,
+        text2          TYPE so_text255,
+        text3          TYPE so_text255,
+        text4          TYPE so_text255,
+        text5          TYPE so_text255,
+        text6          TYPE so_text255,
+        text7          TYPE so_text255.
+  FIELD-SYMBOLS: <fs_addr> TYPE ad_smtpadr.
+
+
+  SELECT SINGLE name1 FROM lfa1 INTO nombre_prov
+    WHERE lifnr EQ lifnr.
+
+  SELECT SINGLE maktx FROM makt
+    WHERE matnr EQ @matnr
+      AND spras EQ @sy-langu
+      INTO @DATA(maktx).
+
+* Inicialización de la clase
+  lcl_send_email = cl_bcs=>create_persistent( ).
+
+* Cuerpo del email
+  text1 ='Se ha efectuado la primera entrada del material'.
+  WRITE matnr TO text2 NO-ZERO.
+  text3 = ' (<b>'.
+  text4 = '</b>) para el proveedor <b>'.
+  text5 = '</b> en el albarán'.
+  text6 = ', contabilizado en el documento'.
+  text7 = '.'.
+  CONCATENATE text1 text2
+    INTO lw_message SEPARATED BY space.
+  CONCATENATE lw_message text3 maktx text4 nombre_prov text5
+    INTO lw_message.
+  CONCATENATE lw_message albaran
+    INTO lw_message SEPARATED BY space.
+  CONCATENATE lw_message text6
+    INTO lw_message.
+  CONCATENATE lw_message mblnr
+    INTO lw_message SEPARATED BY space.
+  CONCATENATE lw_message text7
+    INTO lw_message.
+  APPEND lw_message TO li_message. CLEAR lw_message.
+
+* Crear documento
+  lv_subject = 'Nueva entrada para proveedor'.
+
+  lcl_document =  cl_document_bcs=>create_document( i_type    =  'HTM'
+                                                    i_subject =  lv_subject
+                                                    i_text    =  li_message ).
+
+* Enviar documento al email
+  lcl_send_email->set_document( lcl_document ).
+
+* Añadir remitente
+  lv_sender = 'sap@hinojosa.es'.
+  lcl_sender = cl_cam_address_bcs=>create_internet_address( lv_sender  ).
+  lcl_send_email->set_sender( i_sender = lcl_sender ).
+
+* Añadir destinatarios al email
+  LOOP AT li_addr ASSIGNING <fs_addr>.
+    lcl_recipient = cl_cam_address_bcs=>create_internet_address( <fs_addr> ).
+    lcl_send_email->add_recipient( i_recipient = lcl_recipient ).
+  ENDLOOP.
+  IF li_lista NE space. " 58445 - Envío a listas de distribución
+    lcl_recipient = cl_distributionlist_bcs=>getu_persistent( i_dliname = li_lista i_private = space ).
+    lcl_send_email->add_recipient( i_recipient = lcl_recipient i_express = 'X' ).
+  ENDIF.
+
+* Enviar email
+  lv_sent_to_all = lcl_send_email->send( i_with_error_screen = 'X' ).
+*  COMMIT WORK. " no se puede porque estamos en UPDATE!
+
+  IF lv_sent_to_all EQ 'X'.
+*   Enviado Correctamente
+  ELSE.
+*   Error al enviar
+  ENDIF.
+
+  MOVE matnr TO t_enviado-matnr.
+  MOVE lifnr TO t_enviado-lifnr.
+  MOVE werks TO t_enviado-werks.
+  APPEND t_enviado. CLEAR t_enviado.
+
+ENDFORM.

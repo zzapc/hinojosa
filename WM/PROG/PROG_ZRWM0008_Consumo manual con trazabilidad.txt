@@ -1,0 +1,276 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRWM0008
+*&
+*&---------------------------------------------------------------------*
+*& Autor: Carlos Vivó Jiménez
+*&
+*& Contexto: tras el arranque del proyecto consumos UI5 en CB se hace necesario
+*&    poder registrar manualmente consumos sobre reservas que no existen ya
+*&    en el sistema. Actualmente es una carencia, porque el proc.manual depende
+*&    de la existencia de la reserva para trazar. Este programa buscará si existe
+*&    o no, en cuyo caso la creará y la cerrará ipsofacto.
+*&
+*&---------------------------------------------------------------------*
+REPORT zrwm0008.
+
+TABLES: lein, ltbk, lqua, makt, zwm_intf_bhs.
+
+DATA: pedido1 TYPE zwm_ltbk_adit-upper_orderid,
+      pedido2 TYPE zwm_ltbk_adit-lower_orderid.
+
+INCLUDE zrwm0008_o01.
+
+INCLUDE zrwm0008_i01.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_RESERVA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LQUA  text
+*      <--P_LS_RESB_RSNUM  text
+*----------------------------------------------------------------------*
+FORM crear_reserva  USING    p_lqua TYPE lqua
+                             p_benum
+                    CHANGING p_rsnum.
+
+  TYPES t_bapi TYPE TABLE OF bapi2093_res_item WITH KEY material.
+  DATA: lt_profit TYPE TABLE OF bapi_profitability_segment,
+        lt_ret    TYPE TABLE OF bapiret2 WITH HEADER LINE.
+
+  DATA(it_item) = VALUE t_bapi( material = p_lqua-matnr
+        plant = p_lqua-werks
+        stge_loc = p_lqua-lgort
+        entry_qnt = p_lqua-verme
+        entry_uom = p_lqua-meins
+        movement = abap_true
+        ( item_text = p_benum ) ).
+
+  DATA(ls_header) = VALUE bapi2093_res_head( move_type = '291' res_date = sy-datum ).
+
+  CALL FUNCTION 'BAPI_RESERVATION_CREATE1'
+    EXPORTING
+      reservationheader    = ls_header
+    IMPORTING
+      reservation          = p_rsnum
+    TABLES
+      reservationitems     = it_item
+      profitabilitysegment = lt_profit
+      return               = lt_ret.
+
+  LOOP AT lt_ret TRANSPORTING NO FIELDS WHERE type CA 'XAE'.
+    EXIT.
+  ENDLOOP.
+  IF sy-subrc = 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+  ELSE. " ahora creamos la NT
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = abap_true.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREAT_NT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_RESB_RSNUM  text
+*      <--P_LTBK_TBNUM  text
+*----------------------------------------------------------------------*
+FORM creat_nt  USING    p_rsnum
+                        p_letyp
+                        p_lgnum
+                        p_nlpla
+               CHANGING p_tbnum.
+
+  DATA: lt_ltba TYPE STANDARD TABLE OF ltba.
+
+  SELECT SINGLE * FROM resb
+    WHERE rsnum EQ @p_rsnum
+    INTO @DATA(ls_resb).
+
+  CHECK sy-subrc EQ 0.
+
+  IF ls_resb-meins EQ 'KG'.
+    CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+      EXPORTING
+        i_matnr              = ls_resb-matnr
+        i_in_me              = ls_resb-meins
+        i_out_me             = CONV meins( COND #( WHEN p_letyp EQ 'BB' THEN 'M' ELSE 'ST' ) )
+        i_menge              = ls_resb-bdmng
+      IMPORTING
+        e_menge              = ls_resb-bdmng
+      EXCEPTIONS
+        error_in_application = 1
+        error                = 2
+        OTHERS               = 3.
+    IF sy-subrc <> 0.
+* Implement suitable error handling here
+    ENDIF.
+
+  ENDIF.
+
+  lt_ltba = VALUE #( menga = ls_resb-bdmng altme = COND #( WHEN p_letyp EQ 'BB' THEN 'M' ELSE 'ST' ) lgort = '1000' bwlvs = '919'
+                     matnr = ls_resb-matnr pdatu = sy-datum pzeit = sy-uzeit rsnum = ls_resb-rsnum benum = ls_resb-sgtxt
+                     lgnum = p_lgnum werks = ls_resb-werks nlpla = p_nlpla
+                     ( betyp = 'O' ) ).
+
+  CALL FUNCTION 'L_TR_CREATE'
+    EXPORTING
+      i_single_item         = 'X'
+      i_save_only_all       = 'X'
+      i_commit_work         = space
+    TABLES
+      t_ltba                = lt_ltba
+    EXCEPTIONS
+      item_error            = 1
+      no_entry_in_int_table = 2
+      item_without_number   = 3
+      no_update_item_error  = 4
+      OTHERS                = 5.
+
+  COMMIT WORK AND WAIT.
+
+  SELECT SINGLE tbnum FROM ltbk
+    INTO p_tbnum
+    WHERE rsnum EQ p_rsnum
+      AND bwlvs EQ '919'
+      AND lgnum EQ p_lgnum
+      AND betyp EQ 'O'.
+
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_CONSUMO_MANUAL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_consumo_manual USING vp_nlpla
+                            vp_benum
+                            wp_lqua TYPE lqua
+                            vp_pedido1
+                            vp_pedido2
+                            vp_metros_consumo
+                            vp_cla_cantidad_consumida TYPE xfeld.
+
+
+  DATA wl_ltbk TYPE ltbk.
+
+  "primero buscamos si existe reserva
+  SELECT SINGLE * FROM resb
+    INTO @DATA(wl_resb)
+    WHERE sgtxt EQ @vp_benum
+      AND matnr EQ @wp_lqua-matnr
+      AND werks EQ @wp_lqua-werks.
+
+  IF sy-subrc NE 0. " la creamos si no existe
+    PERFORM crear_reserva USING wp_lqua
+                                vp_benum
+                          CHANGING wl_resb-rsnum.
+
+    IF wl_resb-rsnum IS INITIAL.
+      CLEAR sy-ucomm.
+      MESSAGE 'Error al crear reserva para el consumo' TYPE 'E'.
+    ELSE. " ahora creamos la NT
+      PERFORM creat_nt USING wl_resb-rsnum
+                             wp_lqua-letyp
+                             wp_lqua-lgnum
+                             vp_nlpla
+                     CHANGING wl_ltbk-tbnum.
+
+      IF wl_ltbk-tbnum IS NOT INITIAL.
+        DATA(adit) = VALUE zwm_ltbk_adit( lgnum = wp_lqua-lgnum
+                                          tbnum = wl_ltbk-tbnum
+                                          benum = vp_benum
+                                          menge = wp_lqua-verme
+                                          meins = wp_lqua-meins
+                                          upper_orderid = vp_pedido1
+                                          lower_orderid = vp_pedido2 ).
+        INSERT zwm_ltbk_adit FROM adit.
+
+        IF sy-subrc EQ 0.
+          COMMIT WORK AND WAIT.
+        ENDIF.
+      ELSE.
+        CLEAR sy-ucomm.
+        MESSAGE 'Error al crear la NT para el consumo' TYPE 'E'.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  SELECT SINGLE *
+    INTO wl_ltbk
+    FROM ltbk
+    WHERE rsnum EQ wl_resb-rsnum
+      AND lgnum EQ wp_lqua-lgnum.
+
+  IF sy-subrc NE 0.
+    PERFORM creat_nt USING wl_resb-rsnum
+                           wp_lqua-letyp
+                           wp_lqua-lgnum
+                           vp_nlpla
+                     CHANGING wl_ltbk-tbnum.
+
+    IF wl_ltbk-tbnum IS NOT INITIAL.
+      adit = VALUE zwm_ltbk_adit( lgnum = wp_lqua-lgnum
+                                  tbnum = wl_ltbk-tbnum
+                                  benum = vp_benum
+                                  menge = wp_lqua-verme
+                                  meins = wp_lqua-meins
+                                  upper_orderid = vp_pedido1
+                                  lower_orderid = vp_pedido2 ).
+      INSERT zwm_ltbk_adit FROM adit.
+
+      IF sy-subrc EQ 0.
+        COMMIT WORK AND WAIT.
+      ENDIF.
+    ELSE.
+      CLEAR sy-ucomm.
+      MESSAGE 'Error al crear la NT para el consumo' TYPE 'E'.
+    ENDIF.
+  ENDIF.
+
+  SELECT SINGLE *
+    INTO wl_ltbk
+    FROM ltbk
+    WHERE rsnum EQ wl_resb-rsnum
+    AND lgnum   EQ wp_lqua-lgnum.
+  CHECK sy-subrc EQ 0.
+
+  DATA(lr_ref) = zcl_wm_nt_generic=>get_instance( ).
+
+  DATA vl_metros_restantes TYPE zwm_intf_bhs-metros_restantes.
+  DATA vl_consumo          TYPE ltbp-menge.
+  IF vp_cla_cantidad_consumida = space.
+    vl_metros_restantes = vp_metros_consumo.
+    vl_consumo          = wp_lqua-verme - vp_metros_consumo.
+  ELSE.
+    vl_consumo          = vp_metros_consumo.
+    vl_metros_restantes = wp_lqua-verme - vp_metros_consumo.
+  ENDIF.
+
+
+
+  DATA(ls_entry) = lr_ref->bobecm_create_consumption( iv_lgnum      = wl_ltbk-lgnum
+                                                      is_orig_lqua  = wp_lqua
+                                                      is_orig_ltbk  = wl_ltbk
+                                                      iv_cons_qty   = vl_consumo
+                                                      iv_meins      = wp_lqua-meins
+                                                      iv_calidad    = space
+                                                      iv_restante   = vl_metros_restantes
+                                                      iv_diametro   = space
+                                                      iv_create_entry_only = abap_false ).
+
+  zcl_wm_nt_generic=>close_rsnum( iv_rsnum = wl_resb-rsnum
+                                  iv_last = abap_false
+                                  iv_lgnum = wp_lqua-lgnum ).
+
+ENDFORM.

@@ -1,0 +1,739 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZSSD_FILE_CYC_FORM
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  READFILE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM readfile.
+
+  TYPES: BEGIN OF ty_data_entrada,
+           nombre_deudor                 TYPE c LENGTH 50,
+           nif_deudor                    TYPE stcd1,
+           cod_referencia                TYPE c LENGTH 50,
+           cod_deudor                    TYPE vrsnr,
+           cod_provincia_pais            TYPE c LENGTH 50,
+           cod_sector_actividad          TYPE c LENGTH 50,
+           cod_estado_cla                TYPE c LENGTH 50,
+           fecha_propuesta_clasificacion TYPE c LENGTH 50,
+           importe_solicitado            TYPE c LENGTH 50,
+           importe_concedido             TYPE c LENGTH 50,
+           desc_nota_clasificacion       TYPE c LENGTH 50,
+           wmotivo_c                     TYPE c LENGTH 50,
+         END OF ty_data_entrada.
+
+  TYPES:BEGIN OF ty_final,
+          var1 TYPE string,
+        END OF ty_final.
+
+  DATA:lt_final TYPE TABLE OF ty_final,
+       ls_final TYPE ty_final.
+
+  DATA gt_data  TYPE STANDARD TABLE OF ty_data_entrada.
+  DATA wa_data  TYPE ty_data_entrada.
+  DATA lv_msg   TYPE string.
+  DATA l_string TYPE string.
+  DATA wa_knkk  TYPE knkk.
+  DATA wa_yknkk TYPE knkk.
+  DATA wa_knka  TYPE knka.
+  DATA wa_yknka TYPE knka.
+
+  DATA wa_registro TYPE zssd_cyc_hist.
+  DATA lt_return TYPE STANDARD TABLE OF bapiret2.
+
+  DATA lv_path_error TYPE rlgrap-filename. "VALUE '/usr/sap/HED/CyC/Erroneos/'.   "(DEL) VAR: 18.10.2022 10:10:40 - Ajuste ruta
+  DATA lv_path_proce TYPE rlgrap-filename. "VALUE '/usr/sap/HED/CyC/Procesados/'. "(DEL) VAR: 18.10.2022 10:10:40 - Ajuste ruta
+  DATA lv_filename   TYPE rlgrap-filename VALUE 'S0145130_DIA.CSV'.
+
+  DATA lv_fecha_prop TYPE char10.     " BG 19.10.2023 - Conversión fecha propuesta clasificación
+  DATA lv_kraus      TYPE knkk-kraus. " BG 19.10.2023 - Campo Kraus
+
+  DATA lv_lines      TYPE i.          " BG 22.07.2024 - Cantidad de registros KNKK
+  DATA lt_files      TYPE STANDARD TABLE OF eps2fili. " BG 22.07.2024 - Leer todos los archivos sin procesar de la carpeta CYC
+  DATA lv_file_aux   TYPE eps2filnam.      " BG 22.07.2024 - Leer todos los archivos sin procesar de la carpeta CYC
+  DATA lv_file2      TYPE rlgrap-filename. " BG 22.07.2024 - Leer todos los archivos sin procesar de la carpeta CYC
+  DATA lv_poliza     TYPE char8.           " BG 22.07.2024 - Leer el numero de póliza con el nombre del fichero
+  DATA lr_kkber      TYPE RANGE OF kkber.  " BG 22.07.2024 - Área de control de creditos
+
+
+  IF  p_file = 'X'.
+    " Inicio BG 22.07.2024 -  Se leen todos los archivos .csv de esa carpeta CYC
+    lv_file_aux = pa_file.
+    CALL FUNCTION 'EPS2_GET_DIRECTORY_LISTING'
+      EXPORTING
+        iv_dir_name            = lv_file_aux
+      TABLES
+        dir_list               = lt_files
+      EXCEPTIONS
+        invalid_eps_subdir     = 1
+        sapgparam_failed       = 2
+        build_directory_failed = 3
+        no_authorization       = 4
+        read_directory_failed  = 5
+        too_many_read_errors   = 6
+        empty_directory_list   = 7
+        OTHERS                 = 8.
+    IF sy-subrc <> 0.
+* Implement suitable error handling here
+    ENDIF.
+  ELSE.
+    DATA(o_ftp) = NEW zcl_ap_ftp( ).
+    o_ftp = NEW #( ).
+    o_ftp->connect( user = p_user password = p_pass host = p_dftp ).
+    IF NOT o_ftp->error_conexion IS INITIAL.
+      o_ftp->disconnect( ).
+      MESSAGE 'Error de conexión FTP' TYPE 'E'.
+    ENDIF.
+
+    o_ftp->lista_ficheros( EXPORTING directorio = p_ddir
+                                     no_desconectar = ''
+                           IMPORTING message = DATA(l_msg)
+                                     i_ficheros = DATA(i_ficheros) ).
+
+    IF NOT l_msg IS INITIAL.
+      o_ftp->disconnect( ).
+      MESSAGE l_msg TYPE 'E'.
+
+    ELSE.
+      LOOP AT i_ficheros ASSIGNING FIELD-SYMBOL(<fichero>) WHERE isdir = '0'.
+        APPEND INITIAL LINE TO lt_files ASSIGNING FIELD-SYMBOL(<file>).
+        <file>-name = <fichero>-filename.
+        IF <file>-name(1) = ` `.
+          <file>-name = <file>-name+1.
+        ENDIF.
+        <file>-size = <fichero>-filelength.
+      ENDLOOP.
+    ENDIF.
+
+  ENDIF.
+
+  IF lt_files[] IS INITIAL.
+    WRITE : text-e04.
+    EXIT.
+  ENDIF.
+
+  DATA(lr_name) = VALUE rseloption( sign = 'I' option = 'CP' ( low = '*.CSV' ) ).
+  DELETE lt_files WHERE name NOT IN lr_name[].
+  IF lt_files[] IS INITIAL.
+    WRITE : text-e05.
+    EXIT.
+  ENDIF.
+
+  SELECT * INTO TABLE @DATA(lt_cyc_kkber)
+   FROM zssdt_cyc_kkber.
+
+  LOOP AT lt_files INTO DATA(ls_files_name).
+    lv_filename = ls_files_name-name.
+
+*    lv_poliza =  lv_filename+20(8). " Leer nro. de póliza
+    LOOP AT lt_cyc_kkber INTO DATA(wa_cyc_kkber).
+      IF lv_filename CS wa_cyc_kkber-poliza.
+        lv_poliza = wa_cyc_kkber-poliza.
+        APPEND VALUE #( sign = 'I' option = 'EQ' low = wa_cyc_kkber-kkber  ) TO lr_kkber.
+      ENDIF.
+    ENDLOOP.
+    IF lv_poliza IS INITIAL.
+      WRITE:/ text-e06 , lv_filename.
+      CONTINUE.
+    ENDIF.
+*    IF lv_poliza IS NOT INITIAL.
+**      lr_kkber = VALUE #( FOR wa IN lt_cyc_kkber ( sign   = 'I'
+**                                                   option = 'EQ'
+**                                                    low    = wa-kkber ) ).
+*    ELSE.
+*      WRITE:/ text-e06 , lv_filename.
+*      CONTINUE.
+*    ENDIF.
+
+    CONCATENATE sy-datum sy-timlo lv_filename INTO lv_filename SEPARATED BY '_'.
+
+    "(INS) INI VAR: 18.10.2022 10:10:40 - Ajuste ruta
+    lv_path_error = '/usr/sap/' && sy-sysid && '/CyC/Erroneos/' && lv_filename. " no se cuando se va a usar esta ruta...
+    lv_path_proce = '/usr/sap/' && sy-sysid && '/CyC/Procesados/' && lv_filename.
+    "(INS) FIN VAR: 18.10.2022 10:10:40 - Ajuste ruta
+
+    IF p_file = 'X'.
+      lv_file2 = pa_file && ls_files_name-name.
+
+      WRITE: / 'Se proceso fichero', lv_file2.
+
+      OPEN DATASET lv_file2 FOR INPUT IN TEXT MODE ENCODING DEFAULT MESSAGE lv_msg.
+
+      IF sy-subrc EQ 0.
+        DO.
+          TRY .
+              READ DATASET lv_file2 INTO l_string.
+            CATCH cx_sy_conversion_codepage ##NO_HANDLER.
+
+          ENDTRY.
+          IF sy-subrc NE 0.
+            EXIT.
+
+          ELSEIF sy-index = 1.
+            ls_final-var1 = l_string.
+            INSERT ls_final INTO TABLE lt_final.
+            CONTINUE.
+
+          ELSE.
+
+            ls_final-var1 = l_string.
+            INSERT ls_final INTO TABLE lt_final.
+
+            SPLIT l_string AT ';' INTO wa_data-nombre_deudor
+                                       wa_data-nif_deudor
+                                       wa_data-cod_referencia
+                                       wa_data-cod_deudor
+                                       wa_data-cod_provincia_pais
+                                       wa_data-cod_sector_actividad
+                                       wa_data-cod_estado_cla
+                                       wa_data-fecha_propuesta_clasificacion
+                                       wa_data-importe_solicitado
+                                       wa_data-importe_concedido
+                                       wa_data-desc_nota_clasificacion
+                                       wa_data-wmotivo_c.
+            APPEND wa_data TO gt_data.
+          ENDIF.
+        ENDDO.
+
+        CLOSE DATASET lv_file2.
+      ENDIF.
+    ELSE.
+      DATA: i_lineas2 TYPE TABLE OF string,
+            i_lineas1 TYPE TABLE OF string.
+
+      WRITE: / 'Se proceso fichero', ls_files_name-name.
+      o_ftp->leer_fichero( EXPORTING fichero = ls_files_name-name
+                                     no_desconectar = ''
+                                     binario = 'X'
+                                   IMPORTING message = l_msg
+                                             xstring = DATA(xstring)
+*                                             i_tabla = i_lineas1
+                                              ).
+
+      IF NOT l_msg IS INITIAL.
+        o_ftp->disconnect( ).
+        MESSAGE |Error leyendo fichero { ls_files_name-name }| TYPE 'E'.
+      ENDIF.
+
+      DATA: loc_conv TYPE REF TO cl_abap_conv_in_ce,
+            string   TYPE string.
+      CLEAR string.
+      loc_conv = cl_abap_conv_in_ce=>create( input       = xstring
+                                             encoding    = '1100'  ).
+
+      TRY.
+          loc_conv->read( IMPORTING data = string ).
+        CATCH cx_root INTO DATA(o_root).
+          WRITE: / 'Error conversión:', o_root->get_text( ).
+      ENDTRY.
+
+
+      CLEAR: i_lineas1, i_lineas2.
+      SPLIT string AT cl_abap_char_utilities=>cr_lf INTO TABLE i_lineas2.
+
+
+* Sólo me llega una línea, es que no ha encontrado el caracter salto de línea correcto, sino A000
+      IF lines( i_lineas2 ) = 1.
+
+        CLEAR i_lineas1.
+        l_string = i_lineas2[ 1 ].
+        FIELD-SYMBOLS: <lfs_hex> TYPE x.
+        DATA: l_char   TYPE c,
+              l_linea1 TYPE text1024,
+              l_ind    TYPE int4.
+        DO strlen( l_string ) TIMES.
+          DATA(l_index) = sy-index - 1.
+          l_char = l_string+l_index(1).
+          ASSIGN l_char TO <lfs_hex> TYPE 'X'.
+          IF <lfs_hex> = '0A00'.
+            APPEND l_linea1 TO i_lineas1.
+            CLEAR: l_linea1, l_ind.
+          ELSE.
+            l_linea1+l_ind(1) = l_char.
+            ADD 1 TO l_ind.
+          ENDIF.
+        ENDDO.
+        IF NOT l_linea1 IS INITIAL.
+          APPEND l_linea1 TO i_lineas1.
+        ENDIF.
+      ELSEIF lines( i_lineas2 ) > 1.
+* Llegan muchos regisotros dos lineas que tengo que unir.
+        IF strlen( i_lineas2[ 1 ] ) <= 132.
+          LOOP AT i_lineas2 ASSIGNING FIELD-SYMBOL(<linea2>).
+            DATA(l_mod) = sy-tabix MOD 2.
+            IF l_mod = 1.
+              APPEND INITIAL LINE TO i_lineas1 ASSIGNING FIELD-SYMBOL(<linea1>).
+              <linea1> = <linea2>.
+            ELSE.
+              CONCATENATE <linea1> <linea2> INTO <linea1>.
+            ENDIF.
+          ENDLOOP.
+        ELSE.
+          i_lineas1 = i_lineas2.
+        ENDIF.
+      ENDIF.
+
+
+      LOOP AT i_lineas1 ASSIGNING FIELD-SYMBOL(<linea>).
+        DATA(l_tabix) = sy-tabix.
+        ls_final-var1 = <linea>.
+        INSERT ls_final INTO TABLE lt_final.
+
+        IF l_tabix > 1.
+          SPLIT <linea> AT ';' INTO wa_data-nombre_deudor
+                                     wa_data-nif_deudor
+                                     wa_data-cod_referencia
+                                     wa_data-cod_deudor
+                                     wa_data-cod_provincia_pais
+                                     wa_data-cod_sector_actividad
+                                     wa_data-cod_estado_cla
+                                     wa_data-fecha_propuesta_clasificacion
+                                     wa_data-importe_solicitado
+                                     wa_data-importe_concedido
+                                     wa_data-desc_nota_clasificacion
+                                     wa_data-wmotivo_c.
+          APPEND wa_data TO gt_data.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+    LOOP AT gt_data INTO wa_data.
+      lv_kraus = wa_data-cod_deudor.
+
+      IF lv_kraus IS INITIAL.
+        "ADD JVM - NO se puede cargar algo que no tenga el COD_DEUDOR bien informado, ya que si se hace así, se tomarán todos al pasar % con un LIKE en la select
+        WRITE:/ text-e02 , wa_data-nif_deudor , wa_data-cod_deudor.
+        CONTINUE.
+        "FIN JVM - NO se puede cargar algo que no tenga el COD_DEUDOR bien informado, ya que si se hace así, se tomarán todos al pasar % con un LIKE en la select
+      ENDIF.
+
+      wa_data-cod_deudor = '%' && wa_data-cod_deudor.
+
+
+
+      " 1.- Busca por NIF + Codigo de expediente
+      SELECT DISTINCT b~stcd1, a~* INTO TABLE @DATA(lt_knkk) ##WARN_OK
+        FROM kna1 AS b
+         INNER JOIN knb1 AS c ON b~kunnr = c~kunnr
+         INNER JOIN knkk AS a ON b~kunnr = a~kunnr
+        WHERE b~stcd1 = @wa_data-nif_deudor
+          AND a~kraus LIKE @wa_data-cod_deudor
+          AND a~kkber IN @lr_kkber.
+      IF sy-subrc NE 0.
+        " 2.-Si no lo encuentra, busca por NIF + codigo de expediente vacio
+        IF wa_data-nif_deudor IS NOT INITIAL."ADD JVM - Si el NIF viene vacío porque es un extranjero/extracomunitario no lo encontrará y traerá todos
+          SELECT DISTINCT b~stcd1, a~* INTO TABLE @lt_knkk ##WARN_OK
+            FROM kna1 AS b
+             INNER JOIN knb1 AS c ON b~kunnr = c~kunnr
+             INNER JOIN knkk AS a ON b~kunnr = a~kunnr
+            WHERE b~stcd1 = @wa_data-nif_deudor
+              AND a~kkber IN @lr_kkber.
+        ENDIF."ADD JVM - Si el NIF viene vacío porque es un extranjero/extracomunitario no lo encontrará y traerá todos
+        IF sy-subrc NE 0.
+          " BG 22.07.2024 Si no lo encuentra en el paso 1 y 2, busca solo por número de expediente
+          " en teoria, debería haber solo un registro por codigo de expediente
+          SELECT DISTINCT b~stcd1, a~* INTO TABLE @lt_knkk ##WARN_OK
+          FROM kna1 AS b
+           INNER JOIN knb1 AS c ON b~kunnr = c~kunnr
+           INNER JOIN knkk AS a ON b~kunnr = a~kunnr
+            WHERE a~kraus LIKE @wa_data-cod_deudor
+              AND a~kkber IN @lr_kkber.
+        ENDIF.
+      ENDIF.
+
+      IF lt_knkk[] IS INITIAL.
+        WRITE:/ text-e02 , wa_data-nif_deudor , wa_data-cod_deudor.
+        CONTINUE.
+      ENDIF.
+
+      " BG 16.04.2024 por si tiene más de 1 área de ventas en KNKK
+      LOOP AT lt_knkk INTO DATA(ls_knkk_aux).
+        MOVE-CORRESPONDING ls_knkk_aux-a TO wa_knkk.
+        IF wa_knkk IS NOT INITIAL.
+
+          wa_knkk-klimk =  wa_data-importe_concedido + wa_knkk-zzriesgo_2 + wa_knkk-zzriesgo.
+          wa_knkk-dbekr = wa_data-importe_concedido.
+
+          " BG Inicio 18.10.2023 - Si el limite de credito es cero, entonces se deja el que viene en el archivo CYC
+          IF wa_knkk-klimk IS INITIAL.
+            wa_knkk-klimk = wa_knkk-dbekr.
+          ENDIF.
+          " BG FIN 18.10.2023
+
+          WRITE: / 'Cliente:', wa_data-nif_deudor, wa_knkk-kunnr, wa_knkk-kkber, 'KLIMK=', wa_knkk-klimk, 'DBEKR=', wa_knkk-dbekr.
+
+          wa_knkk-dbpay = 'ZCO'.
+
+          " BG Ini 18.10.2023 - Si no es igual al del archivo/vacio se deja el del archivo CYC
+          IF wa_knkk-kraus NE lv_kraus.
+            wa_knkk-kraus = lv_kraus.
+          ENDIF.
+
+          REPLACE ALL OCCURRENCES OF '/' IN wa_data-fecha_propuesta_clasificacion  WITH '.'.
+          CONDENSE wa_data-fecha_propuesta_clasificacion NO-GAPS.
+          lv_fecha_prop = wa_data-fecha_propuesta_clasificacion.
+          CALL FUNCTION 'CONVERT_DATE_TO_INTERNAL'
+            EXPORTING
+              date_external            = lv_fecha_prop
+            IMPORTING
+              date_internal            = wa_knkk-revdb
+            EXCEPTIONS
+              date_external_is_invalid = 1
+              OTHERS                   = 2.
+          IF sy-subrc <> 0.
+* Implement suitable error handling here
+          ENDIF.
+          " BG Fin 18.10.2023
+
+          wa_knkk-dbrtg = 'CYC'.
+          wa_knkk-dbmon = sy-datum.
+
+          CALL FUNCTION 'CREDITLIMIT_CHANGE'
+            EXPORTING
+              i_knka   = wa_knka
+              i_knkk   = wa_knkk
+              upd_knka = ''
+              upd_knkk = 'U'
+              yknka    = wa_yknka
+              yknkk    = wa_yknkk.
+
+          MOVE-CORRESPONDING wa_knkk TO wa_registro ##ENH_OK.
+
+          wa_registro-tipo = 'E'.
+
+          CALL FUNCTION 'ZSSD_CYC_HISTORICO'
+            EXPORTING
+              i_registro = wa_registro
+            TABLES
+              return     = lt_return.
+
+          LOOP AT lt_return INTO DATA(vw_return).
+
+            MESSAGE ID vw_return-id TYPE vw_return-type
+                                    NUMBER vw_return-number
+                                    WITH vw_return-message_v1
+                                         vw_return-message_v2
+                                         vw_return-message_v3
+                                         vw_return-message_v4
+                                    INTO vw_return-message.
+
+            WRITE:/ vw_return-message, wa_data-nif_deudor , wa_data-cod_deudor.
+          ENDLOOP.
+        ELSE.
+          WRITE:/ text-e02 , wa_data-nif_deudor , wa_data-cod_deudor.
+        ENDIF.
+        CLEAR: lv_fecha_prop, wa_knkk, wa_registro.
+      ENDLOOP.
+      CLEAR: lv_kraus, lv_fecha_prop, wa_knkk, lt_knkk[], lv_lines, ls_knkk_aux, wa_data.
+    ENDLOOP.
+    IF sy-subrc NE 0.
+      WRITE: / 'FICHERO SIN DATOS!'.
+    ENDIF.
+
+    IF NOT lt_final IS INITIAL.
+
+      IF p_file = 'X'.
+        OPEN DATASET lv_path_proce FOR OUTPUT IN TEXT MODE ENCODING DEFAULT MESSAGE lv_msg.
+        IF  sy-subrc  = 0.
+          LOOP AT lt_final INTO ls_final .
+
+            TRANSFER ls_final-var1 TO lv_path_proce.
+
+          ENDLOOP.
+        ELSE.
+          WRITE:/ lv_msg.
+          EXIT.
+        ENDIF.
+        CLOSE DATASET lv_path_proce.
+        IF sy-subrc NE 0.
+          MESSAGE  text-e01 TYPE 'E'.
+          EXIT.
+          EXIT.
+        ELSEIF sy-subrc IS INITIAL.
+          WRITE : text-s02 , lv_path_proce.
+
+          OPEN DATASET lv_file2 FOR INPUT IN TEXT MODE ENCODING DEFAULT MESSAGE lv_msg.
+          IF sy-subrc = 0.
+            DO.
+              DELETE DATASET lv_file2.
+              IF sy-subrc <> 0.
+                EXIT.
+              ENDIF.
+            ENDDO.
+          ELSE.
+            WRITE:/ lv_msg.
+            EXIT.
+          ENDIF.
+          CLOSE DATASET lv_file2.
+          IF sy-subrc NE 0.
+            MESSAGE  text-e01 TYPE 'E'.
+            EXIT.
+          ELSEIF sy-subrc IS INITIAL.
+            WRITE : text-s03 , lv_file2.
+          ENDIF.
+        ENDIF.
+      ELSE.
+* No borro por si acaso
+        DATA(l_error) = ''.
+        IF NOT p_ddirp IS INITIAL.
+          DATA(l_ddirp) = p_ddirp.
+          IF p_ddirp(1) = '/'.
+            l_ddirp = p_ddirp.
+          ELSE.
+            DATA(l_d) = p_ddir && '/'.
+            IF p_ddirp CS l_d.
+              SPLIT p_ddirp AT l_d INTO DATA(l_aux) l_ddirp.
+            ENDIF.
+          ENDIF.
+
+          o_ftp->grabar_fichero( EXPORTING directorio = l_ddirp
+                                           fichero = ls_files_name-name
+                                           xstring = xstring
+                                           no_desconectar = 'X'
+                                           binario = 'X'
+                                 IMPORTING message = l_msg ).
+          IF NOT l_msg IS INITIAL.
+            l_error = 'X'.
+            WRITE: / 'Error moviendo a dir.',  l_ddirp, 'el fichero:', ls_files_name-name,  l_msg.
+          ENDIF.
+        ENDIF.
+
+        o_ftp->cd( p_ddir ).
+*        IF l_error IS INITIAL. "Aunque de error, borramos
+        IF o_ftp->delete( ls_files_name-name ) = ''.
+          WRITE: / 'Error borrando fichero:', ls_files_name-name, o_ftp->mensaje_error.
+        ENDIF.
+*        ENDIF.
+      ENDIF.
+    ELSE.
+      WRITE:/ lv_msg.
+      EXIT.
+    ENDIF.
+
+    CLEAR: ls_files_name, lv_filename, lv_path_error, lv_path_proce, lv_file2,
+           lt_final[], gt_data[], lr_kkber[].
+  ENDLOOP.
+  " Fin BG 22.07.2024 -  Se leen todos los archivos .csv de esa carpeta CYC
+
+*  CONCATENATE sy-datum sy-timlo lv_filename INTO lv_filename SEPARATED BY '_'.
+*
+*  "(INS) INI VAR: 18.10.2022 10:10:40 - Ajuste ruta
+*  lv_path_error = '/usr/sap/' && sy-sysid && '/CyC/Erroneos/' && lv_filename. " no se cuando se va a usar esta ruta...
+*  lv_path_proce = '/usr/sap/' && sy-sysid && '/CyC/Procesados/' && lv_filename.
+*  "(INS) FIN VAR: 18.10.2022 10:10:40 - Ajuste ruta
+*
+*  OPEN DATASET pa_file FOR INPUT IN TEXT MODE ENCODING DEFAULT MESSAGE lv_msg.
+*
+*  IF sy-subrc EQ 0.
+*    DO.
+*      TRY .
+*          READ DATASET pa_file INTO l_string.
+*        CATCH cx_sy_conversion_codepage ##NO_HANDLER.
+*
+*      ENDTRY.
+*      IF sy-subrc NE 0.
+*        EXIT.
+*      ELSEIF sy-index = 1.
+*        ls_final-var1 = l_string.
+*        INSERT ls_final INTO TABLE lt_final.
+*        CONTINUE.
+*      ELSE.
+*
+*        ls_final-var1 = l_string.
+*        INSERT ls_final INTO TABLE lt_final.
+*
+*        SPLIT l_string AT ';' INTO wa_data-nombre_deudor
+*                                   wa_data-nif_deudor
+*                                   wa_data-cod_referencia
+*                                   wa_data-cod_deudor
+*                                   wa_data-cod_provincia_pais
+*                                   wa_data-cod_sector_actividad
+*                                   wa_data-cod_estado_cla
+*                                   wa_data-fecha_propuesta_clasificacion
+*                                   wa_data-importe_solicitado
+*                                   wa_data-importe_concedido
+*                                   wa_data-desc_nota_clasificacion
+*                                   wa_data-wmotivo_c.
+*        APPEND wa_data TO gt_data.
+*      ENDIF.
+*    ENDDO.
+*    CLOSE DATASET pa_file.
+*
+*
+*    LOOP AT gt_data INTO wa_data.
+*      lv_kraus = wa_data-cod_deudor.
+*      wa_data-cod_deudor = '%' && wa_data-cod_deudor.
+*
+*      " 1.- Busca por NIF + Codigo de expediente
+*      SELECT DISTINCT b~stcd1, a~* INTO TABLE @DATA(lt_knkk) ##WARN_OK
+*        FROM kna1 AS b
+*         INNER JOIN knb1 AS c ON b~kunnr = c~kunnr
+*         INNER JOIN knkk AS a ON b~kunnr = a~kunnr
+*        WHERE b~stcd1 = @wa_data-nif_deudor
+*          AND a~kraus LIKE @wa_data-cod_deudor.
+*      IF sy-subrc NE 0.
+*        " 2.-Si no lo encuentra, busca por NIF + codigo de expediente vacio
+*        SELECT DISTINCT b~stcd1, a~* INTO TABLE @lt_knkk ##WARN_OK
+*          FROM kna1 AS b
+*           INNER JOIN knb1 AS c ON b~kunnr = c~kunnr
+*           INNER JOIN knkk AS a ON b~kunnr = a~kunnr
+*          WHERE b~stcd1 = @wa_data-nif_deudor
+*            AND a~kraus = @space.
+*        IF sy-subrc NE 0.
+*          " BG 22.07.2024 Si no lo encuentra en el paso 1 y 2, busca solo por número de expediente
+*          " en teoria, debería haber solo un registro por codigo de expediente
+*          SELECT DISTINCT b~stcd1, a~* INTO TABLE @lt_knkk ##WARN_OK
+*          FROM kna1 AS b
+*           INNER JOIN knb1 AS c ON b~kunnr = c~kunnr
+*           INNER JOIN knkk AS a ON b~kunnr = a~kunnr
+*            WHERE a~kraus LIKE @wa_data-cod_deudor.
+*        ENDIF.
+*      ENDIF.
+*
+*      " Inicio BG 22.07.2024 Si tiene mas de 1 registro ( mas de un area de ventas ) da error.
+*      DESCRIBE TABLE lt_knkk LINES lv_lines.
+*      IF lv_lines > 1.
+*        WRITE:/ text-e03 , wa_data-nif_deudor , wa_data-cod_deudor.
+*        CLEAR: lv_kraus, lv_fecha_prop, wa_knkk, lt_knkk[], lv_lines.
+*        CONTINUE.
+*      ENDIF.
+*      " Fin BG 22.07.2024
+*
+*      READ TABLE lt_knkk INTO DATA(ls_knkk_aux) INDEX 1.
+*      IF sy-subrc = 0.
+*        MOVE-CORRESPONDING ls_knkk_aux-a TO wa_knkk.
+*        IF wa_knkk IS NOT INITIAL.
+*
+*          wa_knkk-klimk =  wa_data-importe_concedido + wa_knkk-zzriesgo_2.
+*          wa_knkk-dbekr = wa_data-importe_concedido.
+*
+*          " BG Inicio 18.10.2023 - Si el limite de credito es cero, entonces se deja el que viene en el archivo CYC
+*          IF wa_knkk-klimk IS INITIAL.
+*            wa_knkk-klimk = wa_knkk-dbekr.
+*          ENDIF.
+*          " BG FIN 18.10.2023
+*
+*          wa_knkk-dbpay = 'ZCO'.
+*
+*          " BG Ini 18.10.2023 - Si no es igual al del archivo/vacio se deja el del archivo CYC
+*          IF wa_knkk-kraus NE lv_kraus.
+*            wa_knkk-kraus = lv_kraus.
+*          ENDIF.
+*
+*          REPLACE ALL OCCURRENCES OF '/' IN wa_data-fecha_propuesta_clasificacion  WITH '.'.
+*          CONDENSE wa_data-fecha_propuesta_clasificacion NO-GAPS.
+*          lv_fecha_prop = wa_data-fecha_propuesta_clasificacion.
+*          CALL FUNCTION 'CONVERT_DATE_TO_INTERNAL'
+*            EXPORTING
+*              date_external            = lv_fecha_prop
+*            IMPORTING
+*              date_internal            = wa_knkk-revdb
+*            EXCEPTIONS
+*              date_external_is_invalid = 1
+*              OTHERS                   = 2.
+*          IF sy-subrc <> 0.
+** Implement suitable error handling here
+*          ENDIF.
+*          " BG Fin 18.10.2023
+*
+*          wa_knkk-dbrtg = 'CYC'.
+*          wa_knkk-dbmon = sy-datum.
+*
+*          CALL FUNCTION 'CREDITLIMIT_CHANGE'
+*            EXPORTING
+*              i_knka   = wa_knka
+*              i_knkk   = wa_knkk
+*              upd_knka = ''
+*              upd_knkk = 'U'
+*              yknka    = wa_yknka
+*              yknkk    = wa_yknkk.
+*
+*          MOVE-CORRESPONDING wa_knkk TO wa_registro ##ENH_OK.
+*
+*          wa_registro-tipo = 'E'.
+*
+*          CALL FUNCTION 'ZSSD_CYC_HISTORICO'
+*            EXPORTING
+*              i_registro = wa_registro
+*            TABLES
+*              return     = lt_return.
+*
+*          LOOP AT lt_return INTO DATA(vw_return).
+*
+*            MESSAGE ID vw_return-id TYPE vw_return-type
+*                                    NUMBER vw_return-number
+*                                    WITH vw_return-message_v1
+*                                         vw_return-message_v2
+*                                         vw_return-message_v3
+*                                         vw_return-message_v4
+*                                    INTO vw_return-message.
+*
+*            WRITE:/ vw_return-message, wa_data-nif_deudor , wa_data-cod_deudor.
+*          ENDLOOP.
+*        ELSE.
+*          WRITE:/ text-e02 , wa_data-nif_deudor , wa_data-cod_deudor.
+*        ENDIF.
+*        CLEAR: lv_kraus, lv_fecha_prop, wa_knkk.
+*      ELSE.
+*        WRITE:/ text-e02 , wa_data-nif_deudor , wa_data-cod_deudor.
+*      ENDIF.
+*
+*      CLEAR: lv_kraus, lv_fecha_prop, wa_knkk, lt_knkk[], lv_lines, ls_knkk_aux, wa_data.
+*    ENDLOOP.
+*
+*    IF NOT lt_final IS INITIAL.
+*
+*      OPEN DATASET lv_path_proce FOR OUTPUT IN TEXT MODE ENCODING DEFAULT MESSAGE lv_msg.
+*      IF  sy-subrc  = 0.
+*        LOOP AT lt_final INTO ls_final .
+*
+*          TRANSFER ls_final-var1 TO lv_path_proce.
+*
+*        ENDLOOP.
+*      ELSE.
+*        WRITE:/ lv_msg.
+*        EXIT.
+*      ENDIF.
+*      CLOSE DATASET lv_path_proce.
+*      IF sy-subrc NE 0.
+*        MESSAGE  text-e01 TYPE 'E'.
+*        EXIT.
+*      ELSEIF sy-subrc IS INITIAL.
+*        WRITE : text-s02 , lv_path_proce.
+*
+*        OPEN DATASET pa_file FOR INPUT IN TEXT MODE ENCODING DEFAULT MESSAGE lv_msg.
+*        IF sy-subrc = 0.
+*          DO.
+*            DELETE DATASET pa_file.
+*            IF sy-subrc <> 0.
+*              EXIT.
+*            ENDIF.
+*          ENDDO.
+*        ELSE.
+*          WRITE:/ lv_msg.
+*          EXIT.
+*        ENDIF.
+*        CLOSE DATASET pa_file.
+*        IF sy-subrc NE 0.
+*          MESSAGE  text-e01 TYPE 'E'.
+*          EXIT.
+*        ELSEIF sy-subrc IS INITIAL.
+*          WRITE : text-s03 , pa_file.
+*        ENDIF.
+*      ENDIF.
+*    ENDIF.
+*
+*  ELSE.
+*    WRITE:/ lv_msg.
+*    EXIT.
+*  ENDIF.
+
+  IF p_ftp = 'X'.
+    o_ftp->disconnect( ).
+  ENDIF.
+
+ENDFORM.

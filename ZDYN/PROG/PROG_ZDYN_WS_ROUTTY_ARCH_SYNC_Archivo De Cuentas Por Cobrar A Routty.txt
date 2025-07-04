@@ -1,0 +1,172 @@
+*&---------------------------------------------------------------------*
+*& Report  ZDYN_WS_ROUTTY_SYNC
+*&
+*&---------------------------------------------------------------------*
+*&
+*&  Send accounts receivable metadata and PDF to Routty
+*&
+*&---------------------------------------------------------------------*
+REPORT zdyn_ws_routty_arch_sync.
+
+INCLUDE zdyn_ws_routty_arch_sync_top.
+INCLUDE zdyn_ws_routty_arch_sync_sel.
+INCLUDE zdyn_ws_routty_sync_f01.
+
+INITIALIZATION.
+  gc_ta_gen = con_ta_gen.
+  gc_ta_ari = con_ta_ari.
+
+START-OF-SELECTION.
+
+  CLEAR: gt_messages, gc_log_object, gc_log_subobject, gb_selected.
+  zdyn_cl_msg=>clear_messages( ).
+
+  SELECT SINGLE * FROM zdyn_routty_tgen INTO CORRESPONDING FIELDS OF gst_config
+                  WHERE sysid    = sy-sysid
+                    AND username = puser
+                    AND bukrs    = pbukrs.
+  IF sy-subrc = 0.
+    gs_user = gst_config-username.
+    gs_pw   = gst_config-password.
+    gs_pw_clear = cl_http_utility=>if_http_utility~decode_base64( encoded = gs_pw ).
+    CLEAR gst_config-password.
+  ELSE.
+    WRITE: 'Configuration missing'(cfg).
+    EXIT.
+  ENDIF.
+
+* now dynamic class generation.
+  IF NOT gst_config-clsname IS INITIAL.
+    TRY.
+        CREATE OBJECT go_routty_rest TYPE (gst_config-clsname)
+          EXPORTING
+            ist_config = gst_config.
+    ENDTRY.
+  ENDIF.
+  IF go_routty_rest IS NOT BOUND.
+    CREATE OBJECT go_routty_rest
+      EXPORTING
+        ist_config = gst_config.
+  ENDIF.
+
+  go_routty_rest->prepare_client( EXPORTING  is_user     = gs_user
+                                             is_password = gs_pw_clear
+                                  EXCEPTIONS OTHERS = 1 ).
+  IF sy-subrc <> 0.
+    go_routty_rest->log_write( EXPORTING  ic_log_object     = gc_log_object
+                                          ic_log_subobject  = gc_log_subobject
+                                          ic_extnumber      = 'Communication'(com)
+                                          ii_level          = pmsglv
+                               EXCEPTIONS OTHERS            = 1 ).
+    RETURN.
+  ENDIF.
+
+********************************************************************************************
+* Connection test
+  IF pauth = abap_true.
+
+    gb_selected = abap_true.
+
+    go_routty_rest->ping_system( ).
+
+    gt_messages_full = zdyn_cl_msg=>get_messages_full( ib_skip_duplicates = abap_false
+                                                       ii_level           = pmsglv ).
+    IF NOT gt_messages IS INITIAL.
+      go_routty_rest->log_write( EXPORTING  ic_log_object     = gc_log_object
+                                            ic_log_subobject  = gc_log_subobject
+                                            ic_extnumber      = 'Routty Connection test'(o01)
+                                            it_msg_full       = gt_messages_full
+                                 EXCEPTIONS OTHERS            = 0 ).
+    ENDIF.
+  ENDIF.
+
+********************************************************************************************
+* Archiving
+  IF parc = abap_true.
+
+    gb_ok = go_routty_rest->mo_access_protection->set_for_doc_send( ic_module = zdyn_if_product_info=>con_module_routty_archiving
+                                                                    ic_id     = pbukrs ).
+    IF gb_ok = abap_false.
+      PERFORM lock_msg.
+      RETURN.
+    ENDIF.
+
+    IF NOT sel_vbel IS INITIAL OR
+       NOT pcrdate  IS INITIAL.
+
+      gb_selected = abap_true.
+      go_routty_rest->process_archiving( EXPORTING  it_sel_sales_doc = sel_vbel[]
+                                                    id_create_date   = pcrdate
+                                         EXCEPTIONS OTHERS           = 0 ).
+      go_routty_rest->add_confirmation_msg( EXPORTING ic_object    = 'Archiving'(o13) ).
+    ENDIF.
+
+    gt_messages_full = zdyn_cl_msg=>get_messages_full( ib_skip_duplicates = abap_false
+                                                       ii_level           = pmsglv ).
+    IF NOT gt_messages_full IS INITIAL.
+      IF papplg = abap_true.
+        gc_log_object    = con_log_object.
+        gc_log_subobject = con_log_subobj_docs_to_routty.
+      ENDIF.
+      go_routty_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+                                            ic_log_subobject = gc_log_subobject
+                                            ic_extnumber     = 'Routty Archiving'(o12)
+                                            it_msg_full      = gt_messages_full
+                                 EXCEPTIONS OTHERS           = 0 ).
+    ENDIF.
+  ENDIF.
+
+********************************************************************************************
+* Verify whether anything has been selected
+  IF gb_selected = abap_false.
+    WRITE: 'Nothing selected'(s01).
+    EXIT.
+  ENDIF.
+
+*********************************************************************************************
+
+  go_routty_rest->mo_access_protection->unset( ).
+
+*********************************************************************************************
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  SCREEN_ADJUST
+*&---------------------------------------------------------------------*
+FORM screen_adjust .
+
+  IF NOT parc IS INITIAL AND NOT pbukrs IS INITIAL.
+    SET PARAMETER ID 'BUK' FIELD pbukrs.
+  ENDIF.
+  CHECK parc IS INITIAL.
+  LOOP AT SCREEN.
+    IF screen-group1 = 'MD'.
+      IF parc IS INITIAL.
+        screen-active = 0.
+      ELSE.
+        screen-active = 1.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  AUTHORITY_CHECK
+*&---------------------------------------------------------------------*
+FORM authority_check .
+
+  CALL FUNCTION 'AUTHORITY_CHECK_TCODE'
+    EXPORTING
+      tcode  = gc_tcode
+    EXCEPTIONS
+      ok     = 0
+      OTHERS = 1.
+  IF sy-subrc NE 0.
+    MESSAGE s172(00) WITH gc_tcode.
+    CLEAR gc_tcode.
+    EXIT.
+  ENDIF.
+
+ENDFORM.

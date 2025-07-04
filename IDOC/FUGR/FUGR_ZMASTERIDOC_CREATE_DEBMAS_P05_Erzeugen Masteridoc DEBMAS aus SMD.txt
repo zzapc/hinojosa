@@ -1,0 +1,231 @@
+FUNCTION zmasteridoc_create_debmas_p05.
+*"--------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(MESSAGE_TYPE) LIKE  TBDME-MESTYP
+*"     VALUE(CREATION_DATE_HIGH) LIKE  SY-DATUM DEFAULT SY-DATUM
+*"     VALUE(CREATION_TIME_HIGH) LIKE  SY-UZEIT DEFAULT SY-UZEIT
+*"--------------------------------------------------------------------
+
+  CONSTANTS: receiver_prt TYPE bdaledc-rcvprt VALUE 'LS',
+             c_p04        TYPE tbdme-mestyp VALUE 'ZDEBMAS_P04'.
+
+  DATA: receiver_prn   TYPE     bdaledc-rcvprn .
+  DATA: receivers_and_filters TYPE bd11_receiver_filters_tab,
+        exception             LIKE edimessage.
+  DATA: created_master_idocs LIKE sy-tabix.
+
+* kna1
+  DATA: BEGIN OF f_kna1key,
+          mandt LIKE bdikna1key-mandt,
+          kunnr LIKE bdikna1key-kunnr,
+        END OF f_kna1key.
+
+  DATA: BEGIN OF t_kna1key OCCURS 10.
+          INCLUDE STRUCTURE bdikna1key.
+        DATA: END OF t_kna1key.
+
+* change pointers
+  DATA: BEGIN OF t_chgptrs OCCURS 10.
+          INCLUDE STRUCTURE bdcp.
+        DATA: END OF t_chgptrs.
+  DATA: BEGIN OF t_chgptrs_aux OCCURS 10.
+          INCLUDE STRUCTURE bdcp.
+        DATA: END OF t_chgptrs_aux.
+
+  DATA: BEGIN OF t_cpident OCCURS 10,
+          cpident LIKE bdcp-cpident,
+        END OF t_cpident.
+
+  DATA: lv_chgptrs LIKE t_chgptrs.                  "mi/note 201673
+  DATA: lv_rcvprn   LIKE bdaledc-rcvprn.
+* \BE Note 517173 - E
+
+* created idocs
+  DATA: created_m_idocs LIKE sy-tabix.
+  DATA: created_comm_idocs LIKE sy-tabix.
+  DATA: created_c_idocs LIKE sy-tabix.
+  DATA: done_since_commit LIKE sy-tabix.
+
+  DATA: BEGIN OF t_resend OCCURS 0,
+          kunnr LIKE kna1-kunnr,
+        END OF t_resend.
+  DATA: need_to_resend LIKE c_true.
+
+  DATA: lv_tabix LIKE sy-tabix.
+  DATA: lv_parza_length TYPE i.
+  DATA: lv_subrc TYPE sysubrc.
+  CONSTANTS lc_cdobjcl_adresse TYPE bdcp-cdobjcl VALUE 'ADRESSE'.
+** start_EoP adaptation
+** Read back internal guideline note 1998910 before starting delivering a correction
+  IF cl_vs_switch_check=>cmd_vmd_cvp_ilm_sfw_01( ) IS NOT INITIAL.
+    INCLUDE erp_cvp_i1_c_ale0032 IF FOUND.
+  ENDIF.
+** end_EoP_adaptation
+
+  "obtenemos el interlocutor
+  PERFORM dist_model_read_for_mestyp(saplbd11)
+     USING
+       message_type
+     CHANGING
+       receivers_and_filters
+       exception.
+  READ TABLE receivers_and_filters INTO DATA(ls_receivers) INDEX 1.
+  IF sy-subrc = 0.
+    receiver_prn = ls_receivers-rcvsystem.
+  ENDIF.
+
+* ADD_ON-Änderungen - B
+* Ermitteln Instanz für BADI VENDOR_ADD_DATA_BI
+*  PERFORM get_badi_instance_bi.
+* ADD_ON-Änderungen - E
+
+  REFRESH t_kna1key.
+
+* read all not processed change pointers for the given messagetype,
+* object class DEBI
+  CLEAR t_chgptrs_aux[].
+  CALL FUNCTION 'CHANGE_POINTERS_READ'
+    EXPORTING
+      change_document_object_class = c_cdobjcl_debi
+      message_type                 = message_type
+      creation_date_high           = creation_date_high
+      creation_time_high           = creation_time_high
+      read_not_processed_pointers  = c_x
+    TABLES
+      change_pointers              = t_chgptrs_aux.
+  APPEND LINES OF t_chgptrs_aux TO t_chgptrs.
+* object class ADRESSE
+  CLEAR t_chgptrs_aux[].
+  CALL FUNCTION 'CHANGE_POINTERS_READ'
+    EXPORTING
+      change_document_object_class = lc_cdobjcl_adresse
+      message_type                 = message_type
+      creation_date_high           = creation_date_high
+      creation_time_high           = creation_time_high
+      read_not_processed_pointers  = c_x
+    TABLES
+      change_pointers              = t_chgptrs_aux.
+  APPEND LINES OF t_chgptrs_aux TO t_chgptrs.
+* create all keys from the change pointers
+
+  "CVP 13.07.2022 11:24
+  LOOP AT t_chgptrs ASSIGNING FIELD-SYMBOL(<fs_chgptrs>) WHERE cdobjcl <> 'ADRESSE'."CVP 06.07.2022 10:19 si va por ADRESSE no lleva cliente como clave.
+
+    "CVP si ya existe una entrada para el cliente de la direccion(ZDES) relacionado -> se borrar la del cliente
+    SELECT SINGLE COUNT(*) FROM kna1 WHERE kunnr = <fs_chgptrs>-cdobjid AND ktokd <> 'ZDES'.
+    IF sy-subrc = 0.
+      SELECT SINGLE kunn2 INTO @DATA(l_kunn2) FROM knvp WHERE parvw = 'WE'
+      AND kunnr = @<fs_chgptrs>-tabkey+3(10)
+      AND parza = @<fs_chgptrs>-tabkey+23(3).
+      IF sy-subrc = 0.
+        READ TABLE t_chgptrs WITH KEY cdobjid = l_kunn2 TRANSPORTING NO FIELDS.
+        IF sy-subrc = 0.
+          PERFORM change_pointers_delete USING message_type <fs_chgptrs>-cpident.
+          DELETE t_chgptrs.
+        ELSE."CV si no existe se cambia su cod de cliente al de la direccion correspondiente ( ktokd = ZDES )
+          <fs_chgptrs>-tabkey+3(10) = l_kunn2.
+          <fs_chgptrs>-cdobjid      = l_kunn2.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  IF t_chgptrs[] IS NOT INITIAL.
+    LOOP AT t_chgptrs.
+      CLEAR f_kna1key.
+      IF f_kna1key-mandt = space.
+        f_kna1key-mandt = t_chgptrs-mandt.
+      ENDIF.
+      "CVP 06.07.2022 10:19 si va por ADRESSE no lleva cliente como clave
+      DATA(l_kunnr) = t_chgptrs-cdobjid.
+      IF t_chgptrs-cdobjcl = 'ADRESSE'.
+        SELECT SINGLE kunnr FROM kna1 INTO @DATA(l_kunnr_aux) WHERE adrnr = @t_chgptrs-cdobjid+4.
+        IF sy-subrc = 0.
+          l_kunnr = l_kunnr_aux.
+        ENDIF.
+      ENDIF.
+      "CVP 22.02.2023 15:50 condicionar para que solo se genere con la clave de cuentas ZCLI
+      SELECT SINGLE COUNT(*) FROM kna1 WHERE kunnr = @l_kunnr AND ktokd <> 'ZDES'.
+      IF sy-subrc = 0.
+        PERFORM change_pointers_delete USING message_type t_chgptrs-cpident.
+        CONTINUE.
+      ENDIF.
+      "CVP 02.11.2022 10:59 valida OV al enviar los idoc de modificacion
+      SELECT SINGLE vkorg,vtweg,spart FROM zssdt001 INTO @DATA(ls_ov) WHERE uso = '1'.
+      IF sy-subrc = 0.
+        SELECT SINGLE * INTO @DATA(l_knvv) FROM knvv
+        WHERE kunnr = @l_kunnr
+        AND  vkorg = @ls_ov-vkorg
+        AND vtweg = @ls_ov-vtweg
+        AND spart = @ls_ov-spart.
+        IF sy-subrc <> 0.
+          PERFORM change_pointers_write USING message_type t_chgptrs-cpident.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+
+      f_kna1key-kunnr = l_kunnr."t_chgptrs-cdobjid.
+      APPEND f_kna1key TO t_kna1key.
+      APPEND t_chgptrs-cpident TO t_cpident.
+    ENDLOOP.
+  ENDIF.
+
+  IF t_kna1key[] IS NOT INITIAL.
+    SORT t_kna1key BY kunnr.
+    DELETE ADJACENT DUPLICATES FROM t_kna1key COMPARING kunnr.
+*    message_type_temp = message_type.
+    CALL FUNCTION 'MASTERIDOC_CREATE_REQ_DEBMAS'
+      EXPORTING
+        rcvpfc               = '  '
+        rcvprn               = receiver_prn
+        rcvprt               = receiver_prt
+        sndpfc               = '  '
+        sndprn               = '          '
+        sndprt               = '  '
+        message_type         = message_type
+      IMPORTING
+        created_comm_idocs   = created_comm_idocs
+        created_master_idocs = created_master_idocs
+      TABLES
+        kna1key              = t_kna1key.
+* commit if necassary
+    IF created_master_idocs > 0.
+
+* write staus of all processed pointers
+      CALL FUNCTION 'CHANGE_POINTERS_STATUS_WRITE'
+        EXPORTING
+          message_type           = message_type
+        TABLES
+          change_pointers_idents = t_cpident.
+
+      CALL FUNCTION 'CHANGE_POINTERS_STATUS_WRITE'
+        EXPORTING
+          message_type           = c_p04
+        TABLES
+          change_pointers_idents = t_cpident.
+
+
+
+      CALL FUNCTION 'DB_COMMIT'.
+      CALL FUNCTION 'DEQUEUE_ALL'.
+      COMMIT WORK.
+
+    ENDIF.
+  ENDIF.
+
+
+
+
+  MESSAGE ID 'B1' TYPE 'I' NUMBER '038'
+          WITH created_master_idocs message_type.
+  MESSAGE ID 'B1' TYPE 'I' NUMBER '039'
+          WITH created_master_idocs message_type.
+
+** start_EoP adaptation
+** Read back internal guideline note 1998910 before starting delivering a correction
+  IF cl_vs_switch_check=>cmd_vmd_cvp_ilm_sfw_01( ) IS NOT INITIAL.
+    INCLUDE erp_cvp_i1_c_ale0033 IF FOUND.
+  ENDIF.
+** end_EoP_adaptation
+ENDFUNCTION.

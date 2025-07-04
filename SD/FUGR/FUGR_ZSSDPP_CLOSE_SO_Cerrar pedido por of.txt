@@ -1,0 +1,221 @@
+FUNCTION zssdpp_close_so.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_AUFNR) TYPE  AUFNR
+*"  EXPORTING
+*"     REFERENCE(E_ERROR) TYPE  FLAG
+*"     REFERENCE(ET_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+
+  DATA: l_salesdocument    TYPE  bapivbeln-vbeln,
+        l_order_header_in  TYPE  bapisdhead1,
+        l_order_header_inx TYPE  bapisdhead1x,
+        t_return           TYPE  bapiret2_t,
+        t_item_in          TYPE TABLE OF  bapisditem,
+        l_item_in          TYPE bapisditem,
+        t_item_inx         TYPE TABLE OF bapisditemx,
+        l_item_inx         TYPE bapisditemx.
+
+  DATA: head_simulate TYPE bapisdhead,
+        it_items_s    TYPE TABLE OF bapiitemin,
+        l_item_s      TYPE bapiitemin,
+        it_items_out  TYPE TABLE OF bapiitemex,
+        it_partners   TYPE TABLE OF bapiparnr,
+        l_parnr       TYPE bapipartnr.
+
+
+  DATA: t_schedule_in  TYPE TABLE OF bapischedule,
+        l_schedule_in  TYPE bapischedule,
+        t_schedule_inx TYPE TABLE OF  bapischedulex,
+        l_schedule_inx TYPE bapischedulex.
+
+  DATA: l_resto         TYPE kwmeng,
+        l_resto_sim     TYPE kwmeng,
+        l_resto_reparto TYPE kwmeng.
+
+  SELECT SINGLE * INTO @DATA(l_aufk) FROM aufk WHERE aufnr = @i_aufnr.
+  SELECT SINGLE * INTO @DATA(l_afpo) FROM afpo WHERE aufnr = @i_aufnr.
+
+  IF l_aufk-kdauf IS INITIAL.
+    SELECT SINGLE kdauf kdpos INTO ( l_aufk-kdauf, l_aufk-kdpos ) FROM zpp0002 WHERE aufnr = i_aufnr.
+  ENDIF.
+
+  SELECT SINGLE * INTO @DATA(l_vbap) FROM vbap WHERE vbeln = @l_aufk-kdauf AND posnr = @l_aufk-kdpos.
+
+  SELECT SINGLE * INTO @DATA(l_vbak) FROM vbak WHERE vbeln = @l_aufk-kdauf.
+
+  CHECK l_aufk-kdauf IS NOT INITIAL.
+
+  SELECT * INTO TABLE @DATA(t_vbep) FROM vbep WHERE vbeln = @l_aufk-kdauf AND posnr = @l_aufk-kdpos.
+
+  head_simulate-doc_type = l_vbak-auart.
+  head_simulate-sales_org = l_vbak-vkorg.
+  head_simulate-distr_chan = l_vbak-vtweg.
+  head_simulate-division = l_vbak-spart.
+  head_simulate-price_date = sy-datum.
+
+  IF l_vbap-kwmeng > l_afpo-wemng.
+
+    l_resto_reparto = l_resto = l_vbap-kwmeng - l_afpo-wemng.
+
+    l_resto_sim = l_resto * 1000.
+  ENDIF.
+
+  l_item_s-material =  l_vbap-matnr.
+  l_item_s-target_qty = l_resto_sim.
+  l_item_s-req_qty = l_resto_sim.
+  l_item_s-item_categ = l_vbap-pstyv.
+
+  APPEND l_item_s TO it_items_s.
+
+
+  SELECT SINGLE land1 AS country land1 AS country_iso name1 AS name ort01 AS city regio AS region stras AS street pstlz AS postl_code  INTO CORRESPONDING FIELDS OF l_parnr
+                    FROM kna1 WHERE kunnr = l_vbak-kunnr.
+  l_parnr-partn_numb = l_vbak-kunnr.
+  l_parnr-partn_role = 'AG'.
+  l_parnr-langu = 'S'.
+  l_parnr-langu_iso = 'S'.
+
+  APPEND l_parnr TO it_partners.
+
+  DATA ls_return_simul TYPE bapireturn.      " JME 22.02.2022
+
+  CALL FUNCTION 'BAPI_SALESORDER_SIMULATE'
+    EXPORTING
+      order_header_in     = head_simulate
+      convert_parvw_auart = ' '
+    IMPORTING
+      return              = ls_return_simul " JME 22.02.2022
+    TABLES
+      order_items_in      = it_items_s
+      order_partners      = it_partners
+      order_items_out     = it_items_out.
+
+  l_salesdocument = l_aufk-kdauf.
+
+  l_order_header_inx-updateflag = 'U'.
+
+  l_item_in-itm_number = l_vbap-posnr.
+  l_item_in-target_qty = l_afpo-wemng.
+  l_item_in-material = l_vbap-matnr.
+
+  APPEND l_item_in TO t_item_in.
+
+  l_item_inx-itm_number = l_vbap-posnr.
+  l_item_inx-target_qty = 'X'.
+  l_item_inx-updateflag = 'U'.
+  APPEND l_item_inx TO t_item_inx.
+
+  SORT t_vbep BY etenr DESCENDING.
+
+  DATA: l_cant     TYPE menge_d,
+        l_cant_pos TYPE menge_d.
+
+  l_cant = l_resto_reparto.
+
+  LOOP AT t_vbep INTO DATA(l_vbep).
+
+    CHECK l_cant > 0.
+*    l_resto_reparto-
+    IF l_vbep-wmeng > l_cant.
+
+      l_cant_pos = l_vbep-wmeng - l_cant.
+      l_cant = 0.
+    ELSE.
+
+
+      l_cant_pos = 0.
+
+      l_cant = l_cant - l_vbep-wmeng.
+    ENDIF.
+
+    l_schedule_in-itm_number = l_vbap-posnr.
+    l_schedule_in-req_qty = l_cant_pos.
+    l_schedule_in-sched_line = l_vbep-etenr.
+    APPEND l_schedule_in TO t_schedule_in.
+
+    l_schedule_inx-itm_number = l_vbap-posnr.
+    l_schedule_inx-sched_line = l_vbep-etenr.
+    IF l_cant_pos IS INITIAL.
+      l_schedule_inx-updateflag = 'D'.
+    ELSE.
+      l_schedule_inx-updateflag = 'U'.
+    ENDIF.
+    l_schedule_inx-req_qty = 'X'.
+
+    APPEND l_schedule_inx TO t_schedule_inx.
+
+  ENDLOOP.
+
+
+  SELECT MAX( posnr ) INTO @DATA(lv_posnr) FROM vbap WHERE vbeln = @l_vbak-vbeln AND posnr < 9000.
+
+  lv_posnr = lv_posnr + 10.
+
+  CLEAR: l_item_in.
+  LOOP AT it_items_out INTO DATA(l_out).
+    MOVE-CORRESPONDING l_out TO l_item_in.
+    l_item_in-itm_number = lv_posnr.
+    l_item_in-target_qty = l_resto.
+    l_item_in-store_loc = l_vbap-lgort.
+    CLEAR: l_item_in-ship_point.
+    l_item_in-reason_rej = 'Z1'.
+    l_item_in-pr_ref_mat = l_vbap-pmatn.
+    APPEND l_item_in TO t_item_in.
+
+*              ENDLOOP.
+    l_item_inx-itm_number = lv_posnr.
+    l_item_inx-updateflag = 'I'.
+    l_item_inx-plant = 'X'.
+    l_item_inx-store_loc = 'X'.
+    l_item_inx-material = 'X'.
+    l_item_inx-target_qty = 'X'.
+    l_item_inx-reason_rej = 'X'.
+    l_item_inx-item_categ = 'X'.
+    l_item_inx-pr_ref_mat = 'X'.
+*  order_items_inx-fixdat_qty = 'X'.
+    APPEND l_item_inx TO t_item_inx.
+
+    l_schedule_in-itm_number = lv_posnr.
+    l_schedule_in-req_qty = l_resto.
+    APPEND l_schedule_in TO t_schedule_in.
+
+    l_schedule_inx-itm_number = lv_posnr.
+    l_schedule_inx-updateflag = 'I'.
+    l_schedule_inx-req_qty = 'X'.
+
+    APPEND l_schedule_inx TO t_schedule_inx.
+
+  ENDLOOP.
+
+  CALL FUNCTION 'BAPI_SALESDOCUMENT_CHANGE'
+    EXPORTING
+      salesdocument    = l_salesdocument
+      order_header_in  = l_order_header_in
+      order_header_inx = l_order_header_inx
+*     simulation       = SPACE
+    TABLES
+      return           = et_return
+      item_in          = t_item_in
+      item_inx         = t_item_inx
+      schedule_in      = t_schedule_in
+      schedule_inx     = t_schedule_inx.
+
+  LOOP AT et_return TRANSPORTING NO FIELDS WHERE type CA 'EAX'.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    e_error = 'X'.
+    RETURN.
+  ENDLOOP.
+
+  REFRESH: et_return.
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+    EXPORTING
+      wait = 'X'.
+
+
+
+
+
+
+ENDFUNCTION.

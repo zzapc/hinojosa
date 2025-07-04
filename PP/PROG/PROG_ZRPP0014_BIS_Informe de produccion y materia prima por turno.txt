@@ -1,0 +1,4290 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRPP0014
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT zrpp0014_bis.
+
+TYPES bool TYPE c.
+
+TYPES: BEGIN OF ty_humed,
+         charg TYPE charg_d,
+*         humed TYPE qmittelwrt,
+         humed TYPE char22,
+       END OF ty_humed.
+
+CONSTANTS si TYPE bool VALUE 'X'.
+CONSTANTS no TYPE bool VALUE ''.
+
+CONSTANTS: c_relid TYPE ltdx-relid VALUE 'LT',
+           gc_tab  TYPE c VALUE cl_bcs_convert=>gc_tab,
+           gc_crlf TYPE c VALUE cl_bcs_convert=>gc_crlf.
+
+DATA: gt_humedad_lote TYPE STANDARD TABLE OF ty_humed.
+
+DATA: c_bobina_pul TYPE matnr VALUE '2001764'.
+
+TABLES aufm.
+TABLES kna1.
+TABLES vbak.
+TABLES mara.
+TABLES user_dir.
+
+DATA gt_entradas TYPE STANDARD TABLE OF zepp_entradas_produccion.
+DATA gt_entradas_xls
+       TYPE STANDARD TABLE OF zepp_entradas_produccion_xls.
+
+
+DATA: so_h_t1     TYPE RANGE OF mkpf-cputm,
+      so_h_t2     TYPE RANGE OF mkpf-cputm,
+      so_h_t3_ini TYPE RANGE OF mkpf-cputm,
+      so_h_t3_fin TYPE RANGE OF mkpf-cputm,
+      so_h_t3     TYPE RANGE OF mkpf-cputm,
+      gv_d_t3_ini TYPE          datum,
+      gv_d_t3_fin TYPE          datum.
+
+DATA: g_data_ini    TYPE datum,
+      g_data_fin    TYPE datum,
+      g_any_ini     TYPE lfgja,
+      g_any_fin     TYPE lfgja,
+      gt_preus_hist TYPE STANDARD TABLE OF mbewh.
+
+DATA ct_fieldcat TYPE slis_t_fieldcat_alv.
+
+SELECTION-SCREEN BEGIN OF BLOCK blk1 WITH FRAME TITLE text-s01.
+SELECT-OPTIONS smatnr FOR aufm-matnr.
+PARAMETERS pwerks TYPE werks_d OBLIGATORY.
+SELECT-OPTIONS scharg FOR aufm-charg.
+* GST - 30/07/2015 ->
+SELECT-OPTIONS slgort FOR aufm-lgort.
+* GST - 30/07/2015 <-
+SELECT-OPTIONS sbudat FOR aufm-budat OBLIGATORY NO-EXTENSION.
+SELECT-OPTIONS skunnr FOR kna1-kunnr.
+SELECT-OPTIONS svbeln FOR vbak-vbeln.
+*SELECT-OPTIONS smatkl FOR mara-matkl.
+SELECT-OPTIONS saufnr FOR aufm-aufnr.
+* GST - 27/04/2015 ->
+*PARAMETERS ppbrut AS CHECKBOX.
+*PARAMETERS ppneto AS CHECKBOX.
+
+* GST - 22/12/2015 ->
+*PARAMETERS ppbrut RADIOBUTTON GROUP sel .
+*PARAMETERS ppneto RADIOBUTTON GROUP sel.
+*PARAMETERS ppbrut NO-DISPLAY.
+*PARAMETERS ppneto NO-DISPLAY.
+* GST - 22/12/2015 <-
+PARAMETERS ptodos RADIOBUTTON GROUP sel.
+PARAMETERS prepro RADIOBUTTON GROUP sel.
+PARAMETERS pzrec RADIOBUTTON GROUP sel.
+PARAMETERS pzquim RADIOBUTTON GROUP sel.
+* GST - 27/04/2015 <-
+* GST - 21/05/2015 ->
+**PARAMETERS pzpulp RADIOBUTTON GROUP sel. "DTM - se elimina esta opción
+*PARAMETERS pzrema RADIOBUTTON GROUP sel.
+* GST - 21/05/2015 <-
+SELECTION-SCREEN END OF BLOCK blk1.
+
+SELECTION-SCREEN BEGIN OF BLOCK blk2 WITH FRAME TITLE text-s02.
+PARAMETERS p_t1 AS CHECKBOX DEFAULT 'X'.
+PARAMETERS p_t2 AS CHECKBOX DEFAULT 'X'.
+PARAMETERS p_t3 AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN END OF BLOCK blk2.
+
+PARAMETERS pvari TYPE disvariant-variant.
+SELECT-OPTIONS: s_excel FOR user_dir-dirname  NO INTERVALS.
+*                s_email FOR user_dir-dirname  NO INTERVALS .
+
+* GST - 07/07/2016 ->
+
+*PARAMETERS p_mes TYPE xfeld NO-DISPLAY.
+
+
+SELECTION-SCREEN BEGIN OF BLOCK blk3 WITH FRAME TITLE text-b03.
+PARAMETERS: p_dftp TYPE text50,
+            p_user TYPE text50,
+            p_pass TYPE text50,
+            p_ruta TYPE text255.
+SELECTION-SCREEN END OF BLOCK blk3.
+
+PARAMETERS: p_ext TYPE text4 DEFAULT 'xls' OBLIGATORY.
+
+INITIALIZATION.
+  PERFORM inicializacion.
+
+* GST - 07/07/2016 <-
+
+AT SELECTION-SCREEN OUTPUT.
+  LOOP AT SCREEN.
+    IF screen-name = 'P_PASS'.
+      screen-invisible = '1'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR pvari.
+  PERFORM buscar_variante CHANGING pvari.
+
+
+START-OF-SELECTION.
+
+* Recuperar fechas y  horas para la selección de datos:
+  PERFORM turnos.
+  PERFORM tratar_fechas.
+
+*  Producció:
+*    Magatzem 1020, moviments 101, 102 i 309
+*    Magatzem 1040, moviments 101, 102, 531 i 532
+*    Magatzem 4001, moviments 101 i 102
+*
+*  Matèries primeres:
+*    Magatzem 4002, moviments 261 i 262
+*
+*  Matèries auxiliars:
+*    Magatzems 1000, 3000 a 3099 moviments 261 i 262
+*
+*  Traspassos pulper:
+*     Magatzem 4002, moviments 311 i 312
+*
+
+  IF ptodos = 'X'.
+    " Producción bruta + neta:
+    PERFORM selec_prod_turnos.
+  ELSEIF pzrec = 'X'.
+    " Consumo MP:
+    PERFORM selec_mat_prima.
+  ELSEIF pzquim = 'X'.
+    " Materiales Auxiliares:
+    PERFORM selec_mat_aux.
+* GST - 21/05/2015 ->
+* DTM - Se elimina esta opción
+**  ELSEIF pzpulp = 'X'.
+**    PERFORM selec_mat_pulp.
+* DTM
+  ELSEIF  prepro = 'X'.
+    PERFORM selec_reproceso.
+
+* GST - 21/05/2015 <-
+*  ELSEIF pzrema = 'X'.
+*    PERFORM selec_remanipulado.
+  ENDIF.
+
+END-OF-SELECTION.
+  IF gt_entradas[] IS INITIAL.
+    MESSAGE 'No se seleccionan datos para los criterios indicados' TYPE
+    'I'.
+  ELSE.
+*    IF p_mes IS INITIAL.
+    IF ( s_excel IS INITIAL AND p_dftp IS INITIAL ) OR sy-batch = ' '.
+      PERFORM mostrar_resultados.
+    ELSE.
+      CHECK s_excel IS NOT INITIAL OR p_dftp IS NOT INITIAL. " si no hay ruta de descarga y es
+*                                     batch
+      PERFORM exportar_excel_ftp.
+    ENDIF.
+*    ENDIF.
+*    PERFORM mostrar_resultados.
+  ENDIF.
+*&---------------------------------------------------------------------*
+*&      Form  MOSTRAR_RESULTADOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM mostrar_resultados .
+*  DATA ct_fieldcat TYPE slis_t_fieldcat_alv.
+  DATA lw_fcat TYPE slis_fieldcat_alv.
+  DATA lw_layo TYPE slis_layout_alv .
+  DATA lw_variant TYPE disvariant.
+
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name = 'ZEPP_ENTRADAS_PRODUCCION'
+    CHANGING
+      ct_fieldcat      = ct_fieldcat.
+
+  LOOP AT ct_fieldcat INTO lw_fcat.
+    CASE lw_fcat-fieldname.
+      WHEN 'MATNR'.
+        lw_fcat-key = si.
+      WHEN 'MAKTX'.
+        lw_fcat-key = si.
+      WHEN 'WERKS'.
+        lw_fcat-key = si.
+      WHEN 'MATKL'.
+        lw_fcat-key = si.
+* GST - 27/04/2015 ->
+      WHEN 'WGBEZ60'.
+        lw_fcat-key = si.
+* GST - 27/04/2015 <-
+      WHEN 'BUDAT'.
+        lw_fcat-emphasize = si.
+      WHEN 'CHARG'.
+        lw_fcat-emphasize = si.
+        lw_fcat-hotspot = 'X'.
+      WHEN 'CHARG_ORIGEN'.
+        lw_fcat-seltext_l = 'Lote origen'.
+        lw_fcat-seltext_m = 'Lote origen'.
+        lw_fcat-seltext_s = 'Lote origen'.
+        lw_fcat-hotspot = 'X'.
+      WHEN 'MATNR_ORIGEN'.
+        lw_fcat-seltext_l = 'Material origen'.
+        lw_fcat-seltext_m = 'Material origen'.
+        lw_fcat-seltext_s = 'Mat. origen'.
+      WHEN 'AUFNR'.
+        lw_fcat-emphasize = si.
+      WHEN 'PRODBRUT'.
+        lw_fcat-checkbox = si.
+      WHEN 'PRODNETA'.
+        lw_fcat-checkbox = si.
+      WHEN 'PULPER'.
+        lw_fcat-checkbox = si.
+        lw_fcat-seltext_l = 'Pulper'.
+        lw_fcat-seltext_m = 'Pulper'.
+        lw_fcat-seltext_s = 'Pulper'.
+      WHEN 'REPROCESO'.
+        lw_fcat-checkbox = si.
+        lw_fcat-seltext_l = 'Reproc'.
+        lw_fcat-seltext_m = 'Reproc'.
+        lw_fcat-seltext_s = 'Reproc'.
+* GST - 26/03/2015 ->
+      WHEN 'BREIT'.
+        lw_fcat-no_out = si.
+      WHEN 'ZZANCHO'.
+        lw_fcat-outputlen = '6'.
+* GST - 26/03/2015 <-
+* RHP - 26/03/2015 ->
+      WHEN 'DIAMETRO'.
+        lw_fcat-seltext_l = 'Diámetro'.
+        lw_fcat-seltext_m = 'Diámetro'.
+        lw_fcat-seltext_s = 'Diámetro'.
+* INI       CMS 27/01/2021
+        lw_fcat-reptext_ddic = 'Diámetro'.
+* FIN       CMS 27/01/2021
+
+* RHP - 26/03/2015 <-
+
+* GST - 27/04/2015 ->
+      WHEN 'TURNO'.
+        lw_fcat-outputlen = '6'.
+* GST - 27/04/2015 <-
+
+* YTG- 05/09/2016 ->
+      WHEN 'PTRABAJO'.
+*        lw_fcat-outputlen = '6'.
+        lw_fcat-seltext_l = 'Puesto trabajo'.
+        lw_fcat-seltext_m = 'Puesto trabajo'.
+        lw_fcat-seltext_s = 'Puesto trabajo'.
+*<-- ACT. 21.11.2016 7000012792 Ticket_##_21650_##_de_fnavarro@palquer
+      WHEN 'VCODE'.
+        lw_fcat-seltext_l = 'Decisión Empleo'.
+        lw_fcat-seltext_m = 'Dec.Emp.'.
+        lw_fcat-seltext_s = 'DE'.
+
+*ACT. 21.11.2016 7000012792 Ticket_##_21650_##_de_fnavarro@palquer -->
+      WHEN 'LGORT_ORIGEN'.
+        lw_fcat-seltext_l = 'Almacén origen'.
+        lw_fcat-seltext_m = 'Alm.Origen'.
+        lw_fcat-seltext_s = 'AlmOrig'.
+      WHEN 'OBS_CAL'.
+        lw_fcat-seltext_l = 'Observaciones calidad'.
+        lw_fcat-seltext_m = 'Obs.calidad'.
+        lw_fcat-seltext_s = 'Obs.cal'.
+      WHEN 'NOTA_REPROC'.
+        lw_fcat-seltext_l = 'Nota reproceso calidad'.
+        lw_fcat-seltext_m = 'Nota reproceso'.
+        lw_fcat-seltext_s = 'Nota repr.'.
+      WHEN 'OPERARIO'.
+        lw_fcat-seltext_l = 'Operario'.
+        lw_fcat-seltext_m = 'Operario'.
+        lw_fcat-seltext_s = 'Operario'.
+      WHEN 'CONTRAMAESTRE'.
+        lw_fcat-seltext_l = 'Contramaestre'.
+        lw_fcat-seltext_m = 'Contramaestre'.
+        lw_fcat-seltext_s = 'Contramaes'.
+    ENDCASE.
+    MODIFY ct_fieldcat FROM lw_fcat.
+  ENDLOOP.
+
+  lw_layo-zebra = si.
+  lw_layo-colwidth_optimize = si.
+
+* Variante:
+  CLEAR lw_variant.
+  lw_variant-report = sy-repid.
+  IF pvari IS NOT INITIAL.
+    lw_variant-variant = pvari.
+  ENDIF.
+
+
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      it_fieldcat             = ct_fieldcat
+      i_save                  = 'A'
+      is_variant              = lw_variant
+      is_layout               = lw_layo
+      i_callback_program      = sy-repid
+      i_callback_user_command = 'USER_COMMAND'
+    TABLES
+      t_outtab                = gt_entradas.
+
+ENDFORM.                    " MOSTRAR_RESULTADOS
+
+FORM user_command
+  USING pu_okcode
+        pu_selfield TYPE slis_selfield.
+
+  CASE pu_okcode.
+    WHEN  '&IC1'.
+      READ TABLE gt_entradas INTO DATA(record) INDEX pu_selfield-tabindex.
+      IF sy-subrc = 0.
+        CASE pu_selfield-fieldname.
+          WHEN 'CHARG'.
+            zcl_ap_lote=>ver( matnr = record-matnr charg = record-charg werks = record-werks ).
+          WHEN 'CHARG_ORIGEN'.
+            zcl_ap_lote=>ver( matnr = record-matnr_origen charg = record-charg_origen werks = record-werks ).
+
+        ENDCASE.
+      ENDIF.
+
+  ENDCASE.
+
+ENDFORM.                    "user_comman
+
+FORM exportar_excel_ftp .
+*----------------------------Declaración de
+*variables-----------------------------------
+  DATA: lv_filename TYPE cgpl_object_text.
+  DATA: lv_rutacompleta   TYPE rlgrap-filename,
+        lv_rutastr        TYPE epsf-epspath,
+        lv_fichero_correo TYPE rlgrap-filename.
+
+  DATA: lt_tablconvertida TYPE truxs_t_text_data.
+  DATA: lv_fname2       TYPE         string,
+        lv_cabecera     LIKE LINE OF lt_tablconvertida,
+        lt_emails       TYPE         zttpp0001,
+        lv_icmdata      TYPE         icmdata,
+        wa_email        TYPE         ad_smtpadr,
+        lt_content_bin  TYPE         solix_tab,
+        lv_content      TYPE         string,
+        lv_content_line TYPE         string.
+
+  DATA: wa_ltdx      TYPE                   ltdx,
+        v_varkey     TYPE                   ltdxkey,
+        it_fcat      TYPE STANDARD TABLE OF ltdxdata,
+        it_sort_info TYPE STANDARD TABLE OF ltdxdata,
+        it_filter    TYPE STANDARD TABLE OF ltdxdata.
+
+  DATA: l_varkey       TYPE ltdxkey,
+        wa_ltdxdata    TYPE ltdxdata,
+        flag_no_out(1),
+        wa_fieldcat    TYPE lvc_s_fcat,
+        it_fieldcat    TYPE lvc_t_fcat,
+        l_struc_index  TYPE i,
+        l_path(120).
+
+  DATA: tab TYPE x VALUE 9.
+  DATA: l_r_structdescr TYPE REF TO cl_abap_structdescr.
+
+  FIELD-SYMBOLS: <dyn_table> TYPE STANDARD TABLE,
+                 <dyn_wa>,
+                 <dyn_field>.
+
+  DATA: dy_table       TYPE REF TO  data,
+        dy_line        TYPE REF TO  data,
+        wa_cab_data    TYPE REF TO  data,
+        xfc            TYPE         lvc_s_fcat,
+        ifc            TYPE         lvc_t_fcat,
+        l_string(1024),
+        f_flag         TYPE         xfeld,
+        ls_fieldcat    TYPE LINE OF lvc_t_fcat,
+        l_xls(1024).
+
+  DATA: it_descriptivos TYPE STANDARD TABLE OF dfies,
+        wa_desc         TYPE                   dfies.
+
+  DATA: binary_content TYPE solix_tab,
+        ls_binary      TYPE solix.
+  DATA size TYPE so_obj_len.
+
+****--------------------------Declaración de
+*variables-----------------------------------
+
+
+  DATA: lt_fieldcat_xls TYPE          lvc_t_fcat,
+        lt_fieldcat_ant TYPE TABLE OF slis_fieldcat_alv.
+
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name = 'ZEPP_ENTRADAS_PRODUCCION_XLS'
+    CHANGING
+      ct_fieldcat      = ct_fieldcat.
+
+* Pasar el anterior fieldcat al formato del nuevo
+  CALL FUNCTION 'LVC_TRANSFER_FROM_SLIS'
+    EXPORTING
+*     it_fieldcat_alv = lt_fieldcat_ant
+      it_fieldcat_alv = ct_fieldcat
+    IMPORTING
+      et_fieldcat_lvc = lt_fieldcat_xls
+    TABLES
+      it_data         = gt_entradas
+    EXCEPTIONS
+      it_data_missing = 1
+      OTHERS          = 2.
+
+  SELECT SINGLE * FROM ltdx INTO wa_ltdx
+       WHERE relid = c_relid
+       AND report =  sy-repid
+       AND variant = pvari.
+
+  IF  sy-subrc = 0.
+    MOVE-CORRESPONDING wa_ltdx TO  v_varkey.
+
+*  Esta función convierte el LTDX de la select en un fieldcat,
+*pero en un formato de fieldcat que es necesario convertir tambien.
+    CALL FUNCTION 'LT_DBDATA_READ_FROM_LTDX'
+      EXPORTING
+        i_tool       = c_relid
+        is_varkey    = v_varkey
+      TABLES
+        t_dbfieldcat = it_fcat               " Fieldcat
+        t_dbsortinfo = it_sort_info          " Criterio ordenamiento
+        t_dbfilter   = it_filter.            " Criterio filtrado
+
+    IF sy-subrc = 0.
+      LOOP AT it_fcat INTO wa_ltdxdata.
+        AT NEW key1.
+          CLEAR flag_no_out.
+        ENDAT.
+*       Rechazar aquellas columnas que están ocultas
+        IF wa_ltdxdata-param = 'NO_OUT' AND wa_ltdxdata-value = 'X'.
+          flag_no_out = 'X'.
+        ENDIF.
+
+        AT END OF key1.
+          IF flag_no_out IS INITIAL.
+            CLEAR wa_fieldcat.
+*Leer el fildcat global para obtener el nombre de la tabla estándar a la
+*que hacer referencia cada columna (MARA, BKPF, etc)
+*READ TABLE ct_fieldcat WITH KEY fieldname =  wa_ltdxdata-key1 INTO
+*ls_fieldcat.
+            READ TABLE lt_fieldcat_xls WITH KEY fieldname =
+            wa_ltdxdata-key1 INTO DATA(ls_fcat_xls).
+            wa_fieldcat-fieldname = wa_ltdxdata-key1.
+            wa_fieldcat-ref_table = ls_fcat_xls-ref_table.
+
+            IF ls_fieldcat-ref_field IS NOT INITIAL.
+
+              wa_fieldcat-ref_field = ls_fieldcat-ref_field.
+            ELSE.
+              wa_fieldcat-ref_field = wa_ltdxdata-key1.
+            ENDIF.
+*     LLamamos a la función DDIF_FIELDINFO_GET
+            CALL FUNCTION 'DDIF_FIELDINFO_GET'
+              EXPORTING
+                tabname        = wa_fieldcat-ref_table
+                fieldname      = wa_fieldcat-fieldname
+              TABLES
+                dfies_tab      = it_descriptivos
+              EXCEPTIONS
+                not_found      = 1
+                internal_error = 2
+                OTHERS         = 3.
+
+            IF sy-subrc <> 0.
+              CALL FUNCTION 'DDIF_FIELDINFO_GET'
+                EXPORTING
+                  tabname        = wa_fieldcat-ref_table
+                  fieldname      = wa_fieldcat-ref_field
+                TABLES
+                  dfies_tab      = it_descriptivos
+                EXCEPTIONS
+                  not_found      = 1
+                  internal_error = 2
+                  OTHERS         = 3.
+            ENDIF.
+
+            READ TABLE it_descriptivos INTO wa_desc INDEX 1.
+            wa_fieldcat-scrtext_s = wa_desc-scrtext_s.
+            wa_fieldcat-scrtext_m = wa_desc-scrtext_m.
+            wa_fieldcat-scrtext_l = wa_desc-scrtext_l.
+*
+            IF wa_fieldcat-fieldname <> 'ZCONT'.
+              APPEND wa_fieldcat TO it_fieldcat.
+            ENDIF.
+          ENDIF.
+        ENDAT.
+      ENDLOOP.
+    ENDIF.
+
+** Con el fieldcatalog en formato ALV crear la tabla dinámica que
+*contendrá solo las columnas de la variante.
+    CALL METHOD cl_alv_table_create=>create_dynamic_table
+      EXPORTING
+        it_fieldcatalog  = it_fieldcat
+        i_length_in_byte = 'X'
+      IMPORTING
+        ep_table         = dy_table.
+    ASSIGN dy_table->* TO <dyn_table>.
+
+**   Rellenar las cabeceras a partir del fieldcat generado con la
+*variante (it_fieldcat). Se usa texto largo, se puede cambiar por
+*scrtext_m (medio) o scrtext_s (corto)
+    CLEAR f_flag.
+    LOOP AT it_fieldcat INTO wa_fieldcat.
+      IF sy-subrc = 0.
+        IF f_flag IS INITIAL.
+          "Si el flag está vacío, es la primera columna, asignarla directamente a
+          "la cabecera y marcar el flag
+          lv_cabecera = wa_fieldcat-scrtext_s.
+          f_flag = 'X'.
+        ELSE.
+          "Si el flag ya está relleno, no es la primera columna, concatenar la col
+          "umna a lo que ya estaba en la cabecera y separarlo con gc_tab
+          CONCATENATE lv_cabecera gc_tab wa_fieldcat-scrtext_s INTO
+          lv_cabecera.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+**   Mover las columnas y filas de la tabla que las contiene todas a la
+*tabla dinámica de la selección reducida
+    MOVE-CORRESPONDING gt_entradas TO gt_entradas_xls.
+    MOVE-CORRESPONDING gt_entradas_xls[] TO <dyn_table>.
+**
+  ELSE.
+    "No se ha seleccionado ninguna variante o no existe, usar el fieldcat cr
+    "eado por defecto
+** Mover los datos del fieldcatalog global (por defecto) al formato que
+*se necesita en cl_alv_table_create=>create_dynamic_table
+    LOOP AT lt_fieldcat_xls INTO ls_fieldcat.
+      CLEAR wa_fieldcat.
+      MOVE-CORRESPONDING ls_fieldcat TO wa_fieldcat.
+      wa_fieldcat-ref_table = ls_fieldcat-ref_table.
+      "Asignar tabla de referencia
+      wa_fieldcat-ref_field = ls_fieldcat-ref_field.
+      "Asignar campo de la tabla de referencia
+*      IF wa_fieldcat-fieldname <> 'ZCONT'.
+*        APPEND wa_fieldcat TO it_fieldcat.
+*      ENDIF.
+    ENDLOOP.
+
+    CALL METHOD cl_alv_table_create=>create_dynamic_table
+      EXPORTING
+        it_fieldcatalog  = it_fieldcat[]
+        i_length_in_byte = 'X'
+      IMPORTING
+        ep_table         = dy_table.
+    ASSIGN dy_table->* TO <dyn_table>.
+
+*Rellenar las cabeceras a partir del fieldcat generado con la variante
+*(it_fieldcat). Se usa texto largo, se puede cambiar por scrtext_m
+*(medio) o scrtext_s (corto)
+    CLEAR: f_flag, l_struc_index.
+    LOOP AT it_fieldcat INTO wa_fieldcat.
+*Obtener el descriptivo de la columna (Se le pasa el nombre de la tabla
+*que contiene el campo y el nombre del campo en sí.
+*       Retorna una tabla con los descriptivos corto, medio y largo)
+      CALL FUNCTION 'DDIF_FIELDINFO_GET'
+        EXPORTING
+          tabname        = wa_fieldcat-ref_table
+          fieldname      = wa_fieldcat-fieldname
+        TABLES
+          dfies_tab      = it_descriptivos
+        EXCEPTIONS
+          not_found      = 1
+          internal_error = 2
+          OTHERS         = 3.
+
+      IF sy-subrc <> 0.
+
+        CALL FUNCTION 'DDIF_FIELDINFO_GET'
+          EXPORTING
+            tabname        = wa_fieldcat-ref_table
+            fieldname      = wa_fieldcat-ref_field
+          TABLES
+            dfies_tab      = it_descriptivos
+          EXCEPTIONS
+            not_found      = 1
+            internal_error = 2
+            OTHERS         = 3.
+
+      ENDIF.
+
+
+      IF sy-subrc = 0.
+*Si la función OK, leer la primera linea y asignar el descriptivo largo
+        READ TABLE it_descriptivos INTO wa_desc INDEX 1.
+        IF sy-subrc = 0.
+          IF f_flag IS INITIAL.
+            "Si el flag está vacío, es la primera columna, asignarla directamente a
+            "la cabecera y marcar el flag
+            lv_cabecera = wa_desc-scrtext_s.
+            f_flag = 'X'.
+          ELSE.
+            "Si el flag ya está relleno, no es la primera columna, concatenar la col
+            "umna a lo que ya estaba en la cabecera y separarlo con gc_tab
+            CONCATENATE lv_cabecera gc_tab wa_desc-scrtext_s INTO
+            lv_cabecera.
+          ENDIF.
+        ENDIF.
+
+      ENDIF.
+    ENDLOOP.
+
+*Mover las columnas y filas de la tabla que las contiene todas a la
+*tabla dinámica de la selección reducida
+*    MOVE-CORRESPONDING gt_stock[] TO <dyn_table>.
+    MOVE-CORRESPONDING gt_entradas[] TO <dyn_table>.
+  ENDIF.
+
+  CASE 'X'.
+    WHEN ptodos.
+      lv_filename = |CMP_PRD_{ pwerks }_{ sy-datum }.{ p_ext }|.
+    WHEN pzrec.
+      lv_filename = |CMP_MP_{ pwerks }_{ sy-datum }.{ p_ext }|.
+    WHEN prepro .
+      lv_filename = |CMP_REP_{ pwerks }_{ sy-datum }.{ p_ext }|.
+    WHEN OTHERS.
+      lv_filename = |CMP_{ pwerks }_{ sy-datum }.{ p_ext }|.
+  ENDCASE.
+
+  CALL FUNCTION 'SAP_CONVERT_TO_TEX_FORMAT'
+    EXPORTING
+      i_field_seperator    = gc_tab
+    TABLES
+      i_tab_sap_data       = <dyn_table>
+    CHANGING
+      i_tab_converted_data = lt_tablconvertida
+    EXCEPTIONS
+      conversion_failed    = 1
+      OTHERS               = 2.
+
+* Insertar la cabecera en la primera posición de la tabla CSV
+  INSERT lv_cabecera INTO lt_tablconvertida INDEX 1.
+
+  CLEAR lv_content.
+  LOOP AT lt_tablconvertida INTO lv_content_line.
+    CONCATENATE lv_content lv_content_line gc_crlf INTO lv_content.
+  ENDLOOP.
+
+  TRY.
+      cl_bcs_convert=>string_to_solix(
+        EXPORTING
+          iv_string   = lv_content
+          iv_codepage = '4103'  "suitable for MS Excel, leave empty
+*          iv_codepage = '4110'  "suitable for MS Excel, leave empty
+          iv_add_bom  = 'X'     "for other doc types
+        IMPORTING
+          et_solix  = binary_content
+          ev_size   = size ).
+    CATCH cx_bcs.
+      MESSAGE e445(so).
+  ENDTRY.
+
+  IF s_excel IS INITIAL.
+    "Siempre guardar el archivo en la carpeta temporal
+    s_excel-low = './'.
+    APPEND s_excel.
+  ENDIF.
+
+  IF s_excel IS NOT INITIAL.
+
+    LOOP AT s_excel.
+      CONCATENATE s_excel-low lv_filename INTO lv_rutacompleta.
+
+      OPEN DATASET lv_rutacompleta FOR OUTPUT IN BINARY MODE.
+*      OPEN DATASET lv_rutacompleta FOR OUTPUT IN BINARY MODE ENCODING DEFAULT.
+      IF sy-subrc = 0.
+        LOOP AT binary_content INTO ls_binary.
+
+          TRANSFER ls_binary-line TO lv_rutacompleta.
+
+        ENDLOOP.
+        CLOSE DATASET lv_rutacompleta.
+        MOVE lv_rutacompleta TO lv_rutastr.
+      ENDIF.
+    ENDLOOP.
+
+  ENDIF.
+
+  DATA: vl_fichero_final TYPE string.
+  IF p_dftp IS NOT INITIAL.
+    DATA(vl_xstring) = cl_bcs_convert=>solix_to_xstring( it_solix   = binary_content
+                                                         iv_size    = CONV #( size ) ).
+    NEW zcl_ap_ftp( )->grabar_fichero( EXPORTING user     = p_user
+                                                 password = p_pass
+                                                 host     = p_dftp
+                                                 directorio = p_ruta
+                                                 fichero    = lv_filename
+                                                 xstring    = vl_xstring
+                                       IMPORTING message = DATA(vl_msg)
+                                                 fichero_final = vl_fichero_final ).
+    IF vl_msg IS NOT INITIAL.
+      MESSAGE vl_msg TYPE 'I'.
+    ELSE.
+      MESSAGE |Fichero { vl_fichero_final } grabado en FTP| TYPE 'S'.
+    ENDIF.
+
+  ENDIF.
+
+
+
+***CALL FUNCTION 'ARCHIVFILE_SERVER_TO_CLIENT'
+***  EXPORTING
+***    path                   =
+****   TARGETPATH             = ' '
+**** EXCEPTIONS
+****   ERROR_FILE             = 1
+****   NO_AUTHORIZATION       = 2
+****   OTHERS                 = 3
+***          .
+****IF sy-subrc <> 0.
+***** Implement suitable error handling here
+****ENDIF.
+
+
+***  IF s_email IS NOT INITIAL.
+***    LOOP AT s_email.
+***      wa_email = s_email-low.
+***      APPEND wa_email TO lt_emails.
+***    ENDLOOP.
+***
+***
+***    CALL FUNCTION 'ZFM_EXCEL_SEND_EMAIL'
+***      EXPORTING
+***        i_excel       = lv_icmdata
+***        i_header      = gv_titulo " cvivo - Proyecto WM
+***        i_attach_name = lv_filename
+***        full_path     = lv_rutastr
+***      TABLES
+***        it_email      = lt_emails.
+***  ENDIF.
+
+ENDFORM.                    " EXPORTAR_EXCEL
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_CLASIFICACION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LW_DATOS  text
+*----------------------------------------------------------------------*
+FORM obtener_clasificacion  CHANGING pw_datos TYPE
+zepp_entradas_produccion.
+  DATA l_objkey TYPE objnum.
+  DATA lt_allocvaluesnum TYPE STANDARD TABLE OF
+  bapi1003_alloc_values_num WITH HEADER LINE.
+  DATA lt_allocvalueschar TYPE STANDARD TABLE OF
+  bapi1003_alloc_values_char WITH HEADER LINE.
+  DATA lt_allocvaluescurr TYPE STANDARD TABLE OF
+  bapi1003_alloc_values_curr WITH HEADER LINE.
+  DATA lt_return TYPE STANDARD TABLE OF bapiret2.
+
+  CONCATENATE pw_datos-matnr pw_datos-charg INTO l_objkey.
+
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = l_objkey
+      objecttable     = 'MCH1'
+      classnum        = 'Z_ROLLO'
+      classtype       = '023'
+    TABLES
+      allocvaluesnum  = lt_allocvaluesnum
+      allocvalueschar = lt_allocvalueschar
+      allocvaluescurr = lt_allocvaluescurr
+      return          = lt_return.
+
+  READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+  CHECK sy-subrc <> 0.
+
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_DIAMETRO1'.
+  IF sy-subrc = 0.
+    pw_datos-diametro = lt_allocvaluesnum-value_from.
+    IF lt_allocvaluesnum-unit_from IS NOT INITIAL.
+      pw_datos-diametro_un = lt_allocvaluesnum-unit_from.
+    ELSE.
+      pw_datos-diametro_un = 'MM'.
+    ENDIF.
+  ENDIF.
+
+* Añadir Operario y contramaestre.
+  TRY .
+      pw_datos-operario = lt_allocvalueschar[ charact = 'Z_OPERARIO' ]-value_char.
+    CATCH cx_root.
+  ENDTRY.
+
+  TRY .
+      pw_datos-contramaestre = lt_allocvalueschar[ charact = 'Z_CONTRAMAESTRE' ]-value_char.
+    CATCH cx_root.
+  ENDTRY.
+
+
+* INI CMS 29/01/2020
+*  DATA: l_humedad TYPE qmittelwrt.
+  DATA: l_humedad TYPE char22.
+
+  CLEAR l_humedad.
+  PERFORM obtener_z_humedad USING pwerks
+                               pw_datos-matnr
+                               pw_datos-charg
+                      CHANGING l_humedad.
+
+  CALL FUNCTION 'MOVE_CHAR_TO_NUM'
+    EXPORTING
+      chr             = l_humedad
+    IMPORTING
+      num             = pw_datos-humedad
+    EXCEPTIONS
+      convt_no_number = 1
+      convt_overflow  = 2
+      OTHERS          = 3.
+  IF sy-subrc <> 0.
+    CLEAR pw_datos-humedad.
+  ENDIF.
+
+
+*  pw_datos-humedad = l_humedad.
+
+* FIN CMS 29/01/2020
+
+
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_PESO1'.
+  IF sy-subrc = 0.
+    pw_datos-brgew = lt_allocvaluesnum-value_from.
+    IF lt_allocvaluesnum-unit_from IS NOT INITIAL.
+      pw_datos-gewei = lt_allocvaluesnum-unit_from.
+    ELSE.
+      pw_datos-gewei = 'KG'.
+    ENDIF.
+  ENDIF.
+
+* RHP 26/03/2015 ->
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_FSC_PORCENTAJE'.
+  IF sy-subrc = 0.
+    pw_datos-fsc = lt_allocvaluesnum-value_from.
+  ENDIF.
+* RHP 26/03/2015 <-
+
+*BREIT  1 Type  BREIT QUAN  13  3 Ancho
+*LAENG  1 Type  LAENG QUAN  13  3 Longitud
+*MEABM  1 Type  MEABM UNIT  3 0 Unidad de medida para
+*longitud/ancho/altura
+
+*<-- ACT. 21.11.2016 7000012792 Ticket_##_21650_##_de_fnavarro@palquer
+* RECUPERAR DECISION DE EMPLEO
+  READ TABLE lt_allocvalueschar "INTO ls_alloc_values_char
+             WITH KEY charact = 'LOBM_UDCODE'.
+
+  IF sy-subrc = 0.
+    pw_datos-vcode = lt_allocvalueschar-value_neutral.
+  ENDIF.
+* ACT. 21.11.2016 7000012792 Ticket_##_21650_##_de_fnavarro@palquer -->
+
+
+ENDFORM.                    " OBTENER_CLASIFICACION
+
+
+FORM obtener_z_humedad USING p_werks TYPE werks_d
+                             p_matnr TYPE matnr
+                             p_charg TYPE charg_d
+*                    CHANGING p_humed TYPE qmittelwrt.
+                    CHANGING p_humed TYPE char22.
+
+  CLEAR p_humed.
+
+  TRY.
+      p_humed = gt_humedad_lote[ charg = p_charg ]-humed.
+
+    CATCH cx_root .
+
+* Obtenemos todos los lotes de inspección de la fecha más actual.
+      SELECT * INTO TABLE @DATA(lt_lotes_insp)
+        FROM qals
+        WHERE werk      = @p_werks AND
+              matnr     = @p_matnr AND
+              charg     = @p_charg AND
+              enstehdat IN ( SELECT MAX( enstehdat )
+                             FROM qals
+                             WHERE werk      = @p_werks AND
+                                   matnr     = @p_matnr AND
+                                   charg     = @p_charg
+                            ).
+      IF sy-subrc <> 0.
+        EXIT.
+      ENDIF.
+
+      CHECK lt_lotes_insp IS NOT INITIAL.
+
+* Ordenamos por hora para tener en el 1er registro el que tenga hora mayor.
+      SORT lt_lotes_insp BY entstezeit DESCENDING.
+
+      TRY.
+* Con el código de lote inspección y la posición 50 (Z_HUMEDAD) obtenemos el dato.
+          DATA(ls_lote_insp) = lt_lotes_insp[ 1 ].
+
+
+          DATA: lt_char_req     TYPE STANDARD TABLE OF bapi2045d1,
+                lt_char_results TYPE STANDARD TABLE OF bapi2045d2,
+                l_mstr_char     TYPE qmstr_char.
+          CALL FUNCTION 'BAPI_INSPOPER_GETDETAIL'
+            EXPORTING
+              insplot                = ls_lote_insp-prueflos
+              inspoper               = '0010'
+              read_char_requirements = 'X'
+              read_char_results      = 'X'
+              char_filter_no         = '1   '
+              char_filter_tcode      = 'QE11'
+              max_insppoints         = 100
+            TABLES
+              char_requirements      = lt_char_req
+              char_results           = lt_char_results.
+
+
+          DATA(ls_char_req) = lt_char_req[ mstr_char = '00001007' ]. " buscamos el %Humedad (1007)
+          p_humed = lt_char_results[ inspchar = ls_char_req-inspchar ]-mean_value.
+
+          APPEND INITIAL LINE TO gt_humedad_lote ASSIGNING FIELD-SYMBOL(<fs_humed>).
+          <fs_humed>-charg = p_charg.
+          <fs_humed>-humed = p_humed.
+
+        CATCH cx_root .
+      ENDTRY.
+
+  ENDTRY.
+
+ENDFORM.                    " obtener_z_humedad
+
+FORM obtener_ni_gramaje USING p_werks  TYPE werks_d
+                             p_matnr   TYPE matnr
+                             p_charg   TYPE charg_d
+                    CHANGING p_ni_gram TYPE char22.
+
+  CLEAR p_ni_gram.
+
+*  TRY.
+*      p_ni_gram = gt_humedad_lote[ charg = p_charg ]-humed.
+*
+*    CATCH cx_root .
+
+* Obtenemos todos los lotes de inspección de la fecha más actual.
+  SELECT * INTO TABLE @DATA(lt_lotes_insp)
+    FROM qals
+    WHERE werk      = @p_werks AND
+          matnr     = @p_matnr AND
+          charg     = @p_charg AND
+          enstehdat IN ( SELECT MAX( enstehdat )
+                         FROM qals
+                         WHERE werk      = @p_werks AND
+                               matnr     = @p_matnr AND
+                               charg     = @p_charg
+                        ).
+  IF sy-subrc <> 0.
+    EXIT.
+  ENDIF.
+
+  CHECK lt_lotes_insp IS NOT INITIAL.
+
+* Ordenamos por hora para tener en el 1er registro el que tenga hora mayor.
+  SORT lt_lotes_insp BY entstezeit DESCENDING.
+
+  TRY.
+* Con el código de lote inspección y la posición 50 (Z_HUMEDAD) obtenemos el dato.
+      DATA(ls_lote_insp) = lt_lotes_insp[ 1 ].
+
+
+      DATA: lt_char_req     TYPE STANDARD TABLE OF bapi2045d1,
+            lt_char_results TYPE STANDARD TABLE OF bapi2045d2,
+            l_mstr_char     TYPE qmstr_char.
+      CALL FUNCTION 'BAPI_INSPOPER_GETDETAIL'
+        EXPORTING
+          insplot                = ls_lote_insp-prueflos
+          inspoper               = '0010'
+          read_char_requirements = 'X'
+          read_char_results      = 'X'
+          char_filter_no         = '1   '
+          char_filter_tcode      = 'QE11'
+          max_insppoints         = 100
+        TABLES
+          char_requirements      = lt_char_req
+          char_results           = lt_char_results.
+
+
+      DATA(ls_char_req) = lt_char_req[ mstr_char = '00001000' ]. " buscamos el NI grmaje (1000)
+      p_ni_gram = lt_char_results[ inspchar = ls_char_req-inspchar ]-remark.
+
+    CATCH cx_root .
+  ENDTRY.
+
+*  ENDTRY.
+
+
+ENDFORM.                    " obtener_z_humedad
+
+FORM datos_ni_gramaje_reproc.
+
+*      SELECT SINGLE matnr INTO @DATA(l_matnr)
+*        FROM mch1
+*        WHERE charg = @pw_datos-charg_origen.
+
+
+ENDFORM.                    " datos_ni_gramaje_reproc
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_CLASIFICACION_BOB
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LW_DATOS  text
+*----------------------------------------------------------------------*
+FORM obtener_clasificacion_bob  CHANGING pw_datos TYPE
+zepp_entradas_produccion.
+
+  DATA l_objkey TYPE objnum.
+  DATA lt_allocvaluesnum TYPE STANDARD TABLE OF
+  bapi1003_alloc_values_num WITH HEADER LINE.
+  DATA lt_allocvalueschar TYPE STANDARD TABLE OF
+  bapi1003_alloc_values_char WITH HEADER LINE.
+  DATA lt_allocvaluescurr TYPE STANDARD TABLE OF
+  bapi1003_alloc_values_curr WITH HEADER LINE.
+  DATA lt_return TYPE STANDARD TABLE OF bapiret2.
+
+  CONCATENATE pw_datos-matnr pw_datos-charg INTO l_objkey.
+
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = l_objkey
+      objecttable     = 'MCH1'
+      classnum        = 'Z_BOBINA'
+      classtype       = '023'
+    TABLES
+      allocvaluesnum  = lt_allocvaluesnum
+      allocvalueschar = lt_allocvalueschar
+      allocvaluescurr = lt_allocvaluescurr
+      return          = lt_return.
+
+  READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+  CHECK sy-subrc <> 0.
+
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_DIAMETRO'.
+  IF sy-subrc = 0.
+    pw_datos-diametro = lt_allocvaluesnum-value_from.
+    IF lt_allocvaluesnum-unit_from IS NOT INITIAL.
+      pw_datos-diametro_un = lt_allocvaluesnum-unit_from.
+    ELSE.
+      pw_datos-diametro_un = 'MM'.
+    ENDIF.
+  ENDIF.
+
+  TRY.
+      pw_datos-kunnr = lt_allocvalueschar[ charact = 'Z_CLIENTE' ]-value_char.
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      pw_datos-nota_reproc = lt_allocvalueschar[ charact = 'Z_NOTA_INSP' ]-value_char.
+    CATCH cx_root .
+  ENDTRY.
+* Añadir Operario y contramaestre.
+  TRY .
+      pw_datos-operario      = lt_allocvalueschar[ charact = 'Z_OPERARIO' ]-value_char.
+    CATCH cx_root.
+  ENDTRY.
+
+  TRY .
+      pw_datos-contramaestre = lt_allocvalueschar[ charact = 'Z_CONTRAMAESTRE' ]-value_char.
+    CATCH cx_root.
+  ENDTRY.
+
+* INI CMS 29/01/2020
+* Obtenemos la humedad a partir de la caract.50(Z_HUMEDAD) del lote de inspección
+
+*  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_HUMEDAD'.
+*  IF sy-subrc = 0.
+*    pw_datos-humedad = lt_allocvaluesnum-value_from.
+*  ENDIF.
+*  DATA: l_humedad TYPE qmittelwrt.
+  DATA: l_humedad TYPE char22.
+
+  CLEAR l_humedad.
+  PERFORM obtener_z_humedad USING pwerks
+                               pw_datos-matnr
+                               pw_datos-charg
+                      CHANGING l_humedad.
+
+  CALL FUNCTION 'MOVE_CHAR_TO_NUM'
+    EXPORTING
+      chr             = l_humedad
+    IMPORTING
+      num             = pw_datos-humedad
+    EXCEPTIONS
+      convt_no_number = 1
+      convt_overflow  = 2
+      OTHERS          = 3.
+  IF sy-subrc <> 0.
+    CLEAR pw_datos-humedad.
+  ENDIF.
+
+
+*  pw_datos-humedad = l_humedad.
+
+* FIN CMS 29/01/2020
+
+
+
+
+
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_PESO'.
+  IF sy-subrc = 0.
+    pw_datos-brgew = lt_allocvaluesnum-value_from.
+    IF lt_allocvaluesnum-unit_from IS NOT INITIAL.
+      pw_datos-gewei = lt_allocvaluesnum-unit_from.
+    ELSE.
+      pw_datos-gewei = 'kg'.
+    ENDIF.
+  ENDIF.
+
+  " Longitud:
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_LONGITUD_B'.
+  IF sy-subrc = 0.
+    pw_datos-laeng = lt_allocvaluesnum-value_from.
+    IF lt_allocvaluesnum-unit_from IS NOT INITIAL.
+      pw_datos-meabm = lt_allocvaluesnum-unit_from.
+    ELSE.
+      pw_datos-meabm = 'M'.
+    ENDIF.
+  ENDIF.
+
+* RHP 26/03/2015 ->
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_FSC_PORCENTAJE'.
+  IF sy-subrc = 0.
+    pw_datos-fsc = lt_allocvaluesnum-value_from.
+  ENDIF.
+* RHP 26/03/2015 <-
+
+* GST - 30/09/2015 - Motivo reproceso ->
+  READ TABLE lt_allocvalueschar
+             WITH KEY charact = 'ZPPI_MOTIVO_REPROCESO_BOBINA'.
+  IF sy-subrc = 0.
+    pw_datos-motiv_reproc = lt_allocvalueschar-value_char.
+* GST - 22/10/2015 - Motivo reproceso SCADA ->
+  ELSE.
+    READ TABLE lt_allocvalueschar
+               WITH KEY charact = 'Z_MOTIVO_REPROCESO_BOBINA'.
+    IF sy-subrc = 0.
+      pw_datos-motiv_reproc = lt_allocvalueschar-value_char.
+    ENDIF.
+* GST - 22/10/2015 - Motivo reproceso SCADA <-
+  ENDIF.
+* GST - 30/09/2015 - Motivo reproceso <-
+
+
+* GST - 09/11/2015 - Motivo remanipulado ->
+  READ TABLE lt_allocvalueschar
+             WITH KEY charact = 'ZPPI_MOTIVO_REMANIPULADO'.
+
+  IF sy-subrc = 0.
+    pw_datos-motiv_remanip = lt_allocvalueschar-value_char.
+  ENDIF.
+* GST - 09/11/2015 - Motivo remanipulado <-
+
+* Puesto de trabajo
+  READ TABLE lt_allocvalueschar
+             WITH KEY charact = 'Z_PUESTO_TRABAJO'.
+
+  IF sy-subrc = 0.
+    pw_datos-ptrabajo = lt_allocvalueschar-value_char.
+  ENDIF.
+
+
+* cgijon: sacar decisión de empleo de las bobinas
+  READ TABLE lt_allocvalueschar
+           WITH KEY charact = 'LOBM_UDCODE'.
+
+  IF sy-subrc = 0.
+    pw_datos-vcode = lt_allocvalueschar-value_neutral.
+  ENDIF.
+
+* uDefine - añadir lote origen
+  READ TABLE lt_allocvalueschar
+         WITH KEY charact = 'Z_LOTE_ORIGEN'.
+
+  IF sy-subrc = 0.
+    pw_datos-charg_origen = lt_allocvalueschar-value_neutral.
+
+    SELECT SINGLE matnr INTO @DATA(l_matnr)
+      FROM mch1
+      WHERE charg = @pw_datos-charg_origen.
+    IF sy-subrc = 0.
+      pw_datos-matnr_origen = l_matnr.
+    ENDIF.
+
+    IF pw_datos-humedad IS INITIAL.
+      PERFORM obtener_z_humedad USING pwerks
+                                 l_matnr
+                                 pw_datos-charg_origen
+                        CHANGING l_humedad.
+
+      CALL FUNCTION 'MOVE_CHAR_TO_NUM'
+        EXPORTING
+          chr             = l_humedad
+        IMPORTING
+          num             = pw_datos-humedad
+        EXCEPTIONS
+          convt_no_number = 1
+          convt_overflow  = 2
+          OTHERS          = 3.
+      IF sy-subrc <> 0.
+        CLEAR pw_datos-humedad.
+      ENDIF.
+
+
+*      pw_datos-humedad = l_humedad.
+
+    ENDIF.
+  ENDIF.
+
+  READ TABLE lt_allocvalueschar
+         WITH KEY charact = 'Z_ROLLO_ORIGEN_V2'.
+
+  IF sy-subrc = 0.
+    pw_datos-matnr_origen =  lt_allocvalueschar-value_neutral..
+    __formatear_material pw_datos-matnr_origen.
+  ENDIF.
+
+ENDFORM.                    " OBTENER_CLASIFICACION_BOB
+*&---------------------------------------------------------------------*
+*&      Form  TURNOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM turnos .
+
+  DATA: ls_h_t1 LIKE LINE OF so_h_t1,
+        ls_h_t2 LIKE LINE OF so_h_t2,
+        ls_h_t3 LIKE LINE OF so_h_t3.
+
+  CLEAR: so_h_t1, ls_h_t1, so_h_t2, ls_h_t2.
+  CLEAR: ls_h_t3, so_h_t3_ini, so_h_t3_fin, so_h_t3, gv_d_t3_ini,
+  gv_d_t3_fin.
+  REFRESH: so_h_t1, so_h_t2, so_h_t3_ini, so_h_t3_fin, so_h_t3.
+
+* Turno 1:
+  IF p_t1 = 'X'.
+    CLEAR ls_h_t1.
+    ls_h_t1-sign = 'I'.
+    ls_h_t1-option = 'BT'.
+    ls_h_t1-low = '060000'.
+    ls_h_t1-high = '135959'.
+    APPEND ls_h_t1 TO so_h_t1.
+  ENDIF.
+
+* Turno 2:
+  IF p_t2 = 'X'.
+    CLEAR ls_h_t2.
+    ls_h_t2-sign = 'I'.
+    ls_h_t2-option = 'BT'.
+    ls_h_t2-low = '140000'.
+    ls_h_t2-high = '215959'.
+    APPEND ls_h_t2 TO so_h_t2.
+  ENDIF.
+
+* Turno 3:
+* Vemos si el día inicial y final es el mismo:
+  IF p_t3 = 'X'.
+    IF sbudat-option = 'EQ'.
+
+      gv_d_t3_ini = sbudat-low.
+      gv_d_t3_fin = sbudat-low + 1.
+
+      CLEAR ls_h_t3.
+      ls_h_t3-sign = 'I'.
+      ls_h_t3-option = 'BT'.
+      ls_h_t3-low = '220000'.
+      ls_h_t3-high = '235959'.
+      APPEND ls_h_t3 TO so_h_t3_ini.
+
+      CLEAR ls_h_t3.
+      ls_h_t3-sign = 'I'.
+      ls_h_t3-option = 'BT'.
+      ls_h_t3-low = '000000'.
+      ls_h_t3-high = '055959'.
+      APPEND ls_h_t3 TO so_h_t3_fin.
+
+    ELSEIF sbudat-option = 'BT'.
+
+      IF sbudat-low = sbudat-high.
+
+        gv_d_t3_ini = sbudat-low.
+        gv_d_t3_fin = sbudat-low + 1.
+
+        CLEAR ls_h_t3.
+        ls_h_t3-sign = 'I'.
+        ls_h_t3-option = 'BT'.
+        ls_h_t3-low = '220000'.
+        ls_h_t3-high = '235959'.
+        APPEND ls_h_t3 TO so_h_t3_ini.
+
+        CLEAR ls_h_t3.
+        ls_h_t3-sign = 'I'.
+        ls_h_t3-option = 'BT'.
+        ls_h_t3-low = '000000'.
+        ls_h_t3-high = '055959'.
+        APPEND ls_h_t3 TO so_h_t3_fin.
+
+      ELSE.
+
+        gv_d_t3_ini = sbudat-low.
+        gv_d_t3_fin = sbudat-high + 1.
+
+        CLEAR ls_h_t3.
+        ls_h_t3-sign = 'I'.
+        ls_h_t3-option = 'BT'.
+        ls_h_t3-low = '220000'.
+        ls_h_t3-high = '235959'.
+        APPEND ls_h_t3 TO so_h_t3_ini.
+
+        CLEAR ls_h_t3.
+        ls_h_t3-sign = 'I'.
+        ls_h_t3-option = 'BT'.
+        ls_h_t3-low = '000000'.
+        ls_h_t3-high = '055959'.
+        APPEND ls_h_t3 TO so_h_t3_fin.
+
+        CLEAR ls_h_t3.
+        ls_h_t3-sign = 'I'.
+        ls_h_t3-option = 'BT'.
+        ls_h_t3-low = '000000'.
+        ls_h_t3-high = '055959'.
+        APPEND ls_h_t3 TO so_h_t3.
+
+        CLEAR ls_h_t3.
+        ls_h_t3-sign = 'I'.
+        ls_h_t3-option = 'BT'.
+        ls_h_t3-low = '220000'.
+        ls_h_t3-high = '235959'.
+        APPEND ls_h_t3 TO so_h_t3.
+
+      ENDIF.
+
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " TURNOS
+
+FORM tratar_fechas.
+
+
+  CASE sbudat-option.
+    WHEN 'EQ'.
+      g_data_ini = sbudat-low.
+      g_data_fin = sbudat-low + 1.
+
+    WHEN 'BT'.
+      IF sbudat-low = sbudat-high.
+        g_data_ini = sbudat-low.
+        g_data_fin = sbudat-low + 1.
+      ELSE.
+        g_data_ini = sbudat-low.
+        IF sbudat-high = '99991231'.
+          g_data_fin = sbudat-high.
+        ELSE.
+          g_data_fin = sbudat-high + 1.
+        ENDIF.
+      ENDIF.
+
+    WHEN OTHERS.
+  ENDCASE.
+
+  g_any_ini = g_data_ini(4).
+  g_any_fin = g_data_fin(4).
+
+*  select *
+*    from mbewh
+*    into table @gt_preu_historic
+*    where
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  SELEC_DATOS_TURNOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+*FORM selec_datos_turnos .
+**05.09.2016 YTG Reducir la cantidad de campos en la tabla interna a
+*solo los que se usan (Rendimiento)
+*  DATA: BEGIN OF lw_aufk,
+*          zzebeln1 TYPE aufk-zzebeln1,
+*          zzebelp1 TYPE aufk-zzebelp1,
+*          zzkunnr1 TYPE aufk-zzkunnr1,
+*        END OF lw_aufk.
+*
+*  DATA lw_datos TYPE zepp_entradas_produccion.
+*  DATA lt_aufm TYPE STANDARD TABLE OF aufm.
+*  DATA lw_aufm TYPE aufm.
+**  DATA lw_aufk TYPE aufk.
+*  DATA lv_arbpl TYPE arbpl.
+*  DATA  lv_where TYPE string.
+**  DATA: lv_object TYPE char28.
+*  DATA: lv_object TYPE objnum.
+*  DATA: it_objectdata TYPE STANDARD TABLE OF clobjdat,
+*        it_class      TYPE STANDARD TABLE OF sclass,
+*        ls_objectdata TYPE                   clobjdat.
+*
+*  CLEAR: lt_aufm.
+*  REFRESH: lt_aufm.
+*
+****  05/09/2016 YTG Optimizando las 3 selects en una sola.
+*  CLEAR lv_where.
+*  IF p_t1 = 'X'.
+**    lv_where = '( b~cputm IN so_h_t1'.
+*    lv_where = '( ( b~cputm IN so_h_t1  AND a~budat IN sbudat )'.
+*  ENDIF.
+*
+*  IF p_t2 = 'X'.
+*    IF lv_where IS INITIAL.
+**      lv_where = '( b~cputm IN so_h_t2'.
+*      lv_where = '( ( b~cputm IN so_h_t2 AND a~budat IN sbudat )'.
+*    ELSE.
+*CONCATENATE lv_where ' OR ( b~cputm IN so_h_t2 AND a~budat IN sbudat )'
+*INTO lv_where SEPARATED BY space.
+*    ENDIF.
+*  ENDIF.
+*
+*  IF p_t3 = 'X'.
+*
+*    IF so_h_t3[] IS INITIAL.
+*
+*      IF lv_where IS INITIAL.
+*lv_where = '( ( ( a~budat = gv_d_t3_ini AND b~cputm IN so_h_t3_ini ) OR
+*( a~budat = gv_d_t3_fin AND b~cputm IN so_h_t3_fin ) )'.
+*      ELSE.
+*CONCATENATE lv_where 'OR ( ( a~budat = gv_d_t3_ini AND b~cputm IN
+*so_h_t3_ini ) OR ( a~budat = gv_d_t3_fin AND b~cputm IN so_h_t3_fin )
+*)' INTO lv_where SEPARATED BY space.
+*      ENDIF.
+*    ELSE.
+*
+*      IF lv_where IS INITIAL.
+*lv_where = '( ( ( a~budat = gv_d_t3_ini AND b~cputm IN so_h_t3_ini ) OR
+*( a~budat = gv_d_t3_fin AND b~cputm IN so_h_t3_fin ) OR ( a~budat <>
+*gv_d_t3_ini AND a~budat <> gv_d_t3_fin AND a~budat IN sbudat AND
+*b~cputm IN so_h_t3 ) )'.
+*      ELSE.
+*CONCATENATE lv_where 'OR ( ( a~budat = gv_d_t3_ini AND b~cputm IN
+*so_h_t3_ini ) OR ( a~budat = gv_d_t3_fin AND b~cputm IN so_h_t3_fin )'
+*'OR ( a~budat <> gv_d_t3_ini AND a~budat <> gv_d_t3_fin AND a~budat IN
+*sbudat AND b~cputm IN so_h_t3 ) )'
+*        INTO lv_where SEPARATED BY space.
+*      ENDIF.
+*
+*    ENDIF.
+*
+*  ENDIF.
+*
+** Comprobar que lv_where no esté vacío, para saber que al menos se ha
+*seleccionado un turno
+*  IF lv_where IS NOT INITIAL.
+*
+*    CONCATENATE lv_where ')' INTO lv_where SEPARATED BY space.
+*
+*
+*    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_aufm
+*      FROM aufm AS a
+*      INNER JOIN mkpf AS b ON ( b~mblnr = a~mblnr
+*                              AND b~mjahr = a~mjahr )
+*      WHERE a~matnr IN smatnr
+*        AND a~werks = pwerks
+**        AND a~budat IN sbudat
+*        AND a~charg IN scharg
+** GST - 30/07/2015 - Ticket 7179 ->
+*        AND a~lgort IN slgort
+** GST - 30/07/2015 - Ticket 7179 <-
+*        AND a~aufnr IN saufnr
+**        AND b~cputm IN so_h_t1
+*AND (lv_where). " Añadir la condición construida a partir de los turnos
+*seleccionados.
+*  ENDIF.
+****  05/09/2016 YTG Optimizando las 3 selects en una sola.
+*
+*
+*  DATA: lt_mseg TYPE TABLE OF mseg,
+*        ls_mseg TYPE mseg.
+*  IF lt_aufm[] IS NOT INITIAL.
+*    SELECT * FROM mseg INTO TABLE lt_mseg
+*                       FOR ALL ENTRIES IN lt_aufm
+*                       WHERE mblnr = lt_aufm-mblnr
+*                         AND lgort = lt_aufm-lgort.
+*  ENDIF.
+*
+*  LOOP AT lt_aufm INTO lw_aufm.
+*    CLEAR lw_datos.
+*    lw_datos-matnr = lw_aufm-matnr.
+*    SELECT SINGLE maktx INTO lw_datos-maktx FROM makt
+*      WHERE matnr = lw_aufm-matnr
+*        AND spras = sy-langu.
+*
+*    lw_datos-werks = lw_aufm-werks.
+*
+*    SELECT SINGLE matkl mtart zzancho zzgramaje
+*INTO (lw_datos-matkl, lw_datos-mtart, lw_datos-zzancho,
+*lw_datos-zzgramaje)
+*        FROM mara
+*        WHERE matnr = lw_aufm-matnr.
+*
+*    lw_datos-budat = lw_aufm-budat.
+*    lw_datos-charg = lw_aufm-charg.
+*    lw_datos-aufnr = lw_aufm-aufnr.
+*    lw_datos-menge = lw_aufm-menge.
+*    lw_datos-meins = lw_aufm-meins.
+*    lw_datos-bwart = lw_aufm-bwart.
+*    lw_datos-lgort = lw_aufm-lgort.
+*
+*READ TABLE lt_mseg INTO ls_mseg WITH KEY mblnr = lw_aufm-mblnr lgort =
+*lw_aufm-lgort.
+*    IF sy-subrc EQ 0.
+*      lw_datos-lgort_origen = ls_mseg-umlgo.
+*    ENDIF.
+*
+*    IF lw_datos-mtart = 'ZROL'.
+*      lw_datos-prodbrut = si.
+*    ELSE.
+*      lw_datos-prodbrut = no.
+** GST - 10/07/2015 ->
+*IF ( ( lw_datos-bwart = '531' OR lw_datos-bwart = '532') AND
+*lw_datos-lgort = '1000' )
+*OR ( ( lw_datos-bwart = '101' OR lw_datos-bwart = '102') AND
+*lw_datos-lgort = '1000'
+*      AND lw_datos-mtart = 'ZSEM' ) .
+*        lw_datos-prodbrut = si.
+*      ENDIF.
+** GST - 10/07/2015 <-
+*    ENDIF.
+** GST - 27/04/2015 ->
+**    CHECK lw_datos-prodbrut = ppbrut.
+*    CHECK lw_datos-prodbrut = ppbrut AND
+*          ( lw_datos-bwart <> '261' AND lw_datos-bwart <> '262').
+** GST - 27/04/2015 <-
+*
+*    IF lw_datos-mtart = 'ZPAP'.
+*      lw_datos-prodneta = si.
+*    ELSE.
+*      lw_datos-prodneta = no.
+*    ENDIF.
+*    CHECK lw_datos-prodneta = ppneto AND
+*          ( lw_datos-bwart <> '261' AND lw_datos-bwart <> '262').
+*
+*IF lw_aufm-bwart = '101' OR lw_aufm-bwart = '102' OR lw_aufm-bwart =
+*'531' OR lw_aufm-bwart = '532'.
+*** 05.09.2016 YTG Quitar el select * para mejorar rendimiento
+**  SELECT SINGLE * INTO lw_aufk FROM aufk WHERE aufnr = lw_aufm-aufnr.
+*SELECT SINGLE zzebeln1 zzebelp1 zzkunnr1 INTO lw_aufk FROM aufk WHERE
+*aufnr = lw_aufm-aufnr.
+*      IF sy-subrc = 0.
+*        lw_datos-vbeln = lw_aufk-zzebeln1.
+*        lw_datos-posnr = lw_aufk-zzebelp1.
+*        lw_datos-kunnr = lw_aufk-zzkunnr1.
+*
+*SELECT SINGLE name1 INTO lw_datos-name1 FROM kna1 WHERE kunnr =
+*lw_datos-kunnr.
+*      ENDIF.
+*    ENDIF.
+*    CHECK lw_datos-vbeln IN svbeln.
+*    CHECK lw_datos-kunnr IN skunnr.
+*
+*    IF lw_datos-charg IS NOT INITIAL.
+** GST - 26/03/2015 ->
+*      IF lw_datos-mtart = 'ZROL'.
+** GST - 26/03/2015 <-
+*        PERFORM obtener_clasificacion CHANGING lw_datos.
+** GST - 26/03/2015 ->
+** GST - 10/07/2015 ->
+*ELSEIF ( ( lw_datos-bwart = '531' OR lw_datos-bwart = '532') AND
+*lw_datos-lgort = '1000')
+*OR ( ( lw_datos-bwart = '101' OR lw_datos-bwart = '102') AND
+*lw_datos-lgort = '1000'
+*      AND lw_datos-mtart = 'ZSEM' ).
+*        PERFORM obtener_clasificacion_pulp CHANGING lw_datos.
+** GST - 10/07/2015 <-
+*      ELSE.
+*        PERFORM obtener_clasificacion_bob CHANGING lw_datos.
+*      ENDIF.
+** GST - 26/03/2015 <-
+*    ENDIF.
+*
+** GST - 24/04/2015 ->
+*IF lw_datos-bwart = '102' OR lw_datos-bwart = '532' OR lw_datos-bwart =
+*'291'."YTG -SAT 7000012572
+*      lw_datos-menge = ( -1 ) * lw_datos-menge.
+*      lw_datos-brgew = ( -1 ) * lw_datos-brgew.
+*    ENDIF.
+** GST - 24/04/2015 <-
+*
+*
+** GST - 27/04/2015 ->
+*    " Hora y Turno:
+*    SELECT SINGLE cpudt cputm INTO (lw_datos-cpudt, lw_datos-cputm)
+*      FROM mkpf
+*      WHERE mblnr = lw_aufm-mblnr
+*      AND mjahr = lw_aufm-mjahr.
+*
+*    IF ( lw_datos-cputm >= '060000' AND lw_datos-cputm <= '135959' ).
+*      lw_datos-turno = 'T1'.
+*      lw_datos-fec_prod = lw_datos-budat.
+**      lw_datos-fec_prod = lw_datos-cpudt.
+*ELSEIF ( lw_datos-cputm >= '140000' AND lw_datos-cputm <= '215959' ).
+*      lw_datos-turno = 'T2'.
+*      lw_datos-fec_prod = lw_datos-budat.
+**      lw_datos-fec_prod = lw_datos-cpudt.
+*ELSEIF ( lw_datos-cputm >= '220000' AND lw_datos-cputm <= '235959' ).
+*      lw_datos-turno = 'T3'.
+*      lw_datos-fec_prod = lw_datos-budat.
+**      lw_datos-fec_prod = lw_datos-cpudt.
+*    ELSE.
+*      lw_datos-turno = 'T3'.
+*      lw_datos-fec_prod = lw_datos-budat - 1.
+*
+**      lw_datos-fec_prod = lw_datos-cpudt. " - 1. " UDEFINEDES Ticket
+*43398
+*    ENDIF.
+*
+**    IF lw_datos-fec_prod < lw_datos-budat.
+**      lw_datos-fec_prod = lw_datos-budat.
+**    ENDIF.
+*
+*    " Descripción grupo artículos:
+*    SELECT SINGLE wgbez60 INTO lw_datos-wgbez60
+*      FROM t023t
+*      WHERE spras = sy-langu
+*      AND matkl = lw_datos-matkl.
+*
+*    CONDENSE lw_datos-wgbez60.
+*
+** GST - 27/04/2015 <-
+*
+** GST - 04/02/2016 - Ticket 9246 ->
+*    lw_datos-contador = 1.
+** GST - 04/02/2016 - Ticket 9246 <-
+*    IF lw_datos-bwart EQ '102' OR lw_datos-bwart EQ '312'.
+*      lw_datos-contador = -1.
+*    ENDIF.
+*
+**   Puesto de trabajo, sino está en la característica de la BOBINA
+*    IF lw_datos-ptrabajo IS INITIAL.
+*      SELECT SINGLE arbpl INTO lv_arbpl
+*         FROM crhd AS c
+*         INNER JOIN afru AS a ON ( c~objid = a~arbid )
+*         WHERE a~aufnr = lw_datos-aufnr
+*         AND   c~werks = lw_datos-werks.
+*      IF sy-subrc = 0.
+*        lw_datos-ptrabajo = lv_arbpl.
+*      ENDIF.
+*    ENDIF.
+*
+*    APPEND lw_datos TO gt_entradas.
+*  ENDLOOP.
+*
+*ENDFORM.                    " SELEC_DATOS_TURNOS
+*&---------------------------------------------------------------------*
+*&      Form  SELEC_PROD_TURNOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM selec_prod_turnos .
+*>>> 05.09.2016 YTG Reducir la cantidad de campos en la tabla interna a
+*solo los que se usan (Rendimiento)
+  DATA: BEGIN OF lw_aufk,
+          zzebeln1 TYPE aufk-zzebeln1,
+          zzebelp1 TYPE aufk-zzebelp1,
+          zzkunnr1 TYPE aufk-zzkunnr1,
+        END OF lw_aufk.
+
+  CONSTANTS c_mat_pulper TYPE matnr VALUE '000000000002001764'.
+
+  DATA lw_datos TYPE zepp_entradas_produccion.
+
+  DATA:BEGIN OF lw_movs.
+         INCLUDE STRUCTURE aufm.
+         DATA: kunnr      TYPE kunnr,
+         umlgo      TYPE lgort_d,
+         umcha      TYPE charg_d,
+         ummat      TYPE matnr,
+         budat_mkpf TYPE budat,
+         cputm_mkpf TYPE cputm,
+         cpudt_mkpf TYPE cpudt,
+       END OF lw_movs.
+
+  DATA: BEGIN OF ls_arbpl,
+          rueck TYPE co_rueck,
+          werks TYPE werks_d,
+          aufnr TYPE aufnr,
+          arbpl TYPE arbpl,
+        END OF ls_arbpl.
+
+  DATA: lt_arbpl         LIKE HASHED TABLE OF ls_arbpl WITH UNIQUE KEY
+  werks aufnr,
+        lt_arbpl_no_hash LIKE STANDARD TABLE OF ls_arbpl.
+
+  DATA: l_budat_start TYPE budat, l_budat_end TYPE budat.
+
+  DATA lt_movs LIKE TABLE OF lw_movs.
+
+  DATA lt_mkpf TYPE TABLE OF mkpf.
+  DATA: BEGIN OF ls_makt,
+          matnr TYPE matnr,
+          maktx TYPE maktx,
+        END OF ls_makt,
+        lt_makt LIKE HASHED TABLE OF ls_makt WITH UNIQUE KEY matnr.
+
+  DATA: BEGIN OF ls_mara,
+          matnr     TYPE matnr,
+          matkl     TYPE matkl,
+          mtart     TYPE mtart,
+          zzancho   TYPE mara-zzancho,
+          zzgramaje TYPE mara-zzgramaje,
+        END OF ls_mara,
+        lt_mara LIKE HASHED TABLE OF ls_mara WITH UNIQUE KEY matnr.
+
+  DATA: BEGIN OF ls_kna1,
+          kunnr TYPE kunnr,
+          name1 TYPE name1_gp,
+        END OF ls_kna1,
+        lt_kna1 LIKE HASHED TABLE OF ls_kna1 WITH UNIQUE KEY kunnr.
+
+
+  DATA: BEGIN OF ls_aufk,
+          aufnr    TYPE aufnr,
+          auart    TYPE auart,
+          zzebeln1 TYPE aufk-zzebeln1,
+          zzebelp1 TYPE aufk-zzebelp1,
+          zzkunnr1 TYPE aufk-zzkunnr1,
+        END OF ls_aufk,
+        lt_aufk LIKE HASHED TABLE OF ls_aufk WITH UNIQUE KEY aufnr.
+
+  DATA: BEGIN OF ls_t023t,
+          matkl   TYPE matkl,
+          wgbez60 TYPE t023t-wgbez60,
+        END OF ls_t023t,
+        lt_t023t LIKE HASHED TABLE OF ls_t023t WITH UNIQUE KEY matkl.
+
+  TYPES: BEGIN OF ty_range_matnr,
+           sign,
+           option(2),
+           low       TYPE matnr,
+           high      TYPE matnr,
+         END OF ty_range_matnr,
+         tt_range_matnr TYPE TABLE OF ty_range_matnr WITH DEFAULT KEY.
+
+  CLEAR: lt_movs.
+  REFRESH: lt_movs.
+
+
+  DATA s_cputm LIKE so_h_t2.
+
+  TYPES: tt_bwart TYPE TABLE OF  bwart_range.
+
+  DATA: s_bwart TYPE tt_bwart .
+
+
+  APPEND VALUE:  bwart_range( sign = 'I' option = 'EQ' low    = '101' )
+  TO s_bwart,
+                 bwart_range( sign = 'I' option = 'EQ' low    = '102' )
+                 TO s_bwart,
+                 bwart_range( sign = 'I' option = 'EQ' low    = '261' )
+                 TO s_bwart,
+                 bwart_range( sign = 'I' option = 'EQ' low    = '262' )
+                 TO s_bwart,
+                 bwart_range( sign = 'I' option = 'EQ' low    = '531' )
+                 TO s_bwart,
+                 bwart_range( sign = 'I' option = 'EQ' low    = '532' )
+                 TO s_bwart,
+                 bwart_range( sign = 'I' option = 'EQ' low    = '310' )
+                 TO s_bwart,
+                 bwart_range( sign = 'I' option = 'EQ' low    = '309' )
+                 TO s_bwart.
+
+  REFRESH slgort.
+  APPEND VALUE: range_lgo( sign = 'I' option = 'EQ' low = '1000' ) TO
+  slgort,
+                range_lgo( sign = 'I' option = 'EQ' low = '1020' ) TO
+                slgort,
+                range_lgo( sign = 'I' option = 'EQ' low = '1040' ) TO
+                slgort,
+                range_lgo( sign = 'I' option = 'EQ' low = '4001' ) TO
+                slgort.
+
+  IF p_t1 EQ abap_true OR p_t2 EQ abap_true.
+
+    IF p_t1 EQ abap_true AND p_t2 EQ abap_true.
+      s_cputm = so_h_t1.
+      s_cputm[ 1 ]-high = so_h_t2[ 1 ]-high.
+    ELSEIF p_t1 EQ abap_true.
+      s_cputm = so_h_t1.
+    ELSEIF p_t2 EQ abap_true.
+      s_cputm = so_h_t2.
+    ENDIF.
+
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_movs
+           FROM mkpf
+           INNER JOIN mseg
+                   ON mkpf~mandt = mseg~mandt
+                      AND mkpf~mblnr = mseg~mblnr
+                      AND mkpf~mjahr = mseg~mjahr
+       WHERE matnr           IN smatnr
+         AND mkpf~budat      IN sbudat
+         AND bwart           IN s_bwart
+         AND mseg~charg      IN scharg
+         AND mseg~cputm_mkpf IN s_cputm
+         AND mseg~lgort      IN slgort
+         AND mseg~werks      EQ pwerks
+         AND aufnr           IN saufnr.
+
+  ENDIF.
+
+  IF p_t3 EQ abap_true.
+
+
+
+    REFRESH s_cputm.
+    APPEND VALUE fkkr_cputm( sign = 'I' option = 'BT' low = '220000'
+    high = '235959') TO s_cputm.
+
+
+*   Cojemos los de las 10 a las 12 de la noche
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_movs
+            FROM mkpf
+            INNER JOIN mseg
+                    ON mkpf~mandt = mseg~mandt
+                       AND mkpf~mblnr = mseg~mblnr
+                       AND mkpf~mjahr = mseg~mjahr
+        WHERE matnr           IN smatnr
+          AND mkpf~budat      IN sbudat
+          AND bwart           IN s_bwart
+          AND mseg~charg      IN scharg
+          AND mseg~cputm_mkpf IN s_cputm
+          AND mseg~lgort      IN slgort
+          AND mseg~werks      EQ pwerks
+          AND aufnr           IN saufnr.
+
+
+
+
+
+*   Cojemos los del dia siguiente hasta las 6 de la mañana.
+    sbudat[ 1 ]-low  = sbudat[ 1 ]-low + 1.
+    IF sbudat[ 1 ]-high <> '99991231'.
+      sbudat[ 1 ]-high = sbudat[ 1 ]-high + 1.
+    ENDIF.
+
+    REFRESH s_cputm.
+    APPEND VALUE fkkr_cputm( sign = 'I' option = 'BT' low = '000000'
+    high = '055959') TO s_cputm.
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_movs
+                FROM mkpf
+                INNER JOIN mseg
+                        ON mkpf~mandt = mseg~mandt
+                           AND mkpf~mblnr = mseg~mblnr
+                           AND mkpf~mjahr = mseg~mjahr
+            WHERE matnr           IN smatnr
+              AND mkpf~budat      IN sbudat
+              AND bwart           IN s_bwart
+              AND mseg~charg      IN scharg
+              AND mseg~cputm_mkpf IN s_cputm
+              AND mseg~lgort      IN slgort
+              AND mseg~werks      EQ pwerks
+              AND aufnr           IN saufnr.
+
+
+  ENDIF.
+
+
+*  Producció:
+*  Magatzem 1020, moviments 101, 102 i 309
+*  Magatzem 1040, moviments 101, 102 i 531
+*  Magatzem 4001, moviments 101/102
+  DELETE: lt_movs WHERE lgort EQ '1020' AND ( bwart NE '101' AND bwart NE '102' AND
+                                              bwart NE '309' AND bwart NE '310' AND
+                         "Nuevos mov.531 y 532 para nuevo modelo costes
+                                              bwart NE '531' AND bwart NE '532' ),
+
+          lt_movs WHERE lgort EQ '1040' AND ( bwart NE '101' AND bwart
+          NE '102' ),
+          lt_movs WHERE lgort EQ '1000' AND ( bwart NE '531' AND bwart
+          NE '532' ),
+          lt_movs WHERE lgort EQ '4001' AND ( bwart NE '101' AND bwart
+          NE '102' ).
+
+
+
+  SELECT DISTINCT rueck c~werks aufnr arbpl INTO TABLE lt_arbpl_no_hash
+   FROM crhd AS c
+   INNER JOIN afru AS a ON ( c~objid = a~arbid ) WHERE c~werks = pwerks
+   .
+
+  SORT lt_arbpl_no_hash BY werks aufnr ASCENDING rueck DESCENDING.
+  DELETE ADJACENT DUPLICATES FROM lt_arbpl_no_hash COMPARING werks aufnr
+  .
+  lt_arbpl = lt_arbpl_no_hash.
+
+
+
+  DATA(r_matnr) = VALUE tt_range_matnr( FOR ls IN lt_movs (  sign = 'I'
+  option = 'EQ' low = ls-matnr ) ).
+  SORT r_matnr BY low DESCENDING.
+  DELETE ADJACENT DUPLICATES FROM r_matnr COMPARING low.
+
+
+  SELECT matnr maktx INTO TABLE lt_makt FROM makt
+                     WHERE matnr IN r_matnr
+                       AND spras = sy-langu.
+
+  SELECT matnr matkl mtart zzancho zzgramaje
+                     FROM mara INTO TABLE lt_mara
+                     WHERE matnr IN r_matnr.
+
+  SELECT aufnr auart zzebeln1 zzebelp1 zzkunnr1
+                     FROM aufk INTO TABLE lt_aufk
+                     FOR ALL ENTRIES IN lt_movs
+                     WHERE aufnr = lt_movs-aufnr.
+
+  SELECT kunnr name1 FROM kna1 INTO TABLE lt_kna1
+                     FOR ALL ENTRIES IN lt_aufk
+                     WHERE kunnr = lt_aufk-zzkunnr1.
+
+  SELECT matkl wgbez60 FROM t023t INTO TABLE lt_t023t
+                       WHERE spras = sy-langu.
+
+
+  LOOP AT lt_movs INTO lw_movs.
+    CLEAR lw_datos.
+    lw_datos-matnr = lw_movs-matnr.
+
+    READ TABLE lt_makt INTO ls_makt WITH TABLE KEY matnr = lw_movs-matnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-maktx = ls_makt-maktx.
+    ENDIF.
+
+    lw_datos-werks = lw_movs-werks.
+
+    READ TABLE lt_mara INTO ls_mara WITH TABLE KEY matnr = lw_movs-matnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-matkl     = ls_mara-matkl.
+      lw_datos-mtart     = ls_mara-mtart.
+      lw_datos-zzancho   = ls_mara-zzancho.
+      lw_datos-zzgramaje = ls_mara-zzgramaje.
+    ENDIF.
+
+    lw_datos-cputm = lw_movs-cputm_mkpf.
+    lw_datos-cpudt = lw_movs-cpudt_mkpf.
+    lw_datos-budat = lw_movs-budat_mkpf.
+    lw_datos-charg = lw_movs-charg.
+    lw_datos-aufnr = lw_movs-aufnr.
+    lw_datos-menge = lw_movs-menge.
+    lw_datos-meins = lw_movs-meins.
+    lw_datos-bwart = lw_movs-bwart.
+    lw_datos-lgort = lw_movs-lgort.
+
+
+
+
+    READ TABLE lt_aufk INTO ls_aufk WITH TABLE KEY aufnr = lw_movs-aufnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-vbeln = ls_aufk-zzebeln1.
+      lw_datos-posnr = ls_aufk-zzebelp1.
+      lw_datos-kunnr = ls_aufk-zzkunnr1.
+    ENDIF.
+* GST - 14/01/2016 ->
+
+    READ TABLE lt_kna1 INTO ls_kna1 WITH TABLE KEY kunnr =
+    lw_datos-kunnr.
+    IF sy-subrc EQ 0.
+      lw_datos-name1 = ls_kna1-name1.
+    ENDIF.
+
+
+    CHECK lw_datos-vbeln IN svbeln.
+    CHECK lw_datos-kunnr IN skunnr.
+
+
+
+    IF lw_datos-charg IS NOT INITIAL.
+      IF lw_movs-ummat = c_mat_pulper OR lw_movs-matnr EQ c_mat_pulper.
+        IF lw_movs-ummat = c_mat_pulper.
+          lw_datos-charg = lw_movs-umcha .
+          lw_datos-matnr = c_mat_pulper .
+        ENDIF.
+        PERFORM obtener_clasificacion_pulp CHANGING lw_datos.
+        lw_datos-charg = lw_movs-charg.
+        lw_datos-matnr = lw_movs-matnr.
+      ELSE.
+
+        IF lw_datos-mtart = 'ZROL'.
+          PERFORM obtener_clasificacion CHANGING lw_datos.
+        ELSEIF lw_datos-mtart = 'ZPAP'.
+          PERFORM obtener_clasificacion_bob CHANGING lw_datos.
+        ENDIF.
+      ENDIF.
+
+
+*    " Hora y Turno:
+      IF ( lw_datos-cputm >= '060000' AND lw_datos-cputm <= '135959' ).
+        lw_datos-turno = 'T1'.
+        IF lw_datos-budat NE '00000000'.
+          lw_datos-fec_prod = lw_datos-budat.
+        ELSE.
+          lw_datos-fec_prod = lw_datos-cpudt.
+        ENDIF.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+      ELSEIF ( lw_datos-cputm >= '140000' AND lw_datos-cputm <= '215959' )
+      .
+        lw_datos-turno = 'T2'.
+        IF lw_datos-budat NE '00000000'.
+          lw_datos-fec_prod = lw_datos-budat.
+        ELSE.
+          lw_datos-fec_prod = lw_datos-cpudt.
+        ENDIF.
+      ELSEIF ( lw_datos-cputm >= '220000' AND lw_datos-cputm <= '235959' )
+      .
+        lw_datos-turno = 'T3'.
+        IF lw_datos-budat NE '00000000'.
+          lw_datos-fec_prod = lw_datos-budat.
+        ELSE.
+          lw_datos-fec_prod = lw_datos-cpudt.
+        ENDIF.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+      ELSE.
+        lw_datos-turno = 'T3'.
+        IF lw_datos-budat NE '00000000'.
+          lw_datos-fec_prod = lw_datos-budat - 1 .
+        ELSE.
+          lw_datos-fec_prod = lw_datos-cpudt - 1.
+        ENDIF.
+      ENDIF.
+
+
+      " Descripción grupo artículos:
+      READ TABLE lt_t023t INTO ls_t023t WITH TABLE KEY matkl =
+      lw_datos-matkl.
+      IF sy-subrc EQ 0.
+        lw_datos-wgbez60 = ls_t023t-wgbez60.
+        CONDENSE lw_datos-wgbez60.
+      ENDIF.
+
+*      IF lw_datos-bwart = '102' OR lw_datos-bwart = '532' OR
+*      lw_datos-bwart = '291' OR lw_datos-bwart = '310'.
+*        lw_datos-menge = ( -1 ) * lw_datos-menge.
+*        lw_datos-brgew = ( -1 ) * lw_datos-brgew.
+*      ENDIF.
+    ENDIF.
+
+*    lw_datos-contador = 1.
+*    IF lw_datos-bwart EQ '102' OR
+*       lw_datos-bwart EQ '201' or " '202' OR
+*       lw_datos-bwart EQ '262' OR
+*       lw_datos-bwart EQ '310' OR
+*       lw_datos-bwart EQ '312' OR
+*       lw_datos-bwart EQ '532'.
+*      lw_datos-contador = -1.
+*    ENDIF.
+    PERFORM tratar_mov_negativos USING lw_datos-bwart
+                              CHANGING lw_datos-contador
+                                       lw_datos-menge
+                                       lw_datos-brgew.
+
+*Pulper
+*si material 2001764, moviments 309/310 del magatzem 1020 o 531/532 del
+*1000, i motiu de     pulper distint de blanc
+
+    IF ( lw_datos-bwart = '309' OR lw_datos-bwart = '310' OR
+         lw_datos-bwart = '531' OR lw_datos-bwart = '532'   ) AND "26-05-2021 - CMS - 65397 - Nuevo modelo de costes
+         lw_datos-lgort = '1020' AND
+         lw_datos-motiv_pulper IS NOT INITIAL AND
+         lw_datos-matnr = c_mat_pulper.
+      lw_datos-pulper = abap_true.
+    ENDIF.
+
+    IF ( lw_datos-bwart = '531' OR lw_datos-bwart = '532' ) AND
+       lw_datos-lgort = '1000' AND
+       lw_datos-motiv_pulper IS NOT INITIAL .
+      lw_datos-pulper = abap_true.
+    ENDIF.
+
+
+
+*Reprocés
+*	si moviments  101/102 del magatzem 4001 i motiu de reprocés distint de blanc
+* 07-07-21 - 67851 - CMS - no tener en cuenta motivo reproc. Para activar flag reproceso
+    IF ( lw_datos-bwart = '101' OR lw_datos-bwart = '102' ) AND
+         lw_datos-lgort = '4001'. " AND
+*         lw_datos-motiv_ reproc IS NOT INITIAL.
+      lw_datos-reproceso = abap_true.
+    ELSE.
+      lw_datos-reproceso = abap_false.
+    ENDIF.
+
+
+*Producció bruta
+*si moviments 101/102 del magatzem 1020 o 309/310 no material pulper
+*2001764 amb motiu     de reprocés distint de blanc
+
+
+    IF ( ( lw_datos-bwart = '101' OR lw_datos-bwart = '102' ) AND
+    lw_datos-lgort = '1020' ) OR
+       ( ( lw_datos-bwart = '309' OR lw_datos-bwart = '310' ) AND
+         lw_datos-motiv_pulper IS NOT INITIAL AND lw_datos-matnr NE
+         c_mat_pulper ).
+
+      lw_datos-prodbrut = abap_true.
+    ENDIF.
+
+*Producció neta
+*	si moviments 101/102 del magatzem 1040
+
+    IF lw_datos-lgort EQ '1040' AND ( lw_datos-bwart = '101' OR
+    lw_datos-bwart = '102' ).
+      lw_datos-prodneta = abap_true.
+    ENDIF.
+
+
+* GST - 04/02/2016 - Ticket 9246 <-
+
+*   Puesto de trabajo, sino está en la característica de la BOBINA
+    IF lw_datos-ptrabajo IS INITIAL.
+      READ TABLE lt_arbpl INTO ls_arbpl WITH TABLE KEY werks =
+      lw_datos-werks aufnr = lw_datos-aufnr.
+      IF sy-subrc = 0.
+        lw_datos-ptrabajo = ls_arbpl-arbpl.
+      ENDIF.
+    ENDIF.
+
+    APPEND lw_datos TO gt_entradas.
+  ENDLOOP.
+
+ENDFORM.                    " SELEC_PROD_TURNOS
+
+FORM tratar_mov_negativos USING p_bwart TYPE bwart
+                       CHANGING p_cont  TYPE zcontador
+                                p_menge  TYPE menge_d
+                                p_brgew  TYPE brgew  .
+  p_cont = 1.
+
+  IF p_bwart EQ '102' OR
+     p_bwart EQ '201' OR " '202' OR
+     p_bwart EQ '262' OR
+     p_bwart EQ '310' OR
+     p_bwart EQ '312' OR
+     p_bwart EQ '532' OR
+     p_bwart EQ '702'.
+
+    p_cont = -1.
+    p_menge = p_menge * -1.
+    p_brgew = p_brgew * -1.
+
+  ENDIF.
+
+ENDFORM.
+FORM selec_reproceso .
+*>>> 05.09.2016 YTG Reducir la cantidad de campos en la tabla interna a
+*solo los que se usan (Rendimiento)
+
+  DATA lw_datos TYPE zepp_entradas_produccion.
+
+  DATA:BEGIN OF lw_movs.
+         INCLUDE STRUCTURE aufm.
+         DATA: kunnr      TYPE kunnr,
+         umlgo      TYPE lgort_d,
+         umcha      TYPE charg_d,
+         ummat      TYPE matnr,
+         budat_mkpf TYPE budat,
+         cputm_mkpf TYPE cputm,
+         cpudt_mkpf TYPE cpudt,
+       END OF lw_movs.
+
+  DATA: BEGIN OF ls_arbpl,
+          rueck TYPE co_rueck,
+          werks TYPE werks_d,
+          aufnr TYPE aufnr,
+          arbpl TYPE arbpl,
+        END OF ls_arbpl.
+
+  DATA: lt_arbpl         LIKE HASHED TABLE OF ls_arbpl WITH UNIQUE KEY
+  werks aufnr,
+        lt_arbpl_no_hash LIKE STANDARD TABLE OF ls_arbpl.
+
+  DATA lt_movs LIKE TABLE OF lw_movs.
+
+  DATA: BEGIN OF ls_makt,
+          matnr TYPE matnr,
+          maktx TYPE maktx,
+        END OF ls_makt,
+        lt_makt LIKE HASHED TABLE OF ls_makt WITH UNIQUE KEY matnr.
+
+  DATA: BEGIN OF ls_mara,
+          matnr     TYPE matnr,
+          matkl     TYPE matkl,
+          mtart     TYPE mtart,
+          zzancho   TYPE mara-zzancho,
+          zzgramaje TYPE mara-zzgramaje,
+        END OF ls_mara,
+        lt_mara LIKE HASHED TABLE OF ls_mara WITH UNIQUE KEY matnr.
+
+  DATA: BEGIN OF ls_kna1,
+          kunnr TYPE kunnr,
+          name1 TYPE name1_gp,
+        END OF ls_kna1,
+        lt_kna1 LIKE HASHED TABLE OF ls_kna1 WITH UNIQUE KEY kunnr.
+
+
+  DATA: BEGIN OF ls_aufk,
+          aufnr    TYPE aufnr,
+          auart    TYPE auart,
+          zzebeln1 TYPE aufk-zzebeln1,
+          zzebelp1 TYPE aufk-zzebelp1,
+          zzkunnr1 TYPE aufk-zzkunnr1,
+        END OF ls_aufk,
+        lt_aufk LIKE HASHED TABLE OF ls_aufk WITH UNIQUE KEY aufnr.
+
+  DATA: BEGIN OF ls_t023t,
+          matkl   TYPE matkl,
+          wgbez60 TYPE t023t-wgbez60,
+        END OF ls_t023t,
+        lt_t023t LIKE HASHED TABLE OF ls_t023t WITH UNIQUE KEY matkl.
+
+  TYPES: BEGIN OF ty_range_matnr,
+           sign,
+           option(2),
+           low       TYPE matnr,
+           high      TYPE matnr,
+         END OF ty_range_matnr,
+         tt_range_matnr TYPE TABLE OF ty_range_matnr WITH DEFAULT KEY.
+
+  CLEAR: lt_movs.
+  REFRESH: lt_movs.
+
+
+  DATA s_cputm LIKE so_h_t2.
+
+  TYPES: tt_bwart TYPE TABLE OF  bwart_range.
+  DATA: s_bwart TYPE tt_bwart .
+
+  APPEND VALUE:  bwart_range( sign = 'I' option = 'EQ' low    = '101' )
+                 TO s_bwart,
+                 bwart_range( sign = 'I' option = 'EQ' low    = '102' )
+                 TO s_bwart,
+*                 bwart_range( sign = 'I' option = 'EQ' low    = '309' )
+*                 TO s_bwart,
+*                 bwart_range( sign = 'I' option = 'EQ' low    = '310' )
+*                 TO s_bwart,
+                 bwart_range( sign = 'I' option = 'EQ' low    = '311' )
+                 TO s_bwart,
+                 bwart_range( sign = 'I' option = 'EQ' low    = '312' )
+                 TO s_bwart.
+
+  REFRESH slgort.
+  APPEND VALUE: "range_lgo( sign = 'I' option = 'EQ' low = '1040' ) TO
+                "slgort,
+                range_lgo( sign = 'I' option = 'EQ' low = '4001' ) TO
+                slgort.
+
+  IF p_t1 EQ abap_true OR p_t2 EQ abap_true.
+
+    IF p_t1 EQ abap_true AND p_t2 EQ abap_true.
+      s_cputm = so_h_t1.
+      s_cputm[ 1 ]-high = so_h_t2[ 1 ]-high.
+    ELSEIF p_t1 EQ abap_true.
+      s_cputm = so_h_t1.
+    ELSEIF p_t2 EQ abap_true.
+      s_cputm = so_h_t2.
+    ENDIF.
+
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_movs
+           FROM mkpf
+           INNER JOIN mseg
+                   ON mkpf~mandt = mseg~mandt
+                      AND mkpf~mblnr = mseg~mblnr
+                      AND mkpf~mjahr = mseg~mjahr
+       WHERE matnr           IN smatnr
+         AND mkpf~budat      IN sbudat
+         AND bwart           IN s_bwart
+         AND mseg~charg      IN scharg
+         AND mseg~cputm_mkpf IN s_cputm
+         AND mseg~lgort      IN slgort
+         AND mseg~werks      EQ pwerks
+         AND aufnr           IN saufnr.
+
+  ENDIF.
+
+  IF p_t3 EQ abap_true.
+
+    REFRESH s_cputm.
+    APPEND VALUE fkkr_cputm( sign = 'I' option = 'BT' low = '220000'
+    high = '235959') TO s_cputm.
+
+
+*   Cojemos los de las 10 a las 12 de la noche
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_movs
+            FROM mkpf
+            INNER JOIN mseg
+                    ON mkpf~mandt = mseg~mandt
+                       AND mkpf~mblnr = mseg~mblnr
+                       AND mkpf~mjahr = mseg~mjahr
+        WHERE matnr           IN smatnr
+          AND mkpf~budat      IN sbudat
+          AND bwart           IN s_bwart
+          AND mseg~charg      IN scharg
+          AND mseg~cputm_mkpf IN s_cputm
+          AND mseg~lgort      IN slgort
+          AND mseg~werks      EQ pwerks
+          AND aufnr           IN saufnr.
+
+
+
+
+
+*   Cojemos los del dia siguiente hasta las 6 de la mañana.
+    sbudat[ 1 ]-low  = sbudat[ 1 ]-low + 1.
+    IF sbudat[ 1 ]-high <> '99991231'.
+      sbudat[ 1 ]-high = sbudat[ 1 ]-high + 1.
+    ENDIF.
+
+    REFRESH s_cputm.
+    APPEND VALUE fkkr_cputm( sign = 'I' option = 'BT' low = '000000'
+    high = '055959') TO s_cputm.
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_movs
+                FROM mkpf
+                INNER JOIN mseg
+                        ON mkpf~mandt = mseg~mandt
+                           AND mkpf~mblnr = mseg~mblnr
+                           AND mkpf~mjahr = mseg~mjahr
+            WHERE matnr           IN smatnr
+              AND mkpf~budat      IN sbudat
+              AND bwart           IN s_bwart
+              AND mseg~charg      IN scharg
+              AND mseg~cputm_mkpf IN s_cputm
+              AND mseg~lgort      IN slgort
+              AND mseg~werks      EQ pwerks
+              AND aufnr           IN saufnr.
+
+
+  ENDIF.
+
+* REPROCESO CMS 23/04/2020
+*•  Almacén destino 4001, movimientos 101 (+) y  102 (-) “De bobinador a reproceso”
+*•  Almacén origen 1040 y almacén destino 4001, movimientos 309/311 (+) y 310/312 (-)
+*•  Almacén origen 4001 y almacén destino 1040, movimientos 309/311 (-) y 310/312 (+)
+
+  DELETE: lt_movs WHERE NOT (
+        (
+          lgort EQ '4001' AND ( bwart EQ '101' OR bwart EQ '102' )
+        )  OR
+        (
+*          lgort EQ '4001' AND  umlgo = '1040' AND ( bwart EQ '311' OR bwart EQ '312' )
+          lgort EQ '4001' AND  ( bwart EQ '311' OR bwart EQ '312' )
+        )" OR
+*        (
+*          lgort EQ '1040' AND  umlgo = '4001' AND ( bwart EQ '311' OR bwart EQ '312' )
+*         )
+                            ).
+
+  SELECT DISTINCT rueck c~werks aufnr arbpl INTO TABLE lt_arbpl_no_hash
+   FROM crhd AS c
+   INNER JOIN afru AS a ON ( c~objid = a~arbid ) WHERE c~werks = pwerks
+   .
+
+  SORT lt_arbpl_no_hash BY werks aufnr ASCENDING rueck DESCENDING.
+  DELETE ADJACENT DUPLICATES FROM lt_arbpl_no_hash COMPARING werks aufnr
+  .
+  lt_arbpl = lt_arbpl_no_hash.
+
+
+
+  DATA(r_matnr) = VALUE tt_range_matnr( FOR ls IN lt_movs (  sign = 'I'
+  option = 'EQ' low = ls-matnr ) ).
+  SORT r_matnr BY low DESCENDING.
+  DELETE ADJACENT DUPLICATES FROM r_matnr COMPARING low.
+
+
+  SELECT matnr maktx INTO TABLE lt_makt FROM makt
+                     WHERE matnr IN r_matnr
+                       AND spras = sy-langu.
+
+  SELECT matnr matkl mtart zzancho zzgramaje
+                     FROM mara INTO TABLE lt_mara
+                     WHERE matnr IN r_matnr.
+
+  SELECT aufnr auart zzebeln1 zzebelp1 zzkunnr1
+                     FROM aufk INTO TABLE lt_aufk
+                     FOR ALL ENTRIES IN lt_movs
+                     WHERE aufnr = lt_movs-aufnr.
+
+  SELECT kunnr name1 FROM kna1 INTO TABLE lt_kna1
+                     FOR ALL ENTRIES IN lt_aufk
+                     WHERE kunnr = lt_aufk-zzkunnr1.
+
+  SELECT matkl wgbez60 FROM t023t INTO TABLE lt_t023t
+                       WHERE spras = sy-langu.
+
+
+  LOOP AT lt_movs INTO lw_movs.
+    CLEAR lw_datos.
+    lw_datos-matnr = lw_movs-matnr.
+
+    READ TABLE lt_makt INTO ls_makt WITH TABLE KEY matnr = lw_movs-matnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-maktx = ls_makt-maktx.
+    ENDIF.
+
+    lw_datos-werks = lw_movs-werks.
+
+    READ TABLE lt_mara INTO ls_mara WITH TABLE KEY matnr = lw_movs-matnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-matkl     = ls_mara-matkl.
+      lw_datos-mtart     = ls_mara-mtart.
+      lw_datos-zzancho   = ls_mara-zzancho.
+      lw_datos-zzgramaje = ls_mara-zzgramaje.
+    ENDIF.
+
+    lw_datos-cputm = lw_movs-cputm_mkpf.
+    lw_datos-cpudt = lw_movs-cpudt_mkpf.
+    lw_datos-budat = lw_movs-budat_mkpf.
+    lw_datos-charg = lw_movs-charg.
+    lw_datos-aufnr = lw_movs-aufnr.
+    lw_datos-menge = lw_movs-menge.
+    lw_datos-meins = lw_movs-meins.
+    lw_datos-bwart = lw_movs-bwart.
+    lw_datos-lgort = lw_movs-lgort.
+
+
+
+
+    READ TABLE lt_aufk INTO ls_aufk WITH TABLE KEY aufnr = lw_movs-aufnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-vbeln = ls_aufk-zzebeln1.
+      lw_datos-posnr = ls_aufk-zzebelp1.
+      lw_datos-kunnr = ls_aufk-zzkunnr1.
+    ENDIF.
+* GST - 14/01/2016 ->
+
+    CHECK lw_datos-vbeln IN svbeln.
+
+    IF lw_datos-charg IS NOT INITIAL.
+
+      IF lw_datos-bwart EQ '311' OR
+         lw_datos-bwart EQ '312' .
+        lw_datos-lgort_origen = lw_movs-umlgo . "mostramos el almacen origen.
+      ENDIF.
+
+      PERFORM obtener_clasificacion_bob CHANGING lw_datos.
+    ENDIF.
+
+    CHECK lw_datos-kunnr IN skunnr.
+    READ TABLE lt_kna1 INTO ls_kna1 WITH TABLE KEY kunnr = lw_datos-kunnr.
+    IF sy-subrc EQ 0.
+      lw_datos-name1 = ls_kna1-name1.
+    ENDIF.
+
+    lw_datos-reproceso = abap_true.
+
+    lw_datos-contador = 1.
+
+    IF lw_datos-bwart EQ '102'.
+      lw_datos-contador = -1.
+      lw_datos-menge = ( -1 ) * lw_datos-menge.
+      lw_datos-brgew = ( -1 ) * lw_datos-brgew.
+    ELSEIF ( lw_datos-bwart EQ '311' OR lw_datos-bwart EQ '312' )
+      AND lw_movs-shkzg = 'H'.
+      lw_datos-menge = ( -1 ) * lw_datos-menge.
+      lw_datos-brgew = ( -1 ) * lw_datos-brgew.
+    ENDIF.
+*    PERFORM tratar_mov_negativos USING lw_datos-bwart
+*                              CHANGING lw_datos-contador
+*                                       lw_datos-menge
+*                                       lw_datos-brgew.
+
+*    " Hora y Turno:
+    IF ( lw_datos-cputm >= '060000' AND lw_datos-cputm <= '135959' ).
+      lw_datos-turno = 'T1'.
+      IF lw_datos-budat NE '00000000'.
+        lw_datos-fec_prod = lw_datos-budat.
+      ELSE.
+        lw_datos-fec_prod = lw_datos-cpudt.
+      ENDIF.
+    ELSEIF ( lw_datos-cputm >= '140000' AND lw_datos-cputm <= '215959' )
+    .
+      lw_datos-turno = 'T2'.
+      IF lw_datos-budat NE '00000000'.
+        lw_datos-fec_prod = lw_datos-budat.
+      ELSE.
+        lw_datos-fec_prod = lw_datos-cpudt.
+      ENDIF.
+    ELSEIF ( lw_datos-cputm >= '220000' AND lw_datos-cputm <= '235959' )
+    .
+      lw_datos-turno = 'T3'.
+      IF lw_datos-budat NE '00000000'.
+        lw_datos-fec_prod = lw_datos-budat.
+      ELSE.
+        lw_datos-fec_prod = lw_datos-cpudt.
+      ENDIF.
+    ELSE.
+      lw_datos-turno = 'T3'.
+      IF lw_datos-budat NE '00000000'.
+        lw_datos-fec_prod = lw_datos-budat - 1 .
+      ELSE.
+        lw_datos-fec_prod = lw_datos-cpudt - 1.
+      ENDIF.
+    ENDIF.
+
+
+    " Descripción grupo artículos:
+    READ TABLE lt_t023t INTO ls_t023t WITH TABLE KEY matkl =
+    lw_datos-matkl.
+    IF sy-subrc EQ 0.
+      lw_datos-wgbez60 = ls_t023t-wgbez60.
+      CONDENSE lw_datos-wgbez60.
+    ENDIF.
+
+* GST - 04/02/2016 - Ticket 9246 <-
+
+*   Puesto de trabajo, sino está en la característica de la BOBINA
+    IF lw_datos-ptrabajo IS INITIAL.
+      READ TABLE lt_arbpl INTO ls_arbpl WITH TABLE KEY werks =
+      lw_datos-werks aufnr = lw_datos-aufnr.
+      IF sy-subrc = 0.
+        lw_datos-ptrabajo = ls_arbpl-arbpl.
+      ENDIF.
+    ENDIF.
+
+* Buscamos NI Gramaje en la bobina.
+    PERFORM obtener_ni_gramaje USING pwerks
+                                   lw_datos-matnr
+                                   lw_datos-charg
+                            CHANGING lw_datos-obs_cal."observaciones calidad
+
+    IF lw_datos-obs_cal IS INITIAL.
+* si no se ha encontrado NI Gramaje en lot.insp. de bobina, buscamos en su rollo asociado.
+      SELECT SINGLE matnr INTO @DATA(l_matnr_rollo)
+      FROM mch1
+      WHERE charg = @lw_datos-charg_origen.
+
+      PERFORM obtener_ni_gramaje USING pwerks
+                                     l_matnr_rollo
+                                     lw_datos-charg_origen
+                              CHANGING lw_datos-obs_cal."observaciones calidad
+    ENDIF.
+
+* CMS - 04/03/2021 - Filtrar reproceso por almacén origen blanco o 1040.
+    IF lw_datos-lgort_origen <> ' ' AND
+       lw_datos-lgort_origen <> '1040'.
+      CONTINUE.
+    ENDIF.
+
+    APPEND lw_datos TO gt_entradas.
+  ENDLOOP.
+ENDFORM.                    " selec_reproceso
+*&---------------------------------------------------------------------*
+*&      Form  SELEC_MAT_PRIMA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM selec_mat_prima.
+
+  DATA lw_datos TYPE zepp_entradas_produccion.
+
+  DATA: BEGIN OF lt_mseg OCCURS 0,
+          matnr      TYPE matnr,
+          werks      TYPE werks_d,
+          budat_mkpf TYPE budat,
+          charg      TYPE charg_d,
+          lgort      TYPE lgort_d,
+
+          umlgo      TYPE lgort_d,
+          aufnr      TYPE aufnr,
+          menge      TYPE menge_d,
+          meins      TYPE meins,
+          bwart      TYPE bwart,
+          cpudt_mkpf TYPE cpudt,
+          cputm_mkpf TYPE cputm,
+          matkl      TYPE matkl,
+          mtart      TYPE mtart,
+          zzancho    TYPE zancho,
+          zzgramaje  TYPE zgramaje,
+          dmbtr      TYPE dmbtr,
+          waers      TYPE waers,
+        END OF lt_mseg.
+
+*05.09.2016 YTG Reducir la cantidad de campos en la tabla interna a solo
+*los que se usan (Rendimiento)
+  DATA: BEGIN OF lw_aufk,
+          zzebeln1 TYPE aufk-zzebeln1,
+          zzebelp1 TYPE aufk-zzebelp1,
+          zzkunnr1 TYPE aufk-zzkunnr1,
+        END OF lw_aufk.
+
+
+  DATA: lw_mseg LIKE LINE OF lt_mseg.
+*  DATA  lw_aufk TYPE aufk.
+  DATA  lv_where TYPE string.
+  DATA  lv_arbpl TYPE arbpl.
+  DATA: lv_object TYPE objnum.
+  DATA: it_objectdata TYPE STANDARD TABLE OF clobjdat,
+        it_class      TYPE STANDARD TABLE OF sclass,
+        ls_objectdata TYPE                   clobjdat.
+  DATA: l_matnr TYPE matnr.
+
+  CLEAR: lt_mseg.
+  REFRESH: lt_mseg.
+
+
+  DATA: BEGIN OF ls_arbpl,
+          werks TYPE werks_d,
+          aufnr TYPE aufnr,
+          arbpl TYPE arbpl,
+        END OF ls_arbpl.
+
+  DATA: lt_arbpl         LIKE HASHED TABLE OF ls_arbpl WITH UNIQUE KEY
+  werks aufnr,
+        lt_arbpl_no_hash LIKE STANDARD TABLE OF ls_arbpl.
+
+  DATA: BEGIN OF ls_t023t,
+          matkl   TYPE matkl,
+          wgbez60 TYPE t023t-wgbez60,
+        END OF ls_t023t,
+        lt_t023t LIKE HASHED TABLE OF ls_t023t WITH UNIQUE KEY matkl.
+
+
+  DATA: BEGIN OF ls_mara,
+          matnr     TYPE matnr,
+          matkl     TYPE matkl,
+          mtart     TYPE mtart,
+          zzancho   TYPE mara-zzancho,
+          zzgramaje TYPE mara-zzgramaje,
+        END OF ls_mara,
+        lt_mara LIKE HASHED TABLE OF ls_mara WITH UNIQUE KEY matnr.
+
+  DATA: BEGIN OF ls_kna1,
+          kunnr TYPE kunnr,
+          name1 TYPE name1_gp,
+        END OF ls_kna1,
+        lt_kna1 LIKE HASHED TABLE OF ls_kna1 WITH UNIQUE KEY kunnr.
+
+  DATA: BEGIN OF ls_makt,
+          matnr TYPE matnr,
+          maktx TYPE maktx,
+        END OF ls_makt,
+        lt_makt LIKE HASHED TABLE OF ls_makt WITH UNIQUE KEY matnr.
+
+  DATA: BEGIN OF ls_aufk,
+          aufnr    TYPE aufnr,
+          auart    TYPE auart,
+          zzebeln1 TYPE aufk-zzebeln1,
+          zzebelp1 TYPE aufk-zzebelp1,
+          zzkunnr1 TYPE aufk-zzkunnr1,
+        END OF ls_aufk,
+        lt_aufk LIKE HASHED TABLE OF ls_aufk WITH UNIQUE KEY aufnr.
+
+
+  TYPES: BEGIN OF ty_range_matnr,
+           sign,
+           option(2),
+           low       TYPE matnr,
+           high      TYPE matnr,
+         END OF ty_range_matnr,
+         tt_range_matnr TYPE TABLE OF ty_range_matnr WITH DEFAULT KEY.
+
+  DATA s_cputm LIKE so_h_t1.
+
+* DTM
+
+  DATA: lt_allocvaluesnum  TYPE STANDARD TABLE OF bapi1003_alloc_values_num WITH HEADER LINE,
+        lt_allocvalueschar TYPE STANDARD TABLE OF bapi1003_alloc_values_char WITH HEADER LINE,
+        lt_allocvaluescurr TYPE STANDARD TABLE OF bapi1003_alloc_values_curr WITH HEADER LINE,
+        lt_return          TYPE STANDARD TABLE OF bapiret2,
+        lv_objkey          TYPE objnum.
+
+* DTM
+
+
+  SELECT * FROM mara INTO CORRESPONDING FIELDS OF TABLE lt_mara
+                     WHERE matnr IN smatnr AND mtart = 'ZREC' OR
+                           ( matnr = '000000000002001764' AND mtart =
+                           'ZSEM' ) AND lvorm = space.
+
+  IF smatnr[] IS INITIAL.
+    DATA(r_matnr) = VALUE tt_range_matnr( FOR ls IN lt_mara (  sign =
+    'I' option = 'EQ' low = ls-matnr ) ).
+    SORT r_matnr BY low DESCENDING.
+  ELSE.
+    r_matnr[] = smatnr[].
+  ENDIF.
+
+  IF p_t1 EQ abap_true AND p_t2 EQ abap_true.
+    so_h_t1[ 1 ]-high = so_h_t2[ 1 ]-high.
+  ELSEIF p_t2 EQ abap_true.
+    so_h_t1 = so_h_t2.
+  ENDIF.
+
+  IF p_t1 EQ abap_true OR p_t2 EQ abap_true.
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_mseg
+            FROM mkpf
+            INNER JOIN mseg
+                    ON mkpf~mandt = mseg~mandt
+                       AND mkpf~mblnr = mseg~mblnr
+                       AND mkpf~mjahr = mseg~mjahr
+        FOR ALL ENTRIES IN r_matnr
+        WHERE matnr           EQ r_matnr-low
+          AND mkpf~budat      IN sbudat
+*INI CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+          AND   ( ( bwart EQ '261' OR bwart EQ '262' OR
+                    bwart EQ '701' OR bwart EQ '702' ) AND "DTM - Ticket 70408
+                ( mseg~lgort    EQ '4002' OR
+                  mseg~lgort    EQ '1000' OR "DTM - Ticket 70408
+                  mseg~lgort    BETWEEN '1001' AND '1019' OR
+                  mseg~lgort    BETWEEN '1022' AND '1039' ) )
+
+
+
+*      ( ( ( bwart = '261' OR bwart = '262' "OR
+**                     bwart = '701' OR bwart = '702'
+*                   )  AND
+*                   mseg~lgort      EQ '4002'
+*                 )
+*                 OR
+*                 ( ( " bwart = '701' OR bwart = '702' "or
+*                     bwart = '261' OR bwart = '262'  " 64859 - 15/04/2021 - CMS añadir mov. 261 y 262
+*                    ) AND
+*                   ( mseg~lgort    BETWEEN '1001' AND '1019' OR
+**                     mseg~lgort    BETWEEN '1022' AND '1029'
+*                     mseg~lgort    BETWEEN '1022' AND '1039' " 64859 - 15/04/2021 - CMS cambiar rango almacenes CAMPA
+*
+*                   )
+*                 )
+*               )
+*FIN CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+          AND mseg~charg      IN scharg
+          AND mseg~cputm_mkpf IN so_h_t1
+          AND mseg~werks      EQ pwerks
+          AND aufnr IN saufnr.
+
+  ENDIF.
+
+  IF p_t3 EQ abap_true.
+
+
+    REFRESH s_cputm.
+    APPEND VALUE fkkr_cputm( sign = 'I' option = 'BT' low = '220000'
+    high = '235959') TO s_cputm.
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_mseg
+            FROM mkpf
+            INNER JOIN mseg
+                    ON mkpf~mandt = mseg~mandt
+                       AND mkpf~mblnr = mseg~mblnr
+                       AND mkpf~mjahr = mseg~mjahr
+        FOR ALL ENTRIES IN r_matnr
+        WHERE matnr           EQ r_matnr-low
+          AND mkpf~budat      IN sbudat
+*INI CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+          AND   ( ( bwart EQ '261' OR bwart EQ '262' OR
+                    bwart EQ '701' OR bwart EQ '702' ) AND "DTM - Ticket 70408
+                ( mseg~lgort    EQ '4002' OR
+                  mseg~lgort    EQ '1000' OR "DTM - Ticket 70408
+                  mseg~lgort    BETWEEN '1001' AND '1019' OR
+                  mseg~lgort    BETWEEN '1022' AND '1039' ) )
+
+*          AND  ( ( ( bwart = '261' OR bwart = '262' "  OR
+**                     bwart = '701' OR bwart = '702'
+*                   )  AND
+*                   mseg~lgort      EQ '4002'
+*                 ) OR
+*                 ( ( " bwart = '701' OR bwart = '702'  "OR
+*                     bwart = '261' OR bwart = '262'  " 64859 - 15/04/2021 - CMS añadir mov. 261 y 262
+*                    ) AND
+*                   ( mseg~lgort    BETWEEN '1001' AND '1019' OR
+**                       mseg~lgort    BETWEEN '1022' AND '1029'
+*                     mseg~lgort    BETWEEN '1022' AND '1039' " 64859 - 15/04/2021 - CMS cambiar rango almacenes CAMPA
+*
+*                    )
+*                 )
+*               )
+*FIN CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+          AND mseg~charg      IN scharg
+          AND mseg~cputm_mkpf IN s_cputm
+          AND mseg~werks      EQ pwerks
+          AND aufnr IN saufnr.
+
+    sbudat[ 1 ]-low  = sbudat[ 1 ]-low + 1.
+    IF sbudat[ 1 ]-high <> '99991231'.
+      sbudat[ 1 ]-high = sbudat[ 1 ]-high + 1.
+    ENDIF.
+    REFRESH s_cputm.
+    APPEND VALUE fkkr_cputm( sign = 'I' option = 'BT' low = '000000'
+    high = '055959') TO s_cputm.
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_mseg
+            FROM mkpf
+            INNER JOIN mseg
+                    ON mkpf~mandt = mseg~mandt
+                       AND mkpf~mblnr = mseg~mblnr
+                       AND mkpf~mjahr = mseg~mjahr
+        FOR ALL ENTRIES IN r_matnr
+        WHERE matnr           EQ r_matnr-low
+          AND mkpf~budat      IN sbudat
+
+          AND   ( ( bwart EQ '261' OR bwart EQ '262' OR
+                    bwart EQ '701' OR bwart EQ '702' ) AND "DTM - Ticket 70408
+                ( mseg~lgort    EQ '4002' OR
+                  mseg~lgort    EQ '1000' OR "DTM - Ticket 70408
+                  mseg~lgort    BETWEEN '1001' AND '1019' OR
+                  mseg~lgort    BETWEEN '1022' AND '1039' ) )
+
+*          AND ( bwart = '261' OR bwart = '262' OR
+*INI CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+*                bwart = '701' OR bwart = '702' )
+*FIN CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+          AND mseg~charg      IN scharg
+          AND mseg~cputm_mkpf IN s_cputm
+          AND mseg~lgort      EQ '4002'
+          AND mseg~werks      EQ pwerks
+          AND aufnr IN saufnr.
+  ENDIF.
+
+
+**  SELECT DISTINCT c~werks aufnr arbpl INTO TABLE lt_arbpl_no_hash
+**   FROM crhd AS c
+**   INNER JOIN afru AS a ON ( c~objid = a~arbid ).
+**
+**  SORT lt_arbpl_no_hash BY werks aufnr ASCENDING.
+**  DELETE ADJACENT DUPLICATES FROM lt_arbpl_no_hash COMPARING werks aufnr
+**  .
+**  lt_arbpl = lt_arbpl_no_hash.
+
+
+  SELECT matnr maktx INTO TABLE lt_makt FROM makt
+                     WHERE matnr IN r_matnr
+                       AND spras = sy-langu.
+
+  SELECT aufnr auart zzebeln1 zzebelp1 zzkunnr1
+                     FROM aufk INTO TABLE lt_aufk
+                     FOR ALL ENTRIES IN lt_mseg
+                     WHERE aufnr = lt_mseg-aufnr.
+
+  SELECT kunnr name1 FROM kna1 INTO TABLE lt_kna1
+                     FOR ALL ENTRIES IN lt_aufk
+                     WHERE kunnr = lt_aufk-zzkunnr1.
+
+  SELECT matkl wgbez60 FROM t023t INTO TABLE lt_t023t
+                   WHERE spras = sy-langu.
+
+
+  LOOP AT lt_mseg INTO lw_mseg.
+
+    CLEAR lw_datos.
+    lw_datos-matnr = lw_mseg-matnr.
+    READ TABLE lt_makt INTO ls_makt WITH TABLE KEY matnr = lw_mseg-matnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-maktx = ls_makt-maktx.
+    ENDIF.
+
+    lw_datos-werks = lw_mseg-werks.
+
+    READ TABLE lt_mara INTO ls_mara WITH TABLE KEY matnr = lw_mseg-matnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-matkl     = ls_mara-matkl.
+      lw_datos-mtart     = ls_mara-mtart.
+      lw_datos-zzancho   = ls_mara-zzancho.
+      lw_datos-zzgramaje = ls_mara-zzgramaje.
+    ENDIF.
+    lw_datos-budat = lw_mseg-budat_mkpf.
+    lw_datos-charg = lw_mseg-charg.
+    lw_datos-aufnr = lw_mseg-aufnr.
+    lw_datos-menge = lw_mseg-menge.
+    lw_datos-meins = lw_mseg-meins.
+    lw_datos-bwart = lw_mseg-bwart.
+    lw_datos-lgort = lw_mseg-lgort.
+    lw_datos-dmbtr = lw_mseg-dmbtr.
+    lw_datos-waers = lw_mseg-waers.
+
+    lw_datos-lgort_origen = lw_mseg-umlgo.
+
+* 05.09.2016 YTG Quitar el select * para mejorar rendimiento
+    READ TABLE lt_aufk INTO ls_aufk WITH TABLE KEY aufnr =
+    lw_datos-aufnr.
+    IF sy-subrc = 0.
+      lw_datos-vbeln = ls_aufk-zzebeln1.
+      lw_datos-posnr = ls_aufk-zzebelp1.
+      lw_datos-kunnr = ls_aufk-zzkunnr1.
+    ENDIF.
+
+    READ TABLE lt_kna1 INTO ls_kna1 WITH TABLE KEY kunnr =
+    lw_datos-kunnr.
+    IF sy-subrc EQ 0.
+      lw_datos-name1 = ls_kna1-name1.
+    ENDIF.
+
+    CHECK lw_datos-vbeln IN svbeln.
+    CHECK lw_datos-kunnr IN skunnr.
+
+* DTM - Se obtienen el puesto de trabajo y el motivo pulper de la bobina pulper
+
+    IF lw_datos-matnr EQ '000000000002001764'.
+
+      CLEAR: lt_allocvaluesnum, lt_allocvalueschar, lt_allocvaluescurr, lt_return.
+      REFRESH: lt_allocvaluesnum, lt_allocvalueschar, lt_allocvaluescurr, lt_return.
+
+      CONCATENATE lw_datos-matnr lw_datos-charg INTO lv_objkey.
+
+      CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+        EXPORTING
+          objectkey       = lv_objkey
+          objecttable     = 'MCH1'
+          classnum        = 'Z_BOBINA_PULPER'
+          classtype       = '023'
+        TABLES
+          allocvaluesnum  = lt_allocvaluesnum
+          allocvalueschar = lt_allocvalueschar
+          allocvaluescurr = lt_allocvaluescurr
+          return          = lt_return.
+
+      READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      CHECK sy-subrc <> 0.
+
+      READ TABLE lt_allocvalueschar WITH KEY charact = 'ZPPI_MOTIVO_RECHAZO'.
+
+      IF sy-subrc = 0.
+
+        lw_datos-motiv_pulper = lt_allocvalueschar-value_char.
+
+      ENDIF.
+
+      READ TABLE lt_allocvalueschar WITH KEY charact = 'ZPPI_PUESTO_TRABAJO'.
+
+      IF sy-subrc = 0.
+
+        lw_datos-ptrabajo = lt_allocvalueschar-value_char.
+
+      ENDIF.
+
+    ENDIF.
+
+* DTM
+
+    " Hora y Turno:
+    lw_datos-cputm = lw_mseg-cputm_mkpf.
+    lw_datos-cpudt = lw_mseg-cpudt_mkpf.
+
+    IF ( lw_datos-cputm >= '060000' AND lw_datos-cputm <= '135959' ).
+      lw_datos-turno = 'T1'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSEIF ( lw_datos-cputm >= '140000' AND lw_datos-cputm <= '215959' )
+    .
+      lw_datos-turno = 'T2'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSEIF ( lw_datos-cputm >= '220000' AND lw_datos-cputm <= '235959' )
+    .
+      lw_datos-turno = 'T3'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSE.
+      lw_datos-turno = 'T3'.
+      lw_datos-fec_prod = lw_datos-budat - 1.
+*      lw_datos-fec_prod = lw_datos-cpudt - 1.
+    ENDIF.
+
+    " Descripción grupo artículos:
+    READ TABLE lt_t023t INTO ls_t023t WITH TABLE KEY matkl =
+    lw_datos-matkl.
+    IF sy-subrc EQ 0.
+      lw_datos-wgbez60 = ls_t023t-wgbez60.
+      CONDENSE lw_datos-wgbez60.
+    ENDIF.
+
+*    lw_datos-contador = 1.
+*    IF lw_datos-bwart EQ '102' OR lw_datos-bwart EQ '312' OR
+*    lw_datos-bwart EQ '202' OR lw_datos-bwart EQ '262'
+*       OR lw_datos-bwart EQ '310' OR lw_datos-bwart EQ '532'
+**INI CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+**auxiliares. 53366
+*       OR lw_datos-bwart EQ '702'.
+**FIN CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+**auxiliares. 53366
+*      lw_datos-contador = -1.
+*      lw_datos-menge = lw_datos-menge * -1.
+*    ENDIF.
+
+* DTM
+
+    IF lw_datos-bwart EQ '262' OR lw_datos-bwart EQ '701'.
+
+      lw_datos-contador = -1.
+      lw_datos-menge = ( -1 ) * lw_datos-menge.
+      lw_datos-brgew = ( -1 ) * lw_datos-brgew.
+
+    ENDIF.
+
+**    PERFORM tratar_mov_negativos USING lw_datos-bwart
+**                              CHANGING lw_datos-contador
+**                                       lw_datos-menge
+**                                       lw_datos-brgew.
+
+*   Puesto de trabajo, sino está en la característica de la BOBINA
+**    IF lw_datos-ptrabajo IS INITIAL.
+**      READ TABLE lt_arbpl INTO ls_arbpl WITH TABLE KEY aufnr =
+**      lw_datos-aufnr werks = lw_datos-werks.
+**      IF sy-subrc = 0.
+**        lw_datos-ptrabajo = ls_arbpl-arbpl.
+**      ENDIF.
+**    ENDIF.
+
+* DTM
+
+    APPEND lw_datos TO gt_entradas.
+  ENDLOOP.
+
+ENDFORM.                    " SELEC_MAT_PRIMA
+*&---------------------------------------------------------------------*
+*&      Form  SELEC_MAT_AUX
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM selec_mat_aux .
+
+  DATA lw_datos TYPE zepp_entradas_produccion.
+  DATA: BEGIN OF lt_mseg OCCURS 0,
+          matnr     TYPE matnr,
+          werks     TYPE werks_d,
+          budat     TYPE budat,
+          charg     TYPE charg_d,
+          lgort     TYPE lgort_d,
+          aufnr     TYPE aufnr,
+          menge     TYPE menge_d,
+          meins     TYPE meins,
+          bwart     TYPE bwart,
+          cpudt     TYPE cpudt,
+          cputm     TYPE cputm,
+          matkl     TYPE matkl,
+          umlgo     TYPE lgort_d,
+          mtart     TYPE mtart,
+          zzancho   TYPE zancho,
+          zzgramaje TYPE zgramaje,
+        END OF lt_mseg.
+
+*>>> 05.09.2016 YTG Reducir la cantidad de campos en la tabla interna a
+*solo los que se usan (Rendimiento)
+
+  DATA: BEGIN OF ls_arbpl,
+          werks TYPE werks_d,
+          aufnr TYPE aufnr,
+          arbpl TYPE arbpl,
+        END OF ls_arbpl.
+
+  DATA: lt_arbpl         LIKE HASHED TABLE OF ls_arbpl WITH UNIQUE KEY
+  werks aufnr,
+        lt_arbpl_no_hash LIKE STANDARD TABLE OF ls_arbpl.
+
+  DATA: BEGIN OF ls_t023t,
+          matkl   TYPE matkl,
+          wgbez60 TYPE t023t-wgbez60,
+        END OF ls_t023t,
+        lt_t023t LIKE HASHED TABLE OF ls_t023t WITH UNIQUE KEY matkl.
+
+
+  DATA: BEGIN OF ls_mara,
+          matnr     TYPE matnr,
+          matkl     TYPE matkl,
+          mtart     TYPE mtart,
+          zzancho   TYPE mara-zzancho,
+          zzgramaje TYPE mara-zzgramaje,
+        END OF ls_mara,
+        lt_mara LIKE HASHED TABLE OF ls_mara WITH UNIQUE KEY matnr.
+
+  DATA: BEGIN OF ls_kna1,
+          kunnr TYPE kunnr,
+          name1 TYPE name1_gp,
+        END OF ls_kna1,
+        lt_kna1 LIKE HASHED TABLE OF ls_kna1 WITH UNIQUE KEY kunnr.
+
+  DATA: BEGIN OF ls_makt,
+          matnr TYPE matnr,
+          maktx TYPE maktx,
+        END OF ls_makt,
+        lt_makt LIKE HASHED TABLE OF ls_makt WITH UNIQUE KEY matnr.
+
+  DATA: BEGIN OF ls_aufk,
+          aufnr    TYPE aufnr,
+          auart    TYPE auart,
+          zzebeln1 TYPE aufk-zzebeln1,
+          zzebelp1 TYPE aufk-zzebelp1,
+          zzkunnr1 TYPE aufk-zzkunnr1,
+        END OF ls_aufk,
+        lt_aufk LIKE HASHED TABLE OF ls_aufk WITH UNIQUE KEY aufnr.
+
+
+  TYPES: BEGIN OF ty_range_matnr,
+           sign,
+           option(2),
+           low       TYPE matnr,
+           high      TYPE matnr,
+         END OF ty_range_matnr,
+         tt_range_matnr TYPE TABLE OF ty_range_matnr WITH DEFAULT KEY.
+
+  DATA s_cputm LIKE so_h_t3.
+
+
+
+  DATA: lw_mseg LIKE LINE OF lt_mseg.
+*  DATA lw_aufk TYPE aufk.
+
+  DATA  lv_where TYPE string.
+  DATA  lv_arbpl TYPE arbpl.
+  DATA: lv_object TYPE objnum.
+  DATA: it_objectdata TYPE STANDARD TABLE OF clobjdat,
+        it_class      TYPE STANDARD TABLE OF sclass,
+        ls_objectdata TYPE                   clobjdat.
+
+
+  CLEAR: lt_mseg.
+  REFRESH: lt_mseg.
+
+*
+*  SELECT a~matnr a~werks b~budat a~charg a~lgort a~aufnr
+*         a~menge a~meins a~bwart b~cpudt b~cputm a~umlgo
+*         c~matkl c~mtart c~zzancho c~zzgramaje
+*      INTO TABLE lt_mseg
+*      FROM mseg AS a
+*      INNER JOIN mkpf AS b ON ( b~mblnr = a~mblnr
+*      AND b~mjahr = a~mjahr )
+*      INNER JOIN mara AS c ON c~matnr = a~matnr
+*      WHERE a~matnr IN smatnr
+*      AND a~werks = pwerks
+*      AND a~charg IN scharg
+*      AND a~lgort IN slgort
+*      AND a~aufnr IN saufnr
+*      AND  a~bwart = '261'
+*      AND b~cputm IN so_h_t1
+*      AND ( c~mtart = 'ZMAP' OR c~mtart = 'ZAUX' ).
+
+
+
+  SELECT * FROM mara INTO CORRESPONDING FIELDS OF TABLE lt_mara
+                 WHERE ( mtart = 'ZAUX' OR
+                       mtart = 'ZMAP' ) AND lvorm = space.
+
+  IF smatnr[] IS INITIAL.
+    DATA(r_matnr) = VALUE tt_range_matnr( FOR ls IN lt_mara (  sign =
+    'I' option = 'EQ' low = ls-matnr ) ).
+    SORT r_matnr BY low DESCENDING.
+  ELSE.
+    r_matnr[] = smatnr[].
+  ENDIF.
+
+  IF p_t1 EQ abap_true OR p_t2 EQ abap_true.
+
+    IF p_t1 EQ abap_true AND p_t2 EQ abap_true.
+      so_h_t1[ 1 ]-high = so_h_t2[ 1 ]-high.
+    ELSEIF p_t2 EQ abap_true.
+      so_h_t1 = so_h_t2.
+    ENDIF.
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_mseg
+            FROM mkpf
+            INNER JOIN mseg
+                    ON mkpf~mandt = mseg~mandt
+                       AND mkpf~mblnr = mseg~mblnr
+                       AND mkpf~mjahr = mseg~mjahr
+      "  FOR ALL ENTRIES IN r_matnr
+        WHERE "matnr           EQ r_matnr-low
+         " AND
+      mkpf~budat      IN sbudat
+          AND ( bwart = '261' OR bwart = '262'  OR bwart = '201' OR
+          bwart = '202'
+*INI CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+             OR bwart = '701' OR bwart = '702' )
+*FIN CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+          AND mseg~charg      IN scharg
+          AND mseg~cputm_mkpf IN so_h_t1
+          AND mseg~lgort      IN slgort
+          AND mseg~werks      EQ pwerks
+          AND aufnr IN saufnr.
+
+  ENDIF.
+
+  IF p_t3 EQ abap_true.
+
+
+    REFRESH s_cputm.
+    APPEND VALUE fkkr_cputm( sign = 'I' option = 'BT' low = '220000'
+    high = '235959') TO s_cputm.
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_mseg
+            FROM mkpf
+            INNER JOIN mseg
+                    ON mkpf~mandt = mseg~mandt
+                       AND mkpf~mblnr = mseg~mblnr
+                       AND mkpf~mjahr = mseg~mjahr
+          WHERE mkpf~budat      IN sbudat
+          AND ( bwart = '261' OR bwart = '262'  OR bwart = '201' OR
+          bwart = '202'
+*INI CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+             OR bwart = '701' OR bwart = '702' )
+*FIN CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+          AND mseg~charg      IN scharg
+          AND mseg~cputm_mkpf IN s_cputm
+          AND mseg~lgort      IN slgort
+          AND mseg~werks      EQ pwerks
+          AND aufnr IN saufnr.
+
+    sbudat[ 1 ]-low  = sbudat[ 1 ]-low + 1.
+*    sbudat[ 1 ]-high = sbudat[ 1 ]-high + 1.
+    IF sbudat[ 1 ]-high <> '99991231'.
+      sbudat[ 1 ]-high = sbudat[ 1 ]-high + 1.
+    ENDIF.
+
+    REFRESH s_cputm.
+    APPEND VALUE fkkr_cputm( sign = 'I' option = 'BT' low = '000000'
+    high = '055959') TO s_cputm.
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_mseg
+            FROM mkpf
+            INNER JOIN mseg
+                    ON mkpf~mandt = mseg~mandt
+                       AND mkpf~mblnr = mseg~mblnr
+                       AND mkpf~mjahr = mseg~mjahr
+        WHERE mkpf~budat      IN sbudat
+          AND ( bwart = '261' OR bwart = '262'  OR bwart = '201' OR
+          bwart = '202'
+*INI CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+             OR bwart = '701' OR bwart = '702' )
+*FIN CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+*auxiliares. 53366
+          AND mseg~charg      IN scharg
+          AND mseg~cputm_mkpf IN s_cputm
+          AND mseg~lgort      IN slgort
+          AND mseg~werks      EQ pwerks
+          AND aufnr IN saufnr.
+  ENDIF.
+
+
+
+
+  SELECT matnr maktx INTO TABLE lt_makt FROM makt
+                     WHERE matnr IN r_matnr
+                       AND spras = sy-langu.
+
+  SELECT aufnr auart zzebeln1 zzebelp1 zzkunnr1
+                     FROM aufk INTO TABLE lt_aufk
+                     FOR ALL ENTRIES IN lt_mseg
+                     WHERE aufnr = lt_mseg-aufnr.
+
+  SELECT kunnr name1 FROM kna1 INTO TABLE lt_kna1
+                     FOR ALL ENTRIES IN lt_aufk
+                     WHERE kunnr = lt_aufk-zzkunnr1.
+
+  SELECT matkl wgbez60 FROM t023t INTO TABLE lt_t023t
+                   WHERE spras = sy-langu.
+
+  LOOP AT lt_mseg INTO lw_mseg WHERE matnr IN r_matnr.
+    CLEAR lw_datos.
+    lw_datos-matnr = lw_mseg-matnr.
+    READ TABLE lt_makt INTO ls_makt WITH TABLE KEY matnr = lw_mseg-matnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-maktx = ls_makt-maktx.
+    ENDIF.
+
+    READ TABLE lt_mara INTO ls_mara WITH TABLE KEY matnr = lw_mseg-matnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-matkl     = ls_mara-matkl.
+      lw_datos-mtart     = ls_mara-mtart.
+      lw_datos-zzancho   = ls_mara-zzancho.
+      lw_datos-zzgramaje = ls_mara-zzgramaje.
+    ENDIF.
+    lw_datos-werks = lw_mseg-werks.
+
+
+    lw_datos-budat = lw_mseg-budat.
+    lw_datos-charg = lw_mseg-charg.
+    lw_datos-aufnr = lw_mseg-aufnr.
+    lw_datos-menge = lw_mseg-menge.
+    lw_datos-meins = lw_mseg-meins.
+    lw_datos-bwart = lw_mseg-bwart.
+    lw_datos-lgort = lw_mseg-lgort.
+
+    lw_datos-lgort_origen = lw_mseg-umlgo.
+
+
+    READ TABLE lt_aufk INTO ls_aufk WITH TABLE KEY aufnr =
+    lw_datos-aufnr.
+    IF sy-subrc = 0.
+      lw_datos-vbeln = ls_aufk-zzebeln1.
+      lw_datos-posnr = ls_aufk-zzebelp1.
+      lw_datos-kunnr = ls_aufk-zzkunnr1.
+    ENDIF.
+
+    READ TABLE lt_kna1 INTO ls_kna1 WITH TABLE KEY kunnr =
+    lw_datos-kunnr.
+    IF sy-subrc EQ 0.
+      lw_datos-name1 = ls_kna1-name1.
+    ENDIF.
+
+    CHECK lw_datos-vbeln IN svbeln.
+    CHECK lw_datos-kunnr IN skunnr.
+
+*    IF lw_datos-charg IS NOT INITIAL.
+*      PERFORM obtener_clasificacion_bob CHANGING lw_datos.
+*    ENDIF.
+
+    " Hora y Turno:
+    lw_datos-cputm = lw_mseg-cputm.
+    lw_datos-cpudt = lw_mseg-cpudt.
+
+    IF ( lw_datos-cputm >= '060000' AND lw_datos-cputm <= '135959' ).
+      lw_datos-turno = 'T1'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSEIF ( lw_datos-cputm >= '140000' AND lw_datos-cputm <= '215959' )
+    .
+      lw_datos-turno = 'T2'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSEIF ( lw_datos-cputm >= '220000' AND lw_datos-cputm <= '235959' )
+    .
+      lw_datos-turno = 'T3'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSE.
+      lw_datos-turno = 'T3'.
+      lw_datos-fec_prod = lw_datos-budat - 1.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ENDIF.
+
+    " Descripción grupo artículos:
+    READ TABLE lt_t023t INTO ls_t023t WITH TABLE KEY matkl =
+    lw_datos-matkl.
+    IF sy-subrc EQ 0.
+      lw_datos-wgbez60 = ls_t023t-wgbez60.
+      CONDENSE lw_datos-wgbez60.
+    ENDIF.
+
+*    lw_datos-contador = 1.
+*    IF lw_datos-bwart EQ '102' OR lw_datos-bwart EQ '312' OR
+*    lw_datos-bwart EQ '262'
+**INI CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+**auxiliares. 53366
+*       OR lw_datos-bwart EQ '702'.
+**FIN CMS ZPP0004, considerar nuevos movimientos en materia prima y mats
+**auxiliares. 53366
+*      lw_datos-contador = -1.
+*    ENDIF.
+**    PERFORM tratar_mov_negativos USING lw_datos-bwart
+**                              CHANGING lw_datos-contador
+**                                       lw_datos-menge
+**                                       lw_datos-brgew.
+
+* DTM
+
+    IF lw_datos-bwart EQ '201' OR lw_datos-bwart EQ '261' OR
+       lw_datos-bwart EQ '702'.
+
+      lw_datos-contador = 1.
+
+    ELSEIF lw_datos-bwart EQ '202' OR lw_datos-bwart EQ '262' OR
+           lw_datos-bwart EQ '701'.
+
+      lw_datos-contador = -1.
+      lw_datos-menge = ( -1 ) * lw_datos-menge.
+      lw_datos-brgew = ( -1 ) * lw_datos-brgew.
+
+    ENDIF.
+
+* DTM
+
+*   Puesto de trabajo, sino está en la característica de la BOBINA
+    IF lw_datos-ptrabajo IS INITIAL.
+      READ TABLE lt_arbpl INTO ls_arbpl WITH TABLE KEY aufnr =
+      lw_datos-aufnr werks = lw_datos-werks.
+      IF sy-subrc = 0.
+        lw_datos-ptrabajo = ls_arbpl-arbpl.
+      ENDIF.
+    ENDIF.
+
+    APPEND lw_datos TO gt_entradas.
+  ENDLOOP.
+
+ENDFORM.                    " SELEC_MAT_AUX
+
+
+*&---------------------------------------------------------------------*
+*&      Form  SELEC_MAT_PULP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM selec_mat_pulp .
+
+  DATA lw_datos TYPE zepp_entradas_produccion.
+  DATA: BEGIN OF lt_mseg OCCURS 0,
+          matnr     TYPE matnr,
+          werks     TYPE werks_d,
+          budat     TYPE budat,
+          charg     TYPE charg_d,
+          lgort     TYPE lgort_d,
+          umlgo     TYPE lgort_d,
+          aufnr     TYPE aufnr,
+          menge     TYPE menge_d,
+          meins     TYPE meins,
+          bwart     TYPE bwart,
+          cpudt     TYPE cpudt,
+          cputm     TYPE cputm,
+          matkl     TYPE matkl,
+          mtart     TYPE mtart,
+          zzancho   TYPE zancho,
+          zzgramaje TYPE zgramaje,
+          lifnr     TYPE lifnr,
+          name1     TYPE name1_gp,
+        END OF lt_mseg.
+
+  DATA: lw_mseg LIKE LINE OF lt_mseg.
+*  DATA lw_aufk TYPE aufk.
+*>>> 09.08.2016 YTG Reducir la cantidad de campos en la tabla interna a
+*solo los que se usan (Rendimiento)
+  DATA: BEGIN OF lw_aufk,
+          zzebeln1 TYPE aufk-zzebeln1,
+          zzebelp1 TYPE aufk-zzebelp1,
+          zzkunnr1 TYPE aufk-zzkunnr1,
+        END OF lw_aufk.
+
+  DATA lv_where TYPE string.
+  DATA lv_arbpl TYPE arbpl.
+  DATA: BEGIN OF ls_arbpl,
+          werks TYPE werks_d,
+          aufnr TYPE aufnr,
+          arbpl TYPE arbpl,
+        END OF ls_arbpl.
+
+  DATA: lt_arbpl         LIKE HASHED TABLE OF ls_arbpl WITH UNIQUE KEY
+  werks aufnr,
+        lt_arbpl_no_hash LIKE STANDARD TABLE OF ls_arbpl.
+
+  DATA: BEGIN OF ls_t023t,
+          matkl   TYPE matkl,
+          wgbez60 TYPE t023t-wgbez60,
+        END OF ls_t023t,
+        lt_t023t LIKE HASHED TABLE OF ls_t023t WITH UNIQUE KEY matkl.
+
+  DATA: BEGIN OF ls_mbewh,
+          matnr TYPE matnr,
+          bwkey TYPE bwkey,
+          bwtar TYPE bwtar_d,
+          lfgja TYPE lfgja,
+          lfmon TYPE lfmon,
+          vprsv TYPE vprsv,
+          verpr TYPE verpr,
+          peinh TYPE peinh,
+          stprs TYPE stprs,
+        END OF ls_mbewh,
+        lt_mbewh LIKE HASHED TABLE OF ls_mbewh WITH UNIQUE KEY matnr
+        bwkey bwtar lfgja lfmon.
+
+  DATA: BEGIN OF ls_mara,
+          matnr     TYPE matnr,
+          matkl     TYPE matkl,
+          mtart     TYPE mtart,
+          zzancho   TYPE mara-zzancho,
+          zzgramaje TYPE mara-zzgramaje,
+        END OF ls_mara,
+        lt_mara LIKE HASHED TABLE OF ls_mara WITH UNIQUE KEY matnr.
+
+  DATA: BEGIN OF ls_kna1,
+          kunnr TYPE kunnr,
+          name1 TYPE name1_gp,
+        END OF ls_kna1,
+        lt_kna1 LIKE HASHED TABLE OF ls_kna1 WITH UNIQUE KEY kunnr.
+
+  DATA: BEGIN OF ls_makt,
+          matnr TYPE matnr,
+          maktx TYPE maktx,
+        END OF ls_makt,
+        lt_makt LIKE HASHED TABLE OF ls_makt WITH UNIQUE KEY matnr.
+
+  DATA: BEGIN OF ls_aufk,
+          aufnr    TYPE aufnr,
+          auart    TYPE auart,
+          zzebeln1 TYPE aufk-zzebeln1,
+          zzebelp1 TYPE aufk-zzebelp1,
+          zzkunnr1 TYPE aufk-zzkunnr1,
+        END OF ls_aufk,
+        lt_aufk LIKE HASHED TABLE OF ls_aufk WITH UNIQUE KEY aufnr.
+
+
+  TYPES: BEGIN OF ty_range_matnr,
+           sign,
+           option(2),
+           low       TYPE matnr,
+           high      TYPE matnr,
+         END OF ty_range_matnr,
+         tt_range_matnr TYPE TABLE OF ty_range_matnr WITH DEFAULT KEY.
+  DATA s_cputm LIKE so_h_t1.
+
+  DATA: lv_object TYPE objnum.
+  DATA: it_objectdata TYPE STANDARD TABLE OF clobjdat,
+        it_class      TYPE STANDARD TABLE OF sclass,
+        ls_objectdata TYPE                   clobjdat.
+
+
+  CLEAR: lt_mseg.
+  REFRESH: lt_mseg.
+
+  IF p_t1 EQ abap_true OR p_t2 EQ abap_true.
+
+    IF p_t1 EQ abap_true AND p_t2 EQ abap_true.
+      s_cputm = so_h_t1.
+      s_cputm[ 1 ]-high = so_h_t2[ 1 ]-high.
+    ELSEIF p_t1 EQ abap_true.
+      s_cputm = so_h_t1.
+    ELSEIF p_t2 EQ abap_true.
+      s_cputm = so_h_t2.
+    ENDIF.
+
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_mseg
+           FROM mkpf
+           INNER JOIN mseg
+                   ON mkpf~mandt = mseg~mandt
+                      AND mkpf~mblnr = mseg~mblnr
+                      AND mkpf~mjahr = mseg~mjahr
+       WHERE matnr           IN smatnr
+         AND mkpf~budat      IN sbudat
+         AND ( bwart           EQ '311' OR bwart EQ '312' )
+         AND mseg~charg      IN scharg
+         AND mseg~cputm_mkpf IN s_cputm
+         AND mseg~lgort      EQ '4002'
+         AND mseg~werks      EQ pwerks
+         AND aufnr           IN saufnr.
+
+  ENDIF.
+
+  IF p_t3 EQ abap_true.
+
+
+
+    REFRESH s_cputm.
+    APPEND VALUE fkkr_cputm( sign = 'I' option = 'BT' low = '220000'
+    high = '235959') TO s_cputm.
+
+
+*   Cojemos los de las 10 a las 12 de la noche
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_mseg
+           FROM mkpf
+           INNER JOIN mseg
+                   ON mkpf~mandt = mseg~mandt
+                      AND mkpf~mblnr = mseg~mblnr
+                      AND mkpf~mjahr = mseg~mjahr
+       WHERE matnr           IN smatnr
+         AND mkpf~budat      IN sbudat
+         AND ( bwart           EQ '311' OR bwart EQ '312' )
+         AND mseg~charg      IN scharg
+         AND mseg~cputm_mkpf IN s_cputm
+         AND mseg~lgort      EQ '4002'
+         AND mseg~werks      EQ pwerks
+         AND aufnr           IN saufnr.
+
+
+
+
+
+*   Cojemos los del dia siguiente hasta las 6 de la mañana.
+    sbudat[ 1 ]-low  = sbudat[ 1 ]-low + 1.
+*    sbudat[ 1 ]-high = sbudat[ 1 ]-high + 1.
+    IF sbudat[ 1 ]-high <> '99991231'.
+      sbudat[ 1 ]-high = sbudat[ 1 ]-high + 1.
+    ENDIF.
+    REFRESH s_cputm.
+    APPEND VALUE fkkr_cputm( sign = 'I' option = 'BT' low = '000000'
+    high = '055959') TO s_cputm.
+
+    SELECT * APPENDING CORRESPONDING FIELDS OF TABLE lt_mseg
+           FROM mkpf
+           INNER JOIN mseg
+                   ON mkpf~mandt = mseg~mandt
+                      AND mkpf~mblnr = mseg~mblnr
+                      AND mkpf~mjahr = mseg~mjahr
+       WHERE matnr           IN smatnr
+         AND mkpf~budat      IN sbudat
+         AND ( bwart           EQ '311' OR bwart EQ '312' )
+         AND mseg~charg      IN scharg
+         AND mseg~cputm_mkpf IN s_cputm
+         AND mseg~lgort      EQ '4002'
+         AND mseg~werks      EQ pwerks
+         AND aufnr           IN saufnr.
+
+
+  ENDIF.
+  CHECK lt_mseg[] IS NOT INITIAL.
+  DATA(r_matnr) = VALUE tt_range_matnr( FOR ls IN lt_mseg (  sign = 'I'
+  option = 'EQ' low = ls-matnr ) ).
+  DELETE ADJACENT DUPLICATES FROM r_matnr COMPARING low.
+  SORT r_matnr BY low DESCENDING.
+
+
+* INI CMS 25/02/2019 Obtenemos datos de precios historicos
+  SELECT  matnr , bwkey , bwtar , lfgja , lfmon , vprsv , verpr , peinh
+  , stprs
+                      FROM mbewh
+                      INTO CORRESPONDING FIELDS OF TABLE @lt_mbewh
+                      WHERE matnr IN @r_matnr AND
+                            lfgja BETWEEN @g_any_ini AND @g_any_fin AND
+                            bwkey = @pwerks AND
+                            vprsv = 'V'.
+* FIN CMS 25/02/2019 Obtenemos datos de precios historicos
+
+  SELECT * FROM mara INTO CORRESPONDING FIELDS OF TABLE lt_mara
+                     WHERE matnr IN r_matnr.
+
+  SELECT matnr maktx INTO TABLE lt_makt FROM makt
+                     FOR ALL ENTRIES IN lt_mseg
+                     WHERE matnr EQ lt_mseg-matnr
+                       AND spras = sy-langu.
+
+  SELECT aufnr auart zzebeln1 zzebelp1 zzkunnr1
+                     FROM aufk INTO TABLE lt_aufk
+                     FOR ALL ENTRIES IN lt_mseg
+                     WHERE aufnr = lt_mseg-aufnr.
+
+  SELECT kunnr name1 FROM kna1 INTO TABLE lt_kna1
+                     FOR ALL ENTRIES IN lt_aufk
+                     WHERE kunnr = lt_aufk-zzkunnr1.
+
+  SELECT matkl wgbez60 FROM t023t INTO TABLE lt_t023t
+                   WHERE spras = sy-langu.
+
+  LOOP AT lt_mseg INTO lw_mseg.
+    CLEAR lw_datos.
+    lw_datos-matnr = lw_mseg-matnr.
+
+    READ TABLE lt_makt INTO ls_makt WITH TABLE KEY matnr = lw_mseg-matnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-maktx = ls_makt-maktx.
+    ENDIF.
+
+    lw_datos-werks = lw_mseg-werks.
+    lw_datos-matkl = lw_mseg-matkl.
+    READ TABLE lt_mara INTO ls_mara WITH TABLE KEY matnr = lw_mseg-matnr
+    .
+    IF sy-subrc EQ 0.
+      lw_datos-matkl     = ls_mara-matkl.
+      lw_datos-mtart     = ls_mara-mtart.
+      lw_datos-zzancho   = ls_mara-zzancho.
+      lw_datos-zzgramaje = ls_mara-zzgramaje.
+    ENDIF.
+
+    lw_datos-budat = lw_mseg-budat.
+    lw_datos-charg = lw_mseg-charg.
+    lw_datos-aufnr = lw_mseg-aufnr.
+    lw_datos-menge = lw_mseg-menge.
+    lw_datos-meins = lw_mseg-meins.
+    lw_datos-bwart = lw_mseg-bwart.
+    lw_datos-lgort = lw_mseg-lgort.
+    lw_datos-lgort_origen = lw_mseg-umlgo.
+
+    DATA(l_any) = lw_datos-budat(4).
+    DATA(l_mes) = lw_datos-budat+4(2).
+
+    c_bobina_pul = |{ c_bobina_pul ALPHA = IN }|.
+
+    READ TABLE lt_mbewh INTO ls_mbewh WITH TABLE KEY matnr =
+    lw_mseg-matnr
+                                                     bwkey = pwerks
+                                                     bwtar = ' '
+                                                     lfgja = l_any
+                                                     lfmon = l_mes.
+    IF sy-subrc EQ 0.
+      " para obtener el coste, cogemos el precio/1000kg y calculamos para los
+      "kilos del lote.
+      CASE lw_mseg-matnr.
+        WHEN c_bobina_pul.
+          " para bobina pulper obtenemos el precio standard
+          lw_datos-dmbtr = ( ls_mbewh-stprs * lw_datos-menge ) /
+          ls_mbewh-peinh .
+        WHEN OTHERS.
+          lw_datos-dmbtr = ( ls_mbewh-verpr * lw_datos-menge ) /
+          ls_mbewh-peinh .
+      ENDCASE.
+
+    ELSE.
+*      Accedemos a la MBEW para obtener el precio actual
+      SELECT SINGLE verpr , peinh , stprs
+        FROM mbew
+        INTO ( @ls_mbewh-verpr , @ls_mbewh-peinh , @ls_mbewh-stprs )
+        WHERE matnr = @lw_mseg-matnr AND
+              bwkey = @pwerks        AND
+              bwtar = ' '.
+      IF sy-subrc = 0.
+        CASE lw_mseg-matnr.
+          WHEN c_bobina_pul.
+            " para bobina pulper obtenemos el precio standard
+            lw_datos-dmbtr = ( ls_mbewh-stprs * lw_datos-menge ) /
+            ls_mbewh-peinh .
+          WHEN OTHERS.
+            lw_datos-dmbtr = ( ls_mbewh-verpr * lw_datos-menge ) /
+            ls_mbewh-peinh .
+
+        ENDCASE.
+
+      ENDIF.
+    ENDIF.
+
+*INI Obtener el proveedor a partir del mismo lote-material en MSEG, con
+*el movimiento 101. CMS 11-03-2019
+    SELECT SINGLE l~lifnr , l~name1
+      FROM mseg AS m
+      INNER JOIN lfa1 AS l ON m~lifnr = l~lifnr
+      INTO ( @lw_datos-lifnr , @lw_datos-liftxt )
+      WHERE m~matnr = @lw_mseg-matnr   AND
+            m~charg = @lw_datos-charg  AND
+            m~werks = @pwerks          AND
+            m~bwart = '101'.
+*FIN Obtener el proveedor a partir del mismo lote-material en MSEG, con
+*el movimiento 101. CMS 11-03-2019
+
+
+    READ TABLE lt_aufk INTO ls_aufk WITH TABLE KEY aufnr =
+    lw_datos-aufnr.
+    IF sy-subrc = 0.
+      lw_datos-vbeln = ls_aufk-zzebeln1.
+      lw_datos-posnr = ls_aufk-zzebelp1.
+      lw_datos-kunnr = ls_aufk-zzkunnr1.
+      READ TABLE lt_kna1 INTO ls_kna1 WITH TABLE KEY kunnr =
+      lw_datos-kunnr.
+      IF sy-subrc EQ 0.
+        lw_datos-name1 = ls_kna1-name1.
+      ENDIF.
+    ENDIF.
+
+
+
+*---> INI SS - SAT 7*12686
+*Caracteristicas motivo rechazo pulper
+    IF lw_datos-charg IS NOT INITIAL.
+      PERFORM obtener_clasificacion_pulp CHANGING lw_datos.
+    ENDIF.
+*<--- FIN
+
+*** Caracteristica de bobina
+*    IF lw_datos-charg IS NOT INITIAL.
+*      PERFORM obtener_clasificacion_bob CHANGING lw_datos.
+*    ENDIF.
+
+    " Hora y Turno:
+    lw_datos-cputm = lw_mseg-cputm.
+    lw_datos-cpudt = lw_mseg-cpudt.
+
+    IF ( lw_datos-cputm >= '060000' AND lw_datos-cputm <= '135959' ).
+      lw_datos-turno = 'T1'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSEIF ( lw_datos-cputm >= '140000' AND lw_datos-cputm <= '215959' )
+    .
+      lw_datos-turno = 'T2'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSEIF ( lw_datos-cputm >= '220000' AND lw_datos-cputm <= '235959' )
+    .
+      lw_datos-turno = 'T3'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSE.
+      lw_datos-turno = 'T3'.
+      lw_datos-fec_prod = lw_datos-budat - 1.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ENDIF.
+
+    " Descripción grupo artículos:
+    SELECT SINGLE wgbez60 INTO lw_datos-wgbez60
+      FROM t023t
+      WHERE spras = sy-langu
+      AND matkl = lw_datos-matkl.
+
+    CONDENSE lw_datos-wgbez60.
+
+*    lw_datos-contador = 1.
+*    IF lw_datos-bwart EQ '102' OR lw_datos-bwart EQ '312' OR
+*    lw_datos-bwart EQ '202' OR lw_datos-bwart EQ '262'
+*       OR lw_datos-bwart EQ '310' OR lw_datos-bwart EQ '532'.
+*      lw_datos-contador = -1.
+*      lw_datos-menge = ( -1 ) * lw_datos-menge.
+*      lw_datos-brgew = ( -1 ) * lw_datos-brgew.
+*    ENDIF.
+    PERFORM tratar_mov_negativos USING lw_datos-bwart
+                              CHANGING lw_datos-contador
+                                       lw_datos-menge
+                                       lw_datos-brgew.
+
+    APPEND lw_datos TO gt_entradas.
+  ENDLOOP.
+
+ENDFORM.                    " SELEC_MAT_PULP
+
+
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_CLASIFICACION_PULP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LW_DATOS  text
+*----------------------------------------------------------------------*
+FORM obtener_clasificacion_pulp  CHANGING pw_datos TYPE
+zepp_entradas_produccion.
+
+  DATA l_objkey TYPE objnum.
+  DATA lt_allocvaluesnum TYPE STANDARD TABLE OF
+  bapi1003_alloc_values_num WITH HEADER LINE.
+  DATA lt_allocvalueschar TYPE STANDARD TABLE OF
+  bapi1003_alloc_values_char WITH HEADER LINE.
+  DATA lt_allocvaluescurr TYPE STANDARD TABLE OF
+  bapi1003_alloc_values_curr WITH HEADER LINE.
+  DATA lt_return TYPE STANDARD TABLE OF bapiret2.
+
+  CONCATENATE pw_datos-matnr pw_datos-charg INTO l_objkey.
+
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = l_objkey
+      objecttable     = 'MCH1'
+      classnum        = 'Z_BOBINA_PULPER'
+      classtype       = '023'
+    TABLES
+      allocvaluesnum  = lt_allocvaluesnum
+      allocvalueschar = lt_allocvalueschar
+      allocvaluescurr = lt_allocvaluescurr
+      return          = lt_return.
+
+  READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+  CHECK sy-subrc <> 0.
+
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_DIAMETRO'.
+  IF sy-subrc = 0.
+    pw_datos-diametro = lt_allocvaluesnum-value_from.
+    IF lt_allocvaluesnum-unit_from IS NOT INITIAL.
+      pw_datos-diametro_un = lt_allocvaluesnum-unit_from.
+    ELSE.
+      pw_datos-diametro_un = 'MM'.
+    ENDIF.
+  ENDIF.
+
+*  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_HUMEDAD'.
+*  IF sy-subrc = 0.
+*    pw_datos-humedad = lt_allocvaluesnum-value_from.
+*  ENDIF.
+
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_PESO'.
+  IF sy-subrc = 0.
+    pw_datos-brgew = lt_allocvaluesnum-value_from.
+    IF lt_allocvaluesnum-unit_from IS NOT INITIAL.
+      pw_datos-gewei = lt_allocvaluesnum-unit_from.
+    ELSE.
+      pw_datos-gewei = 'kg'.
+    ENDIF.
+  ENDIF.
+
+  " Longitud:
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_LONGITUD_B'.
+  IF sy-subrc = 0.
+    pw_datos-laeng = lt_allocvaluesnum-value_from.
+    IF lt_allocvaluesnum-unit_from IS NOT INITIAL.
+      pw_datos-meabm = lt_allocvaluesnum-unit_from.
+    ELSE.
+      pw_datos-meabm = 'M'.
+    ENDIF.
+  ENDIF.
+
+  READ TABLE lt_allocvaluesnum WITH KEY charact = 'Z_FSC_PORCENTAJE'.
+  IF sy-subrc = 0.
+    pw_datos-fsc = lt_allocvaluesnum-value_from.
+  ENDIF.
+
+* GST - 30/09/2015 - Motivo rechazo PULPER ->
+
+  " Motivo rechazo PULPER:
+  READ TABLE lt_allocvalueschar WITH KEY charact = 'ZPPI_MOTIVO_RECHAZO'
+  .
+  IF sy-subrc = 0.
+    pw_datos-motiv_pulper = lt_allocvalueschar-value_char.
+* GST - 22/10/2015 - Motivo rechazo SCADA ->
+  ELSE.
+    READ TABLE lt_allocvalueschar WITH KEY charact = 'Z_MOTIVO_RECHAZO'.
+    IF sy-subrc = 0.
+      pw_datos-motiv_pulper = lt_allocvalueschar-value_char.
+    ENDIF.
+* GST - 22/10/2015 - Motivo rechazo SCADA <-
+  ENDIF.
+
+  READ TABLE lt_allocvalueschar WITH KEY charact =
+  'ZPPI_MOTIVO_REMANIPULADO'.
+  IF sy-subrc = 0.
+    pw_datos-motiv_remanip = lt_allocvalueschar-value_char.
+  ENDIF.
+* GST - 30/09/2015 - Motivo rechazo PULPER <-
+* uDefine - añadir lote origen
+  READ TABLE lt_allocvalueschar
+         WITH KEY charact = 'Z_LOTE_ORIGEN'.
+
+* Añadir Operario y contramaestre.
+  TRY .
+      pw_datos-operario      = lt_allocvalueschar[ charact = 'Z_OPERARIO' ]-value_char.
+    CATCH cx_root.
+  ENDTRY.
+
+  TRY .
+      pw_datos-contramaestre = lt_allocvalueschar[ charact = 'Z_CONTRAMAESTRE' ]-value_char.
+    CATCH cx_root.
+  ENDTRY.
+
+  IF sy-subrc = 0.
+    pw_datos-charg_origen = lt_allocvalueschar-value_neutral.
+
+    SELECT SINGLE matnr FROM mch1
+      INTO pw_datos-matnr_origen
+      WHERE charg = pw_datos-charg_origen.
+  ENDIF.
+
+ENDFORM.                    " OBTENER_CLASIFICACION_PULP
+*&---------------------------------------------------------------------*
+*&      Form  SELEC_REMANIPULADO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM selec_remanipulado .
+
+  DATA lw_datos TYPE zepp_entradas_produccion.
+  DATA: BEGIN OF lt_mseg OCCURS 0,
+          matnr     TYPE matnr,
+          werks     TYPE werks_d,
+          budat     TYPE budat,
+          charg     TYPE charg_d,
+          lgort     TYPE lgort_d,
+          umlgo     TYPE lgort_d,
+          aufnr     TYPE aufnr,
+          menge     TYPE menge_d,
+          meins     TYPE meins,
+          bwart     TYPE bwart,
+          cpudt     TYPE cpudt,
+          cputm     TYPE cputm,
+          matkl     TYPE matkl,
+          mtart     TYPE mtart,
+          zzancho   TYPE zancho,
+          zzgramaje TYPE zgramaje,
+        END OF lt_mseg.
+
+*>>> 05.09.2016 YTG Reducir la cantidad de campos en la tabla interna a
+*solo los que se usan (Rendimiento)
+  DATA: BEGIN OF lw_aufk,
+          zzebeln1 TYPE aufk-zzebeln1,
+          zzebelp1 TYPE aufk-zzebelp1,
+          zzkunnr1 TYPE aufk-zzkunnr1,
+        END OF lw_aufk.
+
+  DATA: lw_mseg LIKE LINE OF lt_mseg.
+*  DATA lw_aufk TYPE aufk.
+  DATA lv_where TYPE string.
+  DATA lv_arbpl TYPE arbpl.
+  DATA: lv_object TYPE objnum.
+  DATA: it_objectdata TYPE STANDARD TABLE OF clobjdat,
+        it_class      TYPE STANDARD TABLE OF sclass,
+        ls_objectdata TYPE                   clobjdat.
+
+
+  CLEAR: lt_mseg.
+  REFRESH: lt_mseg.
+
+  CLEAR lv_where.
+  IF p_t1 = 'X'.
+*    lv_where = '( b~cputm IN so_h_t1'.
+    lv_where = '( ( b~cputm IN so_h_t1  AND b~budat IN sbudat )'.
+  ENDIF.
+
+  IF p_t2 = 'X'.
+    IF lv_where IS INITIAL.
+*      lv_where = '( b~cputm IN so_h_t2'.
+      lv_where = '( ( b~cputm IN so_h_t2 AND b~budat IN sbudat )'.
+    ELSE.
+      CONCATENATE lv_where
+      'OR ( b~cputm IN so_h_t2 AND b~budat IN sbudat )' INTO lv_where
+      SEPARATED BY space.
+    ENDIF.
+  ENDIF.
+
+  IF p_t3 = 'X'.
+
+    IF so_h_t3[] IS INITIAL.
+
+      IF lv_where IS INITIAL.
+        lv_where =
+'( ( ( b~budat = gv_d_t3_ini AND b~cputm IN so_h_t3_ini ) OR ( b~buda' &
+'t = gv_d_t3_fin AND b~cputm IN so_h_t3_fin ) )'
+        .
+      ELSE.
+        CONCATENATE lv_where
+'OR ( ( b~budat = gv_d_t3_ini AND b~cputm IN so_h_t3_ini ) OR ( b~bud' &
+'at = gv_d_t3_fin AND b~cputm IN so_h_t3_fin ) )'
+        INTO lv_where SEPARATED BY space.
+      ENDIF.
+    ELSE.
+
+      IF lv_where IS INITIAL.
+        lv_where =
+'( ( ( b~budat = gv_d_t3_ini AND b~cputm IN so_h_t3_ini ) OR ( b~buda' &
+'t = gv_d_t3_fin AND b~cputm IN so_h_t3_fin ) OR ( b~budat <> gv_d_t3' &
+'_ini AND b~budat <> gv_d_t3_fin AND b~budat IN sbudat AND b~cputm IN' &
+' so_h_t3 ) )'
+        .
+      ELSE.
+        CONCATENATE lv_where
+'OR ( ( b~budat = gv_d_t3_ini AND b~cputm IN so_h_t3_ini ) OR ( b~bud' &
+'at = gv_d_t3_fin AND b~cputm IN so_h_t3_fin )'
+'OR ( b~budat <> gv_d_t3_ini AND b~budat <> gv_d_t3_fin AND b~budat I' &
+'N sbudat AND b~cputm IN so_h_t3 ) )'
+        INTO lv_where SEPARATED BY space.
+      ENDIF.
+
+    ENDIF.
+
+  ENDIF.
+
+*Comprobar que lv_where no esté vacío, para saber que al menos se ha
+*seleccionado un turno
+
+  IF lv_where IS NOT INITIAL.
+
+    CONCATENATE lv_where ')' INTO lv_where SEPARATED BY space.
+
+    SELECT a~matnr a~werks b~budat a~charg a~lgort a~umlgo
+           a~aufnr
+           a~menge a~meins a~bwart b~cpudt b~cputm
+           c~matkl c~mtart c~zzancho c~zzgramaje
+      INTO TABLE lt_mseg
+      FROM mseg AS a
+      INNER JOIN mkpf AS b ON ( b~mblnr = a~mblnr
+      AND b~mjahr = a~mjahr )
+      INNER JOIN mara AS c ON c~matnr = a~matnr
+      WHERE a~matnr IN smatnr
+      AND a~werks = pwerks
+      AND a~charg IN scharg
+      AND a~lgort IN slgort
+      AND a~aufnr IN saufnr
+      AND  a~bwart = '551'
+*      AND c~matkl IN smatkl
+      AND (lv_where).
+    " Añadir la condición construida a partir de los turnos seleccionados
+  ENDIF.
+
+  LOOP AT lt_mseg INTO lw_mseg.
+    CLEAR lw_datos.
+    lw_datos-matnr = lw_mseg-matnr.
+    SELECT SINGLE maktx INTO lw_datos-maktx FROM makt
+      WHERE matnr = lw_mseg-matnr
+        AND spras = sy-langu.
+
+    lw_datos-werks = lw_mseg-werks.
+    lw_datos-matkl = lw_mseg-matkl.
+    lw_datos-mtart = lw_mseg-mtart.
+    lw_datos-zzancho = lw_mseg-zzancho.
+    lw_datos-zzgramaje = lw_mseg-zzgramaje.
+
+    lw_datos-budat = lw_mseg-budat.
+    lw_datos-charg = lw_mseg-charg.
+    lw_datos-aufnr = lw_mseg-aufnr.
+    lw_datos-menge = lw_mseg-menge.
+    lw_datos-meins = lw_mseg-meins.
+    lw_datos-bwart = lw_mseg-bwart.
+    lw_datos-lgort = lw_mseg-lgort.
+
+    lw_datos-lgort_origen = lw_mseg-umlgo.
+
+    IF lw_mseg-aufnr IS NOT INITIAL.
+      SELECT SINGLE zzebeln1 zzebelp1 zzkunnr1
+          INTO lw_aufk FROM aufk
+          WHERE aufnr = lw_mseg-aufnr.
+
+      IF sy-subrc = 0.
+        lw_datos-vbeln = lw_aufk-zzebeln1.
+        lw_datos-posnr = lw_aufk-zzebelp1.
+        lw_datos-kunnr = lw_aufk-zzkunnr1.
+
+        SELECT SINGLE name1 INTO lw_datos-name1 FROM kna1 WHERE kunnr =
+        lw_datos-kunnr.
+      ENDIF.
+
+      CHECK lw_datos-vbeln IN svbeln.
+      CHECK lw_datos-kunnr IN skunnr.
+    ENDIF.
+
+    IF lw_datos-charg IS NOT INITIAL.
+      PERFORM obtener_clasificacion_bob CHANGING lw_datos.
+    ENDIF.
+
+    " Hora y Turno:
+    lw_datos-cputm = lw_mseg-cputm.
+    lw_datos-cpudt = lw_mseg-cpudt.
+
+    IF ( lw_datos-cputm >= '060000' AND lw_datos-cputm <= '135959' ).
+      lw_datos-turno = 'T1'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSEIF ( lw_datos-cputm >= '140000' AND lw_datos-cputm <= '215959' )
+    .
+      lw_datos-turno = 'T2'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSEIF ( lw_datos-cputm >= '220000' AND lw_datos-cputm <= '235959' )
+    .
+      lw_datos-turno = 'T3'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ELSE.
+      lw_datos-turno = 'T3'.
+      lw_datos-fec_prod = lw_datos-budat.
+*      lw_datos-fec_prod = lw_datos-cpudt.
+    ENDIF.
+
+    " Descripción grupo artículos:
+    SELECT SINGLE wgbez60 INTO lw_datos-wgbez60
+        FROM t023t
+        WHERE spras = sy-langu
+        AND matkl = lw_datos-matkl.
+    CONDENSE lw_datos-wgbez60.
+
+    lw_datos-contador = 1.
+    IF lw_datos-bwart EQ '102' OR lw_datos-bwart EQ '312'.
+      lw_datos-contador = -1.
+    ENDIF.
+
+
+*   Puesto de trabajo, sino está en la característica de la BOBINA
+    IF lw_datos-ptrabajo IS INITIAL.
+      SELECT SINGLE arbpl INTO lv_arbpl
+         FROM crhd AS c
+         INNER JOIN afru AS a ON ( c~objid = a~arbid )
+         WHERE a~aufnr = lw_datos-aufnr
+         AND   c~werks = lw_datos-werks.
+      IF sy-subrc = 0.
+        lw_datos-ptrabajo = lv_arbpl.
+      ENDIF.
+    ENDIF.
+
+    APPEND lw_datos TO gt_entradas.
+  ENDLOOP.
+
+ENDFORM.                    " SELEC_REMANIPULADO
+
+
+*&---------------------------------------------------------------------*
+*&      Form  BUSCAR_VARIANTE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_PVARI  text
+*----------------------------------------------------------------------*
+FORM buscar_variante  CHANGING p_vari TYPE disvariant-variant.
+
+  DATA: ls_variant TYPE disvariant,
+        l_exit     TYPE char1.
+
+  ls_variant-report = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant = ls_variant
+      i_save     = 'A'
+*     it_default_fieldcat =
+    IMPORTING
+      e_exit     = l_exit
+      es_variant = ls_variant
+    EXCEPTIONS
+      not_found  = 2.
+  IF sy-subrc = 2.
+    MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSE.
+    IF l_exit EQ space.
+      p_vari = ls_variant-variant.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " BUSCAR_VARIANTE
+
+
+*&---------------------------------------------------------------------*
+*&      Form  INICIALIZACION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM inicializacion .
+
+  SELECT SINGLE parva FROM usr05
+        INTO pwerks
+        WHERE bname = sy-uname AND
+        parid = 'WRK'.
+
+ENDFORM.                    " INICIALIZACION

@@ -1,0 +1,215 @@
+FUNCTION zfm_sd_check_pap_vl10x.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_T_XLIKP) TYPE  SHP_LIKP_T
+*"     REFERENCE(I_T_XLIPS) TYPE  SHP_LIPS_T
+*"     REFERENCE(I_TRTYP) TYPE  TRTYP
+*"  CHANGING
+*"     REFERENCE(C_T_FINCHDEL) TYPE  ZZFINCHDEL_T
+*"----------------------------------------------------------------------
+
+**********************************************************************
+* Desactivamos validaciones por ahora 04.12.2023
+**********************************************************************
+
+  CHECK 1 = 2.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+****** TYPES
+
+  TYPES: BEGIN OF ty_s_po_hist,
+    ebeln TYPE ebeln,
+    ebelp TYPE ebelp,
+    eindt TYPE eindt,
+    menge TYPE menge_d,
+    wemng TYPE wemng,
+    resta TYPE menge_d,
+  END OF ty_s_po_hist.
+
+****** VARIABLES
+
+  DATA: lv_check    TYPE boolean VALUE abap_false,
+        lv_answer   TYPE c,
+        lv_question TYPE string,
+        lv_param    TYPE string,
+        lv_menge    TYPE etmen,
+        lv_wemng    TYPE wemng.
+
+****** STRUCTURES
+
+  DATA: ls_po_hist TYPE ty_s_po_hist.
+
+****** TABLES
+
+  DATA: lt_po_hist      TYPE TABLE OF ty_s_po_hist,
+        lt_po_hist_wrk  TYPE TABLE OF ty_s_po_hist.
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+****** CHECK VSTEL PAPER
+
+  LOOP AT i_t_xlikp INTO DATA(ls_xlikp).
+
+    IF ( ls_xlikp-vstel NE '3000' AND ls_xlikp-vstel NE '3020').
+      MOVE abap_true TO lv_check.
+      EXIT.
+    ENDIF.
+
+  ENDLOOP.
+
+  CHECK lv_check EQ abap_false.
+
+****** CHECK Creación y no bacth
+
+  CHECK i_trtyp EQ 'H' AND sy-batch EQ abap_false.
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+****** PREPARE DATA
+
+  READ TABLE i_t_xlikp INTO ls_xlikp INDEX 1.
+
+****** CHECK 4 LINE
+
+  LOOP AT i_t_xlips INTO DATA(ls_xlips).
+
+**** PEDIDO ANTERIOR PENDIENTE
+
+*** Obtengo pedidos pendientes
+
+    SELECT *
+      FROM ekpo
+      INTO CORRESPONDING FIELDS OF @ls_po_hist
+     WHERE matnr EQ @ls_xlips-matnr
+       AND werks EQ @ls_xlikp-werks
+       AND elikz EQ @space
+       AND loekz EQ @space.
+
+      SELECT SINGLE MIN( eindt ), SUM( menge ), SUM( wemng )
+        FROM eket
+        INTO (@ls_po_hist-eindt, @ls_po_hist-menge, @ls_po_hist-wemng)
+       WHERE ebeln EQ @ls_po_hist-ebeln
+         AND ebelp EQ @ls_po_hist-ebelp.
+
+      ls_po_hist-resta = ls_po_hist-menge - ls_po_hist-wemng.
+
+      APPEND ls_po_hist TO lt_po_hist.
+
+    ENDSELECT.
+
+*** Compruebo si hay alguno anterior a la fecha actual
+
+    MOVE-CORRESPONDING lt_po_hist TO lt_po_hist_wrk.
+
+    READ TABLE lt_po_hist_wrk INTO ls_po_hist WITH KEY ebeln = ls_xlips-vgbel ebelp = ls_xlips-vgpos.
+
+    "Borro las del pedido actual
+    DELETE lt_po_hist_wrk WHERE ebeln = ls_xlips-vgbel AND ebelp = ls_xlips-vgpos.
+    "Borro las de cantidad restante < a 5 Tn
+    DELETE lt_po_hist_wrk WHERE resta < 5000.
+    "Borro las de fechas mayores de entrega a la del pedido actual.
+    DELETE lt_po_hist_wrk WHERE eindt GE ls_po_hist-eindt.
+
+    "Tengo pedidos?
+    IF ( lines( lt_po_hist_wrk ) GT 0 ).
+
+      "Ordeno por fecha
+      SORT lt_po_hist_wrk BY eindt ASCENDING.
+
+      "Leo el primer registro
+      READ TABLE lt_po_hist_wrk INTO ls_po_hist INDEX 1.
+
+      "Monto mensaje y lanzo popup
+      CLEAR: lv_question, lv_answer, lv_param.
+      MOVE text-003 TO lv_question.
+      CONCATENATE ls_po_hist-ebeln ls_po_hist-ebelp INTO lv_param SEPARATED BY space.
+      REPLACE FIRST OCCURRENCE OF '&1' IN lv_question WITH lv_param.
+      CLEAR: lv_param.
+      CONCATENATE ls_xlips-vgbel ls_xlips-vgpos INTO lv_param SEPARATED BY space.
+      REPLACE FIRST OCCURRENCE OF '&2' IN lv_question WITH lv_param.
+      CONCATENATE lv_question text-999 INTO lv_question SEPARATED BY space.
+      PERFORM launch_popup_2_confirm USING lv_question CHANGING lv_answer.
+
+      IF ( lv_answer EQ '2' ).
+        APPEND VALUE #( vbeln = ls_xlips-vbeln pruefung = abap_true msgty = 'E' msgno = '024' msgid = 'ES' ) TO c_t_finchdel.
+        EXIT.
+      ENDIF.
+
+    ENDIF.
+
+**** CANTIDAD EXCEDIDA SOBRE PEDIDO
+
+    CLEAR: ls_po_hist.
+
+    "Obtengo registro de tabla interna
+    READ TABLE lt_po_hist INTO ls_po_hist WITH KEY ebeln = ls_xlips-vgbel ebelp = ls_xlips-vgpos.
+    IF ( sy-subrc EQ 0 ).
+
+      "Comparo:
+      " 1. Cantidad de pedido + 5000 KG
+      " 2. Cantidad entregada + cantidad de entrega
+      " Si 1. es menor a 2, lanzo popup
+      IF ( ( ls_po_hist-menge + 5000 ) LT ( ls_po_hist-wemng + ls_xlips-lfimg ) ).
+
+        CLEAR: lv_question, lv_answer, lv_param.
+        MOVE text-002 TO lv_question.
+        CONCATENATE ls_xlips-vgbel ls_xlips-vgpos INTO lv_param SEPARATED BY space.
+        REPLACE FIRST OCCURRENCE OF '&' IN lv_question WITH lv_param.
+        CLEAR: lv_param.
+        lv_param = lv_wemng - lv_menge - 5000.
+        CONDENSE lv_param NO-GAPS.
+        REPLACE FIRST OCCURRENCE OF '&' IN lv_question WITH lv_param.
+        CONCATENATE lv_question text-999 INTO lv_question SEPARATED BY space.
+        PERFORM launch_popup_2_confirm USING lv_question CHANGING lv_answer.
+
+        IF ( lv_answer EQ '2' ).
+          APPEND VALUE #( vbeln = ls_xlips-vbeln pruefung = abap_true msgty = 'E' msgno = '024' msgid = 'ES' ) TO c_t_finchdel.
+          EXIT.
+        ENDIF.
+
+      ENDIF.
+
+    ENDIF.
+
+**** MENSAJE STOCK FABRICADO
+
+    CLEAR: lv_wemng.
+
+    SELECT SUM( b~wemng )
+      FROM aufk AS a LEFT JOIN afpo AS b
+        ON a~aufnr EQ b~aufnr
+      INTO @lv_wemng
+     WHERE auart IN ( 'ZI02', 'ZI04' )
+       AND a~zzebeln1 EQ @ls_xlips-vgbel
+       AND a~zzebelp1 EQ @ls_xlips-vgpos.
+
+    "Chequeo cantidad fabricada
+    IF ( lv_wemng LE 0 ).
+
+      CLEAR: lv_question, lv_answer, lv_param.
+      MOVE text-001 TO lv_question.
+      CONCATENATE ls_xlips-vgbel ls_xlips-vgpos INTO lv_param SEPARATED BY space.
+      REPLACE '&' IN lv_question WITH lv_param.
+      CONCATENATE lv_question text-999 INTO lv_question SEPARATED BY space.
+      PERFORM launch_popup_2_confirm USING lv_question CHANGING lv_answer.
+
+      IF ( lv_answer EQ '2' ).
+        APPEND VALUE #( vbeln = ls_xlips-vbeln pruefung = abap_true msgty = 'E' msgno = '024' msgid = 'ES' ) TO c_t_finchdel.
+        EXIT.
+      ENDIF.
+
+    ENDIF.
+
+  ENDLOOP.
+
+****** FINAL EXIT
+
+ENDFUNCTION.

@@ -1,0 +1,327 @@
+FUNCTION zsdcom_seleccionar_fact_prliq .
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IS_PRLIQCAB) TYPE  ZTSDCOM_PRLIQCAB
+*"     VALUE(IR_LIFNR) TYPE  ZTTSDCOM_LIFNR_RANGE
+*"     VALUE(IR_BASLI) TYPE  ZTTSDCOM_BASLI_RANGE
+*"     VALUE(IR_KUNNR) TYPE  ZTTSDCOM_KUNNR_RANGE
+*"     VALUE(IR_GSBER) TYPE  ZTTSDCOM_GSBER_RANGE
+*"     VALUE(I_DATUM) TYPE  DATUM
+*"     VALUE(IR_FREC) TYPE  ZTTSDCOM_FREC_RANGE
+*"  EXPORTING
+*"     VALUE(ET_FACTS) TYPE  ZTTSDCOMLIQ002_GRID
+*"     VALUE(ET_POS) TYPE  ZTTSDCOM_POS
+*"----------------------------------------------------------------------
+
+  DATA: lti_comis    TYPE TABLE OF ztsdcom002,
+        lti_pos      TYPE TABLE OF ztsdcom_pos,
+        lti_fact_key TYPE TABLE OF ty_key_fact.
+
+  DATA: ls_cabliq   TYPE zssdcom_prliqcab_key,
+        ls_comis    TYPE ztsdcom002,
+        ls_pos      TYPE ztsdcom_pos,
+        ls_fact_key TYPE ty_key_fact,
+        ls_fact     TYPE zssdcomliq002_grid.
+
+  DATA: lv_kawrt  TYPE kawrt,
+        lv_status TYPE zstat_liq,
+        lv_ind    TYPE i.
+
+  DATA: j_factanul  TYPE vbeln.
+  DATA: et_pos2 TYPE zttsdcom_pos.
+  DATA: est_pos2 TYPE ztsdcom_pos.
+  DATA: j_factanul2  TYPE vbeln.
+* Inicializamos
+  REFRESH et_facts.
+  CLEAR et_pos[].
+
+  MOVE-CORRESPONDING is_prliqcab TO ls_cabliq.
+
+* Sacamos los comisionistas con los que se hará la selección de facturas
+  SELECT * INTO TABLE lti_comis
+  FROM  ztsdcom002
+  WHERE bukrs  = is_prliqcab-bukrs
+  AND   gsber IN ir_gsber
+  AND   lifnr IN ir_lifnr
+  AND   basli IN ir_basli
+  AND   frecuencia_liq IN ir_frec.
+
+* Sacamos toda la información de la tabla de posiciones de provisiones
+* de las facturas que no estén liquidadas totalmente
+  IF lti_comis[] IS NOT INITIAL.
+    SELECT * INTO TABLE lti_pos
+    FROM  ztsdcom_pos
+    FOR ALL ENTRIES IN lti_comis
+    WHERE bukrs      = is_prliqcab-bukrs
+    AND   lifnr      = lti_comis-lifnr
+    AND   kunnr      IN ir_kunnr
+*--->mhernandez.27.06.2014
+*7000004511_PROGRAMA DE COMISIONES
+*        AND   erdat     <= i_datum
+    AND   fkdat     <= i_datum
+*<---fin mhernandez
+    and gsber in ir_gsber
+    AND   zstat_liqpos IN (gc_pos_pdt, gc_pos_par). "Liquidación pendiente / parcial
+  ENDIF.
+
+* Para las facturas parciales, si están en una liquidación que no está contabilizada
+* las quitamos de la lista. Una factura no puede estar en 2 liquidaciones
+  LOOP AT lti_pos INTO ls_pos WHERE zstat_liqpos = gc_pos_par.
+    lv_ind = sy-tabix.
+*   Comprobamos si la factura está en alguna propuesta
+    CLEAR lv_status.
+    SELECT SINGLE a~zstat_liq INTO lv_status
+        FROM  ztsdcom_prliqcab AS a INNER JOIN ztsdcom_prliqpos AS b
+                               ON a~laufd = b~laufd AND
+                                  a~laufi = b~laufi AND
+                                  a~bukrs = b~bukrs
+        WHERE  vbeln = ls_pos-vbeln
+        AND    lifnr = ls_pos-lifnr.
+    IF sy-subrc = 0 AND lv_status = gc_liq_cr.
+      DELETE lti_pos INDEX lv_ind.
+    ENDIF.
+  ENDLOOP.
+
+* Agrupamos las posiciones en una tabla por factura
+  et_pos[] = lti_pos[].
+
+  LOOP AT lti_pos INTO ls_pos.
+    CLEAR ls_fact_key.
+    MOVE-CORRESPONDING ls_pos TO ls_fact_key.
+    COLLECT ls_fact_key INTO lti_fact_key.
+  ENDLOOP.
+
+* Recorremos las facturas chequendo el importe cobrado,...
+  LOOP AT lti_fact_key INTO ls_fact_key.
+    lv_ind = sy-tabix.
+*   Por defecto la factura aparece marcada
+    ls_fact_key-checkbox = 'X'.
+
+* 1.Chequear que no sea una Anulación
+    DATA v_stblg LIKE bkpf-stblg.
+    CLEAR v_stblg.
+    SELECT SINGLE stblg INTO v_stblg FROM bkpf
+          WHERE bukrs  = ls_fact_key-bukrs
+          AND   belnr  = ls_fact_key-vbeln
+          AND   gjahr  = i_datum(4).
+    IF v_stblg IS INITIAL.
+*   Cargamos los datos del comisionista
+      READ TABLE lti_comis INTO ls_comis WITH KEY lifnr = ls_fact_key-lifnr.
+*   Si el comisionista tiene base de liquidación parcial o total sobre lo cobrado
+*   tenemos que sacar el importe cobrado de la factura
+      IF ls_comis-basli = '02' OR ls_comis-basli = '03'.
+        CALL FUNCTION 'ZSDCOM_IMPORTE_COBRADO_FACTURA'
+          EXPORTING
+            i_bukrs = ls_fact_key-bukrs
+            i_vbeln = ls_fact_key-vbeln
+            i_datum = i_datum
+          IMPORTING
+            e_wrbtr = ls_fact_key-imp_cob
+            e_netwr = ls_fact_key-imp_fac.
+*     Dependiendo del tipo de liquidación, desmarcamos la factura o no
+        CASE ls_comis-basli.
+*       Cobro parcial
+          WHEN '02'.
+*         Si no se ha cobrado nada: quitamos el checkbox
+            IF ls_fact_key-imp_cob = 0.
+              CLEAR ls_fact_key-checkbox.
+            ENDIF.
+*       Cobro total
+          WHEN '03'.
+*         Si no se ha cobrado todo: quitamos la línea
+            IF ls_fact_key-imp_cob < ls_fact_key-imp_fac.
+              CLEAR ls_fact_key-checkbox.
+            ENDIF.
+        ENDCASE.
+      ENDIF.
+    ENDIF.
+*   Modificamos la línea con lo cobrado
+    MODIFY lti_fact_key FROM ls_fact_key INDEX lv_ind.
+  ENDLOOP.
+
+* me hago una copia de la lt pos para borrar  las de anulac
+  MOVE-CORRESPONDING et_pos TO et_pos2.
+
+* Recorremos las facturas (que quedan) rellenando todos los datos que faltan
+  LOOP AT lti_fact_key INTO ls_fact_key.
+
+*   Datos clave
+    CLEAR ls_fact.
+
+    MOVE-CORRESPONDING ls_fact_key TO ls_fact.
+
+    ls_fact-checkbox = ls_fact_key-checkbox.
+* jms seidor
+* se modif el codigo y no se extrae ni la anulada ni la original
+*      SELECT SINGLE netwr INTO ls_fact-netwr
+*          FROM  vbrk
+*          WHERE sfakn = ls_fact-vbeln.
+
+    SELECT SINGLE vbeln INTO j_factanul
+    FROM vbrk
+    WHERE sfakn EQ   ls_fact-vbeln
+    AND   fkdat     <= i_datum.
+
+    IF sy-subrc = 0. " No anuladas
+      DELETE et_pos WHERE vbeln = ls_fact-vbeln.
+      CLEAR  j_factanul.
+      CHECK 1 = 2.
+    ENDIF.
+
+
+    SELECT SINGLE sfakn INTO j_factanul2
+    FROM vbrk
+    WHERE sfakn <>   ''
+    AND   fkdat     <= i_datum
+    AND vbeln EQ ls_fact-vbeln.
+
+    READ TABLE et_pos2 INTO est_pos2 WITH KEY vbeln = j_factanul2.
+    IF sy-subrc = 0. " No anuladas
+      DELETE et_pos WHERE vbeln = ls_fact-vbeln.
+      CLEAR j_factanul2.
+      CHECK 1 = 2.
+    ENDIF.
+
+*   Ponemos el icono
+    IF ls_fact-checkbox = 'X'.
+      ls_fact-icono = icon_led_green.
+    ELSE.
+      ls_fact-icono = icon_led_yellow.
+    ENDIF.
+
+*   Importe total de la comisión
+    ls_fact-ztot_com = ls_fact_key-kwert.
+*   Debemos Añadir lo ya liquidado para calcular el total de la comision
+    DATA v_kwert LIKE ztsdcom_pos-kwert.
+    CLEAR v_kwert.
+    SELECT SUM( kwert ) INTO v_kwert FROM ztsdcom_pos
+      WHERE zstat_liqpos = '2'
+        AND vbeln = ls_fact-vbeln
+        AND bukrs = ls_fact-bukrs
+        AND lifnr = ls_fact-lifnr
+        AND kschl = ls_fact-kschl
+        AND gsber = ls_fact-gsber.
+
+    ls_fact-ztot_com = ls_fact-ztot_com + v_kwert.
+
+*   Sacamos el total neto de la factura
+    ls_fact-netwr = ls_fact_key-imp_fac.
+    IF ls_fact-netwr IS INITIAL.
+      SELECT SINGLE netwr INTO ls_fact-netwr
+          FROM  vbrk
+          WHERE vbeln = ls_fact-vbeln.
+    ENDIF.
+
+*   Sacamos la base imponible de la condición en la factura
+    LOOP AT lti_pos INTO ls_pos WHERE bukrs     = ls_fact_key-bukrs
+                                AND   lifnr     = ls_fact_key-lifnr
+                                AND   vbeln     = ls_fact_key-vbeln
+                                AND   kschl     = ls_fact_key-kschl
+                                AND   waerk     = ls_fact_key-waerk
+                                AND   gsber     = ls_fact_key-gsber
+                                AND   zcont_man = space.
+      ls_fact-kawrt = ls_fact-kawrt + ls_pos-kawrt.
+    ENDLOOP.
+
+*   Importe parcial liquidado (en otras liquidaciones)
+    CALL FUNCTION 'ZSDCOM_IMPORTE_PARCIAL_LIQUID'
+      EXPORTING
+        is_cabliq = ls_cabliq
+        i_bukrs   = ls_fact_key-bukrs
+        i_lifnr   = ls_fact_key-lifnr
+        i_vbeln   = ls_fact_key-vbeln
+        i_kschl   = ls_fact_key-kschl
+      IMPORTING
+        e_importe = ls_fact-zliq_par.
+
+*   Importe propuesto
+    READ TABLE lti_comis INTO ls_comis WITH KEY lifnr = ls_fact_key-lifnr.
+    CALL FUNCTION 'ZSDCOM_IMPORTE_PROP_A_LIQUIDAR'
+      EXPORTING
+        i_basli   = ls_comis-basli
+        i_tot_fac = ls_fact-netwr
+        i_tot_cob = ls_fact_key-imp_cob
+        i_tot_com = ls_fact-ztot_com
+        i_par_com = ls_fact-zliq_par
+      IMPORTING
+        e_importe = ls_fact-zimp_pro.
+
+*   En el importe a liquidar ponemos el propuesto
+    ls_fact-zimp_liq = ls_fact-zimp_pro.
+
+*   Sacamos los datos básicos de la factura
+    READ TABLE lti_pos INTO ls_pos WITH KEY vbeln = ls_fact_key-vbeln.
+    ls_fact-belnr    = ls_pos-belnr_vf.
+    ls_fact-gjahr    = ls_pos-gjahr.
+    ls_fact-kunnr    = ls_pos-kunnr.
+*   Sacamos el nombre del cliente
+    SELECT SINGLE name1 INTO ls_fact-name1
+        FROM  kna1
+        WHERE kunnr = ls_fact-kunnr.
+*   Añadimos la línea a la tabla interna
+
+*   Actualizar las columnas de EUR
+    "JGS
+    IF ls_fact-waerk = 'EUR'.
+      ls_fact-zimp_pro_eur = ls_fact-zimp_pro.
+      ls_fact-zimp_liq_eur = ls_fact-zimp_liq.
+      ls_fact-waerk_eur = 'EUR'.
+    ELSE.
+
+      DATA v_budat TYPE budat.
+      DATA v_kursf LIKE bkpf-kursf.
+      DATA v_kuty2 LIKE bkpf-kuty2.
+      CLEAR: v_budat, v_kursf, v_kuty2.
+      SELECT SINGLE budat kursf kuty2 INTO (v_budat, v_kursf, v_kuty2) FROM bkpf
+        WHERE bukrs = ls_fact-bukrs
+          AND belnr = ls_fact-belnr
+          AND gjahr = ls_fact-gjahr.
+
+      CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+        EXPORTING
+          date             = v_budat
+          foreign_amount   = ls_fact-zimp_pro
+          foreign_currency = ls_fact-waerk
+          local_currency   = 'EUR'
+          rate             = v_kursf
+          type_of_rate     = v_kuty2
+          read_tcurr       = 'X'
+        IMPORTING
+          "exchange_rate    = v_kursf
+          local_amount     = ls_fact-zimp_pro_eur
+        EXCEPTIONS
+          no_rate_found    = 1
+          overflow         = 2
+          no_factors_found = 3
+          no_spread_found  = 4
+          derived_2_times  = 5
+          OTHERS           = 6.
+
+      CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+        EXPORTING
+          date             = v_budat
+          foreign_amount   = ls_fact-zimp_liq
+          foreign_currency = ls_fact-waerk
+          local_currency   = 'EUR'
+          rate             = v_kursf
+          type_of_rate     = v_kuty2
+          read_tcurr       = 'X'
+        IMPORTING
+          "exchange_rate    = v_kursf
+          local_amount     = ls_fact-zimp_liq_eur
+        EXCEPTIONS
+          no_rate_found    = 1
+          overflow         = 2
+          no_factors_found = 3
+          no_spread_found  = 4
+          derived_2_times  = 5
+          OTHERS           = 6.
+
+      ls_fact-waerk_eur = 'EUR'.
+    ENDIF.
+
+    APPEND ls_fact TO et_facts.
+  ENDLOOP.
+
+ENDFUNCTION.

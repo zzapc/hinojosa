@@ -1,0 +1,262 @@
+*&---------------------------------------------------------------------*
+*& Report  ZVAXX_GUI_STATUS
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+REPORT zsapmv45b_zgui.
+
+FORM fcode_zord USING t185f t185 t185v.
+
+**********************************************************************
+* Tipos locales
+**********************************************************************
+
+** PLANR
+
+  TYPES: BEGIN OF ty_planr,
+    planr TYPE planr,
+  END OF ty_planr.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+  FIELD-SYMBOLS: <fs_vbap> TYPE vbapvb,
+                 <fs_vbak> TYPE vbak.
+
+
+  DATA: lt_mdps TYPE TABLE OF mdps,
+        lt_mdez TYPE TABLE OF mdez,
+        lt_mdsu TYPE TABLE OF mdsu,
+
+        lt_planr TYPE TABLE OF ty_planr.
+
+  DATA: ls_planr TYPE ty_planr,
+        ls_mdez  TYPE mdez,
+        ls_mdps  TYPE mdps.
+
+  DATA: ls_orders TYPE zst_vaxx_order_button,
+        lt_orders TYPE ztt_vaxx_order_button.
+
+  DATA: lv_status_line TYPE bsvx-sttxt.
+
+  DATA: lo_alv_popup TYPE REF TO zcl_utils_alv.
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+  ASSIGN ('(SAPMV45A)VBAK') TO <fs_vbak>.
+  ASSIGN ('(SAPMV45A)XVBAP') TO <fs_vbap>.
+
+  IF ( <fs_vbak> IS ASSIGNED AND <fs_vbap> IS ASSIGNED ).
+
+    break fcardona.
+
+*** CHECK MATNR
+
+    IF ( <fs_vbap>-matnr IS INITIAL ).
+      MESSAGE 'Todavía no ha informado material' TYPE 'S' DISPLAY LIKE 'E'.
+      EXIT.
+    ENDIF.
+
+*** CHECK WERKS
+
+    IF ( <fs_vbap>-werks IS INITIAL ).
+      MESSAGE 'Todavía no ha informado el centro' TYPE 'S' DISPLAY LIKE 'E'.
+      EXIT.
+    ENDIF.
+
+*** GET STOCK REQ
+
+    CALL FUNCTION 'MD_STOCK_REQUIREMENTS_LIST_API'
+      EXPORTING
+        matnr                          = <fs_vbap>-matnr
+        werks                          = <fs_vbap>-werks
+     TABLES
+       mdpsx                          = lt_mdps
+       mdezx                          = lt_mdez
+       mdsux                          = lt_mdsu
+     EXCEPTIONS
+       material_plant_not_found       = 1
+       plant_not_found                = 2
+       OTHERS                         = 3
+              .
+    IF sy-subrc <> 0.
+      MESSAGE 'No se ha podido obtener lista de ordenes asociadas al material' TYPE 'S' DISPLAY LIKE 'E'.
+      EXIT.
+    ENDIF.
+
+*** PLANNR
+
+    "Obtenemos claves de planificación
+    MOVE-CORRESPONDING lt_mdez TO lt_planr.
+
+    "Borramos duplicados para recorrerlas 1 a 1
+    DELETE ADJACENT DUPLICATES FROM lt_planr.
+
+    "Recorremos cada clave para exportar los datos
+    LOOP AT lt_planr INTO ls_planr.
+
+      CLEAR: ls_orders.
+
+** STOCK DE CENTRO (WB)
+
+      CLEAR: ls_mdez, ls_mdps.
+      READ TABLE lt_mdez INTO ls_mdez WITH KEY planr = ls_planr-planr delkz = 'WB'.
+      IF ( sy-subrc = 0 ).
+*        ls_orders-dat00 = ls_mdez-dat00.
+      ENDIF.
+
+** STOCK INDIV. DE CLIENTE (KB)
+
+      CLEAR: ls_mdez, ls_mdps.
+      READ TABLE lt_mdez INTO ls_mdez WITH KEY planr = ls_planr-planr delkz = 'KB'.
+      IF ( sy-subrc = 0 ).
+
+        IF ( ls_mdez-kunnr NE <fs_vbak>-kunnr ).
+          CONTINUE.
+        ENDIF.
+
+      ENDIF.
+
+** PEDIDO DE VENTAS
+
+      CLEAR: ls_mdez, ls_mdps.
+      READ TABLE lt_mdez INTO ls_mdez WITH KEY planr = ls_planr-planr delkz = 'VC'.
+      IF ( sy-subrc = 0 ).
+
+        READ TABLE lt_mdps INTO ls_mdps WITH KEY planr = ls_planr-planr delkz = 'VC'.
+        IF ( sy-subrc EQ 0 ).
+
+          MOVE ls_mdps-kdauf TO ls_orders-vbeln.
+          MOVE ls_mdps-kdpos TO ls_orders-posnr.
+          MOVE ls_mdps-mng01 TO ls_orders-mng01.
+
+          SELECT SINGLE vdatu
+            FROM vbak
+            INTO ls_orders-vdatu
+           WHERE vbeln EQ ls_orders-vbeln.
+
+        ENDIF.
+
+      ENDIF.
+
+** PEDIDO DE CLIENTE
+
+      IF ( ls_orders-vbeln IS NOT INITIAL ).
+
+        SELECT SINGLE bstkd
+          FROM vbkd
+          INTO ls_orders-bstkd
+         WHERE vbeln EQ ls_orders-vbeln.
+
+      ENDIF.
+
+** ORD. PRODUCCIÓN + ORD. PREVISIONALES
+
+      CLEAR: ls_mdez, ls_mdps.
+      LOOP AT lt_mdez INTO ls_mdez.
+
+        CLEAR: ls_mdps.
+
+        CHECK ls_mdez-planr EQ ls_planr-planr.
+        CHECK ls_mdez-delkz EQ 'FE' OR ls_mdez-delkz EQ 'PA'.
+
+        CASE ls_mdez-delkz.
+
+          WHEN 'FE'. "ORD. PRODUCCIÓN
+
+            READ TABLE lt_mdps INTO ls_mdps WITH KEY planr = ls_planr-planr delkz = 'FE'.
+            IF ( sy-subrc EQ 0 ).
+
+              MOVE ls_mdps-delkz TO ls_orders-delkz.
+              MOVE ls_mdps-del12 TO ls_orders-aufnr.
+              MOVE ls_mdps-mng01 TO ls_orders-mng02.
+              MOVE ls_mdps-dat00 TO ls_orders-dat01.
+
+              "TODO: obtener fecha de servicio.
+              SELECT SINGLE objnr
+                FROM aufk
+                INTO @DATA(lv_objnr)
+               WHERE aufnr EQ @ls_orders-aufnr.
+
+              IF ( sy-subrc EQ 0 ).
+
+                CALL FUNCTION 'STATUS_TEXT_EDIT'
+                  EXPORTING
+                    objnr                   = lv_objnr
+
+                    spras                   = 'S'
+                  IMPORTING
+                    line                    = lv_status_line
+                  exceptions
+                    object_not_found        = 1
+                    OTHERS                  = 2.
+                IF sy-subrc EQ 0.
+
+                  IF ( lv_status_line CS 'CTEC' ). "OR lv_status_line CS 'NLIQ' ). FCARDONA - 07.11.2022 - Corregir status en botón.
+                    ls_orders-status = 'TERMINADA'.
+                    IF ( ls_orders-vdatu GE ls_orders-dat01 ).
+                      MOVE ls_orders-vdatu TO ls_orders-dat02.
+                    ELSE.
+                      MOVE ls_orders-dat01 TO ls_orders-dat02.
+                    ENDIF.
+                  ELSEIF ( lv_status_line CS 'LIB.' ).
+                    ls_orders-status = 'EN PROCESO'.
+                    MOVE ls_orders-dat01 TO ls_orders-dat02.
+                  ELSE.
+                    ls_orders-status = 'NO INICIADA'.
+                  ENDIF.
+
+                ENDIF.
+
+              ENDIF.
+
+            ENDIF.
+
+          WHEN 'PA'. "ORD. PREVISIONAL
+
+            READ TABLE lt_mdps INTO ls_mdps WITH KEY planr = ls_planr-planr delkz = 'PA'.
+            IF ( sy-subrc EQ 0 ).
+
+              MOVE ls_mdps-delkz TO ls_orders-delkz.
+              MOVE ls_mdps-delnr TO ls_orders-aufnr.
+              MOVE ls_mdps-mng01 TO ls_orders-mng02.
+              MOVE ls_mdps-dat00 TO ls_orders-dat01.
+              ls_orders-status = 'PREVISIONAL'.
+
+            ENDIF.
+
+        ENDCASE.
+
+        APPEND ls_orders TO lt_orders.
+
+      ENDLOOP.
+
+    ENDLOOP.
+
+  ENDIF.
+
+  IF ( lines( lt_orders ) GT 0 ).
+
+    SORT lt_orders ASCENDING BY vbeln.
+
+    zcl_utils_alv=>s_show_alv_popup(
+      EXPORTING
+        i_t_data          = lt_orders
+      EXCEPTIONS
+        no_valid_iparams  = 1
+        error_alv_factory = 2
+        OTHERS            = 3
+    ).
+    IF sy-subrc <> 0.
+*     MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.

@@ -1,0 +1,623 @@
+
+CLASS zsmm_utils DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC .
+
+  PUBLIC SECTION.
+
+    CLASS-METHODS check_job
+      IMPORTING
+        !i_jobname      TYPE string
+      RETURNING
+        VALUE(o_activo) TYPE xfeld .
+    CLASS-METHODS num_jobs
+      IMPORTING
+        !i_jobname   TYPE string
+      RETURNING
+        VALUE(o_num) TYPE int4 .
+    METHODS constructor .
+    METHODS crear_of
+      IMPORTING
+        !i_ebeln TYPE ebeln
+        !i_ebelp TYPE ebelp
+        !i_matnr TYPE matnr
+        !i_werks TYPE werks_d
+        !i_menge TYPE menge_d
+        !i_bdter TYPE bdter
+      EXPORTING
+        !o_aufnr TYPE aufnr .
+    METHODS borrar_of
+      IMPORTING
+        !i_aufnr   TYPE aufnr
+      EXPORTING
+        !o_ok      TYPE xfeld
+        !ow_ret    TYPE bapiret2
+        !ot_return TYPE zspp_bapi_order_return.
+    METHODS creation_prod_ord
+      IMPORTING
+        !i_ebeln       TYPE ebeln
+        !it_posiciones TYPE purchase_order_items .
+    METHODS cumple_criterios_subco
+      IMPORTING
+        !i_ebeln                TYPE ebeln
+        !i_ebelp                TYPE ebelp
+        VALUE(i_structure_ekpo) TYPE ekpo OPTIONAL
+        VALUE(i_structure_ekko) TYPE ekko OPTIONAL
+      EXPORTING
+        !o_caso                 TYPE zsmm_caso_subco
+        !o_aplica               TYPE xfeld .
+    METHODS get_of_subco
+      IMPORTING
+        !i_ebeln       TYPE ebeln
+        !i_ebelp       TYPE ebelp
+        !i_matnr       TYPE matnr
+      RETURNING
+        VALUE(o_aufnr) TYPE aufnr .
+
+    METHODS get_of_tabla
+      IMPORTING
+        !i_ebeln       TYPE ebeln
+        !i_ebelp       TYPE ebelp
+        !i_matnr       TYPE matnr
+      RETURNING
+        VALUE(o_aufnr) TYPE aufnr .
+
+    METHODS modifica_of_subco
+      IMPORTING
+        !i_ebeln TYPE ebeln
+        !i_ebelp TYPE ebelp
+        !i_matnr TYPE matnr
+*        !i_mbdat TYPE datum
+*        !i_eindt TYPE datum
+*        !i_menge TYPE menge_d
+      EXPORTING
+        !o_ok    TYPE xfeld
+        !wa_ret  TYPE bapiret2.
+
+    METHODS get_caso_subco
+      IMPORTING
+                !i_ebeln        TYPE ebeln
+                !i_ebelp        TYPE ebelp
+      EXPORTING o_bdter         TYPE datum
+                o_werks         TYPE werks_d
+                o_menge         TYPE menge_d
+
+                o_vbeln         TYPE vbeln
+                o_vbelp         TYPE posnr
+                o_zzped_cliente TYPE zzped_cliente
+                o_zzcliente     TYPE kunnr
+
+      RETURNING VALUE(o_caso)   TYPE char01.
+  PROTECTED SECTION.
+
+    TYPES:
+      BEGIN OF ty_pedpos,
+        vbeln TYPE vbeln,
+        posnr TYPE posnr,
+        edatu TYPE edatu,
+        menge TYPE menge_d,
+      END OF ty_pedpos .
+  PRIVATE SECTION.
+endclass. "ZSMM_UTILS definition
+class ZSMM_UTILS implementation.
+  METHOD borrar_of.
+
+    CLEAR o_ok.
+
+    "Sólo puede borrarse la OF si está ABIE
+    zspp_utils=>get_of_status(
+    EXPORTING
+        i_aufnr    = i_aufnr
+    IMPORTING
+        ot_status  = DATA(lt_of_stat)
+    ).
+
+    DATA wa_ret TYPE bapiret2.
+
+    IF line_exists( lt_of_stat[ istat = 'I0001' ] ) ."AND NOT line_exists( lt_of_stat[ istat = 'I0076' ] ).
+
+      "Se debe borrar la OF
+      DATA: it_orders  TYPE TABLE OF bapi_order_key,
+            it_det_ret TYPE TABLE OF bapi_order_return.
+
+      APPEND INITIAL LINE TO it_orders ASSIGNING FIELD-SYMBOL(<of>).
+      <of>-order_number = i_aufnr.
+
+      CALL FUNCTION 'BAPI_PRODORD_SET_DELETION_FLAG'
+*                 EXPORTING
+*                   WORK_PROCESS_GROUP       = 'COWORK_BAPI'
+*                   WORK_PROCESS_MAX         = 99
+        IMPORTING
+          return        = wa_ret
+        TABLES
+          orders        = it_orders
+          detail_return = it_det_ret
+*         APPLICATION_LOG          =
+        .
+
+      IF NOT ( line_exists( it_det_ret[  type = 'E' ] ) OR
+               line_exists( it_det_ret[  type = 'X' ] ) OR
+               line_exists( it_det_ret[  type = 'A' ] ) ).
+        o_ok = abap_true.
+      ENDIF.
+    ELSE.
+      wa_ret-type = 'E'.
+      wa_ret-number = 398.
+      wa_ret-id = '00'.
+      wa_ret-message_v1 = |El status de la orden <> ABIE|.
+      wa_ret-message_v2 = |{ i_aufnr ALPHA = OUT }|.
+      wa_ret-message_v3 = |no permite su borrado|.
+    ENDIF.
+
+    ow_ret = wa_ret.
+    ot_return = it_det_ret.
+
+    IF ow_ret IS INITIAL AND ot_return[] IS NOT INITIAL.
+      LOOP AT ot_return ASSIGNING FIELD-SYMBOL(<f>) WHERE type <> space.
+        MOVE-CORRESPONDING <f> TO ow_ret.
+      ENDLOOP.
+    ENDIF.
+
+
+  ENDMETHOD.
+  METHOD check_job.
+
+    DATA: preliminary TYPE c,
+          ready       TYPE c,
+          running     TYPE c,
+          scheduled   TYPE c.
+
+    CLEAR o_activo.
+    "Recuperamos el job de la tabla de jobs
+    SELECT jobname, jobcount FROM tbtco
+      INTO TABLE @DATA(it_joblist)
+     WHERE jobname   = @i_jobname
+       AND authckman = @sy-mandt
+       AND (    sdlstrtdt <> '00000000'
+             OR reldate   <> '00000000' )
+       AND status <> 'F'
+     ORDER BY PRIMARY KEY.
+
+    LOOP AT it_joblist INTO DATA(wa_joblist).
+      CALL FUNCTION 'SHOW_JOBSTATE'
+        EXPORTING
+          jobcount         = wa_joblist-jobcount  " num job
+          jobname          = wa_joblist-jobname  " nombre del job
+        IMPORTING
+*         aborted          = aborted
+*         finished         = finished
+          preliminary      = preliminary
+          ready            = ready
+          running          = running
+          scheduled        = scheduled
+        EXCEPTIONS
+          jobcount_missing = 1
+          jobname_missing  = 2
+          job_notex        = 3
+          OTHERS           = 4.
+
+      IF sy-subrc = 0.
+        IF preliminary = 'X' OR ready = 'X' OR running = 'X' OR scheduled = 'X'.
+          o_activo = 'X'.
+          EXIT.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+  ENDMETHOD.
+  METHOD constructor.
+  ENDMETHOD.
+  METHOD crear_of.
+
+    CLEAR: o_aufnr.
+
+    SELECT SINGLE cuobj INTO @DATA(wa_cuobj)
+      FROM marc
+      WHERE werks EQ  @i_werks
+      AND matnr EQ @i_matnr.
+
+    DATA wa_order TYPE  bapi_pp_order_create.
+    CLEAR wa_order.
+    DATA: wa_ret   TYPE bapiret2.
+    CLEAR: wa_ret.
+
+
+    wa_order-material = i_matnr.
+    wa_order-plant = i_werks.
+    "Le pasamos el CUOBJ a la Bapi
+    wa_order-configuration = wa_cuobj.
+
+    wa_order-planning_plant  = i_werks.
+    wa_order-quantity = i_menge.
+
+    SELECT SINGLE auart INTO wa_order-order_type FROM t399x WHERE werks EQ wa_order-plant AND auart LIKE 'Z___'.
+    wa_order-basic_start_date = wa_order-basic_end_date = i_bdter.
+    CLEAR: wa_ret.
+
+    CALL FUNCTION 'BAPI_PRODORD_CREATE'
+      EXPORTING
+        orderdata    = wa_order
+      IMPORTING
+        return       = wa_ret
+        order_number = o_aufnr
+*       ORDER_TYPE   =
+      .
+
+  ENDMETHOD.
+  METHOD creation_prod_ord.
+
+    DATA: jobname            TYPE tbtcjob-jobname, "DEPRECATED VALUE 'ZCREA_ORDEN_PRODUCCION_SUBCO',
+          jobcount           TYPE tbtcjob-jobcount,
+          host               TYPE msxxlist-host,
+          starttimeimmediate TYPE btch0000-char1 VALUE 'X'.
+
+    jobname = zcl_ap_parametros=>get_atributo1( clave        = 'ZOFPEDIDO'
+                                                   campo        = 'JOB' ).
+
+*    LOOP AT it_posiciones ASSIGNING FIELD-SYMBOL(<fs_pos>).
+*      DATA(p) = <fs_pos>-item->get_data( ).
+    DATA lv_delay TYPE syuzeit.
+
+    DATA lv_retardo TYPE i.
+
+    DATA(lv_retardo_param) = zcl_ap_parametros=>get_atributo1(
+                                                       clave        = 'ZOFPEDIDO'
+                                                       campo        = 'RETARDO'
+                                                  ).
+
+    TRY.
+        lv_retardo = lv_retardo_param.
+      CATCH cx_root.
+        lv_retardo = 35.
+    ENDTRY.
+
+    lv_delay = sy-uzeit + lv_retardo.
+* Job open
+    CALL FUNCTION 'JOB_OPEN'
+      EXPORTING
+        delanfrep        = ' '
+        jobgroup         = ' '
+        jobname          = jobname
+        sdlstrtdt        = sy-datum
+        sdlstrttm        = lv_delay
+      IMPORTING
+        jobcount         = jobcount
+      EXCEPTIONS
+        cant_create_job  = 01
+        invalid_job_data = 02
+        jobname_missing  = 03.
+    IF sy-subrc NE 0.
+      "error processing
+    ENDIF.
+
+* Insert process into job
+    DATA(lv_report) = zcl_ap_parametros=>get_atributo1( clave        = 'ZOFPEDIDO'
+                                                   campo        = 'REPORT' ).
+
+    SUBMIT (lv_report) AND RETURN WITH p_ebeln = i_ebeln
+                           USER sy-uname
+                           VIA JOB jobname
+                           NUMBER jobcount.
+    IF sy-subrc > 0.
+      "error processing
+    ENDIF.
+
+* Close job
+*    starttime-sdlstrtdt = sy-datum.
+*    starttime-sdlstrttm = sy-uzeit.
+    CALL FUNCTION 'JOB_CLOSE'
+      EXPORTING
+        "            event_id             = starttime-eventid
+        "            event_param          = starttime-eventparm
+        "            event_periodic       = starttime-periodic
+        jobcount             = jobcount
+        jobname              = jobname
+"       laststrtdt           = starttime-laststrtdt
+"       laststrttm           = starttime-laststrttm
+"       prddays              = 1
+"       prdhours             = 0
+"       prdmins              = 0
+"       prdmonths            = 0
+"       prdweeks             = 0
+        sdlstrtdt            = sy-datum
+        sdlstrttm            = lv_delay
+*       strtimmed            = abap_true
+"       targetsystem         = host
+      EXCEPTIONS
+        cant_start_immediate = 01
+        invalid_startdate    = 02
+        jobname_missing      = 03
+        job_close_failed     = 04
+        job_nosteps          = 05
+        job_notex            = 06
+        lock_failed          = 07
+        OTHERS               = 99.
+    IF sy-subrc EQ 0.
+      "error processing
+    ENDIF.
+
+*    ENDLOOP.
+
+  ENDMETHOD.
+  METHOD cumple_criterios_subco.
+    CLEAR: o_caso, o_aplica.
+
+    DATA: wa_ekpo TYPE ekpo,
+          wa_ekko TYPE ekko.
+
+    FREE: wa_ekpo, wa_ekko.
+
+    IF i_structure_ekpo IS SUPPLIED AND i_structure_ekpo IS NOT INITIAL.
+      wa_ekpo = i_structure_ekpo.
+    ELSE.
+      SELECT SINGLE * INTO wa_ekpo FROM ekpo WHERE ebeln = i_ebeln AND ebelp = i_ebelp.
+    ENDIF.
+
+    IF i_structure_ekko IS SUPPLIED AND i_structure_ekko IS NOT INITIAL.
+      wa_ekko = i_structure_ekko.
+    ELSE.
+      SELECT SINGLE * INTO wa_ekko FROM ekko WHERE ebeln = i_ebeln.
+    ENDIF.
+
+    SELECT DISTINCT t1~bsart, t1~werks, t1~lgort, t2~pstyp, t1~knttp
+     INTO TABLE @DATA(it_custo) FROM ztmm0050 AS t1 LEFT OUTER JOIN t163y AS t2 ON t2~epstp = t1~pstyp
+      WHERE spras EQ @sy-langu
+      AND bsart = @wa_ekko-bsart
+      AND werks = @wa_ekpo-werks
+      AND lgort = @wa_ekpo-lgort
+      and reslo = @wa_ekpo-reslo   "APC20241120 Añadimos este nuevo criterio
+      AND t2~pstyp = @wa_ekpo-pstyp
+      AND knttp = @wa_ekpo-knttp.
+    IF sy-subrc = 0.
+      o_aplica = abap_true.
+    ELSE.
+      o_aplica = abap_false.
+    ENDIF.
+
+    "JVM - ADD nuevo requerimiento, excluir creación de OFs para Mercaderías
+    DATA(atributo1) = zcl_ap_parametros=>get_atributo1( clave        = 'ZMEPOOF_EX'
+                                                        campo        = 'MATKL' ).
+    DATA lv_matkl TYPE matkl.
+    lv_matkl = atributo1.
+
+    SELECT SINGLE matkl
+      FROM mara
+      WHERE matnr = @wa_ekpo-matnr
+      AND matkl = @lv_matkl
+      INTO @DATA(vl_matkl).
+    IF sy-subrc = 0.
+      CLEAR: o_aplica, o_caso.
+    ENDIF.
+    "FIN JVM
+
+  ENDMETHOD.
+  METHOD get_caso_subco.
+
+    CLEAR: o_bdter, o_werks, o_menge, o_vbeln, o_vbelp, o_zzped_cliente, o_zzcliente, o_caso.
+
+*  CASUÍSTICA 1: ENVÍO DE SEMITERMINADO DE XÀTIVA A PERIS VÍA PEDIDO DE SUBCONTRATISTA.
+*  CREACIÓN DE OF AUTOMÁTICAMENTE DE SEMITERMINADO ENVIADO COMO COMPONENTE DEL PEDIDO DE SUBCO,
+*  MEDIANTE ADAPTACIÓN DE PROGRAMA ZSPP_CREAR_OF_PEDIDO.
+*  OBTENER EL PEDIDO Y POSICIÓN DE VENTAS DEL QUE NACE ESTA NECESIDAD DESDE EKKN-VBELN Y EKKN-VBELP.
+*  METER ESOS VALORES A PIÑÓN FIJO COMO SI EMPUJASES ALL DAY ALL NIGHT EN LA AFPO-KDAUF Y AFPO-KDPOS.
+    SELECT SINGLE vbeln, vbelp, zzcrear_of, werks
+      FROM ekkn AS t1 INNER JOIN ekpo AS t2 ON t1~ebeln EQ t2~ebeln
+      WHERE t1~ebeln = @i_ebeln
+      AND t1~ebelp = @i_ebelp
+      AND t2~loekz = @space
+      INTO @DATA(pedi_pos).
+    IF sy-subrc = 0 AND pedi_pos-vbeln IS NOT INITIAL AND pedi_pos-zzcrear_of EQ abap_true.
+      o_caso = '1'.
+    ELSE.
+
+*  CASUÍSTICA 2: ENVÍO DE PRODUCTO TERMINADO DE XÀTIVA A PERIS VÍA PEDIDO DE TRASLADO.
+*  AÑADIR UN FLAG A NIVEL DE POSICIÓN DE PEDIDO DE TRASLADO QUE SEA "CREAR OF". SE CREARÁ NUEVAMENTE
+*  "MEDIANTE ADAPTACIÓN DEL PROGRAMA ZSPP_CREAR_OF_PEDIDO.
+*  CREACIÓN DE CAMPO Z Nº PEDIDO DE CLIENTE EN POSICIÓN PEDIDO DE TRASLADO.
+*  CREACIÓN DE CAMPO Z EN LOTE LOGÍSTICO PARA EL MANTENIMIENTO DE Nº PEDIDO DE CLIENTE, QUE SE
+*  ALIMENTARÁ DEL CAMPO RELLENADO POR EL USUARIO EN LA POSICIÓN DEL PEDIDO DE TRASLADO.
+*  CREACIÓN DE CAMPO Z Nº PEDIDO DE CLIENTE EN OF. QUE SE ALIMENTARÁ DEL CAMPO RELLENADO POR EL
+*  USUARIO EN LA POSICIÓN DEL PEDIDO DE TRASLADO.
+*  CON LA CREACIÓN AUTOMÁTICA DE LA OF DEL PT SE INFORMARÁ EN LOS CAMPOS Z DE LA OF Y DEL LOTE, EL
+*  Nº DE PEDIDO DE CLIENTE.
+*  CON LA CREACIÓN DEL PEDIDO DE VENTA A CLIENTE DESDE EL MONITOR DE EXPEDICIONES, SE INFORMARÁ DEL
+*  Nº DE PEDIDO DE CLIENTE DEL LOTE SELECCIONADO.
+      SELECT SINGLE zzcrear_of, zzped_cliente, zzcliente, t1~matnr, t1~werks, t1~menge, CASE t3~mbdat WHEN '00000000' THEN t3~eindt ELSE t3~mbdat  END AS bdter
+         FROM ekpo AS t1 INNER JOIN ekko AS t2
+        ON t1~ebeln EQ t2~ebeln
+        INNER JOIN eket AS t3 ON t1~ebeln EQ t3~ebeln AND t1~ebelp EQ t3~ebelp
+        WHERE t1~ebeln = @i_ebeln
+        AND t1~ebelp = @i_ebelp
+        AND t1~loekz = @space
+        AND t3~etenr = ( SELECT MIN( etenr ) FROM eket WHERE eket~ebeln = t1~ebeln AND eket~ebelp = t1~ebelp )
+        INTO @DATA(crear_si).
+      IF sy-subrc = 0 AND crear_si-zzcrear_of EQ abap_true.
+        o_caso = '2'.
+      ELSE.
+
+
+***ESTA FUNCIONALIDAD AUTOMÁTICA (Nº PEDIDO DE CLIENTE) SOLO APLICARÍA EN EL CASO DE CREACIÓN AUTOMÁTICA
+*DE OF A PARTIR DEL PEDIDO DE TRASLADO.
+*
+*  CASUÍSTICA 3: ENVÍO DE PRODUCTO TERMINADO DE XÀTIVA A CENTRO DE MONTAJE VÍA PEDIDO DE TRASLADO.
+*  STOCK RESERVADO PARA CLIENTES (LOTE CAMPO Z CLIENTE): MATERIALES DE AGRICULTURA QUE PUEDEN SER ENVIADOS
+*  A X CLIENTES, PERO UNO EN ESPECÍFICO QUIERE STOCK RESERVADO PARA ÉL EN CM:
+*  CREACIÓN DE CAMPO Z CLIENTE EN POSICIÓN PEDIDO DE TRASLADO.
+*  CREACIÓN DE CAMPO Z EN LOTE PARA EL MANTENIMIENTO DE CLIENTE, QUE SE ALIMENTARÁ DEL CAMPO RELLENADO POR
+*  EL USUARIO EN LA POSICIÓN DEL PEDIDO DE TRASLADO.
+*  CREACIÓN DE CAMPO Z CLIENTE EN OF. QUE SE ALIMENTARÁ DEL CAMPO RELLENADO POR EL USUARIO EN LA POSICIÓN
+*  DEL PEDIDO DE TRASLADO.
+*  CON LA CREACIÓN AUTOMÁTICA DE LA OF DEL PT SE INFORMARÁ EN LOS CAMPOS Z DE LA OF Y DEL LOTE, EL CLIENTE
+*  PARA EL QUE SE RESERVA EL STOCK.
+
+        SELECT SINGLE zzcrear_of, zzped_cliente, zzcliente, t1~matnr, t1~werks, t1~menge, CASE t3~mbdat WHEN '00000000' THEN t3~eindt ELSE t3~mbdat  END AS bdter
+          FROM ekpo AS t1 INNER JOIN ekko AS t2
+          ON t1~ebeln EQ t2~ebeln
+        INNER JOIN eket AS t3 ON t1~ebeln EQ t3~ebeln AND t1~ebelp EQ t3~ebelp
+          WHERE t1~ebeln = @i_ebeln
+          AND t1~ebelp = @i_ebelp
+          AND t3~etenr = ( SELECT MIN( etenr ) FROM eket WHERE eket~ebeln = t1~ebeln AND eket~ebelp = t1~ebelp )
+          AND t1~loekz = @space
+          INTO @crear_si.
+        IF sy-subrc = 0 AND crear_si-zzcliente <> space AND crear_si-zzcrear_of EQ abap_true.
+          o_caso = '3'.
+        ENDIF.
+      ENDIF.
+
+    ENDIF.
+
+
+    o_bdter = crear_si-bdter.
+    o_werks = crear_si-werks.
+    o_menge = crear_si-menge.
+    o_vbeln = pedi_pos-vbeln.
+    o_vbelp = pedi_pos-vbelp.
+    o_zzped_cliente = crear_si-zzped_cliente.
+    o_zzcliente = crear_si-zzcliente.
+
+
+
+  ENDMETHOD.
+  METHOD get_of_subco.
+
+    CLEAR o_aufnr.
+
+    SELECT SINGLE t1~aufnr
+        INTO @o_aufnr
+        FROM zsppt_ofpedsubco AS t1 INNER JOIN aufk AS t2
+        ON t1~aufnr = t2~aufnr
+        WHERE ebeln = @i_ebeln
+        AND ebelp = @i_ebelp
+        AND matnr = @i_matnr
+        AND t1~aufnr <> @space
+        AND t2~loekz = @space.
+
+  ENDMETHOD.
+  METHOD get_of_tabla.
+    CLEAR o_aufnr.
+
+    SELECT SINGLE aufnr
+        INTO @o_aufnr
+        FROM zsppt_ofpedsubco
+        WHERE ebeln = @i_ebeln
+        AND ebelp = @i_ebelp
+        AND matnr = @i_matnr
+        AND aufnr <> @space
+        AND paso <> '99'.
+
+  ENDMETHOD.
+  METHOD modifica_of_subco.
+    CLEAR wa_ret.
+    CLEAR: o_ok.
+    zspp_utils=>get_of_status(
+      EXPORTING
+        i_aufnr    = me->get_of_tabla(
+                      EXPORTING
+                        i_ebeln = i_ebeln
+                        i_ebelp = i_ebelp
+                        i_matnr = i_matnr
+*                      RECEIVING
+*                        o_aufnr =
+                    )
+      IMPORTING
+        ot_status  = DATA(lt_status)
+*        ot_return  =
+*      CHANGING
+*        co_obj_log =
+    ).
+
+    IF NOT line_exists( lt_status[ istat = 'I0001' ] ).
+
+      o_ok = abap_false.
+      wa_ret-type = 'I'.
+      wa_ret-id = '00'.
+      wa_ret-number = 398.
+      wa_ret-message_v1 = text-lib.
+      RETURN.
+    ENDIF.
+
+    "Si tiene OF asignada, vemos si hay cambios para reflejarlos en la OF
+    SELECT SINGLE t1~menge, CASE t3~mbdat WHEN '00000000' THEN t3~eindt ELSE t3~mbdat END AS bdter, t1~loekz
+      FROM ekpo AS t1 INNER JOIN ekko AS t2
+      ON t1~ebeln EQ t2~ebeln
+      INNER JOIN eket AS t3 ON t1~ebeln EQ t3~ebeln AND t1~ebelp EQ t3~ebelp
+      WHERE t1~ebeln = @i_ebeln
+      AND t1~ebelp = @i_ebelp
+      AND t1~loekz NOT IN ( 'L', 'X' ) "Borrado, si está bloqueado si que lo tomamos¿? Según nuria parece que si ya que no borra OF
+      AND t3~etenr = ( SELECT MIN( etenr ) FROM eket WHERE eket~ebeln = t1~ebeln AND eket~ebelp = t1~ebelp )
+      INTO @DATA(wa_bbdd).
+
+    "Si está abierta se puede modificar la OF
+    IF line_exists( lt_status[ istat = 'I0001' ] ) AND NOT line_exists(  lt_status[ istat = 'I0076' ] ).
+      "Ha cambiado la fecha del reparto o la cantidad, modificar la OF
+      DATA: wa_orderdata  TYPE bapi_pp_order_change,
+            wa_orderdatax TYPE bapi_pp_order_changex,
+            wa_return     TYPE bapiret2.
+
+      CLEAR: wa_orderdata, wa_orderdatax, wa_return.
+
+*      IF mbdat EQ '00000000'.
+*        wa_orderdata-basic_end_date = wa_orderdata-basic_start_date  = i_eindt.
+*      ELSE.
+      wa_orderdata-basic_end_date = wa_orderdata-basic_start_date  = wa_bbdd-bdter.
+*      ENDIF.
+      wa_orderdatax-basic_end_date = wa_orderdatax-basic_start_date = 'X'.
+
+      wa_orderdata-quantity = wa_bbdd-menge.
+      wa_orderdatax-quantity = 'X'.
+
+      IF wa_orderdatax IS NOT INITIAL.
+
+        CLEAR wa_return.
+
+        CALL FUNCTION 'BAPI_PRODORD_CHANGE'
+          EXPORTING
+            number     = me->get_of_tabla( EXPORTING i_ebeln = i_ebeln i_ebelp = i_ebelp i_matnr = i_matnr )
+            orderdata  = wa_orderdata
+            orderdatax = wa_orderdatax
+          IMPORTING
+            return     = wa_return
+*           ORDER_TYPE =
+*           ORDER_STATUS           =
+*           MASTER_DATA_READ       =
+          .
+
+        wa_ret = wa_return.
+
+        IF wa_return-type <> 'E' AND wa_return-type <> 'A' AND wa_return-type <> 'X'.
+          o_ok = abap_true.
+
+
+          DATA it_orders TYPE  zspp_tt_update_ordenes.
+          FREE it_orders.
+          APPEND INITIAL LINE TO it_orders ASSIGNING FIELD-SYMBOL(<auf>).
+          <auf>-aufnr = me->get_of_tabla( EXPORTING i_ebeln = i_ebeln i_ebelp = i_ebelp i_matnr = i_matnr ).
+
+          CALL FUNCTION 'ZSPP_ENVIO_ORDERS_BACKGROUND' IN BACKGROUND TASK AS SEPARATE UNIT
+            EXPORTING
+              it_aufnr = it_orders.
+
+        ENDIF.
+
+      ENDIF.
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD num_jobs.
+
+    SELECT COUNT( * ) FROM tbtco
+      INTO @o_num
+     WHERE jobname EQ @i_jobname
+       AND authckman  = @sy-mandt
+       AND (    sdlstrtdt <> '00000000'
+             OR reldate   <> '00000000' )
+       AND status IN ( 'R', 'Y', 'P', 'S' ).
+*btc_running LIKE tbtco-status VALUE 'R',
+*btc_ready LIKE tbtco-status VALUE 'Y',
+*btc_scheduled LIKE tbtco-status VALUE 'P',
+*btc_released LIKE tbtco-status VALUE 'S',
+*btc_aborted LIKE tbtco-status VALU
+    . " En ejecución
+
+  ENDMETHOD.

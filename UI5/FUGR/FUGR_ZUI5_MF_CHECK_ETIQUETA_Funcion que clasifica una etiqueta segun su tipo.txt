@@ -1,0 +1,281 @@
+FUNCTION zui5_mf_check_etiqueta.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(ETIQUETA) TYPE  ZUI5_ETIQUETA
+*"  EXPORTING
+*"     VALUE(O_DATOS_ETIQUETA) TYPE  ZUI5_S_DATOS_ETIQUETA
+*"     VALUE(O_BAPI_RETURN) TYPE  BAPIRET2
+*"----------------------------------------------------------------------
+
+  TYPES: BEGIN OF ty_hu_stock,
+           matnr TYPE matnr,
+           werks TYPE werks_d,
+           lgort TYPE lgort_d,
+           charg TYPE charg_d,
+           clabs TYPE labst,
+         END OF ty_hu_stock.
+
+  TYPES: BEGIN OF ty_check_stock,
+           lgort TYPE lgort_d,
+           clabs TYPE labst,
+         END OF ty_check_stock.
+
+  DATA: lv_material          TYPE matnr,
+        lv_objeto(10)        TYPE c,
+        lv_objeto_aux(20)    TYPE c,
+        lv_flag_stock(1)     TYPE c,
+        lv_tipo_material     TYPE mtart,
+        lv_material_lote     TYPE xchpf,
+        lv_tipo_mercancia(1) TYPE c,
+        lt_check_stock       TYPE TABLE OF ty_check_stock,
+        ls_check_stock       TYPE ty_check_stock,
+        lv_exidv             TYPE exidv,
+        lt_hu_stock          TYPE TABLE OF ty_hu_stock,
+        ls_hu_stock          TYPE ty_hu_stock,
+        lv_num_pos           TYPE i,
+        lv_num_pos_stock     TYPE i.
+
+  DATA: lv_codigo_kit_hu LIKE vekp-inhalt,
+        lv_posicion_hu   LIKE vekp-venum,
+        lv_almacen       TYPE lgort_d,
+        lt_vepo          TYPE TABLE OF vepo,
+        ls_vepo          TYPE vepo,
+        lv_stock         LIKE mchb-clabs.
+
+  DATA: lv_object_key      LIKE bapi1003_key-object,
+        lv_objecttable     LIKE bapi1003_key-objecttable,
+        lv_classnum        LIKE bapi1003_key-classnum,
+        lv_classtype       LIKE bapi1003_key-classtype,
+        lt_allocvalueschar TYPE TABLE OF bapi1003_alloc_values_char,
+        lt_allocvaluesnum  TYPE TABLE OF bapi1003_alloc_values_num,
+        lt_allocvaluescurr TYPE TABLE OF bapi1003_alloc_values_curr,
+        ls_allocvalueschar TYPE bapi1003_alloc_values_char,
+        lt_return          TYPE TABLE OF bapiret2,
+        ls_return          TYPE bapiret2.
+
+  SPLIT etiqueta AT ' ' INTO lv_material lv_objeto_aux.
+
+  CONDENSE lv_objeto_aux NO-GAPS.
+
+  lv_objeto = lv_objeto_aux(10).
+
+*Recuperamos el tipo de mercancia que se quiere trasladar
+  CALL FUNCTION 'ZUI5_CHECK_TIPO'
+    EXPORTING
+      etiqueta       = etiqueta
+    IMPORTING
+      tipo_mercancia = lv_tipo_mercancia
+      tipo_material  = o_datos_etiqueta-tipo_material.
+
+*Formateamos el codigo de material para posteriores busquedas en tablas
+  CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+    EXPORTING
+      input  = lv_material
+    IMPORTING
+      output = lv_material.
+
+*Preparamos los datos para traer la ubicacion
+  CONCATENATE lv_material lv_objeto INTO lv_object_key.
+  CONCATENATE 'Z_' o_datos_etiqueta-tipo_material INTO lv_classnum.
+
+  IF lv_tipo_mercancia = 'A' OR lv_tipo_mercancia = 'B'.
+    CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+      EXPORTING
+        objectkey       = lv_object_key
+        objecttable     = 'MCH1'
+        classnum        = lv_classnum
+        classtype       = '023'
+*   IMPORTING
+*       STATUS          =
+*       STANDARDCLASS   =
+      TABLES
+        allocvaluesnum  = lt_allocvaluesnum
+        allocvalueschar = lt_allocvalueschar
+        allocvaluescurr = lt_allocvaluescurr
+        return          = lt_return.
+
+*Controlamos los posibles errores al recuperar la ubicacion
+    READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+    IF sy-subrc = 0.
+      o_bapi_return-type = 'S'.
+      o_bapi_return-id = 'Z_WM'.
+      o_bapi_return-number = '006'.
+
+      CALL FUNCTION 'BAPI_MESSAGE_GETDETAIL'
+        EXPORTING
+          id         = o_bapi_return-id
+          number     = o_bapi_return-number
+          language   = sy-langu
+          textformat = 'ASC'
+        IMPORTING
+          message    = o_bapi_return-message.
+      EXIT.
+    ENDIF.
+
+*Asignamos la ubicacion a la estructura de salida
+    READ TABLE lt_allocvalueschar INTO ls_allocvalueschar WITH KEY charact = 'Z_UBICACION'.
+    IF sy-subrc = 0.
+      o_datos_etiqueta-ubicacion = ls_allocvalueschar-value_neutral.
+    ENDIF.
+  ENDIF.
+* CASO A: Se trata de un KIT (HU).
+  IF lv_tipo_mercancia = 'A'.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = lv_objeto
+      IMPORTING
+        output = lv_exidv.
+
+*Recuperamos la posicion del hu y el codigo del material que corresponde al kit
+    SELECT SINGLE venum inhalt
+      INTO (lv_posicion_hu,lv_codigo_kit_hu)
+      FROM vekp
+      WHERE exidv = lv_exidv.
+
+*Recuperamos el almacen donde esta almacenado el hu
+    SELECT *
+      INTO TABLE lt_vepo
+      FROM vepo
+      WHERE venum = lv_posicion_hu.
+
+    SELECT matnr charg clabs werks lgort
+      INTO CORRESPONDING FIELDS OF TABLE lt_hu_stock
+      FROM mchb
+      FOR ALL ENTRIES IN lt_vepo
+      WHERE matnr = lt_vepo-matnr AND charg = lt_vepo-charg AND werks = lt_vepo-werks AND lgort = lt_vepo-lgort AND clabs > 0.
+
+    DESCRIBE TABLE lt_vepo LINES lv_num_pos.
+    DESCRIBE TABLE lt_hu_stock LINES lv_num_pos_stock.
+
+*Si todas las posiciones tienen stock
+    IF lv_num_pos = lv_num_pos_stock.
+      READ TABLE lt_vepo INTO ls_vepo INDEX 1.
+      IF sy-subrc = 0.
+        lv_almacen = ls_vepo-lgort.
+      ENDIF.
+
+*Eliminamos los 0 del codigo descripcion del material en hu
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = lv_codigo_kit_hu
+        IMPORTING
+          output = lv_codigo_kit_hu.
+
+*Copiamos los datos a la estructura de salida
+      o_datos_etiqueta-almacen = lv_almacen.
+      o_datos_etiqueta-codigo_hu = lv_objeto.
+      o_datos_etiqueta-nombre_material = lv_codigo_kit_hu.
+
+*Si alguna posicion no tiene stock.
+    ELSE.
+      o_bapi_return-type = 'S'.
+      o_bapi_return-id = 'Z_WM'.
+      o_bapi_return-number = '002'.
+
+      CALL FUNCTION 'BAPI_MESSAGE_GETDETAIL'
+        EXPORTING
+          id         = o_bapi_return-id
+          number     = o_bapi_return-number
+          language   = sy-langu
+          textformat = 'ASC'
+        IMPORTING
+          message    = o_bapi_return-message.
+    ENDIF.
+
+
+
+*CASO B: Se trata de un material no kit gestionado por lotes.
+  ELSEIF lv_tipo_mercancia = 'B'.
+
+*Recuperamos la descripcion del material
+    SELECT SINGLE maktx
+      INTO o_datos_etiqueta-descripcion
+      FROM makt
+      WHERE matnr = lv_material.
+
+    SELECT  clabs lgort
+      INTO CORRESPONDING FIELDS OF TABLE lt_check_stock
+      FROM mchb
+      WHERE matnr = lv_material AND werks = '4000' AND charg = lv_objeto.
+    IF sy-subrc <> 0.
+*Si no existe el lote
+      o_bapi_return-type = 'S'.
+      o_bapi_return-id = 'Z_WM'.
+      o_bapi_return-number = '000'.
+
+      CALL FUNCTION 'BAPI_MESSAGE_GETDETAIL'
+        EXPORTING
+          id         = o_bapi_return-id
+          number     = o_bapi_return-number
+          language   = sy-langu
+          textformat = 'ASC'
+        IMPORTING
+          message    = o_bapi_return-message.
+    ELSE.
+      LOOP AT lt_check_stock INTO ls_check_stock.
+        IF ls_check_stock-clabs > 0.
+          lv_flag_stock = 'X'.
+          lv_stock = ls_check_stock-clabs.
+          lv_almacen = ls_check_stock-lgort.
+        ENDIF.
+      ENDLOOP.
+      IF lv_flag_stock = 'X'.
+*Si hay stock del material en el centro indicado
+        CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+          EXPORTING
+            input  = lv_material
+          IMPORTING
+            output = lv_material.
+
+*Copiamos los datos a la estructura de salida
+        o_datos_etiqueta-almacen = lv_almacen.
+        o_datos_etiqueta-cantidad = lv_stock.
+        o_datos_etiqueta-nombre_material = lv_material.
+        o_datos_etiqueta-codigo_lote = lv_objeto.
+
+      ELSE.
+*Si no hay stock del material en el centro indicado
+        o_bapi_return-type = 'S'.
+        o_bapi_return-id = 'Z_WM'.
+        o_bapi_return-number = '001'.
+
+        CALL FUNCTION 'BAPI_MESSAGE_GETDETAIL'
+          EXPORTING
+            id         = o_bapi_return-id
+            number     = o_bapi_return-number
+            language   = sy-langu
+            textformat = 'ASC'
+          IMPORTING
+            message    = o_bapi_return-message.
+
+      ENDIF.
+    ENDIF.
+  ELSE.
+
+*Recuperamos la descripcion del material
+    SELECT SINGLE maktx
+      INTO o_datos_etiqueta-descripcion
+      FROM makt
+      WHERE matnr = lv_material.
+
+*Se trata de un material no kit y no gestionado por lotes.
+    CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+      EXPORTING
+        input  = lv_material
+      IMPORTING
+        output = lv_material.
+
+    o_datos_etiqueta-nombre_material = lv_material.
+
+  ENDIF.
+
+*Si el almacen origen es 1400, el almacen destino se devuelve vacio. En otro caso, el almacen destino sera el 1400.
+  IF o_datos_etiqueta-almacen = '1400'.
+    o_datos_etiqueta-almacen_dest = ''.
+  ELSE.
+    o_datos_etiqueta-almacen_dest = '1400'.
+  ENDIF.
+
+ENDFUNCTION.

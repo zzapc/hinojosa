@@ -1,0 +1,303 @@
+
+class ZCL_VCXI_XCE_MM_TOOL_BLCK_DMG definition
+  public
+  final
+  create public .
+
+public section.
+
+  types:
+    begin of YS_TOOL_STOCK,
+        MATNR type MATNR,
+        WERKS type WERKS_D,
+        CHARG type CHARG_D,
+      end of YS_TOOL_STOCK .
+  types:
+    YT_TOOL_STOCK type standard table of YS_TOOL_STOCK with default key .
+
+  methods CONSTRUCTOR .
+  methods REPAIR_EXTERNAL
+    importing
+      !IT_REPAIR_EXT type ZVCXI_XCE_MM_TT_REPAIR_EXT
+    changing
+      !CR_MSG type ref to /VCXI/CL_CKXM_MESSAGE
+    raising
+      /VCXI/CX_CKX .
+  methods REPAIR_INTERNAL
+    importing
+      !IT_REPAIR_INT type ZVCXI_XCE_MM_TT_REPAIR_INT
+    changing
+      !CR_MSG type ref to /VCXI/CL_CKXM_MESSAGE
+    raising
+      /VCXI/CX_CKX .
+  methods REORDER
+    importing
+      !IT_REORDER type ZVCXI_XCE_MM_TT_REORDER
+    changing
+      !CR_MSG type ref to /VCXI/CL_CKXM_MESSAGE
+    raising
+      /VCXI/CX_CKX .
+protected section.
+private section.
+
+  data R_LIFETIME type ref to ZCL_VCXI_XCE_MM_TOOL_LIFETIME .
+  class-data F_SERVICE_MATERIAL type MATNR .
+
+  methods GET_SLOC
+    importing
+      !IF_WERKS type WERKS_D optional
+      !IF_TSLOC type ZVCXI_XCE_MM_TSLOC
+    returning
+      value(RF_LGORT) type LGORT_D
+    raising
+      /VCXI/CX_CKX .
+  methods GET_TOOL_STOCK
+    importing
+      !IT_TOOL_STOCK type YT_TOOL_STOCK
+    changing
+      !CT_REPAIR_INT type ZVCXI_XCE_MM_TT_REPAIR_INT optional
+      !CT_REPAIR_EXT type ZVCXI_XCE_MM_TT_REPAIR_EXT optional
+    raising
+      /VCXI/CX_CKX .
+endclass. "ZCL_VCXI_XCE_MM_TOOL_BLCK_DMG definition
+class ZCL_VCXI_XCE_MM_TOOL_BLCK_DMG implementation.
+  method CONSTRUCTOR.
+*** Create Life Time instance
+    ME->R_LIFETIME = new ZCL_VCXI_XCE_MM_TOOL_LIFETIME( ).
+
+*** Set Service Material
+    ME->F_SERVICE_MATERIAL = 'REPAIR'.
+
+  endmethod.
+  method GET_SLOC.
+
+*** Get Storage Location from Database Table
+    select single LGORT into @RF_LGORT
+           from ZVCXI_XCE_TC310
+          where TSLOC eq @IF_TSLOC
+            and WERKS eq @IF_WERKS.
+    if SY-SUBRC ne 0.
+      select single LGORT into @RF_LGORT
+             from ZVCXI_XCE_TC310
+            where TSLOC eq @IF_TSLOC.
+    endif.
+
+    if SY-SUBRC ne 0.
+***   No Storage Location found
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                            IF_MSGID = 'ZVCXI_XCE_MM'
+                                            IF_MSGNO = '017' ).
+    endif.
+
+  endmethod.
+  method GET_TOOL_STOCK.
+
+*** Get Tool Stock with Stock (Unrestricted & Blocked)
+    select MCHB~MATNR, MCHB~WERKS, MCHB~CHARG, MCHB~LGORT,
+           sum( CLABS ) as LABST,
+           sum( CSPEM ) as SPEME
+       from @IT_TOOL_STOCK as TOOL_STOCK
+       inner join MCHB
+        on MCHB~MATNR = TOOL_STOCK~MATNR
+       and MCHB~WERKS = TOOL_STOCK~WERKS
+       and MCHB~CHARG = TOOL_STOCK~CHARG
+       where ( CLABS ne 0 or
+               CSPEM ne 0 )
+      group by MCHB~MATNR, MCHB~WERKS, MCHB~CHARG, MCHB~LGORT
+      into table @data(LT_TOOL_STOCK).
+
+    if CT_REPAIR_INT is supplied.
+      loop at CT_REPAIR_INT assigning field-symbol(<S_REPAIR_INT>).
+        loop at LT_TOOL_STOCK into data(LS_TOOL_STOCK) where MATNR = <S_REPAIR_INT>-MATNR
+                                                         and WERKS = <S_REPAIR_INT>-WERKS
+                                                         and CHARG = <S_REPAIR_INT>-CHARG.
+          <S_REPAIR_INT>-LGORT = LS_TOOL_STOCK-LGORT.
+          <S_REPAIR_INT>-LABST = LS_TOOL_STOCK-LABST.
+          <S_REPAIR_INT>-SPEME = LS_TOOL_STOCK-SPEME.
+
+        endloop.
+      endloop.
+    else.
+      loop at CT_REPAIR_EXT assigning field-symbol(<S_REPAIR_EXT>).
+        loop at LT_TOOL_STOCK into LS_TOOL_STOCK where MATNR = <S_REPAIR_EXT>-MATNR
+                                                   and WERKS = <S_REPAIR_EXT>-WERKS
+                                                   and CHARG = <S_REPAIR_EXT>-CHARG.
+          <S_REPAIR_EXT>-LGORT = LS_TOOL_STOCK-LGORT.
+          <S_REPAIR_EXT>-LABST = LS_TOOL_STOCK-LABST.
+          <S_REPAIR_EXT>-SPEME = LS_TOOL_STOCK-SPEME.
+
+        endloop.
+      endloop.
+    endif.
+
+    if SY-SUBRC ne 0.
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                            IF_MSGID = 'ZVCXI_XCE_MM'
+                                            IF_MSGNO = '018' ).
+    endif.
+
+  endmethod.
+  method REORDER.
+
+    data(LT_REORDER) = IT_REORDER.
+
+*** Combines Reorder and Scrap Steps
+    loop at LT_REORDER assigning field-symbol(<S_REORDER>).
+      ME->R_LIFETIME->REORDER( exporting IT_REORDER = value #( ( MATNR       = <S_REORDER>-MATNR
+                                                                 WERKS       = <S_REORDER>-WERKS
+                                                                 VDATU       = <S_REORDER>-VDATU
+                                                                 TPRCE       = <S_REORDER>-TPRCE
+                                                                 TPRCE_KSTAR = <S_REORDER>-TPRCE_KSTAR
+                                                                 TDISC       = <S_REORDER>-TDISC
+                                                                 TDISC_KSTAR = <S_REORDER>-TDISC_KSTAR ) )
+                                changing CR_MSG     = CR_MSG ).
+      ME->R_LIFETIME->SCRAP( exporting IT_SCRAP = value #( ( MATNR   = <S_REORDER>-MATNR
+                                                             WERKS   = <S_REORDER>-WERKS
+                                                             CHARG   = <S_REORDER>-CHARG ) )
+                              changing CR_MSG  = CR_MSG ).
+
+  endloop.
+    endmethod.
+  method REPAIR_EXTERNAL.
+
+    data: LF_UMLGO type UMLGO.
+    data: LT_GMITEM     type table of BAPI2017_GM_ITEM_CREATE,
+          LT_REPAIR_EXT type ZVCXI_XCE_MM_TT_REPAIR_EXT.
+
+*** Get Tool Stock with Stock (Unrestricted & Blocked)
+    LT_REPAIR_EXT = IT_REPAIR_EXT.
+    ME->GET_TOOL_STOCK( exporting IT_TOOL_STOCK = corresponding #( LT_REPAIR_EXT )
+                        changing  CT_REPAIR_EXT = LT_REPAIR_EXT ).
+
+*** Collect Items
+    free: LT_GMITEM.
+    loop at LT_REPAIR_EXT into data(LS_REPAIR_EXT).
+***   If with Sales Order
+      if LS_REPAIR_EXT-WSO_X eq ABAP_TRUE.
+        ME->R_LIFETIME->CREATE_SDOC_TOOL( exporting IF_MATNR         = LS_REPAIR_EXT-MATNR
+                                                    IF_MATNR_SERVICE = ME->F_SERVICE_MATERIAL
+                                                    IS_TPRCE         = LS_REPAIR_EXT-S_TPRCE
+                                                    IF_WERKS         = LS_REPAIR_EXT-WERKS
+                                                    IF_VDATU         = LS_REPAIR_EXT-VDATU
+                                          importing ER_BOB_SDOC      = data(LR_BOB_SDOC)
+                                          changing  CR_MSG           = CR_MSG ).
+
+      endif.
+
+***   Create Purchase Order
+      ME->R_LIFETIME->CREATE_PURORD_TOOL( exporting IF_MATNR_SERVICE = ME->F_SERVICE_MATERIAL
+                                                    IF_MATNR         = LS_REPAIR_EXT-MATNR
+                                                    IF_WERKS         = LS_REPAIR_EXT-WERKS
+                                                    IF_BPREI         = LS_REPAIR_EXT-BPREI
+                                                    IF_KOSTL         = LS_REPAIR_EXT-KOSTL
+                                                    IF_LIFNR         = LS_REPAIR_EXT-LIFNR
+                                                    IF_EKORG         = LS_REPAIR_EXT-EKORG
+                                                    IF_VDATU         = LS_REPAIR_EXT-VDATU
+                                          changing  CR_MSG           = CR_MSG ).
+
+***   Get Storage Location
+      LF_UMLGO = ME->GET_SLOC( IF_WERKS = LS_REPAIR_EXT-WERKS
+                               IF_TSLOC = 'REPAIR_EXT' ).
+      if LS_REPAIR_EXT-LABST ne 0.
+        append lines of ZCL_VCXI_XCI_BOB_GOODSMVT=>PREPARE_GMITEM_BLOCK( IF_MATNR  = LS_REPAIR_EXT-MATNR
+                                                                         IF_WERKS  = LS_REPAIR_EXT-WERKS
+                                                                         IF_CHARG  = LS_REPAIR_EXT-CHARG
+                                                                         IF_LGORT  = LS_REPAIR_EXT-LGORT
+                                                                         IF_UMLGO  = LF_UMLGO
+                                                                         IF_ERFMG  = LS_REPAIR_EXT-LABST
+                                                                       ) to LT_GMITEM.
+
+      endif.
+      if LS_REPAIR_EXT-SPEME ne 0.
+        append value #( MOVE_TYPE      = '325'              "Transfer posting blocked stock to blocked stock within plant
+                        MATERIAL       = LS_REPAIR_EXT-MATNR
+                        PLANT          = LS_REPAIR_EXT-WERKS
+                        STGE_LOC       = LS_REPAIR_EXT-LGORT      MOVE_STLOC     = LF_UMLGO
+                        BATCH          = LS_REPAIR_EXT-CHARG      MOVE_BATCH     = LS_REPAIR_EXT-CHARG
+                        ENTRY_QNT      = LS_REPAIR_EXT-SPEME
+                        ENTRY_UOM      = 'ST'
+                      ) to LT_GMITEM.
+
+      endif.
+      clear LF_UMLGO.
+    endloop.
+
+*** Create Goods Movements
+    try.
+        data(LF_TESTRUN) = ABAP_FALSE.
+        ZCL_VCXI_XCI_BOB_GOODSMVT=>CREATE( exporting IF_BKTXT   = 'Tool External Repair'(001)
+                                                     IF_GMCODE  = ZCL_VCXI_XCI_BOB_GOODSMVT=>C_GMCODE_TRANSFER "Transfer
+                                                     IT_GMITEM  = LT_GMITEM
+                                                     IF_TESTRUN = LF_TESTRUN
+                                           changing  CR_MSG     = CR_MSG ).
+
+      catch /VCXI/CX_CKX into data(LR_CX_CKX).
+        CR_MSG->ADD_MESSAGE_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+    endtry.
+
+  endmethod.
+  method REPAIR_INTERNAL.
+
+    data: LF_UMLGO type UMLGO.
+    data: LT_GMITEM    type table of BAPI2017_GM_ITEM_CREATE,
+          LT_REPAIR_INT type ZVCXI_XCE_MM_TT_REPAIR_INT.
+
+*** Get Tool Stock with Stock (Unrestricted & Blocked)
+    LT_REPAIR_INT = IT_REPAIR_INT.
+    ME->GET_TOOL_STOCK( exporting IT_TOOL_STOCK = corresponding #( LT_REPAIR_INT )
+                        changing  CT_REPAIR_INT = LT_REPAIR_INT ).
+
+*** Collect Items
+    free: LT_GMITEM.
+    loop at LT_REPAIR_INT into data(LS_REPAIR_INT).
+***   If with Sales Order
+      if LS_REPAIR_INT-WSO_X eq ABAP_TRUE.
+        ME->R_LIFETIME->CREATE_SDOC_TOOL( exporting IF_MATNR         = LS_REPAIR_INT-MATNR
+                                                    IF_MATNR_SERVICE = ME->F_SERVICE_MATERIAL
+                                                    IS_TPRCE         = LS_REPAIR_INT-S_TPRCE
+                                                    IF_WERKS         = LS_REPAIR_INT-WERKS
+                                                    IF_VDATU         = LS_REPAIR_INT-VDATU
+                                          changing  CR_MSG           = CR_MSG ).
+
+      endif.
+
+***   Get Storage Location
+      LF_UMLGO = ME->GET_SLOC( IF_WERKS = LS_REPAIR_INT-WERKS
+                               IF_TSLOC  = 'REPAIR_INT' ).
+      if LS_REPAIR_INT-LABST ne 0.
+        append lines of ZCL_VCXI_XCI_BOB_GOODSMVT=>PREPARE_GMITEM_BLOCK( IF_MATNR  = LS_REPAIR_INT-MATNR
+                                                                         IF_WERKS  = LS_REPAIR_INT-WERKS
+                                                                         IF_CHARG  = LS_REPAIR_INT-CHARG
+                                                                         IF_LGORT  = LS_REPAIR_INT-LGORT
+                                                                         IF_UMLGO  = LF_UMLGO
+                                                                         IF_ERFMG  = LS_REPAIR_INT-LABST ) to LT_GMITEM.
+
+      endif.
+      if LS_REPAIR_INT-SPEME ne 0.
+        append value #( MOVE_TYPE      = '325'              "Transfer posting blocked stock to blocked stock within plant
+                        MATERIAL       = LS_REPAIR_INT-MATNR
+                        PLANT          = LS_REPAIR_INT-WERKS
+                        STGE_LOC       = LS_REPAIR_INT-LGORT      MOVE_STLOC     = LF_UMLGO
+                        BATCH          = LS_REPAIR_INT-CHARG      MOVE_BATCH     = LS_REPAIR_INT-CHARG
+                        ENTRY_QNT      = LS_REPAIR_INT-SPEME
+                        ENTRY_UOM      = 'ST'
+                      ) to LT_GMITEM.
+
+      endif.
+      clear LF_UMLGO.
+    endloop.
+
+*** Create Goods Movements
+    try.
+        data(LF_TESTRUN) = ABAP_FALSE.
+        ZCL_VCXI_XCI_BOB_GOODSMVT=>CREATE( exporting IF_BKTXT   = 'Tool Internal Repair'(002)
+                                                     IF_GMCODE  = ZCL_VCXI_XCI_BOB_GOODSMVT=>C_GMCODE_TRANSFER "Transfer
+                                                     IT_GMITEM  = LT_GMITEM
+                                                     IF_TESTRUN = LF_TESTRUN
+                                           changing  CR_MSG     = CR_MSG ).
+
+      catch /VCXI/CX_CKX into data(LR_CX_CKX).
+        CR_MSG->ADD_MESSAGE_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+    endtry.
+
+  endmethod.

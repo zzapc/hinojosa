@@ -1,0 +1,3022 @@
+***********************************************************************
+* TIPO : LISTADO
+* TITULO : Listado órdenes
+* *
+* DESCRIPCION : Listado órdenes
+*
+*
+* AUTOR: Andrés Picazo                                FECHA: 04/10/2013
+*
+* MODIFICACIONES
+*
+***********************************************************************
+REPORT zordenes.
+
+*------INCLUDES--------------------------------------------------------*
+
+*------TABLAS/ESTRUCTURAS----------------------------------------------*
+TABLES: caufvd, afpo, marc, mara, tj02t, tj30t, resb, stxh, rseg,
+        stpo,
+*        ztet_equipos,
+*        ztpp004, zaufk,
+        sscrfields, aufk, caufv,
+*        zresb_ord,
+*        zresb,
+*        zres_ordenes,
+*        *zresb_ord,
+        aufm,  jcds, mkpf,
+        t001w, mchb, mseg, crhd.
+
+DATA: zwhs_cola TYPE zwhs_cola.
+
+*------TABLAS INTERNAS-------------------------------------------------*
+INCLUDE zlistado_ordenes_datos.
+
+TYPES: BEGIN OF t_mov,
+         aufnr TYPE aufnr,
+         matnr TYPE matnr,
+         charg TYPE charg_d,
+         bwart TYPE bwart,
+         werks TYPE mseg-werks,
+         lgort TYPE mseg-lgort,
+         umwrk TYPE mseg-umwrk,
+         umlgo TYPE mseg-umlgo,
+         menge TYPE mseg-menge,
+         meins TYPE mseg-meins,
+         q,
+       END OF t_mov.
+__data_set_var mov.
+
+*TYPES: BEGIN OF t_lotes_aprov,
+*         mblnr         TYPE zresb-mblnr,
+*         mjahr         TYPE zresb-mjahr,
+*         charg         TYPE zresb-charg,
+*         menge         TYPE zresb-menge,
+*         meins         TYPE zresb-meins,
+*         erdat         TYPE zresb-erdat,
+*         erzet         TYPE zresb-erzet,
+*         ratio_abc(10),
+*         matnr         TYPE zresb-matnr,
+*       END OF t_lotes_aprov.
+*DATA i_lotes_aprov TYPE TABLE OF t_lotes_aprov.
+
+
+TYPES: BEGIN OF t_cons,
+         aufnr          TYPE aufnr,
+         matnr          TYPE matnr,
+         charg          TYPE charg_d,
+         werks          TYPE werks_d,
+         lgort          TYPE lgort_d,
+         fllegada       TYPE dats,
+         clabs          TYPE mchb-clabs,
+         cinsm          TYPE mchb-cinsm,
+         cspem          TYPE mchb-cspem,
+         meins          TYPE meins,
+         ico_candado(4),
+         menge          TYPE matbew-verbr,
+         rsnum          TYPE resb-rsnum,
+         rspos          TYPE resb-rspos,
+         orden_origen   TYPE aufnr,
+         fecha_origen   TYPE dats,
+         lgort_origen   TYPE afpo-lgort,
+         mensaje_origen TYPE zidmsg,
+         message        TYPE bapi_msg,
+       END OF t_cons.
+__data_set_var cons.
+
+RANGES r_bwart_cons FOR mseg-bwart.
+*----------------------------------------------------------------------*
+* CLASS lcl_alv DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv DEFINITION INHERITING FROM zcl_ap_alv_check.
+  PUBLIC SECTION.
+    METHODS: handle_double_click REDEFINITION.
+    METHODS: handle_user_command REDEFINITION.
+    METHODS: top_of_page REDEFINITION.
+ENDCLASS. "lcl_alv DEFINITION
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report DEFINITION INHERITING FROM zcl_ap_dev.
+  PUBLIC SECTION.
+    METHODS: main.
+
+    METHODS:  listado,
+      seleccionar_datos,
+      copia_orden IMPORTING aufnr     TYPE aufnr
+                  RETURNING VALUE(ok) TYPE abap_bool,
+      consumir.
+
+ENDCLASS.                    "REPORT DEFINITION
+
+
+*------VARIABLES-------------------------------------------------------*
+DATA: o_prog      TYPE REF TO zcl_report,
+      o_alv       TYPE REF TO lcl_alv,
+      o_grid_cons TYPE REF TO zcl_ap_alv_grid.
+
+*------PARAMETER/SELECT-OPTIONS EN PANTALLA----------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK 001 WITH FRAME.
+SELECT-OPTIONS: s_werks FOR marc-werks,
+                s_ftrmi FOR caufvd-ftrmi,
+                s_gstrs FOR caufvd-gstrs,
+                s_gstri FOR caufvd-gstri,
+                s_gstrp FOR caufvd-gstrp,
+                s_auart FOR caufvd-auart,
+                s_aufnr FOR caufvd-aufnr,
+                s_matnr FOR marc-matnr,
+                s_arbpl FOR crhd-arbpl,
+                s_bismt FOR mara-bismt,
+                s_charg FOR afpo-charg,
+                s_lgort FOR afpo-lgort,
+*                s_equipo FOR ztet_equipos-equipo,
+                s_verid  FOR afpo-verid,
+                s_status FOR tj02t-txt04 MATCHCODE OBJECT rman_prsp_systat,
+                s_stuser FOR tj30t-txt04 MATCHCODE OBJECT h_txt04,
+                s_dispo  FOR marc-dispo,
+                s_compo FOR stpo-idnrk.
+*                s_fpr_em FOR aufk-fpr_em.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS: p_comp   AS CHECKBOX USER-COMMAND com,
+            p_mstock AS CHECKBOX MODIF ID stk,
+            p_resval AS CHECKBOX,
+            p_kilos  AS CHECKBOX DEFAULT 'X',
+            p_valpor TYPE i NO-DISPLAY.
+
+*PARAMETERS: p_opera LIKE ztpp004-zzoperario.
+*            p_spro AS CHECKBOX.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS: p_vari LIKE disvariant-variant DEFAULT '/STD'.
+SELECTION-SCREEN END OF BLOCK 001.
+PARAMETERS: p_export NO-DISPLAY.
+SELECTION-SCREEN: FUNCTION KEY 2,
+                  FUNCTION KEY 3,
+                  FUNCTION KEY 4.
+
+
+************************************************************************
+*
+* LOGICA DEL PROGRAMA
+*
+************************************************************************
+
+*-------------------------------------------------- --------------------*
+* CLASS lcl_alv IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv IMPLEMENTATION.
+  METHOD handle_double_click.
+    DATA: r_bwart  TYPE RANGE OF bwart,
+          lr_bwart LIKE LINE OF r_bwart,
+          r_matnr  TYPE RANGE OF matnr,
+          lr_matnr LIKE LINE OF r_matnr.
+*    DATA: i_lotes_aprov_dev TYPE TABLE OF t_lotes_aprov,
+*          l_menge           TYPE zresb-menge.
+*    FIELD-SYMBOLS <aprov> TYPE t_lotes_aprov.
+
+    READ TABLE i_ordenes INDEX row INTO l_ordenes.
+    IF sy-subrc = 0.
+      CASE column.
+        WHEN 'TEXTO' OR 'TEXTO_ICO'.
+          zcl_ap_popup=>edit_text( EXPORTING display_mode = 'X'  CHANGING string = l_ordenes-texto ).
+        WHEN 'NOTA' OR 'NOTA_ICO'.
+          zcl_ap_popup=>edit_text( EXPORTING display_mode = 'X'  CHANGING string = l_ordenes-nota ).
+
+        WHEN 'GAMNG'.
+          SUBMIT zlist_notif
+            AND RETURN
+           WITH s_aufnr = l_ordenes-aufnr.
+
+        WHEN 'GMEIN' OR 'PORC' OR 'TOTAL'.
+          CLEAR lr_bwart.
+          lr_bwart-option = 'BT'.
+          lr_bwart-sign   = 'I'.
+          lr_bwart-low    = '101'.
+          lr_bwart-high   = '102'.
+          APPEND lr_bwart TO r_bwart.
+          lr_bwart-low    = '531'.
+          lr_bwart-high   = '532'.
+          APPEND lr_bwart TO r_bwart.
+          SUBMIT zlist_movs
+            AND RETURN
+           WITH s_aufnr = l_ordenes-aufnr
+           WITH s_bwart IN r_bwart.
+
+        WHEN 'GWEMG'.
+          SUBMIT zlist_movs
+            AND RETURN
+           WITH s_aufnr = l_ordenes-aufnr
+           WITH s_bwart BETWEEN '101' AND '102'.
+
+        WHEN 'RPR' OR 'RPR_NO'.
+          SUBMIT zlist_movs
+            AND RETURN
+           WITH s_aufnr = l_ordenes-aufnr
+           WITH s_bwart BETWEEN '531' AND '532'.
+
+        WHEN 'MATNR' OR 'LGORT' OR 'CHARG' OR 'MEINS' OR 'ENMNG' OR 'PORCC'.
+          IF l_ordenes-matnr IS INITIAL.
+            SUBMIT zlist_movs
+              AND RETURN
+             WITH s_aufnr = l_ordenes-aufnr
+*             WITH s_bwart BETWEEN '261' AND '262'.
+              WITH s_bwart IN r_bwart_cons.
+          ELSE.
+            IF l_ordenes-charg IS INITIAL.
+              SUBMIT zlist_movs
+                AND RETURN
+               WITH s_aufnr = l_ordenes-aufnr
+               WITH s_matnr = l_ordenes-matnr
+             WITH s_bwart BETWEEN '261' AND '262'.
+            ELSE.
+              SUBMIT zlist_movs
+                AND RETURN
+               WITH s_aufnr = l_ordenes-aufnr
+               WITH s_matnr = l_ordenes-matnr
+               WITH s_charg = l_ordenes-charg
+*             WITH s_bwart BETWEEN '261' AND '262'.
+              WITH s_bwart IN r_bwart_cons.
+            ENDIF.
+          ENDIF.
+        WHEN 'LIGHTS' OR 'ICONO_COMP' OR 'BDMNG'.
+          IF p_comp IS INITIAL.
+            SET PARAMETER ID 'Z_NO_VAR_DEF' FIELD 'X'.
+            SET PARAMETER ID 'ZORDENES_P' FIELD 'X'.
+            SUBMIT zordenes
+               AND RETURN
+               WITH s_werks IN s_werks
+              WITH s_gstrs IN s_gstrs
+              WITH s_gstrp IN s_gstrp
+              WITH s_aufnr = l_ordenes-aufnr
+              WITH p_comp  = 'X'
+              WITH p_resval = p_resval
+              WITH s_werks IN s_werks
+              WITH p_kilos = p_kilos.
+            SET PARAMETER ID 'Z_NO_VAR_DEF' FIELD ''.
+            SET PARAMETER ID 'ZORDENES_P' FIELD ''.
+          ELSE.
+            zcl_orden=>visualizar( l_ordenes-aufnr ).
+          ENDIF.
+
+*        WHEN 'APROVISIONADO'.
+*          CLEAR r_matnr.
+*          IF NOT l_ordenes-matnr IS INITIAL.
+*            lr_matnr-option = 'EQ'.
+*            lr_matnr-sign   = 'I'.
+*            lr_matnr-low    = l_ordenes-matnr.
+*            APPEND lr_matnr TO r_matnr.
+*          ENDIF.
+*
+*          SELECT * FROM zresb
+*            INTO CORRESPONDING FIELDS OF TABLE i_lotes_aprov
+*           WHERE aufnr = l_ordenes-aufnr
+*             AND matnr IN r_matnr
+*             AND loekz = ''
+*             AND origen = ''.
+*
+*          SELECT * FROM zresb
+*            INTO CORRESPONDING FIELDS OF TABLE i_lotes_aprov_dev
+*           WHERE aufnr = l_ordenes-aufnr
+*             AND matnr IN r_matnr
+*             AND loekz = 'X'
+*             AND origen = ''.
+*
+*
+*          LOOP AT i_lotes_aprov_dev ASSIGNING <aprov>.
+*
+*
+*            l_menge = - <aprov>-menge.
+*            READ TABLE i_lotes_aprov TRANSPORTING NO FIELDS WITH KEY charg = <aprov>-charg
+*                                                                     menge = l_menge.
+*            IF sy-subrc = 0.
+*              DELETE i_lotes_aprov INDEX sy-tabix.
+*              DELETE i_lotes_aprov_dev.
+*            ELSE.
+*              APPEND <aprov> TO i_lotes_aprov.
+*            ENDIF.
+*          ENDLOOP.
+**20170104MTEN Mostramos el ratio y el material
+*          LOOP AT i_lotes_aprov ASSIGNING <aprov>.
+*            <aprov>-ratio_abc = zcl_clas_lote=>get_ratioabc( matnr = <aprov>-matnr charg = <aprov>-charg ).
+*          ENDLOOP.
+*
+*          IF NOT i_lotes_aprov[] IS INITIAL.
+*            zcl_ap_alv=>show_popup_st( CHANGING t_tabla = i_lotes_aprov ).
+*          ENDIF.
+
+*        WHEN 'ICO_MONITOR'.
+*          SELECT SINGLE lgnum FROM zwm_log_procesos JOIN zwm_datos_idoc ON zwm_log_procesos~docnum = zwm_datos_idoc~docnum
+*            INTO @DATA(l_lgnum)
+*           WHERE aufnr = @l_ordenes-aufnr.
+*          IF sy-subrc = 0.
+*            DATA r_fecha TYPE RANGE OF sy-datum.
+*            SUBMIT zewm_monitor_procesos_ampliado
+*            AND RETURN
+*             WITH p_lgnum = l_lgnum
+*             WITH s_cpdat IN r_fecha
+*             WITH s_aufnr = l_ordenes-aufnr.
+*          ENDIF.
+
+        WHEN OTHERS.
+          zcl_orden=>visualizar( l_ordenes-aufnr ).
+      ENDCASE.
+    ENDIF.
+  ENDMETHOD. "handle_double_click
+  METHOD handle_user_command.
+    DATA: l_row TYPE i.
+    DATA: l_objkey       TYPE zwhs_cola-objkey,
+          l_cola         TYPE zwhs_cola,
+          l_hora         TYPE sy-uzeit,
+          l_string       TYPE string,
+          l_ok,
+          l_idcola       TYPE zidcola,
+          l_mensaje      TYPE bapi_msg,
+          l_titulo       TYPE string,
+          l_ctd          TYPE mengv13,
+*          i_zresb_ord    TYPE TABLE OF zresb_ord,
+          o_mov          TYPE REF TO zcl_ap_docmat,
+          l_mensaje_cerr TYPE string,
+          l_message      TYPE bapi_msg,
+          l_return,
+          l_dif          TYPE mengv13,
+          l_error.
+    __data_set_vart zwhs_cola.
+
+    SET PARAMETER ID 'Z_NO_VAR_DEF' FIELD 'X'.
+    CASE e_salv_function.
+      WHEN 'EXCEL'.
+        exportar_excel( ).
+
+*      WHEN 'VAL'.
+**        IF ztpp004 IS INITIAL.
+*        CLEAR zres_ordenes-motivo_abort.
+*        ztpp004-zzoperario = p_opera.
+*        zcl_ap_popup=>popup_usuario( EXPORTING campo1 = 'ZTPP004-ZZOPERARIO'
+**                                               campo2 = 'ZRES_ORDENES-MOTIVO_ABORT'
+*                                               titulo = 'Informe operario'
+*                                     IMPORTING return = l_return
+*                                     CHANGING  valor1 = ztpp004-zzoperario ).
+**                                               valor2 = zres_ordenes-motivo_abort ).
+**        ENDIF.
+**        IF l_return NE 'A' AND ( NOT ztpp004-zzoperario IS INITIAL OR NOT zres_ordenes-motivo_abort IS INITIAL ).
+*        IF l_return NE 'A'.
+*          SELECT SINGLE * FROM ztpp004
+*            INTO ztpp004
+*           WHERE zzoperario = ztpp004-zzoperario.
+*          IF sy-subrc NE 0 AND NOT ztpp004-zzoperario IS INITIAL.
+*            MESSAGE i398(00) WITH 'Operario' ztpp004-zzoperario 'incorrecto'.
+*            CLEAR ztpp004.
+*          ELSE.
+*
+*
+**            IF zres_ordenes-motivo_abort IS INITIAL.
+**              MESSAGE 'Informe motivo' TYPE 'I'.
+**            ELSE.
+*            p_opera = ztpp004-zzoperario.
+*            SET PARAMETER ID 'ZOPERARIO' FIELD p_opera.
+*            get_seleccion( ).
+*            LOOP AT i_ordenes ASSIGNING <ordenes> WHERE check = 'X'.
+*              IF <ordenes>-asttx CS 'VAL'.
+*                MESSAGE 'Orden ya está validada' TYPE 'I'.
+*                CONTINUE.
+*              ENDIF.
+*
+*              CLEAR zresb_ord.
+*              SELECT SUM( aprovisionado ) SUM( devuelto ) SUM( consumido ) FROM zresb_ord
+*                INTO (zresb_ord-aprovisionado, zresb_ord-devuelto, zresb_ord-consumido)
+*               WHERE aufnr = <ordenes>-aufnr.
+*              SUBTRACT zresb_ord-devuelto FROM zresb_ord-aprovisionado.
+*
+*              IF <ordenes>-asttx = 'ABOR'.
+*                IF zresb_ord-aprovisionado > zresb_ord-consumido AND zresb_ord-aprovisionado > 0.
+*                  MESSAGE 'No se puede validar orden abortada sin consumir stock aprovisionado' TYPE 'I'.
+*                  CONTINUE.
+*                ENDIF.
+*              ELSE.
+*                IF zresb_ord-aprovisionado > zresb_ord-consumido AND zresb_ord-aprovisionado > 0.
+*                  MESSAGE 'No se puede validar orden sin consumir stock aprovisionado' TYPE 'I'.
+*                  CONTINUE.
+*                ENDIF.
+*              ENDIF.
+*
+*              l_ok =  'X'.
+*
+*              IF l_ok = 'X'.
+*                SELECT SINGLE * FROM zwhs_cola
+*                  INTO zwhs_cola
+*                 WHERE idcliente = 'TET'
+*                   AND estado    = 'E'
+*                   AND aufnr     = <ordenes>-aufnr.
+*                IF sy-subrc = 0.
+** APC2010611
+*                  l_string = zcl_ap_utils=>concat( p1 = 'Orden' p2 = <ordenes>-aufnr p3 = 'contiene mensajes erróneos' ).
+**                  l_ok = zcl_ap_popup=>confirmar( texto = l_string texto2 = '¿Está seguro de querere continuar?' ).
+*                  CLEAR l_ok.
+*                  MESSAGE l_string TYPE 'I'.
+*                ENDIF.
+*
+** Validar una orden que tenga materiales aprovisionables no aprovisionados:
+*                IF l_ok = 'X' .
+*                  IF <ordenes>-nota IS INITIAL.
+*                    l_mensaje = zcl_orden=>val_aprov( aufnr = <ordenes>-aufnr ).
+*                    IF NOT l_mensaje IS INITIAL.
+*                      MESSAGE l_mensaje TYPE 'I'.
+*                      CLEAR l_ok.
+*                    ENDIF.
+*                  ENDIF.
+*                ENDIF.
+*
+*                IF l_ok = 'X'.
+*                  IF NOT <ordenes>-sttxt CS 'CTEC'.
+*                    IF <ordenes>-auart = 'ZP01'.
+*                      IF zcl_ap_popup=>confirmar( texto = '¿Desea cerrar técnicamente la orden de envasado?' ) = 'X'.
+*                        <ordenes>-message = zcl_ap_orden_pp=>cerrar_tecnicamente( <ordenes>-aufnr ).
+*                        IF <ordenes>-message(1) = '>' OR <ordenes>-message IS INITIAL.
+*                          <ordenes>-lights = zcl_ap_alv=>c_sem_verde.
+*                          <ordenes>-message = <ordenes>-message+1.
+*                        ELSE.
+*                          CLEAR l_ok.
+*                          <ordenes>-lights = zcl_ap_alv=>c_sem_rojo.
+*                          CONTINUE.
+*                        ENDIF.
+*                      ENDIF.
+*                    ELSE.
+*                      <ordenes>-message = zcl_ap_orden_pp=>cerrar_tecnicamente( <ordenes>-aufnr ).
+*                      IF <ordenes>-message(1) = '>' OR <ordenes>-message IS INITIAL.
+*                        <ordenes>-lights = zcl_ap_alv=>c_sem_verde.
+*                        <ordenes>-message = <ordenes>-message+1.
+*                      ELSE.
+*                        CLEAR l_ok.
+*                        <ordenes>-lights = zcl_ap_alv=>c_sem_rojo.
+*                        CONTINUE.
+*                      ENDIF.
+*                    ENDIF.
+*                  ENDIF.
+*                ENDIF.
+*
+*                IF l_ok = 'X'.
+*                  IF zcl_orden=>es_ord_preparacion( <ordenes>-auart ) = 'X' OR zcl_orden=>es_ord_dilucion( <ordenes>-auart ) = 'X'.
+*                    IF zcl_orden=>tiene_liquidacion( <ordenes>-aufnr ) = ''.
+*                      DATA o_bi TYPE REF TO zcl_ap_batch_input.
+*                      IF zcl_dafsa=>werks IN s_werks.
+*                        SET PARAMETER ID 'CAC' FIELD zcl_dafsa=>kokrs.
+*                      ENDIF.
+*                      CREATE OBJECT o_bi.
+*
+*                      o_bi->inicio( ).
+*
+** Usamos el periodo de la fecha de primera entrada de mercancía (si estuviera en blanco, la del sistema)
+*                      IF <ordenes>-fpr_em IS INITIAL.
+*                        <ordenes>-fpr_em = sy-datum.
+*                      ENDIF.
+*
+** Request Screen for All Settlement Transactions
+*                      o_bi->dynpro( program = 'SAPLKO71' dynpro = '1000').
+*                      o_bi->campos( campo = 'BDC_OKCODE' valor = '=AUSF').
+*                      o_bi->campos( campo = 'LKO74-PERIO' valor = <ordenes>-fpr_em+4(2) ). " Período liquidación
+*                      o_bi->campos( campo = 'LKO74-BUPERIO' valor = <ordenes>-fpr_em+4(2) ). " Período contable
+*                      o_bi->campos( campo = 'LKO74-GJAHR' valor = <ordenes>-fpr_em(4) ). " Ejercicio
+*                      o_bi->campos( campo = 'LKO74-VAART' valor = '1'). " Liquidación CO: Forma de proceso
+*                      o_bi->campos( campo = 'LKO74-TESTLAUF' valor = ''). " Efectuar ejecución test
+*                      o_bi->campos( campo = 'CODIA-AUFNR' valor = <ordenes>-aufnr ). " Número de orden
+*
+*                      l_message = o_bi->llamar_transaccion( tcode = 'KO88' modo = 'A' ).
+*
+*                      IF zcl_orden=>tiene_liquidacion( <ordenes>-aufnr ) = ''.
+*                        l_error = 'X'.
+*                        CLEAR l_ok.
+*                        IF l_message IS INITIAL.
+*                          MESSAGE 'Grabe primero norma de liquidación' TYPE 'I'.
+*                        ELSE.
+*                          __concat2 l_message 'Error grabando norma de liquidación' l_message.
+*                          MESSAGE l_message TYPE 'I'.
+*                        ENDIF.
+*                        CONTINUE.
+*                      ENDIF.
+*                    ENDIF.
+*                  ENDIF.
+*                ENDIF.
+*
+*                IF l_ok = 'X'.
+*                  <ordenes>-message = zcl_ap_orden_pp=>cambia_status_usuario( aufnr = <ordenes>-aufnr status = 'VAL' ).
+*                  IF <ordenes>-message(1) = '>' OR <ordenes>-message IS INITIAL.
+*                    <ordenes>-lights = zcl_ap_alv=>c_sem_verde.
+*                    <ordenes>-message = <ordenes>-message+1.
+*                    SELECT SINGLE * FROM zaufk
+*                      INTO zaufk
+*                     WHERE aufnr = <ordenes>-aufnr.
+*                    IF sy-subrc = 0.
+*                      UPDATE zaufk
+*                         SET operario = ztpp004-zzoperario
+*                       WHERE aufnr = <ordenes>-aufnr.
+*                    ELSE.
+*                      CLEAR zaufk.
+*                      zaufk-aufnr = <ordenes>-aufnr.
+*                      zaufk-operario = ztpp004-zzoperario.
+*                      INSERT zaufk FROM zaufk.
+*                    ENDIF.
+*
+*                    IF NOT zres_ordenes-motivo_abort IS INITIAL.
+*                      UPDATE zres_ordenes
+*                         SET motivo_abort   = zres_ordenes-motivo_abort
+*                             operario_abort = ztpp004-zzoperario
+*                       WHERE aufnr = <ordenes>-aufnr.
+*                      IF sy-subrc NE 0.
+*                        MOVE-CORRESPONDING <ordenes> TO zres_ordenes.
+*                        zres_ordenes-operario_abort = ztpp004-zzoperario.
+*                        INSERT zres_ordenes FROM zres_ordenes.
+*                      ENDIF.
+*                    ENDIF.
+*
+** APC20150930 Si la orden es de gazpacho enviamos mensaje PPR
+*                    IF zcl_orden=>es_ord_dilucion( <ordenes>-auart ) = 'X'.
+*                      SELECT SINGLE * FROM caufv
+*                        INTO caufv
+*                       WHERE aufnr = <ordenes>-aufnr
+*                         AND dispo = 'Z10'.
+*                      IF sy-subrc = 0.
+*                        SELECT SINGLE * FROM zwhs_cola
+*                          INTO zwhs_cola
+*                         WHERE idcliente = 'TET'
+*                           AND idmsg     = 'PPR'
+*                           AND aufnr     = <ordenes>-aufnr.
+*                        IF sy-subrc NE 0.
+*                          zwhs=>genera_msg( EXPORTING idmsg   = 'PPR'
+*                                                      objkey  = <ordenes>-aufnr
+*                                            IMPORTING idcola  = l_idcola
+*                                                      mensaje = l_mensaje  ).
+*                          IF l_idcola IS INITIAL AND NOT l_mensaje IS INITIAL.
+*                            MESSAGE i398(00) WITH 'Error al envia mensaje PPR' l_mensaje(40) l_mensaje+40(40) l_mensaje+80(40).
+*                          ENDIF.
+*                        ENDIF.
+*                      ENDIF.
+*                    ENDIF.
+*
+** APC20180104 Marcamos los posibles mensajes con errores de la orden como procesados
+*                    SELECT * FROM zwhs_cola
+*                      INTO TABLE i_zwhs_cola
+*                     WHERE idcliente = 'TET'
+*                       AND aufnr     = <ordenes>-aufnr
+*                       AND estado    = 'E'
+*                       AND idmsg    NE 'PTS'.
+*                    LOOP AT i_zwhs_cola ASSIGNING <zwhs_cola>.
+*                      UPDATE zwhs_cola
+*                         SET estado = 'X'
+*                       WHERE idcola = <zwhs_cola>-idcola.
+*                      IF sy-subrc = 0.
+*                        zwhs=>inserta_log( idcola = <zwhs_cola>-idcola tipo = 'W' mensaje = 'Marcamos mensaje como procesado al validar desde ZORDENES' ).
+*                      ENDIF.
+*                    ENDLOOP.
+*                  ELSE.
+*                    <ordenes>-lights = zcl_ap_alv=>c_sem_rojo.
+*                    CLEAR l_ok.
+*                  ENDIF.
+*                ENDIF.
+*              ENDIF.
+*            ENDLOOP.
+*
+*            LOOP AT i_ordenes ASSIGNING <ordenes> WHERE check = 'X'.
+*              <ordenes>-sttxt = zcl_orden=>get_status_st( <ordenes>-aufnr ).
+*              <ordenes>-asttx = zcl_orden=>get_status_st( aufnr = <ordenes>-aufnr usuario = 'X' ).
+*            ENDLOOP.
+*            refresh(   ).
+*
+*          ENDIF.
+*
+*
+*        ENDIF.
+
+*      WHEN 'BORRAR'.
+*
+*        get_seleccion( ).
+*        LOOP AT i_ordenes ASSIGNING <ordenes> WHERE check = 'X'.
+*          IF <ordenes>-asttx CS 'BORR'.
+*            MESSAGE 'Orden ya borrada previamente' TYPE 'I'.
+*          ELSE.
+*            SELECT SUM( aprovisionado ) SUM( devuelto ) FROM zresb_ord
+*              INTO (zresb_ord-aprovisionado, zresb_ord-devuelto)
+*             WHERE aufnr = <ordenes>-aufnr.
+*            SUBTRACT zresb_ord-devuelto FROM zresb_ord-aprovisionado.
+*            IF zresb_ord-aprovisionado > 0.
+*              MESSAGE 'Anule aprovisionamientos antes de anular orden' TYPE 'I'.
+*            ELSE.
+*              CLEAR zres_ordenes.
+*              zres_ordenes-operario_borr = p_opera.
+*              zcl_ap_popup=>popup_usuario( EXPORTING campo1 = 'ZRES_ORDENES-OPERARIO_BORR'
+*                                                     campo2 = 'ZRES_ORDENES-MOTIVO_BORR'
+*                                                     titulo = 'Informe operario y motivo'
+*                                           IMPORTING return = l_return
+*                                           CHANGING  valor1 = zres_ordenes-operario_borr
+*                                                     valor2 = zres_ordenes-motivo_borr ).
+*              IF l_return NE 'A'.
+*                IF zres_ordenes-operario_borr IS INITIAL OR zres_ordenes-motivo_borr IS INITIAL.
+*                  MESSAGE 'Informe motivo y operario' TYPE 'I'.
+*                ELSE.
+*                  p_opera = zres_ordenes-operario_borr.
+*                  SET PARAMETER ID 'ZOPERARIO' FIELD p_opera.
+*                  IF o_prog->copia_orden( <ordenes>-aufnr ) = 'X'.
+*                    l_hora = sy-uzeit.
+*                    <ordenes>-message = zcl_ap_orden_pp=>cambia_status_usuario( aufnr = <ordenes>-aufnr status = 'BORR' ).
+*                    IF <ordenes>-message(1) = '>' OR <ordenes>-message IS INITIAL.
+*                      zcl_ap_orden_pp=>cerrar_tecnicamente( aufnr = <ordenes>-aufnr ).
+*                      <ordenes>-lights = zcl_ap_alv=>c_sem_verde.
+*                      <ordenes>-message = <ordenes>-message+1.
+*                      <ordenes>-asttx = 'BORR'.
+*
+*                      IF NOT zres_ordenes-motivo_borr IS INITIAL.
+*                        UPDATE zres_ordenes
+*                           SET motivo_borr   = zres_ordenes-motivo_borr
+*                               operario_borr = zres_ordenes-operario_borr
+*                         WHERE aufnr = <ordenes>-aufnr.
+*                        IF sy-subrc NE 0.
+*                          MOVE-CORRESPONDING <ordenes> TO zres_ordenes.
+*                          INSERT zres_ordenes FROM zres_ordenes.
+*                        ENDIF.
+*                      ENDIF.
+*
+*                      WAIT UP TO 2 SECONDS.
+*                      CONCATENATE <ordenes>-aufnr '$DELETE' INTO l_objkey.
+*                      SELECT SINGLE * FROM zwhs_cola
+*                        INTO l_cola
+*                       WHERE objkey = l_objkey
+*                         AND idmsg  = 'PSC'
+*                         AND fecha_creacion = sy-datum
+*                         AND hora_creacion >= l_hora.
+*                      IF sy-subrc NE 0.
+*                        CALL FUNCTION 'Z_WHS_GENERA_MENSAJE'
+*                          EXPORTING
+*                            idmsg  = 'PSC'
+*                            objkey = l_objkey.
+*
+*                      ENDIF.
+*                    ELSE.
+*                      <ordenes>-lights = zcl_ap_alv=>c_sem_rojo.
+*                    ENDIF.
+*                  ENDIF.
+*                ENDIF.
+*              ENDIF.
+*            ENDIF.
+*          ENDIF.
+*        ENDLOOP.
+*        refresh( ).
+
+      WHEN 'CIERRE'.
+        get_seleccion( ).
+        LOOP AT i_ordenes ASSIGNING <ordenes> WHERE check = 'X'.
+
+          l_ok =  'X'.
+
+          IF l_ok = 'X'.
+            SELECT SINGLE * FROM zwhs_cola
+              INTO zwhs_cola
+             WHERE idcliente = 'TET'
+               AND estado    = 'E'
+               AND aufnr     = <ordenes>-aufnr.
+            IF sy-subrc = 0.
+              l_string = zcl_ap_utils=>concat( p1 = 'Orden' p2 = <ordenes>-aufnr p3 = 'contiene mensajes erróneos' ).
+              l_ok = zcl_ap_popup=>confirmar( texto = l_string texto2 = '¿Está seguro de querere continuar?' ).
+            ENDIF.
+
+            IF l_ok = 'X'.
+              <ordenes>-message = zcl_ap_orden_pp=>cerrar_tecnicamente( <ordenes>-aufnr ).
+              IF <ordenes>-message(1) = '>' OR <ordenes>-message IS INITIAL.
+                <ordenes>-lights = zcl_ap_alv=>c_sem_verde.
+                <ordenes>-message = <ordenes>-message+1.
+              ELSE.
+                <ordenes>-lights = zcl_ap_alv=>c_sem_rojo.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+        refresh( ).
+
+      WHEN 'COR2'.
+
+        l_row = get_fila_activa( ).
+
+        READ TABLE i_ordenes ASSIGNING <ordenes> INDEX l_row.
+        IF sy-subrc = 0.
+          zcl_ap_orden_pp=>visualizar( aufnr = <ordenes>-aufnr editar = 'X' ).
+        ENDIF.
+
+*      WHEN 'APROV_CERT'.
+*        LOOP AT i_ordenes ASSIGNING <ordenes> WHERE asttx = 'VAL'.
+*          SELECT SINGLE * FROM zresb_ord
+*            INTO zresb_ord
+*           WHERE aufnr = <ordenes>-aufnr
+*             AND matnr = <ordenes>-matnr
+*             AND charg = <ordenes>-charg
+*             AND cerrado = ''.
+*          IF sy-subrc = 0.
+*            l_dif = zresb_ord-aprovisionado - zresb_ord-consumido - zresb_ord-devuelto.
+*            IF l_dif > 0.
+*              l_string = zcl_ap_utils=>concat( p1 = 'No se puede cerrar' p2 = <ordenes>-aufnr p3 = 'lote' p4 = <ordenes>-matnr p5 = <ordenes>-charg
+*                                               p6 = 'porque quedan por consumir' p7 = l_dif p8 = <ordenes>-meins p9 = 'aprovisionados previamente' ).
+*              MESSAGE l_string TYPE 'I'.
+*              CONTINUE.
+*            ENDIF.
+*          ENDIF.
+*
+*          UPDATE zresb_ord
+*             SET cerrado = 'X'
+*           WHERE aufnr = <ordenes>-aufnr
+*             AND matnr = <ordenes>-matnr
+*             AND charg = <ordenes>-charg
+*             AND cerrado = ''.
+*          <ordenes>-cerrado = 'X'.
+*        ENDLOOP.
+*        IF sy-subrc NE 0.
+*          MESSAGE 'No hay ninguna orden en estado VAL' TYPE 'I'.
+*        ELSE.
+*          MESSAGE 'Se han marcado como cerrado el aprovisionamiento de las ordenes' TYPE 'I'.
+*        ENDIF.
+
+*      WHEN 'ZSTOCKS' OR 'APROV_CONS' OR 'APROV_DEV' OR 'APROV_CERR'.
+*        DATA: r_lgort  TYPE RANGE OF lgort_d,
+*              lr_lgort LIKE LINE OF r_lgort,
+*              r_matnr  TYPE RANGE OF matnr,
+*              lr_matnr LIKE LINE OF r_matnr.
+*
+*        IF '0026' IN s_werks.
+*          CLEAR lr_lgort.
+*          lr_lgort-option = 'CP'.
+*          lr_lgort-sign ='I'.
+*          lr_lgort-low = '5*'.
+*          APPEND lr_lgort TO r_lgort.
+*          lr_lgort-low = 'TK99'.
+*          APPEND lr_lgort TO r_lgort.
+*        ENDIF.
+*
+*        IF p_comp IS INITIAL.
+*          MESSAGE 'Seleccione desglose por componentes' TYPE 'I'.
+*        ELSE.
+*          get_seleccion( ).
+*          CLEAR i_mov.
+*          LOOP AT i_ordenes ASSIGNING <ordenes> WHERE check = 'X'.
+*            zcl_orden=>update_zresb_ord( aufnr = <ordenes>-aufnr matnr = <ordenes>-matnr charg = <ordenes>-charg ).
+*
+*            IF e_salv_function = 'ZSTOCKS'.
+*              CLEAR lr_matnr.
+*              lr_matnr-option = 'EQ'.
+*              lr_matnr-sign   = 'I'.
+*              lr_matnr-low    = <ordenes>-matnr.
+*              COLLECT lr_matnr INTO r_matnr.
+*            ELSEIF e_salv_function = 'APROV_CERR'.
+**              IF <ordenes>-asttx = 'VAL'.
+*              IF NOT <ordenes>-charg IS INITIAL.
+*                SELECT SINGLE * FROM zresb_ord
+*                  INTO zresb_ord
+*                 WHERE aufnr = <ordenes>-aufnr
+*                   AND matnr = <ordenes>-matnr
+*                   AND charg = <ordenes>-charg
+*                   AND cerrado = ''.
+*              ELSE.
+*                SELECT SUM( aprovisionado ) SUM( consumido ) SUM( devuelto ) FROM zresb_ord
+*                  INTO (zresb_ord-aprovisionado, zresb_ord-consumido, zresb_ord-devuelto)
+*                 WHERE aufnr = <ordenes>-aufnr
+*                   AND matnr = <ordenes>-matnr
+*                   AND cerrado = ''.
+*              ENDIF.
+*              IF sy-subrc = 0.
+*                l_dif = zresb_ord-aprovisionado - zresb_ord-consumido - zresb_ord-devuelto.
+*                IF l_dif > 0.
+*                  l_string = zcl_ap_utils=>concat( p1 = 'No se puede cerrar' p2 = <ordenes>-aufnr p3 = 'lote' p4 = <ordenes>-matnr p5 = <ordenes>-charg
+*                                                   p6 = 'porque quedan por consumir' p7 = l_dif p8 = <ordenes>-meins p9 = 'aprovisionados previamente' ).
+*                  MESSAGE l_string TYPE 'I'.
+*                  CONTINUE.
+*                ENDIF.
+*              ENDIF.
+*
+*              IF <ordenes>-charg IS INITIAL.
+*                UPDATE zresb_ord
+*                   SET cerrado = 'X'
+*                 WHERE aufnr = <ordenes>-aufnr
+*                   AND matnr = <ordenes>-matnr
+*                   AND cerrado = ''.
+*              ELSE.
+*                UPDATE zresb_ord
+*                   SET cerrado = 'X'
+*                 WHERE aufnr = <ordenes>-aufnr
+*                   AND matnr = <ordenes>-matnr
+*                   AND charg = <ordenes>-charg
+*                   AND cerrado = ''.
+*              ENDIF.
+*              <ordenes>-cerrado = 'X'.
+*              IF l_mensaje_cerr IS INITIAL.
+*                l_mensaje_cerr = 'Se marca la selección como cerradas para aprovisonamiento'.
+*              ENDIF.
+**              ELSE.
+**                l_mensaje_cerr = 'No se marcan como cerradas ordenes no VAL'.
+**              ENDIF.
+*            ELSE.
+*              IF <ordenes>-aprovisionado > 0.
+*                IF <ordenes>-charg IS INITIAL.
+*                  SELECT * FROM zresb_ord
+*                    INTO TABLE i_zresb_ord
+*                   WHERE aufnr = <ordenes>-aufnr
+*                     AND matnr = <ordenes>-matnr
+*                    AND cerrado = ''.
+*                ELSE.
+*                  SELECT * FROM zresb_ord
+*                    INTO TABLE i_zresb_ord
+*                   WHERE aufnr = <ordenes>-aufnr
+*                     AND matnr = <ordenes>-matnr
+*                     AND charg = <ordenes>-charg
+*                     AND cerrado = ''.
+*                ENDIF.
+*
+*                LOOP AT i_zresb_ord INTO zresb_ord.
+*                  CLEAR l_mov.
+*                  l_ctd = zresb_ord-aprovisionado - ( zresb_ord-consumido + zresb_ord-devuelto ).
+*                  MOVE-CORRESPONDING zresb_ord TO l_mov.
+*                  l_mov-menge = abs( l_ctd ).
+*                  SELECT SINGLE bestq FROM zresb
+*                    INTO l_mov-q
+*                   WHERE aufnr = l_mov-aufnr
+*                     AND matnr = l_mov-matnr
+*                     AND charg = l_mov-charg
+*                     AND bestq = 'Q'
+*                     AND mjahr = '9999'.
+*                  IF l_ctd NE 0.
+*                    IF l_ctd > 0.
+*                      IF e_salv_function = 'APROV_CONS'.
+*                        l_mov-bwart = '261'.
+*                        l_mov-lgort = zcl_dafsa=>alm_aprov.
+*                      ELSE.
+*                        l_mov-bwart = '311'.
+*                        l_mov-lgort = zcl_dafsa=>alm_aprov.
+*                        l_mov-umwrk = zcl_dafsa=>werks.
+*                        l_mov-umlgo = zcl_dafsa=>alm_mp.
+*                      ENDIF.
+*                      APPEND l_mov TO i_mov.
+*                    ELSE.
+**APC20160107 Sólo hacemos esto si existe cantidad aprovisionada
+*                      IF e_salv_function = 'APROV_CONS'.
+**                        l_mov-bwart = '262'.
+**                        l_mov-lgort = '5109'.
+*                        MESSAGE 'No hay nada que consumir' TYPE 'I'.
+*                      ELSE.
+**                        l_mov-bwart = '311'.
+**                        l_mov-lgort = '5101'.
+**                        l_mov-umwrk = '1010'.
+**                        l_mov-umlgo = '5109'.
+*                        MESSAGE 'No hay nada que devolver' TYPE 'I'.
+*                      ENDIF.
+**                      APPEND l_mov TO i_mov.
+*                    ENDIF.
+*                  ENDIF.
+*                ENDLOOP.
+*              ENDIF.
+*            ENDIF.
+*          ENDLOOP.
+*          IF sy-subrc = 0.
+*            IF e_salv_function = 'ZSTOCKS'.
+*              SUBMIT zstocks
+*                AND RETURN
+*               WITH s_matnr IN r_matnr
+**               WITH s_werks = zcl_dafsa=>werks.
+*               WITH s_werks IN s_werks.
+**               WITH s_lgort IN r_lgort.
+*            ELSEIF e_salv_function = 'APROV_CERR'.
+*              IF NOT l_mensaje_cerr IS INITIAL.
+*                MESSAGE l_mensaje_cerr TYPE 'I'.
+*              ENDIF.
+*            ELSE.
+*              IF i_mov IS INITIAL.
+*                MESSAGE 'No hay datos aprovisionamiento pendiente' TYPE 'I'.
+*              ELSE.
+*                IF e_salv_function = 'APROV_CONS'.
+*                  l_titulo = 'Consumos'.
+*                  l_string = 'Se va consumir el exceso de aprovisionamiento'.
+*                ELSE.
+*                  l_titulo = 'Devolución'.
+*                  l_string = 'Se va devolver el exceso de aprovisionamiento'.
+*                ENDIF.
+*                CLEAR l_ok.
+*                CALL FUNCTION 'Z_POPUP_ALV'
+*                  EXPORTING
+*                    titulo  = l_titulo
+*                    texto   = l_string
+*                    ancho   = 90
+*                    alto    = 14
+*                  IMPORTING
+*                    ok      = l_ok
+*                  TABLES
+*                    t_datos = i_mov.
+*                IF l_ok = 'X'.
+*                  CREATE OBJECT o_mov.
+*                  __concat3 l_titulo l_titulo 'Orden' <ordenes>-aufnr.
+*
+*                  o_mov->set_cabecera( budat = sy-datum
+*                                       bldat = sy-datum
+*                                       xblnr = 'ZORDENES'
+*                                       bktxt = l_titulo ).
+*
+*                  IF e_salv_function NE 'APROV_CONS'.
+*                    LOOP AT i_mov INTO l_mov WHERE q = 'Q'.
+*                      DELETE FROM zresb
+*                       WHERE aufnr = l_mov-aufnr
+*                         AND matnr = l_mov-matnr
+*                         AND charg = l_mov-charg
+*                         AND mjahr = '9999'
+*                         AND bestq = 'Q'.
+*                      DELETE i_mov.
+*                      zcl_orden=>update_zresb_ord( aufnr = l_mov-aufnr matnr = l_mov-matnr charg = l_mov-charg ).
+*                    ENDLOOP.
+*                  ENDIF.
+*
+*                  IF i_mov IS INITIAL.
+*                    zcl_orden=>update_zresb_ord( aufnr = zresb-aufnr matnr = zresb-matnr charg = zresb-charg ).
+*                  ELSE.
+*                    LOOP AT i_mov INTO l_mov.
+*
+*                      IF l_mov-bwart(1) = '3'.
+*                        CLEAR: resb, l_mov-aufnr.
+*                      ELSE.
+*                        SELECT SINGLE * FROM resb
+*                          INTO resb
+*                         WHERE aufnr = l_mov-aufnr
+*                           AND matnr = l_mov-matnr
+*                           AND charg = l_mov-charg.
+*                        IF sy-subrc NE 0.
+*                          SELECT SINGLE * FROM resb
+*                            INTO resb
+*                           WHERE aufnr = l_mov-aufnr
+*                             AND matnr = l_mov-matnr
+*                             AND charg = ''.
+*                        ENDIF.
+*                      ENDIF.
+*
+*                      IF l_mov IS INITIAL.
+*                        SELECT SINGLE werks FROM aufk
+*                          INTO l_mov-werks
+*                         WHERE aufnr = l_mov-aufnr.
+*                      ENDIF.
+*
+*                      o_mov->set_posicion( bwart       = l_mov-bwart
+**INI S4 Nota 2215424 APALACIOS 26.11.2018
+**                                           matnr       = l_mov-matnr
+*                                           matnr       = CONV zcl_ap_material=>tt_matnr( l_mov-matnr )
+**FIN S4 Nota 2215424 APALACIOS 26.11.2018
+*                                           menge       = l_mov-menge
+*                                           meins       = l_mov-meins
+**                                           werks       = zcl_dafsa=>werks
+*                                           werks       = l_mov-werks
+*                                           lgort       = l_mov-lgort
+*                                           charg       = l_mov-charg
+*                                           aufnr       = l_mov-aufnr
+*                                           rsnum       = resb-rsnum
+*                                           rspos       = resb-rspos
+*                                           umwrk       = l_mov-umwrk
+*                                           umlgo       = l_mov-umlgo
+*                                           ).
+*                    ENDLOOP.
+*
+*                    o_mov->crea_doc_camb_reserva( IMPORTING mblnr            = mkpf-mblnr
+*                                               mjahr            = mkpf-mjahr ).
+*
+*
+*                    IF mkpf-mblnr IS INITIAL.
+*                      MESSAGE o_mov->mensaje TYPE 'I'.
+*                      MESSAGE i398(00) WITH 'Se ha procesado el exceso aprovisionamiento'.
+*                    ELSE.
+*                      LOOP AT i_mov INTO l_mov.
+*                        CLEAR zresb.
+*                        SELECT SINGLE * FROM resb
+*                          INTO resb
+*                         WHERE aufnr = l_mov-aufnr
+*                           AND matnr = l_mov-matnr
+*                           AND charg = l_mov-charg.
+*                        IF sy-subrc NE 0.
+*                          SELECT SINGLE * FROM resb
+*                            INTO resb
+*                           WHERE aufnr = l_mov-aufnr
+*                             AND matnr = l_mov-matnr
+*                             AND charg = ''.
+*                        ENDIF.
+*                        zresb-aufnr = l_mov-aufnr.
+*                        zresb-rsnum = resb-rsnum.
+*                        zresb-rspos = resb-rspos.
+*                        zresb-mblnr = mkpf-mblnr.
+*                        zresb-mjahr = mkpf-mjahr.
+*                        zresb-tabix = sy-tabix.
+*                        zresb-matnr = l_mov-matnr.
+*                        zresb-charg = l_mov-charg.
+*                        zresb-menge = l_mov-menge.
+*                        zresb-meins = l_mov-meins.
+*                        IF l_mov-bwart = '262'.
+*                          zresb-loekz = 'X'.
+*                        ENDIF.
+*                        zresb-erdat = sy-datum.
+*                        zresb-erzet = sy-uzeit.
+*                        IF e_salv_function = 'APROV_CONS'.
+*                          zresb-origen = 'R'.
+*                        ELSE.
+*                          zresb-origen = 'D'.
+*                        ENDIF.
+*                        INSERT zresb FROM zresb.
+*
+*                        zcl_orden=>update_zresb_ord( aufnr = zresb-aufnr matnr = zresb-matnr charg = zresb-charg ).
+*
+*
+*                        UPDATE zresb_ord
+*                           SET cerrado = 'X'
+*                         WHERE aufnr  = l_mov-aufnr
+*                           AND matnr  = l_mov-matnr
+*                           AND matnr  = l_mov-matnr
+*                           AND charg  = l_mov-charg.
+*                      ENDLOOP.
+*
+*                      MESSAGE i398(00) WITH 'Se creado mov.' mkpf-mblnr mkpf-mjahr.
+*                    ENDIF.
+*                  ENDIF.
+*                ENDIF.
+*              ENDIF.
+*            ENDIF.
+*          ELSE.
+*            MESSAGE 'Seleccione algún registro' TYPE 'I'.
+*          ENDIF.
+*        ENDIF.
+
+*      WHEN 'MONITOR' OR 'MON_ALM'.
+*        DATA: r_aufnr  TYPE RANGE OF aufnr,
+*              lr_aufnr LIKE LINE OF r_aufnr,
+*              r_fecha  TYPE RANGE OF sy-datum.
+*
+*        get_seleccion( ).
+*        LOOP AT i_ordenes ASSIGNING <ordenes> WHERE check = 'X'.
+*          CLEAR lr_aufnr.
+*          lr_aufnr-option = 'EQ'.
+*          lr_aufnr-sign   = 'I'.
+*          lr_aufnr-low    = <ordenes>-aufnr.
+*          COLLECT lr_aufnr INTO r_aufnr.
+*        ENDLOOP.
+*        IF sy-subrc = 0.
+*          SET PARAMETER ID 'Z_NO_VAR_DEF' FIELD 'X'.
+*          IF '0026' IN s_werks.
+*            IF sy-ucomm = 'MON_ALM'.
+*              CLEAR: r_lgort, lr_lgort.
+*              lr_lgort-option = 'EQ'.
+*              lr_lgort-sign   = 'I'.
+*              SELECT DISTINCT lgort FROM aufm
+*                INTO lr_lgort-low
+*               WHERE aufnr IN r_aufnr.
+*                COLLECT lr_lgort INTO r_lgort.
+*              ENDSELECT.
+*
+*              SUBMIT zwhs_monitor
+*                AND RETURN
+**              VIA SELECTION-SCREEN
+*               WITH p_idcli = 'TET'
+*               WITH s_lgort IN r_lgort
+**             WITH s_fechac IN r_fecha
+*              USING SELECTION-SET 'U_ZORDENES'.
+*            ELSE.
+*              SUBMIT zwhs_monitor
+*                AND RETURN
+**              VIA SELECTION-SCREEN
+*               WITH p_idcli = 'TET'
+*               WITH s_aufnr IN r_aufnr
+*               WITH s_fechac IN r_fecha
+*               WITH p_vari = '/ZORDENES'.
+*            ENDIF.
+*          ELSE.
+*            SELECT SINGLE lgnum FROM zwm_log_procesos JOIN zwm_datos_idoc ON zwm_log_procesos~docnum = zwm_datos_idoc~docnum
+*              INTO @DATA(l_lgnum)
+*             WHERE aufnr IN @r_aufnr.
+*            IF sy-subrc = 0.
+*              SUBMIT zewm_monitor_procesos_ampliado
+*              AND RETURN
+*               WITH p_lgnum = l_lgnum
+*               WITH s_cpdat IN r_fecha
+*               WITH s_aufnr IN r_aufnr.
+*            ENDIF.
+*          ENDIF.
+*          SET PARAMETER ID 'Z_NO_VAR_DEF' FIELD ''.
+*        ELSE.
+*          MESSAGE 'Seleccione alguna orden' TYPE 'I'.
+*        ENDIF.
+
+      WHEN 'REFRESCAR'.
+        o_prog->seleccionar_datos( ).
+        refresh( refresh_mode = if_salv_c_refresh=>full ).
+
+*      WHEN 'ALTA'.
+*        l_row = get_fila_activa( ).
+*        READ TABLE i_ordenes ASSIGNING <ordenes> INDEX l_row.
+*        IF sy-subrc = 0.
+*          CALL FUNCTION 'Z_ORDEN_MIGO'
+*            STARTING NEW TASK 'TEST' DESTINATION 'NONE' "Da problemas al grabar en el nuevo modo
+*            EXPORTING
+*              aufnr  = <ordenes>-aufnr
+*              accion = e_salv_function(1).
+*        ENDIF.
+
+      WHEN 'CO11N'.
+        l_row = get_fila_activa( ).
+        READ TABLE i_ordenes ASSIGNING <ordenes> INDEX l_row.
+        IF sy-subrc = 0.
+*          CONCATENATE 'ANR=' <ordenes>-aufnr into l_string.
+*          set PARAMETER ID 'ANR' FIELD <ordenes>-aufnr.
+*          CALL FUNCTION 'TH_CREATE_MODE'
+*            EXPORTING
+*              transaktion    = 'CO11N'
+*              del_on_eot     = 1
+*              PARAMETERS     = l_string
+**       PROCESS_DARK   = ''
+**       INHERIT_STAT_TRANS_ID       = 0
+**     IMPORTING
+**       MODE           =
+*            EXCEPTIONS
+*              max_sessions   = 1
+*              internal_error = 2
+*              no_authority   = 3
+*              OTHERS         = 4.
+          DATA: spagpa_tab   TYPE TABLE OF rfc_spagpa,
+                l_spagpa_tab TYPE rfc_spagpa.
+          l_spagpa_tab-parid = 'ANR'.
+          l_spagpa_tab-parval = <ordenes>-aufnr.
+          APPEND l_spagpa_tab TO spagpa_tab.
+          CALL FUNCTION 'ABAP4_CALL_TRANSACTION'
+            STARTING NEW TASK 'test'
+            EXPORTING
+              tcode                   = 'CO11N'
+              skip_screen             = 'X'
+*             MODE_VAL                = 'A'
+*             UPDATE_VAL              = 'A'
+* IMPORTING
+*             SUBRC                   =
+            TABLES
+*             USING_TAB               =
+              spagpa_tab              = spagpa_tab
+*             MESS_TAB                =
+            EXCEPTIONS
+              call_transaction_denied = 1
+              tcode_invalid           = 2
+              OTHERS                  = 3.
+        ENDIF.
+
+
+      WHEN 'CONSUMIR'.
+        get_seleccion( CHANGING t_tabla = i_ordenes ).
+        READ TABLE i_ordenes TRANSPORTING NO FIELDS WITH KEY check = 'X'.
+        IF sy-subrc NE 0.
+          MESSAGE 'Seleccione alguna orden' TYPE 'I'.
+        ELSE.
+          o_prog->consumir( ).
+        ENDIF.
+
+      WHEN 'APROV_NOM'.
+        zcl_ap_parametros=>mantenimiento_st( clave = 'ZAPROV_PRO' campo = 'MAT_NO_APROV' ).
+
+      WHEN 'APROV_AJU'.
+        zcl_ap_parametros=>mantenimiento_st( clave = 'ZAPROV_PRO' campo = 'MAT_AJUSTE' ).
+
+      WHEN 'PSC'.
+        get_seleccion( ).
+        LOOP AT i_ordenes ASSIGNING <ordenes> WHERE check = 'X'.
+          CLEAR l_objkey.
+          SELECT SINGLE aufnr FROM zwhs_cola
+            INTO <ordenes>-aufnr
+           WHERE idmsg = 'PSC'
+             AND aufnr = <ordenes>-aufnr.
+          IF sy-subrc NE 0.
+            IF <ordenes>-sttxt CS 'BORR'.
+              CLEAR l_objkey. "Si la orden está borrada y no se había enviado, no la enviamos ahora.
+            ELSE.
+              l_objkey = 'NEW'. "Como nunca he enviado la orden antes, a Tetra le digo que es nueva
+            ENDIF.
+          ELSE.
+            IF <ordenes>-sttxt CS 'BORR'. "Si ya he enviado antes la orden y está marcada para borrado
+              l_objkey = 'DELETE'.
+            ELSE.
+              l_objkey = 'UPDATE'.
+            ENDIF.
+          ENDIF.
+          IF NOT l_objkey IS INITIAL.
+            CONCATENATE <ordenes>-aufnr '$' l_objkey INTO l_objkey.
+            CLEAR zwhs_cola.
+            zwhs=>genera_msg( EXPORTING idmsg   = 'PSC'
+                                        objkey  = l_objkey
+                                        commit = ''
+                              IMPORTING idcola  = zwhs_cola-idcola
+                                        mensaje = l_mensaje ).
+            IF NOT zwhs_cola-idcola IS INITIAL.
+              MESSAGE s398(00) WITH 'Se ha generado mensaje PSC' zwhs_cola-idcola 'para orden' <ordenes>-aufnr.
+
+*              zcl_ap_dev=>commit( dequeue_all = 'X' ).
+*              l_mensaje = zcl_ap_orden_pp=>cambia_status_usuario( aufnr = <ordenes>-aufnr status = 'MES' no_permitir_anterior = 'X' ).
+*              IF l_mensaje(1) NE '>' AND NOT l_mensaje IS INITIAL.
+*                MESSAGE i398(00) WITH l_mensaje.
+*              ENDIF.
+            ELSE.
+              MESSAGE i398(00) WITH 'Error generando mensaje PSC para orden' <ordenes>-aufnr.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+
+      WHEN OTHERS.
+    ENDCASE.
+    SET PARAMETER ID 'Z_NO_VAR_DEF' FIELD ''.
+  ENDMETHOD. "handle_USER_COMMAND
+  METHOD top_of_page.
+    CLEAR o_content.
+
+    o_top_page->set_titulo( sy-title ).
+
+    o_top_page->add_rango( texto = 'F.Liberación real' rango = s_ftrmi[] ).
+    o_top_page->add_rango( texto = 'F.Inicio programado' rango = s_gstrs[] ).
+    o_top_page->add_rango( texto = 'F.Inicio real' rango = s_gstri[] ).
+    o_top_page->add_rango( texto = 'F.Inicio extrema' rango = s_gstrp[] ).
+    o_top_page->add_rango( texto = 'Orden' rango = s_aufnr[] ).
+    o_top_page->add_rango( texto = 'Clase de Orden' rango = s_auart[] ).
+    o_top_page->add_rango( texto = 'Material' rango = s_matnr[] ).
+    o_top_page->add_rango( texto = 'Centro' rango = s_werks[] ).
+    o_top_page->add_rango( texto = 'Almacén' rango = s_lgort[] ).
+    o_top_page->add_rango( texto = 'Version' rango = s_verid[] ).
+    o_top_page->crea_info_seleccion( ).
+
+    o_content = o_top_page->get_grid( ).
+
+  ENDMETHOD.                    "top_of_page
+ENDCLASS. "lcl_alv IMPLEMENTATION
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report IMPLEMENTATION.
+  METHOD main.
+    seleccionar_datos( ).
+
+    IF p_export IS INITIAL.
+      listado( ).
+    ELSE.
+      IF p_valpor IS INITIAL.
+        EXPORT i_ordenes FROM i_ordenes TO MEMORY ID 'ZLISTADO_ORDENES'.
+      ELSE.
+        EXPORT i_ordenes FROM i_ordenes v_error_porcentajes FROM v_error_porcentajes TO MEMORY ID 'ZLISTADO_ORDENES'.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.                    "REPORT
+
+  METHOD seleccionar_datos.
+    TYPES: BEGIN OF t_semi,
+             tipo(1),
+             matnr   TYPE matnr,
+             menge   TYPE mengv13,
+             meins   TYPE meins,
+             ctd     TYPE mengv13,
+           END OF t_semi,
+           BEGIN OF t_matnr_cons,
+             matnr TYPE matnr,
+             charg TYPE charg_d,
+           END OF t_matnr_cons.
+
+    DATA: i_caufv       TYPE TABLE OF caufv,
+          i_resb        TYPE TABLE OF resb,
+          i_list        TYPE TABLE OF t_ordenes,
+          l_listado     TYPE t_ordenes,
+          r_matnr_comp  TYPE RANGE OF matnr,
+          lr_matnr_comp LIKE LINE OF r_matnr_comp,
+          l_first,
+          o_ord         TYPE REF TO zcl_ap_orden_pp,
+          i_aufm        TYPE TABLE OF aufm,
+          i_semi        TYPE TABLE OF t_semi,
+          l_semi        TYPE t_semi,
+          l_aux(50),
+          l_aux2(50),
+          l_total       TYPE mengv13,
+          l_ord         TYPE t_ordenes,
+          i_matnr_cons  TYPE TABLE OF t_matnr_cons,
+          l_matnr_cons  TYPE t_matnr_cons,
+          i_resb2       TYPE TABLE OF resb,
+          l_cont        TYPE i,
+          l_tol         TYPE p DECIMALS 2,
+          l_tol_inf     TYPE p DECIMALS 2,
+          l_tol_sup     TYPE p DECIMALS 2,
+*          lr_equipo     LIKE LINE OF s_equipo,
+          r_matnr       TYPE RANGE OF matnr,
+          l_gwemg       TYPE caufvd-gwemg,
+          r_ord_act     TYPE RANGE OF aufnr,
+          lr_ord_act    LIKE LINE OF r_ord_act.
+
+    FIELD-SYMBOLS: <orden> TYPE caufv,
+                   <opred> TYPE caufv,
+                   <resb>  TYPE resb,
+                   <aufm>  TYPE aufm,
+                   <semi>  TYPE t_semi.
+
+    CLEAR i_ordenes.
+
+    l_tol = o_par->get_atr1( campo = 'TOLERANCIA_CONSUMOS' ).
+    l_tol_inf = 100 - l_tol.
+    l_tol_sup = 100 + l_tol.
+
+*    LOOP AT s_equipo INTO lr_equipo.
+*      l_cont = strlen( lr_equipo-low ).
+*      IF l_cont = 4.
+*        SELECT SINGLE equipo FROM ztet_equipos
+*          INTO lr_equipo-low
+*         WHERE lgort = lr_equipo-low.
+*        MODIFY s_equipo FROM lr_equipo.
+*      ENDIF.
+*    ENDLOOP.
+
+    CREATE OBJECT o_ord.
+
+    DATA(o_pp) = NEW zhcl_pp_core( ).
+
+
+*    r_matnr = zcl_material=>get_rango_mat_from_bismt( s_bismt[] ).
+
+    IF NOT s_arbpl[] IS INITIAL.
+      DATA: r_aufnr  TYPE RANGE OF aufnr,
+            lr_aufnr LIKE LINE OF r_aufnr.
+
+      lr_aufnr-option = 'EQ'.
+      lr_aufnr-sign = 'I'.
+      SELECT DISTINCT aufnr FROM caufv
+        INNER JOIN afvc ON afvc~aufpl = caufv~aufpl
+        INNER JOIN crhd ON crhd~objid = afvc~arbid
+        INTO lr_aufnr-low
+     WHERE plnbez IN s_matnr
+       AND plnbez IN r_matnr
+       AND ftrmi IN s_ftrmi
+       AND gstrs IN s_gstrs
+       AND gstri IN s_gstri
+       AND gstrp IN s_gstrp
+       AND caufv~aufnr IN s_aufnr
+       AND caufv~auart IN s_auart
+       AND caufv~werks IN s_werks
+       AND caufv~dispo IN s_dispo
+          AND crhd~objty = 'A'
+        AND crhd~arbpl IN s_arbpl.
+        APPEND lr_aufnr TO r_aufnr.
+      ENDSELECT.
+      IF sy-subrc NE 0.
+        APPEND lr_aufnr TO r_aufnr.
+      ENDIF.
+    ENDIF.
+
+    SELECT * FROM caufv JOIN afpo ON caufv~aufnr = afpo~aufnr
+      INTO CORRESPONDING FIELDS OF TABLE i_caufv
+     WHERE plnbez IN s_matnr
+       AND plnbez IN r_matnr
+       AND ftrmi IN s_ftrmi
+       AND gstrs IN s_gstrs
+       AND gstri IN s_gstri
+       AND gstrp IN s_gstrp
+       AND caufv~aufnr IN s_aufnr
+       AND caufv~aufnr IN r_aufnr
+       AND caufv~auart IN s_auart
+       AND caufv~werks IN s_werks
+       AND verid IN s_verid
+       AND caufv~dispo IN s_dispo
+       AND lgort IN s_lgort
+       AND charg IN s_charg
+*       AND fpr_em IN s_fpr_em
+       AND loekz = ''.
+
+    LOOP AT i_caufv ASSIGNING <orden>.
+      IF o_ord->contiene_status_orden_rango( aufnr = <orden>-aufnr r_status = s_status[] ) = 'X'.
+        IF o_ord->contiene_status_us_orden_rango( aufnr = <orden>-aufnr r_status = s_stuser[] ) = 'X'.
+          CLEAR l_ordenes.
+*          l_ordenes-equipo_asoc = ztet=>get_equipo_asoc_orden( aufnr = <orden>-aufnr auart = <orden>-auart ).
+*          IF l_ordenes-equipo_asoc IN s_equipo.
+
+          IF NOT s_compo[] IS INITIAL.
+            SELECT SINGLE * FROM resb
+              INTO resb
+             WHERE aufnr = <orden>-aufnr
+               AND matnr IN s_compo.
+            IF sy-subrc NE 0.
+              CONTINUE.
+            ENDIF.
+          ENDIF.
+
+          caufvd = zcl_ap_orden_pp=>get_caufvd( <orden>-aufnr ).
+          MOVE-CORRESPONDING caufvd TO l_ordenes.
+
+*            SELECT SINGLE operario operario_aprov FROM zaufk
+*                    INTO (l_ordenes-operario, l_ordenes-operario_aprov)
+*                   WHERE aufnr = <orden>-aufnr.
+
+          CLEAR l_ordenes-lgort.
+          SELECT SINGLE verid lgort FROM afpo
+            INTO (l_ordenes-verid, l_ordenes-lgort_o)
+           WHERE aufnr = <orden>-aufnr.
+
+          IF l_ordenes-lgort_o IS INITIAL.
+            SELECT SINGLE lgort FROM aufm
+              INTO l_ordenes-lgort_o
+             WHERE aufnr = <orden>-aufnr
+               AND bwart = '101'
+               AND lgort NE ''.
+          ENDIF.
+
+          l_ordenes-maktx = zcl_ap_material=>get_descripcion( CONV zcl_ap_material=>tt_matnr( l_ordenes-plnbez ) ).
+          l_ordenes-arbpl = zcl_orden=>get_puesto_trabajo( aufnr = l_ordenes-aufnr vornr = '0010' ).
+
+*            l_ordenes-aprovisionada = zcl_orden=>esta_aprovisionada( <orden>-aufnr ).
+          SELECT SINGLE mtart FROM mara
+            INTO l_ordenes-mtart
+           WHERE matnr = l_ordenes-plnbez.
+
+          CONCATENATE sy-mandt <orden>-aufnr INTO stxh-tdname.
+          SELECT SINGLE * FROM stxh
+            INTO stxh
+           WHERE tdobject = 'AUFK'
+             AND tdname   = stxh-tdname
+             AND tdid     = 'KOPF'.
+          IF sy-subrc = 0.
+            l_ordenes-texto_ico = '@0P@'.
+            l_ordenes-texto = zcl_ap_textos=>get_texto_string( id = stxh-tdid name = stxh-tdname spras = stxh-tdspras object = stxh-tdobject ).
+          ENDIF.
+
+          zcl_ap_gos=>leer_nota( EXPORTING clave = <orden>-aufnr tipo = 'BUS0001' IMPORTING contenido = l_ordenes-nota ).
+          IF NOT l_ordenes-nota IS INITIAL.
+            l_ordenes-nota_ico = '@0P@'.
+          ENDIF.
+
+*            IF zcl_material=>es_liquidable( <orden>-plnbez ) = 'X'.
+*              IF zcl_orden=>tiene_liquidacion( <orden>-aufnr ) = ''.
+*                l_ordenes-ico_candado = '@06@'.
+*              ENDIF.
+*            ENDIF.
+
+          l_ordenes-semana = zcl_ap_fechas=>get_semana( <orden>-gstrp ).
+          l_ordenes-sttxt = zcl_orden=>get_status_st( <orden>-aufnr ).
+          l_ordenes-asttx = zcl_orden=>get_status_st( aufnr = <orden>-aufnr usuario = 'X' ).
+
+          l_ordenes-ruta = o_pp->get_ruta( matnr = <orden>-plnbez
+                                           werks = <orden>-werks ).
+
+* Cantidad de rechazo
+          SELECT SUM( xmnga ) FROM afru
+            INTO l_ordenes-xmnga
+           WHERE aufnr = <orden>-aufnr
+             AND stokz = ''
+             AND stzhl = ''.
+
+          l_gwemg = caufvd-gwemg.
+          caufvd-gwemg = l_ordenes-gwemg = zcl_orden=>get_ctd_movs_mm( aufnr = l_ordenes-aufnr
+                                                                       matnr = l_ordenes-plnbez
+                                                                       bwart = '101' bwart2 = '102' ).
+
+          IF l_gwemg NE caufvd-gwemg.
+            __rangoc_eq r_ord_act l_ordenes-aufnr.
+          ENDIF.
+
+*            IF l_ordenes-fpr_em IS INITIAL AND caufvd-gwemg NE 0.
+*              SELECT MIN( budat ) FROM aufm
+*                INTO l_ordenes-fpr_em
+*               WHERE aufnr = caufvd-aufnr
+*                 AND bwart = '101'.
+*              IF NOT l_ordenes-fpr_em IS INITIAL.
+*                UPDATE aufk
+*                   SET fpr_em = l_ordenes-fpr_em
+*                 WHERE aufnr = l_ordenes-aufnr.
+*              ENDIF.
+*            ENDIF.
+
+* Buscamos semielaborados
+          CLEAR: i_aufm, i_semi.
+          SELECT * FROM aufm
+            INTO TABLE i_aufm
+           WHERE aufnr = l_ordenes-aufnr
+             AND bwart IN ('531', '532')
+             AND matnr IN s_compo.
+
+          LOOP AT i_aufm ASSIGNING <aufm>.
+            CLEAR l_semi.
+            MOVE-CORRESPONDING <aufm> TO l_semi.
+            IF <aufm>-shkzg = 'H'.
+              l_semi-menge = - l_semi-menge.
+            ENDIF.
+            COLLECT l_semi INTO i_semi.
+          ENDLOOP.
+
+          LOOP AT i_semi ASSIGNING <semi>.
+            <semi>-tipo = zcl_ap_string=>ultimo_caracter( <semi>-matnr ).
+            IF l_ordenes-gmein = <semi>-meins.
+              <semi>-ctd = <semi>-menge.
+            ELSE.
+
+              <semi>-ctd = zcl_ap_material=>convertir_unidad( matnr = CONV zcl_ap_material=>tt_matnr( l_ordenes-plnbez )
+                                                          unidad_origen = <semi>-meins
+                                                          unidad_destino = l_ordenes-gmein
+                                                          cantidad = <semi>-menge ).
+            ENDIF.
+
+*            IF zcl_orden=>es_ord_envasado( l_ordenes-auart ) = 'X'.
+*              IF <semi>-tipo = '2' OR <semi>-tipo = '3'.
+*                ADD <semi>-ctd TO l_ordenes-rpr.
+*              ELSE.
+*                ADD <semi>-ctd TO l_ordenes-rpr_no.
+*              ENDIF.
+*            ELSE.
+*              IF <semi>-tipo = '1'.
+*                ADD <semi>-ctd TO l_ordenes-rpr.
+*              ELSE.
+*                ADD <semi>-ctd TO l_ordenes-rpr_no.
+*              ENDIF.
+*            ENDIF.
+
+            WRITE <semi>-menge TO l_aux UNIT <semi>-meins.
+            CONDENSE l_aux NO-GAPS.
+            CONCATENATE l_aux <semi>-meins INTO l_aux SEPARATED BY space.
+            WRITE <semi>-ctd TO l_aux2 UNIT l_ordenes-gmein.
+            CONDENSE l_aux2 NO-GAPS.
+            CONCATENATE l_aux2 l_ordenes-gmein INTO l_aux2 SEPARATED BY space.
+            CONCATENATE l_aux l_aux2 INTO l_aux SEPARATED BY ','.
+            WRITE <semi>-matnr TO l_aux2.
+            zcl_ap_lista=>add_lista( EXPORTING valor = l_aux2 subvalor = l_aux CHANGING lista = l_ordenes-repro ).
+          ENDLOOP.
+          l_ordenes-total = l_ordenes-gwemg + l_ordenes-rpr.
+
+          SELECT SINGLE charg FROM afpo
+            INTO l_ordenes-charg_ord
+           WHERE aufnr = l_ordenes-aufnr
+             AND charg NE ''.
+
+          IF l_ordenes-sttxt CS 'CTEC'.
+            SELECT * FROM resb
+              INTO TABLE i_resb
+             WHERE rsnum = <orden>-rsnum
+               AND matnr IN r_matnr_comp
+               AND matnr IN s_compo.
+* APC20150119 Quito esto porque al cerrar técnicamente la orden se marcan para borrado tadas las posiciones
+*           AND xloek = ''.
+
+          ELSE.
+            SELECT * FROM resb
+              INTO TABLE i_resb
+             WHERE rsnum = <orden>-rsnum
+               AND matnr IN r_matnr_comp
+               AND matnr IN s_compo
+              AND xloek = ''.
+          ENDIF.
+
+* Quito posibles lineas de agrupacion de lotes
+          i_resb2 = i_resb.
+          LOOP AT i_resb ASSIGNING <resb> WHERE nomng NE 0.
+            READ TABLE i_resb2 TRANSPORTING NO FIELDS WITH KEY posnr = <resb>-posnr.
+            IF sy-subrc = 0.
+              DELETE i_resb.
+            ENDIF.
+          ENDLOOP.
+
+*APC20190228 Quito lineas duplicadas con cantidad necesaria 0 y sin lote ni almacen
+          i_resb2 = i_resb.
+          LOOP AT i_resb2 ASSIGNING <resb> WHERE bdmng NE 0 AND charg NE '' AND lgort NE ''.
+            DELETE i_resb WHERE posnr = <resb>-posnr AND matnr = <resb>-matnr AND bdmng = 0 AND charg = '' AND lgort = ''.
+          ENDLOOP.
+
+** Quitamos lotes duplicados
+*          TYPES: BEGIN OF t_lot,
+*                   matnr TYPE matnr,
+*                   charg TYPE charg_d,
+*                   cont  TYPE i,
+*                 END OF t_lot.
+*          DATA: i_lot TYPE TABLE OF t_lot,
+*                l_lot TYPE t_lot.
+*
+*          LOOP AT i_resb ASSIGNING <resb>.
+*            l_lot-matnr = <resb>-matnr.
+*            l_lot-charg = <resb>-charg.
+*            l_lot-cont = 1.
+*            COLLECT l_lot INTO i_lot.
+*          ENDLOOP.
+*
+*          LOOP AT i_lot INTO l_lot WHERE cont > 1.
+*            CLEAR l_cont.
+*            LOOP AT i_resb ASSIGNING <resb> WHERE matnr = l_lot-matnr
+*                                              AND charg = l_lot-charg.
+*              IF l_cont IS INITIAL.
+*                CLEAR <resb>-bdmng.
+*                LOOP AT i_resb2 INTO resb WHERE matnr = l_lot-matnr
+*                                              AND charg = l_lot-charg.
+*                  ADD resb-bdmng TO <resb>-bdmng.
+*                ENDLOOP.
+*              ELSE.
+*                DELETE i_resb.
+*              ENDIF.
+*              ADD 1 TO l_cont.
+*            ENDLOOP.
+*          ENDLOOP.
+
+
+
+
+* Busco si hay consumos de materiales que no están en la receta.
+          CLEAR i_matnr_cons.
+          SELECT matnr charg FROM aufm
+            INTO TABLE i_matnr_cons
+           WHERE aufnr = caufvd-aufnr
+*              and  bwart in ('261', '262')
+             AND bwart IN r_bwart_cons
+             AND matnr IN s_compo
+           GROUP BY matnr charg.
+
+          LOOP AT i_matnr_cons INTO l_matnr_cons.
+            CLEAR resb.
+            READ TABLE i_resb INTO resb WITH KEY matnr = l_matnr_cons-matnr
+                                                 charg = l_matnr_cons-charg.
+            IF sy-subrc NE 0.
+              READ TABLE i_resb INTO resb WITH KEY matnr = l_matnr_cons-matnr
+                                                   charg = ''.
+              IF sy-subrc NE 0.
+                CLEAR resb.
+                MOVE-CORRESPONDING caufvd TO resb.
+                resb-matnr = l_matnr_cons-matnr.
+                resb-charg = l_matnr_cons-charg.
+
+                READ TABLE i_resb TRANSPORTING NO FIELDS WITH KEY matnr = l_matnr_cons-matnr.
+                IF sy-subrc NE 0.
+                  READ TABLE i_resb2 ASSIGNING <resb> WITH KEY matnr = l_matnr_cons-matnr.
+                  IF sy-subrc = 0.
+                    resb-bdmng = <resb>-bdmng.
+                  ENDIF.
+                ENDIF.
+
+                APPEND resb TO i_resb.
+              ENDIF.
+            ENDIF.
+          ENDLOOP.
+
+
+          IF i_resb[] IS INITIAL.
+            APPEND l_ordenes TO i_list.
+          ELSE.
+            LOOP AT i_resb ASSIGNING <resb>.
+              <resb>-enmng = - zcl_orden=>get_ctd_movs_mm( aufnr = <resb>-aufnr
+                                                           matnr = <resb>-matnr
+                                                           charg = <resb>-charg
+                                                           rspos = <resb>-rspos
+*                                                             bwart = '261' bwart2 = '262' ).
+                                                           r_bwart = r_bwart_cons[] ).
+
+*APC20150917 Consumos de reprocesados
+              IF <resb>-rspos IS INITIAL.
+                IF <resb>-charg(2) = 'RB'.
+                  ADD <resb>-enmng TO l_ordenes-rpr_cons.
+                ENDIF.
+              ENDIF.
+            ENDLOOP.
+
+            LOOP AT i_resb ASSIGNING <resb>.
+              CLEAR l_first.
+              AT FIRST.
+                l_first = 'X'.
+                l_ordenes-gamng = caufvd-gamng.
+                l_ordenes-gmein = caufvd-gmein.
+                l_ordenes-gwemg = caufvd-gwemg.
+              ENDAT.
+              IF l_first IS INITIAL.
+                CLEAR: l_ordenes-gamng, l_ordenes-gwemg, l_ordenes-rpr, l_ordenes-rpr_no, l_ordenes-total, l_ordenes-rpr_cons.
+              ELSE.
+                l_ord = l_ordenes.
+              ENDIF.
+              MOVE-CORRESPONDING <resb> TO l_ordenes.
+
+
+              IF <resb>-meins NE l_ordenes-gmein AND ( l_ordenes-gmein = 'L' OR l_ordenes-gmein = 'KG' ).
+                IF <resb>-meins = 'G'.
+                  <resb>-enmng = <resb>-enmng / 1000.
+                  <resb>-meins = 'KG'.
+                ENDIF.
+                l_ordenes-enmng_l = zcl_ap_material=>convertir_unidad( matnr = <resb>-matnr
+                cantidad = <resb>-enmng unidad_origen = <resb>-meins unidad_destino = l_ordenes-gmein ).
+                IF l_ordenes-enmng_l = 0.
+                  l_ordenes-enmng_l = l_ordenes-enmng.
+                ENDIF.
+              ELSE.
+                l_ordenes-enmng_l = <resb>-enmng.
+              ENDIF.
+*                IF SY-UNAME = 'AGARCIA' AND SY-TCODE = 'SE38'.
+*                  WRITE: / <RESB>-MATNR, <RESB>-ENMNG, <RESB>-MEINS, L_ORDENES-ENMNG_L, L_ORDENES-GMEIN.
+*                ENDIF.
+
+              l_ordenes-ctd_reservada = l_ordenes-bdmng.
+
+              IF caufvd-gamng NE 0.
+*APC20161222 En órdenes de envasado no resto reprocesados
+*                IF l_ord-auart = zcl_orden=>c_ord_envasado.
+*                  l_total = l_ord-total.
+*                ELSE.
+                l_total = l_ord-total - l_ord-rpr_cons.
+*                ENDIF.
+                IF l_total < 0.
+                  CLEAR l_total.
+                ENDIF.
+*                SELECT SINGLE * FROM mara
+*                  INTO mara
+*                 WHERE matnr = l_ordenes-matnr.
+*                IF mara-mtart = zcl_material=>c_rpr.
+*                  ADD l_ord-rpr_no TO l_total.
+*                ENDIF.
+
+*              l_ordenes-bdmng = l_ordenes-bdmng * caufvd-gwemg / caufvd-gamng.
+                IF p_resval IS INITIAL.
+                  l_ordenes-bdmng = l_ordenes-bdmng * l_total / caufvd-gamng.
+                ENDIF.
+              ENDIF.
+
+              l_ordenes-desviacion_lm = l_ordenes-bdmng - l_ordenes-ctd_reservada.
+
+*APC20180104 Cambiamos para que desviaciaón de consumos sea Ctd.BOM - Consumida
+*                l_ordenes-desviacion_consumos = l_ordenes-enmng - l_ordenes-ctd_reservada.
+              l_ordenes-desviacion_consumos = l_ordenes-bdmng - l_ordenes-enmng.
+              APPEND l_ordenes TO i_list.
+            ENDLOOP.
+          ENDIF.
+*          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    LOOP AT i_list ASSIGNING <ordenes> WHERE matnr NE ''.
+
+
+      SELECT SINGLE kzumw iloos FROM mara
+        INTO (mara-kzumw, mara-iloos)
+       WHERE matnr = <ordenes>-matnr.
+*      IF mara-kzumw = 'X' OR <ordenes>-aprovisionado > 0.
+*        IF <ordenes>-sttxt CS 'LIB.' OR <ordenes>-sttxt CS 'CTEC'.
+**          IF <ordenes>-enmng = <ordenes>-aprovisionado. "APC20160119
+*          IF <ordenes>-consumido = <ordenes>-aprovisionado OR  "APC20160119
+*             <ordenes>-enmng = <ordenes>-aprovisionado.  "APC20160127
+**            <ordenes>-ico_aprov = '@01@'.
+*          ELSE.
+*            <ordenes>-ico_aprov = '@CC@'.
+*          ENDIF.
+*        ELSE.
+*          IF <ordenes>-ctd_reservada = <ordenes>-aprovisionado. "APC20160119
+**            <ordenes>-ico_aprov = '@01@'.
+*          ELSE.
+*            <ordenes>-ico_aprov = '@CC@'.
+*          ENDIF.
+*        ENDIF.
+*      ENDIF.
+
+*      IF mara-kzumw IS INITIAL.
+      IF mara-iloos = 'X'.
+        <ordenes>-ico_tipo_mat = '@EK@'.
+      ELSEIF zcl_ap_parametros=>existe( clave =  'ZAPROV_PRO' campo = 'MAT_AJUSTE' valor = <ordenes>-matnr quitar_ceros = 'X' ) = 'X'.
+        <ordenes>-ico_tipo_mat = '@EJ@'.
+      ENDIF.
+
+
+*APC20160302 No controlamos status aprovisionamiento en estas ordenes
+      IF ( <ordenes>-asttx = 'INIC' OR <ordenes>-asttx = 'INAP' OR <ordenes>-asttx = 'APRO' )
+        OR <ordenes>-asttx = 'TETR' AND mara-kzumw IS INITIAL.
+        CLEAR <ordenes>-ico_aprov.
+      ENDIF.
+
+      IF <ordenes>-bdmng NE 0.
+        IF p_valpor NE 0.
+          IF <ordenes>-ico_tipo_mat IS INITIAL.
+            IF <ordenes>-enmng = 0.
+              <ordenes>-porcc = 99.
+              <ordenes>-lights = zcl_ap_alv=>c_sem_rojo.
+              v_error_porcentajes = 'X'.
+            ELSE.
+              <ordenes>-porcc = abs( ( <ordenes>-bdmng - <ordenes>-enmng ) * 100 / <ordenes>-bdmng ).
+              IF <ordenes>-porcc > p_valpor.
+                <ordenes>-lights = zcl_ap_alv=>c_sem_rojo.
+                v_error_porcentajes = 'X'.
+              ELSE.
+                <ordenes>-lights = zcl_ap_alv=>c_sem_verde.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ELSE.
+          <ordenes>-porcc = <ordenes>-enmng * 100 / <ordenes>-bdmng.
+
+          IF  o_par->existe_i( campo = 'MAT_AJUSTE' valor = <ordenes>-matnr quitar_ceros = 'X' ) = ''.
+            IF <ordenes>-porcc < l_tol_inf.
+              <ordenes>-lights = zcl_ap_alv=>c_sem_ambar.
+            ELSEIF <ordenes>-porcc > l_tol_sup.
+              <ordenes>-lights = zcl_ap_alv=>c_sem_rojo.
+            ELSE.
+              <ordenes>-lights = zcl_ap_alv=>c_sem_verde.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ELSE.
+        SELECT SINGLE * FROM resb
+          INTO resb
+         WHERE aufnr = <ordenes>-aufnr
+           AND matnr = <ordenes>-matnr.
+        IF sy-subrc NE 0.
+          <ordenes>-lights = zcl_ap_alv=>c_sem_rojo.
+          <ordenes>-message = 'Consumos fuera de la orden'.
+        ELSE.
+          <ordenes>-lights = zcl_ap_alv=>c_sem_ambar.
+        ENDIF.
+        IF <ordenes>-meins IS INITIAL.
+*INI S4 Nota 2215424 APALACIOS 26.11.2018
+*          <ordenes>-meins = zcl_ap_material=>get_unidad_base( <ordenes>-matnr ).
+          <ordenes>-meins = zcl_ap_material=>get_unidad_base( CONV zcl_ap_material=>tt_matnr( <ordenes>-matnr ) ).
+*FIN S4 Nota 2215424 APALACIOS 26.11.2018
+        ENDIF.
+      ENDIF.
+
+*      IF NOT <ordenes>-charg IS INITIAL.
+*        SELECT SINGLE cerrado aprovisionado consumido devuelto FROM zresb_ord
+*          INTO (<ordenes>-cerrado, <ordenes>-aprovisionado, <ordenes>-consumido, <ordenes>-devuelto)
+*         WHERE aufnr = <ordenes>-aufnr
+*           AND matnr = <ordenes>-matnr
+*           AND charg = <ordenes>-charg.
+*      ELSE.
+*        SELECT SINGLE cerrado FROM zresb_ord
+*          INTO (<ordenes>-cerrado)
+*         WHERE aufnr = <ordenes>-aufnr
+*           AND matnr = <ordenes>-matnr
+*           AND cerrado = 'X'.
+*
+*        SELECT SUM( aprovisionado ) SUM( consumido ) SUM( devuelto ) FROM zresb_ord
+*          INTO (<ordenes>-aprovisionado, <ordenes>-consumido, <ordenes>-devuelto)
+*         WHERE aufnr = <ordenes>-aufnr
+*           AND matnr = <ordenes>-matnr
+*        GROUP BY aufnr matnr.
+*        ENDSELECT.
+*      ENDIF.
+
+* Indicador de consumos manuales
+* Que la referencia del movimiento no empiece por COD: Id Cola:
+      IF <ordenes>-bdmng NE 0.
+        SELECT SINGLE * FROM aufm JOIN mkpf ON aufm~mblnr = mkpf~mblnr
+          INTO CORRESPONDING FIELDS OF mkpf
+         WHERE aufnr = <ordenes>-aufnr
+           AND matnr = <ordenes>-matnr
+           AND xblnr LIKE '%:%'
+*          AND bwart IN ('261', '262')
+           AND bwart IN r_bwart_cons
+           AND vgart NE 'WR'.
+        IF sy-subrc NE 0.
+*APC20160302 Añadimos validación de que haya algún otro tipo de consumo
+          SELECT SINGLE * FROM aufm JOIN mkpf ON aufm~mblnr = mkpf~mblnr
+            INTO CORRESPONDING FIELDS OF mkpf
+           WHERE aufnr = <ordenes>-aufnr
+             AND matnr = <ordenes>-matnr
+             AND NOT bktxt LIKE 'ZWM024%'
+             AND xblnr NE 'ZAPROV_PROV'
+             AND NOT xblnr LIKE '%:%'
+*            AND bwart IN ('261', '262')
+             AND bwart IN r_bwart_cons.
+          IF sy-subrc = 0.
+            <ordenes>-ico_cons_man = '@0M@'.
+          ENDIF.
+        ELSE.
+*Que sea un movimiento de anulación de otro documento de material
+          SELECT SINGLE * FROM aufm JOIN mseg ON aufm~mblnr = mseg~mblnr
+                                             AND aufm~mjahr = mseg~mjahr
+                                             AND aufm~zeile = mseg~zeile
+            INTO CORRESPONDING FIELDS OF mkpf
+           WHERE aufm~aufnr = <ordenes>-aufnr
+             AND aufm~matnr = <ordenes>-matnr
+             AND smbln NE ''.
+          IF sy-subrc = 0.
+            <ordenes>-ico_cons_man = '@GW@'.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    IF p_comp IS INITIAL.
+**************************** RESUMEN ORDENES
+      LOOP AT i_list INTO l_ordenes.
+*APC20250331 No todo tiene conversión a KG
+*        IF NOT ( l_ordenes-meins = 'L' OR l_ordenes-meins = 'KG' OR l_ordenes-meins = 'G' ).
+*          CLEAR l_ordenes-enmng.
+*        ENDIF.
+
+        CLEAR: l_ordenes-matnr, l_ordenes-lgort, l_ordenes-charg, l_ordenes-meins, l_ordenes-rgekz, l_ordenes-icono_comp, l_ordenes-lights, l_ordenes-message,
+               l_ordenes-ico_cons_man, l_ordenes-ico_aprov, l_ordenes-ico_tipo_mat, l_ordenes-rspos, l_ordenes-vornr, l_ordenes-posnr, l_ordenes-sortf.
+
+**APC20160107 Si sólo un componente está cerrado, consideramos toda la orden como cerrada
+*        SELECT SINGLE cerrado FROM zresb_ord
+*          INTO (l_ordenes-cerrado)
+*         WHERE aufnr = l_ordenes-aufnr
+*           AND cerrado = 'X'.
+
+        COLLECT l_ordenes INTO i_ordenes.
+      ENDLOOP.
+
+      LOOP AT i_ordenes ASSIGNING <ordenes> WHERE gamng NE 0.
+*        <ordenes>-porc = <ordenes>-gwemg * 100 / <ordenes>-gamng.
+*        IF <ordenes>-bdmng NE 0.
+*          <ordenes>-porcc = <ordenes>-enmng * 100 / <ordenes>-bdmng.
+*        ENDIF.
+        <ordenes>-porc = <ordenes>-total * 100 / <ordenes>-gamng.
+
+        IF <ordenes>-porc < 95.
+          <ordenes>-lights = zcl_ap_alv=>c_sem_ambar.
+        ELSEIF <ordenes>-porc > 105.
+          <ordenes>-lights = zcl_ap_alv=>c_sem_rojo.
+        ELSE.
+          <ordenes>-lights = zcl_ap_alv=>c_sem_verde.
+        ENDIF.
+      ENDLOOP.
+
+      LOOP AT i_ordenes ASSIGNING <ordenes>.
+        <ordenes>-dif_kilos = <ordenes>-enmng_l - <ordenes>-gwemg.
+
+*        SELECT SUM( palets ) FROM ztet_env_prod
+*          INTO <ordenes>-robot
+*         WHERE aufnr = <ordenes>-aufnr.
+
+*        SELECT COUNT( * ) FROM aufm
+*          INTO <ordenes>-ssccs_generadas
+*         WHERE aufnr = <ordenes>-aufnr
+*           AND bwart = '101'.
+        <ordenes>-ssccs_generadas = <ordenes>-gwemg.
+
+*        IF zcl_orden=>es_ord_envasado( auart = <ordenes>-auart ) = 'X'.
+*          IF <ordenes>-robot = <ordenes>-ssccs_generadas.
+*            <ordenes>-ico_robot = '@5B@'.
+*          ELSEIF <ordenes>-robot IS INITIAL AND NOT <ordenes>-ssccs_generadas IS INITIAL.
+*            <ordenes>-ico_robot = '@5D@'.
+*          ELSE.
+*            <ordenes>-ico_robot = '@5C@'.
+*          ENDIF.
+*        ENDIF.
+
+        IF <ordenes>-gwemg NE 0.
+          <ordenes>-porcc = ( <ordenes>-enmng - <ordenes>-gwemg ) * 100 / <ordenes>-gwemg.
+        ENDIF.
+
+        READ TABLE i_list INTO l_ordenes WITH KEY aufnr = <ordenes>-aufnr
+                                                  lights = zcl_ap_alv=>c_sem_rojo.
+        IF sy-subrc = 0.
+          <ordenes>-icono_comp = '@5C@'.
+        ELSE.
+          READ TABLE i_list INTO l_ordenes WITH KEY aufnr = <ordenes>-aufnr
+                                                    lights = zcl_ap_alv=>c_sem_ambar.
+          IF sy-subrc = 0.
+            <ordenes>-icono_comp = '@5D@'.
+          ELSE.
+            READ TABLE i_list INTO l_ordenes WITH KEY aufnr = <ordenes>-aufnr
+                                                      lights = zcl_ap_alv=>c_sem_verde.
+            IF sy-subrc = 0.
+              <ordenes>-icono_comp = '@5B@'.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+        LOOP AT i_list INTO l_ordenes WHERE aufnr = <ordenes>-aufnr
+                                        AND ico_cons_man NE ''.
+          <ordenes>-ico_cons_man = l_ordenes-ico_cons_man.
+          EXIT.
+        ENDLOOP.
+
+        LOOP AT i_list INTO l_ordenes WHERE aufnr = <ordenes>-aufnr
+                                        AND ico_aprov NE ''.
+          <ordenes>-ico_aprov = l_ordenes-ico_aprov.
+          EXIT.
+        ENDLOOP.
+
+
+      ENDLOOP.
+    ELSE.
+**************************** DETALLE COMPONENTES
+      i_ordenes = i_list.
+      LOOP AT i_ordenes ASSIGNING <ordenes>.
+
+        SELECT SINGLE mtart matkl FROM mara
+          INTO (<ordenes>-mtartc, <ordenes>-matklc)
+         WHERE matnr = <ordenes>-matnr.
+
+        IF <ordenes>-mtartc = 'ZPAP' AND <ordenes>-sortf IS INITIAL.
+          DELETE i_ordenes.
+          CONTINUE.
+        ENDIF.
+
+        IF <ordenes>-vornr NE '0010'.
+          <ordenes>-arbpl = zcl_orden=>get_puesto_trabajo( aufnr = <ordenes>-aufnr vornr = <ordenes>-vornr ).
+        ENDIF.
+
+        IF <ordenes>-gwemg NE 0.
+          <ordenes>-porcc = ( <ordenes>-enmng - <ordenes>-gwemg ) * 100 / <ordenes>-gwemg.
+        ENDIF.
+
+
+        <ordenes>-maktxc = zcl_ap_material=>get_descripcion( CONV zcl_ap_material=>tt_matnr( <ordenes>-matnr ) ).
+
+        READ TABLE i_list INTO l_listado WITH KEY aufnr = <ordenes>-aufnr.
+        IF sy-subrc = 0.
+          <ordenes>-gamng = l_listado-gamng.
+          <ordenes>-gwemg = l_listado-gwemg.
+          <ordenes>-rpr   = l_listado-rpr.
+          <ordenes>-rpr_no = l_listado-rpr_no.
+          <ordenes>-total = l_listado-total.
+          <ordenes>-robot = l_listado-robot.
+        ENDIF.
+      ENDLOOP.
+
+
+    ENDIF.
+
+    IF p_kilos = 'X'.
+      DEFINE conv_unit_ord.
+        <ordenes>-&1 = zcl_AP_material=>convertir_unidad( matnr = CONV zcl_ap_material=>tt_matnr( <ordenes>-plnbez )
+        cantidad = <ordenes>-&1 unidad_origen = <ordenes>-gmein unidad_destino = 'KG' ).
+      END-OF-DEFINITION.
+
+
+      LOOP AT i_ordenes ASSIGNING <ordenes> WHERE gmein NE 'KG'.
+        SELECT SINGLE matnr FROM marm
+          INTO <ordenes>-plnbez
+         WHERE matnr = <ordenes>-plnbez
+           AND meinh = 'KG'.
+        IF sy-subrc = 0.
+          conv_unit_ord: gamng, gwemg, rpr, rpr_no, rpr_cons, total, dif_kilos, enmng_l.
+          <ordenes>-gmein = 'KG'.
+        ENDIF.
+      ENDLOOP.
+
+* Conversion unidades
+      IF p_comp = 'X'.
+        DEFINE conv_unit_comp.
+          IF <ordenes>-meins  = 'G'.
+            <ordenes>-&1 = <ordenes>-&1 / 1000.
+          ELSE.
+            <ordenes>-&1 = zcl_AP_material=>convertir_unidad( matnr = <ordenes>-matnr
+            cantidad = <ordenes>-&1 unidad_origen = <ordenes>-meins unidad_destino = 'KG' ).
+          ENDIF.
+        END-OF-DEFINITION.
+
+
+        LOOP AT i_ordenes ASSIGNING <ordenes> WHERE meins = 'L' OR meins = 'G'.
+          SELECT SINGLE matnr FROM marm
+            INTO <ordenes>-matnr
+           WHERE matnr = <ordenes>-matnr
+             AND meinh = 'KG'.
+          IF sy-subrc = 0 OR <ordenes>-meins = 'G'.
+            conv_unit_comp: bdmng, ctd_reservada, desviacion_lm, enmng, desviacion_consumos.
+            <ordenes>-meins = 'KG'.
+          ELSE.
+* Si no tiene conversión a kilos, no mostramos la cantidad consumida
+            CLEAR <ordenes>-enmng.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+
+
+    IF p_mstock = 'X'.
+      LOOP AT i_ordenes ASSIGNING <ordenes> WHERE NOT matnr IS INITIAL.
+
+        SELECT SINGLE xchpf FROM marc
+          INTO @DATA(l_xchpf)
+         WHERE matnr = @<ordenes>-matnr
+           AND werks = @<ordenes>-werks.
+
+        IF l_xchpf IS INITIAL.
+          SELECT SINGLE labst FROM mard
+             INTO @<ordenes>-clabs
+            WHERE matnr = @<ordenes>-matnr
+              AND werks = @<ordenes>-werks.
+        ELSE.
+          SELECT SUM( clabs ) FROM mchb
+            INTO @<ordenes>-clabs
+           WHERE matnr = @<ordenes>-matnr
+             AND werks = @<ordenes>-werks.
+        ENDIF.
+
+        SELECT SINGLE meins FROM mara
+          INTO @DATA(l_meins)
+         WHERE matnr = @<ordenes>-matnr.
+        IF l_meins NE <ordenes>-meins.
+          <ordenes>-clabs = zcl_ap_material=>convertir_unidad( matnr = <ordenes>-matnr cantidad = <ordenes>-clabs unidad_origen = l_meins unidad_destino = <ordenes>-meins ).
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+  ENDMETHOD.                    "seleccionar_datos
+
+
+  METHOD listado.
+
+    sgpi_texto( 'Generando informe' ).
+
+    o_alv->set_layout( p_vari ).
+    o_alv->set_top_of_page( ).
+
+    o_alv->set_orden( 'AUFNR' ).
+
+    o_alv->set_field_noout( 'SEMANA,GSTRP,RPR_NO,REPRO,RPR_CONS,LIGHTS' ).
+
+    IF p_comp IS INITIAL.
+      o_alv->set_field_quitar( 'MATNR,MAKTXC,BISMTC,LGORT,CHARG,MEINS,RGEKZ,ICO_CONS_MAN,ICO_APROV,RSPOS,VORNR,SORTF,MTARTC,MATKLC' ).
+
+    ELSE.
+      o_alv->set_field_quitar( 'ICONO_COMP,DIF_KILOS' ).
+    ENDIF.
+
+    o_alv->set_field_text( 'ROBOT,APROVISIONADA' ).
+    o_alv->set_field_text( campo = 'LGORT_O' valor = 'Alm.Orden' ).
+    o_alv->set_field_text( campo = 'REPRO' valor = 'transformados' ).
+    o_alv->set_field_text( campo = 'RPR' valor = 'RPR Packs' ).
+    o_alv->set_field_text( campo = 'RPR_NO' valor = 'RPR Líquido' ).
+    o_alv->set_field_text( campo = 'RPR_CONS' valor = 'Consumos transformados' ).
+    o_alv->set_field_text( campo = 'TOTAL' valor = 'Total altas' ).
+    o_alv->set_field_text( campo = 'PORC' valor = '% Orden' ).
+    o_alv->set_field_text( campo = 'PORCC' valor = '% Consumos' ).
+    o_alv->set_field_text( campo = 'ICONO_COMP' valor = 'Comp' ).
+    o_alv->set_field_text( campo = 'ICO_ROBOT' valor = 'NP' valor2 = 'Verificación palets' ).
+    o_alv->set_field_text( campo = 'ICO_TIPO_MAT' valor = 'TM' valor2 = 'Tipo material' ).
+    o_alv->set_field_text( campo = 'SSCCS_GENERADAS' valor = 'Altas SSCCs' ).
+    o_alv->set_field_text( 'DIF_KILOS' ).
+    o_alv->set_field_text( 'TEXTO,NOTA' ).
+    o_alv->set_field_text( campo = 'TEXTO_ICO' valor = 'T.' valor2 = 'Orden tiene texto' ).
+    o_alv->set_field_text( campo = 'NOTA_ICO' valor = 'N.' valor2 = 'Orden tiene nota' ).
+    o_alv->set_field_text( campo = 'BDMNG' valor = 'Ctd.BOM' ).
+    o_alv->set_field_text( campo = 'ENMNG' valor = 'Ctd.Cons.' ).
+    o_alv->set_field_text( campo = 'CTD_RESERVADA' valor = 'Ctd.Reservada' ).
+    o_alv->set_field_text( campo = 'DESVIACION_LM' valor = 'Desv.LM' ).
+    o_alv->set_field_text( campo = 'DESVIACION_CONSUMOS' valor = 'Desv.Cons' ).
+*    o_alv->set_field_text( campo = 'OPERARIO' valor = 'Op.Valida' valor2 = 'Operario que valida' ).
+*    o_alv->set_field_text( campo = 'OPERARIO_APROV' valor = 'Op.Aprov.' valor2 = 'Operario que aprovisiona' ).
+    o_alv->set_field_text( campo = 'ICO_CONS_MAN' valor = 'C.M.' valor2 = 'Consumo manual' ).
+    o_alv->set_field_text( campo = 'ICO_APROV' valor = 'E.A.' valor2 = 'Estado aprovisionamiento' ).
+    o_alv->set_field_text( campo = 'ICO_CANDADO' valor = 'No liq.' valor2 = 'Orden sin liquidar' ).
+    o_alv->set_field_text( campo = 'ICO_MONITOR' valor = 'MP' valor2 = 'Estado monitor de procesos' ).
+    o_alv->set_field_text( campo = 'MTARTC' valor = 'TM.C' valor2 = 'Tipo material del componente' ).
+    o_alv->set_field_text( campo = 'MATKLC' valor = 'GrArt.C' valor2 = 'Grupo artículos del componente' ).
+    o_alv->set_field_text( campo = 'XMNGA' valor = 'Ctd.Rechazo' valor2 = 'Cantidad rechazada' ).
+    IF p_mstock IS INITIAL.
+      o_alv->set_field_quitar( 'CLABS' ).
+    ELSE.
+      o_alv->set_field_text( campo = 'CLABS' valor = 'Stck.Comp.' valor2 = 'Stock componente en libre utilización' ).
+    ENDIF.
+
+    o_alv->show( ).
+
+  ENDMETHOD.                    "
+
+  METHOD copia_orden.
+    DATA: i_aufm         TYPE TABLE OF aufm,
+          i_aufm_anul    TYPE TABLE OF aufm,
+          l_aufm         TYPE aufm,
+          i_afru         TYPE TABLE OF afru,
+          l_ctd_notif    TYPE mengv13,
+          l_ctd_cons     TYPE mengv13,
+          l_return,
+          l_caufv_origen TYPE caufv,
+          l_mensaje      TYPE bapi_msg,
+          o_log          TYPE REF TO zcl_ap_popup,
+          o_doc          TYPE REF TO zcl_ap_docmat,
+          l_new, l_fin,
+          l_mblnr        TYPE mblnr,
+          l_mkpf         TYPE mkpf,
+          l_crear_mov.
+
+    FIELD-SYMBOLS: <aufm> TYPE aufm,
+                   <afru> TYPE afru.
+
+    SELECT * FROM afru
+      INTO TABLE i_afru
+     WHERE aufnr = aufnr
+       AND stokz = ''
+       AND stzhl = ''
+       AND manur NE '2'.  "Notificación automática de la notificación de un hito
+
+    SELECT * FROM aufm
+      INTO TABLE i_aufm
+     WHERE aufnr = aufnr
+       AND bwart = '261'.
+
+    SELECT * FROM aufm
+      INTO TABLE i_aufm_anul
+     WHERE aufnr = aufnr
+       AND bwart = '262'.
+
+* Quitamos los consumos procedentes de notificaciones
+    LOOP AT i_afru ASSIGNING <afru> WHERE wablnr NE ''.
+      DELETE i_aufm WHERE mblnr = <afru>-wablnr.
+    ENDLOOP.
+
+    IF NOT i_aufm_anul IS INITIAL.
+      LOOP AT i_aufm ASSIGNING <aufm>.
+        IF zcl_ap_docmat=>esta_anulado( mblnr = <aufm>-mblnr mjahr = <aufm>-mjahr zeile = <aufm>-zeile ) = 'X'.
+          READ TABLE i_aufm_anul TRANSPORTING NO FIELDS WITH KEY matnr = <aufm>-matnr
+                                                                 charg = <aufm>-charg
+                                                                 menge = <aufm>-menge.
+          IF sy-subrc = 0.
+            DELETE i_aufm_anul INDEX sy-tabix.
+          ENDIF.
+          DELETE i_aufm.
+        ELSE.
+          READ TABLE i_aufm_anul TRANSPORTING NO FIELDS WITH KEY matnr = <aufm>-matnr
+                                                                 charg = <aufm>-charg
+                                                                 menge = <aufm>-menge.
+          IF sy-subrc = 0.
+            DELETE i_aufm_anul INDEX sy-tabix.
+            DELETE i_aufm.
+          ELSE.
+            LOOP AT i_aufm_anul INTO l_aufm WHERE matnr = <aufm>-matnr
+                                              AND charg = <aufm>-charg.
+              IF l_aufm-menge < <aufm>-menge.
+                SUBTRACT l_aufm-menge FROM <aufm>-menge.
+                CLEAR l_aufm-menge.
+              ELSE.
+                SUBTRACT <aufm>-menge FROM l_aufm-menge.
+                <aufm>-menge = 0.
+              ENDIF.
+              MODIFY i_aufm_anul FROM l_aufm.
+            ENDLOOP.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+    DELETE i_aufm WHERE menge <= 0.
+
+
+
+
+    IF i_afru IS INITIAL AND i_aufm IS INITIAL.
+* Si no hay consumos ni notificaciones no hacemos nada
+      ok = 'X'.
+    ELSE.
+      CLEAR caufv-aufnr.
+      zcl_ap_popup=>popup_usuario( EXPORTING campo1 = 'CAUFV-AUFNR'
+                                             titulo = 'Informe orden destino'
+                                   IMPORTING return = l_return
+                                   CHANGING  valor1 = caufv-aufnr ).
+      IF l_return NE 'A'.
+        IF caufv-aufnr IS INITIAL.
+          ok = 'X'.
+*          MESSAGE 'Informe orden' TYPE 'I'. "APC20151103 Permitimos que no pongan la orden
+        ELSEIF caufv-aufnr = aufnr.
+          MESSAGE 'Informe una orden diferente a la origen' TYPE 'I'.
+        ELSE.
+          SELECT SINGLE * FROM caufv
+            INTO caufv
+           WHERE aufnr = caufv-aufnr.
+          IF sy-subrc NE 0.
+            MESSAGE 'Orden no existe' TYPE 'I'.
+          ELSE.
+            SELECT SINGLE * FROM caufv
+              INTO l_caufv_origen
+             WHERE aufnr = aufnr.
+            IF l_caufv_origen-plnbez NE caufv-plnbez.
+              MESSAGE 'Los materiales de la ordenes no coinciden' TYPE 'I'.
+            ELSEIF l_caufv_origen-auart NE caufv-auart.
+              MESSAGE 'Los tipos de ordenes no coinciden' TYPE 'I'.
+            ELSE.
+              CREATE OBJECT: o_log.
+
+*              LOOP AT i_afru ASSIGNING <afru>.
+*                zcl_orden=>anular_notificacion_st( EXPORTING rueck = <afru>-rueck rmzhl = <afru>-rmzhl commit = ''
+*                                                   IMPORTING mensaje = l_mensaje ).
+*                IF NOT l_mensaje IS INITIAL.
+*                  EXIT.
+*                ELSE.
+*                  o_log->add_message( msgty = 'I'
+*                        msgv1 = 'Se ha anulado notif'
+*                        msgv2 = <afru>-rmzhl
+*                        msgv3 = <afru>-lmnga ).
+*                ENDIF.
+*              ENDLOOP.
+*              IF sy-subrc = 0.
+*                IF NOT l_mensaje IS INITIAL.
+*                  ROLLBACK WORK.
+*                  o_log->guardar_log( proceso = 'ZORDENES' ).
+*                  MESSAGE i398(00) WITH 'Error anulando notificación' l_mensaje(40) l_mensaje+40(40) l_mensaje+80(40).
+*                  EXIT.
+*                ENDIF.
+*              ENDIF.
+
+              LOOP AT i_afru ASSIGNING <afru>.
+                IF <afru>-wablnr IS INITIAL.
+                  CLEAR l_crear_mov.
+                ELSE.
+                  l_crear_mov = 'X'.
+                ENDIF.
+                zcl_orden=>notificar_st( EXPORTING aufnr = caufv-aufnr
+                                                   vornr    = <afru>-vornr
+                                                     cantidad = <afru>-lmnga
+                                                     rechazo  = <afru>-xmnga
+                                                     meins    = <afru>-gmein
+                                                     budat    = <afru>-budat
+                                                     fecha_ini = <afru>-isdd
+                                                     hora_ini  = <afru>-isdz
+                                                     fecha_fin = <afru>-ierd
+                                                     hora_fin  = <afru>-ierz
+                                                     parcial_final = ''
+                                                     crear_mov = l_crear_mov
+                                                     act1_ctd  = <afru>-ism01
+                                                     act1_uni  = <afru>-ile01
+                                                     act2_ctd  = <afru>-ism02
+                                                     act2_uni  = <afru>-ile02
+                                                     act3_ctd  = <afru>-ism03
+                                                     act3_uni  = <afru>-ile03
+                                                     texto     = <afru>-ltxa1
+                                                     commit    = 'X'
+                                          IMPORTING mensaje = l_mensaje ).
+                IF NOT l_mensaje IS INITIAL.
+                  EXIT.
+                ELSE.
+                  o_log->add_message( msgty = 'I'
+                        msgv1 = 'Se ha creado notif'
+                        msgv2 = <afru>-rmzhl
+                        msgv3 = <afru>-lmnga ).
+
+                  zcl_orden=>anular_notificacion_st( EXPORTING rueck = <afru>-rueck rmzhl = <afru>-rmzhl commit = 'X'
+                                                     IMPORTING mensaje = l_mensaje ).
+                  IF NOT l_mensaje IS INITIAL.
+                    EXIT.
+                  ELSE.
+                    o_log->add_message( msgty = 'I'
+                          msgv1 = 'Se ha anulado notif'
+                          msgv2 = <afru>-rmzhl
+                          msgv3 = <afru>-lmnga ).
+                  ENDIF.
+                ENDIF.
+              ENDLOOP.
+              IF sy-subrc = 0.
+                IF NOT l_mensaje IS INITIAL.
+                  ROLLBACK WORK.
+                  o_log->guardar_log( proceso = 'ZORDENES' ).
+                  MESSAGE i398(00) WITH 'Error creando notificación' l_mensaje(40) l_mensaje+40(40) l_mensaje+80(40).
+                  EXIT.
+                ENDIF.
+              ENDIF.
+
+              CREATE OBJECT o_doc.
+
+              SORT i_aufm.
+              LOOP AT i_aufm ASSIGNING <aufm>.
+                CLEAR l_new.
+                AT NEW mjahr.
+                  l_new = 'X'.
+                ENDAT.
+                IF l_new = 'X'.
+                  o_doc->anular_doc( EXPORTING mblnr = <aufm>-mblnr mjahr = <aufm>-mjahr commit = 'X' espera_a_grabado = ''
+                                             IMPORTING smbln = l_mblnr ).
+                  IF l_mblnr IS INITIAL.
+                    o_log->add_message( msgty = 'E'
+                          msgv1 = 'Error anulando consumo'
+                          msgv2 = <aufm>-mblnr
+                          msgv3 = o_doc->mensaje(40)
+                          msgv4 = o_doc->mensaje+40(40) ).
+                    l_mensaje = o_doc->mensaje.
+*                    EXIT.
+                  ELSE.
+                    <aufm>-kokrs = 'OK'.
+                    o_log->add_message( msgty = 'I'
+                          msgv1 = 'Se ha anulado consumo'
+                          msgv2 = <aufm>-mblnr
+                          msgv3 = <aufm>-mjahr ).
+                  ENDIF.
+                ENDIF.
+              ENDLOOP.
+              IF sy-subrc = 0.
+                IF NOT l_mensaje IS INITIAL.
+                  ROLLBACK WORK.
+                  o_log->guardar_log( proceso = 'ZORDENES' ).
+                  MESSAGE i398(00) WITH 'Error anulando consumo' l_mensaje(40) l_mensaje+40(40) l_mensaje+80(40).
+                  EXIT.
+                ENDIF.
+              ENDIF.
+
+              LOOP AT i_aufm ASSIGNING <aufm> WHERE kokrs = 'OK'.
+                CLEAR: l_new, l_fin.
+                AT NEW mjahr.
+                  l_new = 'X'.
+                ENDAT.
+                IF l_new = 'X'.
+                  SELECT SINGLE * FROM mkpf
+                    INTO l_mkpf
+                   WHERE mblnr = <aufm>-mblnr
+                     AND mjahr = <aufm>-mjahr.
+                  CLEAR o_doc.
+                  CREATE OBJECT o_doc.
+                  o_doc->set_cabecera( budat = <aufm>-budat
+                                       bldat = <aufm>-bldat
+                                       xblnr = l_mkpf-xblnr
+                                       bktxt = l_mkpf-bktxt ).
+                ENDIF.
+
+                CLEAR rseg.
+                SELECT SINGLE * FROM resb
+                  INTO resb
+                 WHERE aufnr = caufv-aufnr
+                   AND matnr = <aufm>-matnr
+                   AND charg = <aufm>-charg.
+                IF sy-subrc NE 0.
+                  SELECT SINGLE * FROM resb
+                    INTO resb
+                   WHERE aufnr = caufv-aufnr
+                     AND matnr = <aufm>-matnr.
+                ENDIF.
+
+                o_doc->set_posicion( bwart       = <aufm>-bwart
+*INI S4 Nota 2215424 APALACIOS 26.11.2018
+*                                     matnr       = <aufm>-matnr
+                                     matnr       = CONV zcl_ap_material=>tt_matnr( <aufm>-matnr )
+*FIN S4 Nota 2215424 APALACIOS 26.11.2018
+                                     menge       = <aufm>-menge
+                                     meins       = <aufm>-meins
+                                     werks       = <aufm>-werks
+                                     lgort       = <aufm>-lgort
+                                     charg       = <aufm>-charg
+                                     aufnr       = caufv-aufnr
+                                     rsnum       = resb-rsnum
+                                     rspos       = resb-rspos
+                                     ).
+
+                AT END OF mjahr.
+                  l_fin = 'X'.
+                ENDAT.
+                IF l_fin = 'X'.
+                  o_doc->crea_doc( EXPORTING espera_a_grabado = 'X'
+                                             commit           = 'X'
+                                   IMPORTING mblnr            = l_mblnr ).
+                  IF l_mblnr IS INITIAL.
+                    o_log->add_message( msgty = 'E'
+                          msgv1 = 'Error creando consumo'
+                          msgv2 = <aufm>-mblnr
+                          msgv3 = o_doc->mensaje(40)
+                          msgv4 = o_doc->mensaje+40(40) ).
+
+                    l_mensaje = o_doc->mensaje.
+*                   EXIT.
+                  ELSE.
+                    o_log->add_message( msgty = 'I'
+                          msgv1 = 'Se ha creado consumo'
+                          msgv2 = l_mblnr ).
+
+*                    o_doc->anular_doc( EXPORTING mblnr = <aufm>-mblnr mjahr = <aufm>-mjahr commit = 'X' espera_a_grabado = ''
+*                                               IMPORTING smbln = l_mblnr ).
+*                    IF l_mblnr IS INITIAL.
+*                      o_log->add_message( msgty = 'E'
+*                            msgv1 = 'Error anulando consumo'
+*                            msgv2 = <aufm>-mblnr
+*                            msgv3 = o_doc->mensaje(40)
+*                            msgv4 = o_doc->mensaje+40(40) ).
+*                      l_mensaje = o_doc->mensaje.
+**                    EXIT.
+*                      ROLLBACK WORK.
+*                    ELSE.
+*                      o_log->add_message( msgty = 'I'
+*                            msgv1 = 'Se ha anulado consumo'
+*                            msgv2 = <aufm>-mblnr
+*                            msgv3 = <aufm>-mjahr ).
+*                    ENDIF.
+                  ENDIF.
+                ENDIF.
+              ENDLOOP.
+*              IF sy-subrc = 0.
+*                IF NOT l_mensaje IS INITIAL.
+*                  ROLLBACK WORK.
+*                  o_log->guardar_log( proceso = 'ZORDENES' ).
+*                  MESSAGE i398(00) WITH 'Error creando consumo' l_mensaje(40) l_mensaje+40(40) l_mensaje+80(40).
+*                  EXIT.
+*                ENDIF.
+*              ENDIF.
+
+              zcl_ap_dev=>commit( dequeue_all = 'X' ).
+
+              ok = 'X'.
+              o_log->guardar_log( proceso = 'ZORDENES' clave = aufnr ).
+              o_log->show_errores( ).
+
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+
+  ENDMETHOD.                    "copia_orden
+
+  METHOD consumir.
+*    DATA: l_hay_reservas,
+*          i_aufnr        TYPE TABLE OF aufnr,
+*          l_error,
+*          l_iloos        TYPE mara-iloos,
+*          l_xchpf        TYPE marc-xchpf,
+*          mard           TYPE mard.
+*    __data_set_vart zresb.
+*
+*    __def_rangoc lgort_d.
+*
+*    CLEAR i_cons.
+*    LOOP AT i_ordenes INTO l_ordenes WHERE check = 'X'.
+*      CLEAR l_cons.
+*      l_cons-aufnr = l_ordenes-aufnr.
+*
+*
+*      COLLECT l_ordenes-aufnr INTO i_aufnr.
+*
+*
+*      SELECT * FROM zresb
+*        INTO TABLE i_zresb
+*       WHERE aufnr = l_ordenes-aufnr
+*         AND bestq = 'Q'.
+*      LOOP AT i_zresb ASSIGNING <zresb>.
+*        CALL FUNCTION 'Z_WF_QM_DE_ZRESB_TRASPASO'
+*          EXPORTING
+*            matnr = <zresb>-matnr
+*            charg = <zresb>-charg.
+*      ENDLOOP.
+*
+*      IF l_ordenes-matnr IS INITIAL.
+*        SELECT * FROM resb
+*          INTO resb
+*         WHERE aufnr = l_ordenes-aufnr
+*           AND matnr NE ''
+*           AND xloek = ''.
+*
+*          SELECT SINGLE iloos FROM mara
+*            INTO l_iloos
+*           WHERE matnr = resb-matnr.
+*
+*          SELECT SINGLE xchpf FROM marc
+*            INTO l_xchpf
+*           WHERE matnr = resb-matnr
+*             AND werks = l_ordenes-werks.
+*
+*          CLEAR r_lgort_d.
+*
+*          IF l_iloos = 'X'.
+*            IF l_ordenes-werks = zcl_dafsa=>werks.
+*              __rangoc_eq r_lgort_d zcl_dafsa=>alm_pmp.
+*              lr_lgort_d-option = 'CP'.
+*              lr_lgort_d-low = '5*'.
+*              APPEND lr_lgort_d TO r_lgort_d.
+*            ENDIF.
+*          ENDIF.
+*
+*          IF l_xchpf IS INITIAL.
+*            SELECT * FROM mard
+*               INTO mard
+*              WHERE matnr = resb-matnr
+**                AND werks = zcl_dafsa=>werks
+*                AND werks = resb-werks
+*                 AND lgort IN r_lgort_d
+*                AND labst > 0.
+*              MOVE-CORRESPONDING mard TO l_cons.
+*              l_cons-clabs = mard-labst.
+*              SELECT SINGLE rsnum rspos FROM resb
+*                INTO (l_cons-rsnum, l_cons-rspos)
+*               WHERE aufnr = l_cons-aufnr
+*                 AND matnr = l_cons-matnr
+*                 AND xloek NE ''.
+*              APPEND l_cons TO i_cons.
+*            ENDSELECT.
+*          ELSE.
+*            SELECT * FROM mchb
+*              INTO mchb
+*             WHERE matnr = resb-matnr
+**               AND werks = zcl_dafsa=>werks
+*               AND werks = resb-werks
+**             AND ( lgort LIKE '5%'
+**               OR  lgort IN (zcl_dafsa=>alm_pmp) )
+*               AND lgort IN r_lgort_d
+*               AND ( clabs > 0 OR cinsm > 0 OR cspem > 0 ).
+*              MOVE-CORRESPONDING mchb TO l_cons.
+*              l_cons-rsnum = resb-rsnum.
+*              l_cons-rspos = resb-rspos.
+*              APPEND l_cons TO i_cons.
+*            ENDSELECT.
+*          ENDIF.
+*        ENDSELECT.
+*      ELSE.
+*
+*        SELECT SINGLE iloos FROM mara
+*          INTO l_iloos
+*         WHERE matnr = l_ordenes-matnr.
+*
+*        CLEAR r_lgort_d.
+*
+*        IF l_iloos = 'X'.
+*          IF l_ordenes-werks = zcl_dafsa=>werks.
+*            __rangoc_eq r_lgort_d zcl_dafsa=>alm_pmp.
+*            lr_lgort_d-option = 'CP'.
+*            lr_lgort_d-low = '5*'.
+*            APPEND lr_lgort_d TO r_lgort_d.
+*          ENDIF.
+*        ENDIF.
+*
+*        SELECT SINGLE xchpf FROM marc
+*          INTO l_xchpf
+*         WHERE matnr = l_ordenes-matnr
+*           AND werks = l_ordenes-werks.
+*
+*        IF l_xchpf IS INITIAL.
+*          SELECT * FROM mard
+*             INTO mard
+*            WHERE matnr = l_ordenes-matnr
+**              AND werks = zcl_dafsa=>werks
+*               AND werks = l_ordenes-werks
+*               AND lgort IN r_lgort_d
+*              AND labst > 0.
+*            MOVE-CORRESPONDING mard TO l_cons.
+*            l_cons-clabs = mard-labst.
+*            SELECT SINGLE rsnum rspos FROM resb
+*              INTO (l_cons-rsnum, l_cons-rspos)
+*             WHERE aufnr = l_cons-aufnr
+*               AND matnr = l_cons-matnr
+*               AND charg = l_cons-charg
+*               AND xloek = ''.
+*            IF sy-subrc = 0.
+*              SELECT SINGLE rsnum rspos FROM resb
+*                INTO (l_cons-rsnum, l_cons-rspos)
+*               WHERE aufnr = l_cons-aufnr
+*                 AND matnr = l_cons-matnr
+*                 AND charg = ''
+*                 AND xloek = ''.
+*            ENDIF.
+*            APPEND l_cons TO i_cons.
+*          ENDSELECT.
+*        ELSE.
+*          SELECT * FROM mchb
+*             INTO mchb
+*            WHERE matnr = l_ordenes-matnr
+**              AND werks = zcl_dafsa=>werks
+*              AND werks = l_ordenes-werks
+**             AND ( lgort LIKE '5%'
+**               OR  lgort IN (zcl_dafsa=>alm_pmp) )
+*               AND lgort IN r_lgort_d
+*              AND ( clabs > 0 OR cinsm > 0 OR cspem > 0 ).
+*            MOVE-CORRESPONDING mchb TO l_cons.
+*
+*            SELECT SINGLE rsnum rspos FROM resb
+*              INTO (l_cons-rsnum, l_cons-rspos)
+*             WHERE aufnr = l_cons-aufnr
+*               AND matnr = l_cons-matnr
+*               AND charg = l_cons-charg
+*               AND xloek = ''.
+*            IF sy-subrc NE 0.
+*              SELECT SINGLE rsnum rspos FROM resb
+*                INTO (l_cons-rsnum, l_cons-rspos)
+*               WHERE aufnr = l_cons-aufnr
+*                 AND matnr = l_cons-matnr
+*                 AND charg = ''
+*                 AND xloek = ''.
+*            ENDIF.
+*            APPEND l_cons TO i_cons.
+*          ENDSELECT.
+*        ENDIF.
+*      ENDIF.
+*    ENDLOOP.
+*    LOOP AT i_cons ASSIGNING <cons>.
+**INI S4 Nota 2215424 APALACIOS 26.11.2018
+**      <cons>-meins = zcl_material=>get_unidad_base( <cons>-matnr ).
+*      <cons>-meins = zcl_material=>get_unidad_base( CONV zcl_ap_material=>tt_matnr( <cons>-matnr ) ).
+**FIN S4 Nota 2215424 APALACIOS 26.11.2018
+*
+*      IF <cons>-lgort = zcl_dafsa=>alm_aprov.
+*        CLEAR zresb_ord.
+*        SELECT SUM( aprovisionado ) SUM( devuelto ) SUM( consumido ) FROM zresb_ord
+*          INTO (zresb_ord-aprovisionado, zresb_ord-devuelto, zresb_ord-consumido)
+*         WHERE aufnr = <cons>-aufnr.
+*        SUBTRACT zresb_ord-devuelto FROM zresb_ord-aprovisionado.
+*        <cons>-clabs = zresb_ord-aprovisionado.
+*      ENDIF.
+*      SELECT SINGLE menge orden_origen fecha_origen mensaje_origen FROM zresb_env
+*        INTO (<cons>-menge, <cons>-orden_origen, <cons>-fecha_origen, <cons>-mensaje_origen)
+*       WHERE aufnr = <cons>-aufnr
+*         AND matnr = <cons>-matnr
+*         AND charg = <cons>-charg
+*         AND umlgo = <cons>-lgort.
+*      IF sy-subrc = 0.
+*        IF NOT <cons>-orden_origen IS INITIAL.
+*          IF zcl_material=>es_pmp( <cons>-matnr ) = 'X'.
+*            IF zcl_orden=>tiene_liquidacion( <cons>-orden_origen ) = ''.
+*              <cons>-ico_candado = '@06@'.
+*            ENDIF.
+*          ENDIF.
+*
+*          SELECT SINGLE lgort FROM afpo
+*            INTO <cons>-lgort_origen
+*           WHERE aufnr = <cons>-orden_origen.
+*        ENDIF.
+*        l_hay_reservas = 'X'.
+*      ENDIF.
+*
+*      SELECT MIN( cpudt_mkpf ) FROM mseg
+*        INTO <cons>-fllegada
+*       WHERE matnr = <cons>-matnr
+*         AND charg = <cons>-charg
+**         AND werks = zcl_dafsa=>werks
+*         AND werks = <cons>-werks
+*         AND lgort = <cons>-lgort
+**           AND cpudt_mkpf IN s_gstrs
+*         AND shkzg = 'S'.
+*
+*      IF <cons>-rsnum IS INITIAL.
+*        SELECT SINGLE matnr FROM resb
+*          INTO (<cons>-matnr)
+*         WHERE aufnr = <cons>-aufnr
+*           AND matnr = <cons>-matnr
+*           AND charg = ''
+*           AND xloek = 'X'.
+*        IF sy-subrc = 0.
+*          <cons>-message = '@06@ Componente borrado de la reserva'.
+*        ENDIF.
+*      ENDIF.
+*    ENDLOOP.
+*
+*    CHECK l_error IS INITIAL.
+**    IF l_hay_reservas = 'X'.
+*    IF NOT o_grid_cons IS INITIAL.
+*      o_grid_cons->free( ).
+*      CLEAR o_grid_cons.
+*    ENDIF.
+*
+*    CLEAR mkpf.
+*    IF NOT l_ordenes-fpr_em IS INITIAL.
+*      mkpf-budat = l_ordenes-fpr_em.
+*    ELSEIF NOT l_ordenes-gstri IS INITIAL.
+*      mkpf-budat = l_ordenes-gstri.
+*    ELSE.
+*      mkpf-budat = sy-datum.
+*    ENDIF.
+*
+*    CALL SCREEN 0500 STARTING AT 3 3 ENDING AT 100 20.
+**    ELSE.
+**      LOOP AT i_aufnr INTO caufvd-aufnr.
+**        CALL FUNCTION 'Z_ORDEN_MIGO'
+**          STARTING NEW TASK 'TEST' DESTINATION 'NONE' "Da problemas al grabar en el nuevo modo
+**          EXPORTING
+**            aufnr  = caufvd-aufnr
+**            accion = 'C'.
+**      ENDLOOP.
+**    ENDIF.
+
+  ENDMETHOD.                    "consumir
+
+ENDCLASS.                    "REPORT IMPLEMENTATION
+
+*----------------------------------------------------------------------*
+* INITIALIZATION
+*----------------------------------------------------------------------*
+INITIALIZATION.
+
+
+  SET PARAMETER ID 'STSMA' FIELD 'ZGJGPP2'.
+
+  CREATE OBJECT o_prog
+    EXPORTING
+      status        = 'INICIO'
+      get_nombre_pc = ''.
+
+  GET PARAMETER ID 'ZORDENES_P' FIELD DATA(l_compn).
+  IF l_compn IS INITIAL.
+    CREATE OBJECT o_alv
+      EXPORTING
+        status = 'STANDARD'
+        tabla  = 'I_ORDENES'.
+  ELSE.
+    CREATE OBJECT o_alv
+      EXPORTING
+        status = 'STANDARD_DET'
+        tabla  = 'I_ORDENES'
+        handle = 'COMP'.
+  ENDIF.
+
+  CLEAR s_gstrp.
+  s_gstrp-option = 'BT'.
+  s_gstrp-sign   = 'I'.
+  DATA l_week TYPE scal-week.
+  l_week = zcl_ap_fechas=>get_semana( fecha = sy-datum ).
+  s_gstrp-low    = zcl_ap_fechas=>get_primer_dia_semana( l_week ).
+  s_gstrp-low = s_gstrp-low - 1.
+  s_gstrp-high = s_gstrp-low + 6.
+  APPEND s_gstrp.
+
+  p_vari = o_alv->get_default_layout( ).
+  o_prog->initialization( EXPORTING nombre_pc = o_prog->nombre_pc CHANGING sscrfields = sscrfields ).
+
+  SET PARAMETER ID 'ZOPERARIO' FIELD ''.
+
+  APPEND VALUE #( option = 'BT' sign = 'I' low = '261' high = '262' ) TO r_bwart_cons.
+  APPEND VALUE #( option = 'BT' sign = 'I' low = '411' high = '412' ) TO r_bwart_cons. "Movimientos EWM
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR s_arbpl-low.
+
+  SELECT DISTINCT arbpl FROM crhd
+    INTO TABLE @DATA(i_arbpl)
+   WHERE objty = 'A'
+     AND werks IN @s_werks
+   ORDER BY arbpl.
+
+  DATA(o_popup) = NEW zcl_ap_matchcode_z( tabname = 'CRHD' ).
+  o_popup->add_field( field = 'ARBPL' selectflag = 'X' ).
+  LOOP AT i_arbpl ASSIGNING FIELD-SYMBOL(<arbpl>).
+    o_popup->add_valor( <arbpl>-arbpl ).
+  ENDLOOP.
+  o_popup->matchcode( EXPORTING field   = 'ARBPL'
+                      CHANGING  valor   =  s_arbpl-low ).
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_vari.
+
+  IF p_comp = 'X'.
+    DATA(o_alvs) = NEW zcl_ap_alv(
+        status = 'STANDARD_DET'
+        tabla  = 'I_ORDENES'
+        handle = 'COMP' ).
+    p_vari = o_alvs->get_f4_layout( ).
+  ELSE.
+    p_vari = o_alv->get_f4_layout( ).
+  ENDIF.
+
+AT SELECTION-SCREEN ON s_werks.
+
+  IF s_werks[] IS INITIAL.
+    MESSAGE 'Informe centro' TYPE 'E'.
+  ELSE.
+
+  ENDIF.
+
+AT SELECTION-SCREEN OUTPUT.
+
+
+
+  zcl_ap_dynpro=>screen_visible( group1 = 'STK' variable = p_comp ).
+
+************************************************************************
+* AT SELECTION-SCREEN.
+************************************************************************
+AT SELECTION-SCREEN.
+  IF sy-ucomm = 'COM'.
+    IF p_comp = 'X'.
+      DATA(o_alvs) = NEW zcl_ap_alv(
+          status = 'STANDARD_DET'
+          tabla  = 'I_ORDENES'
+          handle = 'COMP' ).
+      p_vari = o_alvs->get_default_layout( ).
+    ELSE.
+      p_vari = o_alv->get_default_layout( ).
+    ENDIF.
+  ENDIF.
+  CASE sy-ucomm.
+*    WHEN 'MOTIVOS'.
+*      zcl_ap_utils=>mantener_tabla( 'ZORD_MOT_CE' ).
+    WHEN 'ZSEMISUB'.
+      zcl_ap_utils=>mantener_tabla( 'ZSEMISUB' ).
+  ENDCASE.
+
+  o_prog->at_selection(  ).
+
+*----------------------------------------------------------------------
+* START-OF-SELECTION.
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  SET PARAMETER ID 'ZORDENES_P' FIELD ''.
+*  SET PARAMETER ID 'ZOPERARIO' FIELD p_opera.
+  IF p_comp = 'X'.
+    o_alv->free( ).
+
+    CREATE OBJECT o_alv
+      EXPORTING
+        status = 'STANDARD_DET'
+*       lights = 'LIGHTS'
+        tabla  = 'I_ORDENES'
+        handle = 'COMP'.
+  ENDIF.
+
+
+  o_prog->main( ).
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0500  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE status_0500 OUTPUT.
+
+  o_prog->set_status( cprog = 'ZAP_STATUS' status = 'ST_DYN' excluir = '' ).
+  SET TITLEBAR '500'.
+
+  IF o_grid_cons IS INITIAL.
+    CREATE OBJECT o_grid_cons
+      EXPORTING
+        estructura = ''.
+
+    o_grid_cons->set_layout( no_rowmove = 'X' no_rowins = 'X' ).
+    o_grid_cons->quitar_opciones( cl_gui_alv_grid=>mc_fc_refresh ).
+    o_grid_cons->set_campos_tabint( i_cons[] ).
+    o_grid_cons->set_field_input( 'MENGE' ).
+    o_grid_cons->set_field_noout( 'RSNUM,RSPOS,MENSAJE_ORIGEN' ).
+    o_grid_cons->set_field_text( 'ORDEN_ORIGEN,FECHA_ORIGEN' ).
+    o_grid_cons->set_field( campo =  'MENGE' op = 'NO_CERO' ).
+    o_grid_cons->set_field_text( campo = 'FLLEGADA' valor = 'F.Llegada' valor2 = 'F.Llegada stock a almacén' ).
+    o_grid_cons->set_field_text( campo = 'ICO_CANDADO' valor = 'No liq.' valor2 = 'Orden sin liquidar' ).
+    o_grid_cons->show( CHANGING tabla = i_cons ).
+
+    o_grid_cons->add_button( button = 'F01' text = 'Consumir'  icon = '@15@' qinfo = 'Consumir' ).
+    o_grid_cons->add_button( button = 'F02' text = 'Cancelar'  icon = '@0W@' qinfo = 'Cancelar' ).
+  ENDIF.
+
+ENDMODULE.                 " STATUS_0500  OUTPUT
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0500  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0500 INPUT.
+  DATA l_error.
+
+  CASE sy-ucomm.
+    WHEN 'F01'.
+      o_grid_cons->comprobar_cambios( ).
+
+      CLEAR l_error.
+      READ TABLE i_cons ASSIGNING <cons> WITH KEY ico_candado = '@06@'.
+      IF sy-subrc = 0.
+        MESSAGE i398(00) WITH 'Liquide la orden' <cons>-orden_origen 'antes de consumir'.
+        l_error = 'X'.
+        EXIT.
+      ENDIF.
+
+      LOOP AT i_cons ASSIGNING <cons> WHERE menge NE 0.
+        IF <cons>-menge > <cons>-clabs.
+          MESSAGE i398(00) WITH 'No puede consumir más cantidad que la disponible del lote' <cons>-charg.
+          l_error = 'X'.
+          EXIT.
+        ENDIF.
+      ENDLOOP.
+
+      CHECK l_error IS INITIAL.
+
+      DATA: o_mov TYPE REF TO zcl_ap_docmat.
+      CLEAR o_mov.
+      CREATE OBJECT o_mov.
+      o_grid_cons->comprobar_cambios( ).
+
+      o_mov->set_cabecera( bktxt = 'ZORDENES'
+                           budat = mkpf-budat ).
+      CLEAR mseg.
+      LOOP AT i_cons ASSIGNING <cons> WHERE menge NE 0.
+        IF <cons>-menge > 0.
+          mseg-bwart = '261'.
+        ELSE.
+          mseg-bwart = '262'.
+        ENDIF.
+        o_mov->set_posicion( bwart = mseg-bwart
+*INI S4 Nota 2215424 APALACIOS 26.11.2018
+*                             matnr = <cons>-matnr
+                             matnr = CONV zcl_ap_material=>tt_matnr( <cons>-matnr )
+*FIN S4 Nota 2215424 APALACIOS 26.11.2018
+                             charg = <cons>-charg
+                             menge = <cons>-menge
+                             meins = <cons>-meins
+                             aufnr  = <cons>-aufnr
+*                             werks = zcl_dafsa=>werks
+                             werks = <cons>-werks
+                             lgort = <cons>-lgort
+                             rsnum = <cons>-rsnum
+                             rspos = <cons>-rspos
+                             ).
+      ENDLOOP.
+      IF sy-subrc NE 0.
+        MESSAGE 'Indique cantidades' TYPE 'I'.
+      ELSE.
+        o_mov->mensaje = 'FALTA IMPLEMENTAR crea_doc_camb_reserva'.
+*        o_mov->crea_doc_camb_reserva( EXPORTING espera_a_grabado = 'X'
+*                                       dequeue_all = 'X'
+*                                       modo_ct = 'N'
+*                         IMPORTING mblnr = mseg-mblnr
+*                                   mjahr = mseg-mjahr ).
+
+        IF mseg-mblnr IS INITIAL.
+          MESSAGE o_mov->mensaje TYPE 'I'.
+        ELSE.
+          MESSAGE i398(00) WITH 'Se ha creado el movimiento' mseg-mblnr.
+*          LEAVE TO SCREEN 0.
+          zcl_ap_dev=>relanzar_report( ).
+        ENDIF.
+      ENDIF.
+    WHEN 'F02'.
+      LEAVE TO SCREEN 0.
+  ENDCASE.
+ENDMODULE.                 " USER_COMMAND_0500  INPUT
+*&---------------------------------------------------------------------*
+*&      Module  VALIDAR_BUDAT  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE validar_budat INPUT.
+
+  IF sy-ucomm = 'F01'.
+    IF mkpf-budat IS INITIAL.
+      MESSAGE 'Informe fecha contable' TYPE 'E'.
+    ENDIF.
+  ENDIF.
+
+ENDMODULE.                 " VALIDAR_BUDAT  INPUT

@@ -1,0 +1,217 @@
+FUNCTION ZPD_WC_USEX_RECEIVERS.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(IB_CONTINUE) LIKE  BOOLE-BOOLE
+*"     REFERENCE(IS_HEADER) LIKE  /COCKPIT/SHDR_IF STRUCTURE
+*"        /COCKPIT/SHDR_IF
+*"     REFERENCE(IS_WEBCYCLE) LIKE  /COCKPIT/SWC_WEBCYCLE STRUCTURE
+*"        /COCKPIT/SWC_WEBCYCLE
+*"     REFERENCE(IS_WC_STEP) LIKE  /COCKPIT/SWC_STEP STRUCTURE
+*"        /COCKPIT/SWC_STEP
+*"     REFERENCE(IS_WC_FLOW) LIKE  /COCKPIT/SWC_FLOW STRUCTURE
+*"        /COCKPIT/SWC_FLOW
+*"  TABLES
+*"      IT_ITEM STRUCTURE  /COCKPIT/SITEM_IF
+*"      IT_ACCOUNT STRUCTURE  /COCKPIT/SACCT_IF
+*"      IT_TAX STRUCTURE  /COCKPIT/STAX_IF
+*"      ET_RECEIVER STRUCTURE  /COCKPIT/SWC_RECEIVER
+*"      ET_MESSAGES STRUCTURE  BAPIRET2
+*"  EXCEPTIONS
+*"      NOT_FOUND
+*"----------------------------------------------------------------------
+*Receiver is PR/ BANF creator if no PR exists take PO creator
+
+
+  DATA:
+     ls_fun_details LIKE /cockpit/bsp_waf,
+     ls_po_header   TYPE bapiekkol,
+     lc_po_number   TYPE ebeln,
+     lc_usertype    LIKE /cockpit/bsp_p2u-wc_usertype_grp,
+     lc_username    LIKE /cockpit/bsp_p2u-wc_user,
+     lt_users       LIKE TABLE OF /cockpit/swc_users WITH HEADER LINE,
+     lc_user_group  LIKE /cockpit/cwc_grp-user_group,
+     ls_receiver    LIKE /cockpit/swc_receiver,
+     li_subrc       LIKE sy-subrc,
+     lv_noPO        Type i,
+**** this structure must be the one for the check
+   ls_trigg_params      LIKE /cockpit/bsp_wc_func_r07.
+
+include   /COCKPIT/BSP_CONSTANTS.
+
+  CHECK is_header-fi_mm_flg EQ 'MM'.
+
+* check if function is activ
+  CALL FUNCTION '/COCKPIT/BSP_ACT_WC_FUNC_GET'
+       EXPORTING
+            ic_function    = 'R04'
+            ic_comp_code   = is_header-comp_code
+            ic_cp_doc_type = is_header-cp_doc_type
+            ic_wc_id       = is_wc_flow-wc_id
+            ic_wc_step_id  = is_wc_flow-wc_step_id
+       IMPORTING
+            es_wc_afun     = ls_fun_details.
+* if structure is not empty then this function is active
+  CHECK NOT ls_fun_details IS INITIAL.
+
+* Checks depending on the structure
+  ls_trigg_params = ls_fun_details-func_params.
+
+  CLEAR: lc_po_number,
+         li_subrc.
+  IF it_item IS INITIAL.
+* need extension here: also get user type
+    IF is_header-po_number IS NOT INITIAL.
+        CALL FUNCTION '/COCKPIT/BAPI_PO_GETDETAIL'
+           EXPORTING
+                purchaseorder  = is_header-po_number
+           IMPORTING
+                po_header      = ls_po_header
+           EXCEPTIONS
+                error_or_abort = 1
+                OTHERS         = 2.
+
+      SELECT SINGLE usnam
+      FROM ZFI_PD_ENVIO
+      INTO  lc_username
+      WHERE EKGRP EQ ls_po_header-pur_group.
+
+      IF sy-subrc NE 0.
+
+*message: No determination for purchasing group: &1 possible
+          CALL FUNCTION '/COCKPIT/OBJ_MESSAGE_APPEND'
+               EXPORTING
+                    i_type         = 'I'
+                    i_id           = con_msg_class
+                    i_number       = '104'
+                    i_message_v1   = ls_po_header-pur_group
+               TABLES
+                    c_tab_messages = et_messages.
+*          IF 1 EQ 2. MESSAGE e104 WITH space. ENDIF.
+
+      ENDIF.
+
+* add the determined person from Purchase group to the receivers
+      MOVE-CORRESPONDING is_wc_flow TO et_receiver.
+      et_receiver-wc_usertype = 'S'.
+      et_receiver-wc_user     = lc_username.
+      APPEND et_receiver.
+    ELSE.
+*message: No determination because there are no PO
+          CALL FUNCTION '/COCKPIT/OBJ_MESSAGE_APPEND'
+               EXPORTING
+                    i_type         = 'I'
+                    i_id           = con_msg_class
+                    i_number       = '032'
+*                    i_message_v1   = ls_po_header-pur_group
+               TABLES
+                    c_tab_messages = et_messages.
+*          IF 1 EQ 2. MESSAGE i032. ENDIF.
+    ENDIF.
+  ELSE.
+
+  LOOP AT it_item.
+
+  IF it_item-po_number IS INITIAL.
+    lv_noPO = '1'.
+  ELSE.
+    lv_noPO = '0'.
+    IF it_item-po_number NE lc_po_number.
+* Determine only from 1st found PO
+      IF  NOT lc_po_number IS INITIAL AND
+          NOT ls_trigg_params-1st_po IS INITIAL.
+        EXIT.
+      ENDIF.
+      lc_po_number = it_item-po_number.
+      CALL FUNCTION '/COCKPIT/BAPI_PO_GETDETAIL'
+           EXPORTING
+                purchaseorder  = it_item-po_number
+           IMPORTING
+                po_header      = ls_po_header
+           EXCEPTIONS
+                error_or_abort = 1
+                OTHERS         = 2.
+      li_subrc = sy-subrc.
+    ENDIF.
+
+    IF li_subrc = 0.
+
+* need extension here: also get user type
+      SELECT SINGLE usnam
+      FROM ZFI_PD_ENVIO
+      INTO  lc_username
+      WHERE EKGRP EQ ls_po_header-pur_group.
+
+      IF sy-subrc NE 0.
+
+*message: No determination for purchasing group: &1 possible
+          CALL FUNCTION '/COCKPIT/OBJ_MESSAGE_APPEND'
+               EXPORTING
+                    i_type         = 'I'
+                    i_id           = con_msg_class
+                    i_number       = '104'
+                    i_message_v1   = ls_po_header-pur_group
+               TABLES
+                    c_tab_messages = et_messages.
+*          IF 1 EQ 2. MESSAGE e104 WITH space. ENDIF.
+          CONTINUE.
+      ENDIF.
+
+* add the determined person from Purchase group to the receivers
+      MOVE-CORRESPONDING is_wc_flow TO et_receiver.
+      et_receiver-wc_usertype = 'S'.
+      et_receiver-wc_user     = lc_username.
+      APPEND et_receiver.
+
+      EXIT.
+
+    ENDIF. "subrc
+  ENDIF.
+
+  ENDLOOP.
+  IF lv_noPO = '1'.
+*message: No determination because there are no PO
+    CALL FUNCTION '/COCKPIT/OBJ_MESSAGE_APPEND'
+        EXPORTING
+          i_type         = 'I'
+          i_id           = con_msg_class
+          i_number       = '032'
+*          i_message_v1   = ls_po_header-pur_group
+        TABLES
+          c_tab_messages = et_messages.
+*   IF 1 EQ 2. MESSAGE i032. ENDIF.
+
+  ENDIF.
+  ENDIF.
+* Resolve user groups
+  LOOP AT et_receiver WHERE wc_usertype EQ con_user_group.
+    CLEAR   lt_users.
+    REFRESH lt_users.
+    lc_user_group = et_receiver-wc_user.
+    CALL FUNCTION '/COCKPIT/WC_USRGRP_RESOLVE'
+         EXPORTING
+              ic_user_group = lc_user_group
+         TABLES
+              et_users      = lt_users
+         EXCEPTIONS
+              OTHERS        = 0.
+
+* check structure
+    LOOP AT lt_users.
+      CLEAR ls_receiver.
+      MOVE-CORRESPONDING is_wc_flow TO ls_receiver.
+      ls_receiver-wc_user     = lt_users-wc_user.
+      ls_receiver-wc_usertype = lt_users-wc_usertype_grp.
+      APPEND ls_receiver TO et_receiver.
+
+    ENDLOOP.
+  ENDLOOP.
+
+* Delete user groups
+  DELETE et_receiver WHERE wc_usertype EQ con_user_group.
+
+* Delete duplicates
+  SORT et_receiver BY wc_pos wc_subpos wc_usertype wc_user.
+  DELETE ADJACENT DUPLICATES FROM et_receiver.
+
+ENDFUNCTION.

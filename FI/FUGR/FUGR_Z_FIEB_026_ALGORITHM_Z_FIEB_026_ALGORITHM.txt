@@ -1,0 +1,501 @@
+FUNCTION z_fieb_026_algorithm.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_NOTE_TO_PAYEE) TYPE  STRING OPTIONAL
+*"     REFERENCE(I_COUNTRY) TYPE  LAND1 OPTIONAL
+*"  TABLES
+*"      T_AVIP_IN STRUCTURE  AVIP OPTIONAL
+*"      T_AVIP_OUT STRUCTURE  AVIP
+*"      T_FILTER1 OPTIONAL
+*"      T_FILTER2 OPTIONAL
+*"----------------------------------------------------------------------
+
+* Consultor: David España (Seidor) (04.01.2019)
+
+********************************************************************************************************************************
+* ¡¡¡ ALGORITMO PARA LA COMPENSACIÓN DE PARTIDAS DE TERCEROS !!!
+*
+* Este algoritmo se utiliza para la PROPUESTA + COMPENSACIÓN (1:1 o 1:N) de partidas abiertas de cliente/proveedor.
+*
+* Nota: Si se requiere únicamente compensación de tercero ---> utilizar ALGORITMO 901 / 904.
+*       Si se requiere propuesta de tercero en caso que no pueda realizar la compensación ---> utilizar ALGORITMO 903 / 906.
+*
+* En la BADI IF_EX_FEB_BADI~CHANGE_POSTING_DATA se realiza la contabilización en cuentas de mayor, cambios de cuenta, etc...
+********************************************************************************************************************************
+
+
+  TYPES: BEGIN OF s_bkpf,
+           bukrs TYPE bukrs,
+           belnr TYPE belnr_d,
+           gjahr TYPE gjahr,
+         END OF s_bkpf.
+
+  TYPES: BEGIN OF s_ktonr,
+           ktonr TYPE ktonr,
+         END OF s_ktonr.
+
+  DATA: lt_ktonr TYPE STANDARD TABLE OF s_ktonr.
+  DATA: l_kunnr TYPE kunnr.
+  DATA: l_lifnr TYPE lifnr.
+
+  DATA: l_note_to_payee TYPE string,
+        l_length        TYPE i,
+        l_mode          TYPE char3,
+        BEGIN OF xblnr_tab OCCURS 10,
+          xblnr TYPE xblnr1,
+        END OF xblnr_tab,
+        long_tab    TYPE TABLE OF char18,
+        l_xblnr     TYPE xblnr1,
+        l_num10(10) TYPE n,
+        r_bukrs     TYPE RANGE OF bukrs WITH HEADER LINE,
+        lt_bkpf     TYPE STANDARD TABLE OF s_bkpf.
+
+  FIELD-SYMBOLS: <resultstring> TYPE any,
+                 <bkpf>         TYPE s_bkpf,
+                 <long>         TYPE char18.
+
+
+  FIELD-SYMBOLS: <fs_febep> TYPE febep,
+                 <fs_febko> TYPE febko.
+
+  DATA:
+   wl_note_to_payee TYPE string.
+
+  TYPES: BEGIN OF st_kna1,
+           kunnr TYPE kunnr,
+           stcd1 TYPE stcd1,
+         END OF st_kna1.
+
+  ASSIGN ('(RFEBBU10)FEBKO') TO <fs_febko>.
+  ASSIGN ('(RFEBBU10)FEBEP') TO <fs_febep>.
+
+  DATA: lv_kunnr LIKE knb1-kunnr,
+        lv_lifnr LIKE lfb1-lifnr,
+        lv_bukrs LIKE bseg-bukrs,
+        lv_belnr LIKE bseg-belnr,
+        lv_gjahr LIKE bseg-gjahr.
+
+  DATA: lv_importfebep TYPE diffb_f05a,
+        lt_zfi_docs_t  TYPE zseitrt_003,
+        ls_zfi_docs_t  TYPE LINE OF zseitrt_003,
+        lv_emensaje    TYPE msgty,
+        lv_absnd       TYPE absnd_eb,
+        lt_zseitrt_001 TYPE TABLE OF zseitrt_001,
+        wa_zseitrt_001 TYPE zseitrt_001,
+        lv_attr2       TYPE char1,
+        lv_koart       TYPE char1,
+        lv_cliente     TYPE kunnr,
+        lv_proveedor   TYPE lifnr.
+
+  CLEAR: lv_absnd.
+
+  LOOP AT t_avip_in WHERE bukrs <> space.
+
+    r_bukrs-sign = 'I'.
+    r_bukrs-option = 'EQ'.
+    r_bukrs-low = t_avip_in-bukrs.
+    APPEND r_bukrs.
+    EXIT.
+
+  ENDLOOP.
+
+  CASE i_country.
+
+    WHEN 'ES'.
+
+      lv_absnd = <fs_febko>-absnd(8). "Banco del extracto electrónico
+
+      IF <fs_febep>-intag EQ '901' OR " N43 - Búsqueda Tercero por Nombre (solo comp.)
+         <fs_febep>-intag EQ '903'.   " N43 - Búsqueda Tercero por Nombre (prop. + comp.)
+
+        SELECT * INTO TABLE @DATA(tl_zseitrt_001)
+          FROM zseitrt_001
+            WHERE zeebanc     EQ @lv_absnd          "banco
+              AND zeecuenta   EQ @<fs_febko>-ktonr  "número de cta. bancaria
+              AND zeecta_sust EQ '*'.
+
+      ENDIF.
+
+      IF <fs_febep>-intag EQ '904' OR " N43 - Búsqueda Tercero por NIF (solo comp.)
+         <fs_febep>-intag EQ '906'.   " N43 - Búsqueda Tercero por NIF (prop. + comp.)
+
+        CLEAR lv_attr2.
+
+        SELECT attr2
+          FROM t033f
+          INTO lv_attr2
+          WHERE eigr1 = <fs_febep>-vgint.
+
+          CASE lv_attr2.
+            WHEN '8'. "cliente
+
+              SELECT kunnr, stcd1 INTO TABLE @DATA(tl_kna1)
+               FROM kna1
+                WHERE stcd1 NE ''.
+
+            WHEN '7'. "proveedor
+
+              SELECT lifnr, stcd1, ktokk INTO TABLE @DATA(tl_lfa1)
+               FROM lfa1
+                WHERE stcd1 NE ''
+                AND ktokk NE 'ZDIR'.
+
+          ENDCASE.
+        ENDSELECT.
+
+*SEIDOR(16.09.2021) INI MODIF-------------------------------------------{
+*NOTA:En la busqueda de NIF, existe un problema que en ocasiones en
+*el texto del Extrato tenemos dos NIF, y estamos tomando el NIF,
+*incorrecto y creando doc.al tercero que no toca.Para solucionar este
+*problema se ha creado una tabla Z de exclusion de terceros para evitar
+*estos problemas.Para ello eliminaremos el ternecero por NIF, que este
+*en esta tabla y asi evitaremos generar documentos erroneos.
+        DATA:tl_exclu TYPE TABLE OF zseitrt_ct_exclu,
+             xl_exclu TYPE zseitrt_ct_exclu.
+
+        SELECT * FROM zseitrt_ct_exclu
+          INTO CORRESPONDING FIELDS OF TABLE tl_exclu
+          WHERE type_ope    EQ <fs_febko>-vgtyp
+            AND opext_desde <= <fs_febep>-vgext
+            AND opext_hasta => <fs_febep>-vgext
+            AND signo       EQ <fs_febep>-epvoz.
+
+
+        IF tl_exclu[] IS NOT INITIAL.
+
+          LOOP AT tl_exclu INTO xl_exclu.
+
+            "Si estamos tratando Clientes
+            IF tl_kna1[] IS NOT INITIAL.
+
+              DELETE tl_kna1 WHERE stcd1 EQ xl_exclu-znif.
+
+              "Si estanmos tratando Proveedores
+            ELSEIF tl_lfa1[] IS NOT INITIAL.
+
+              DELETE tl_lfa1 WHERE stcd1 EQ xl_exclu-znif.
+
+            ENDIF.
+
+          ENDLOOP.
+        ENDIF.
+*SEIDOR(16.09.2021) FIN MODIF-------------------------------------------}
+      ENDIF.
+
+      CALL FUNCTION 'SCP_REPLACE_STRANGE_CHARS'
+        EXPORTING
+          intext  = i_note_to_payee
+        IMPORTING
+          outtext = wl_note_to_payee.
+
+      REPLACE ALL OCCURRENCES OF '..' IN wl_note_to_payee WITH ''.
+      CONDENSE wl_note_to_payee .
+
+
+***** CASO 1: Búsqueda por nombre. *****
+
+      IF tl_zseitrt_001[] IS NOT INITIAL.
+
+        LOOP AT tl_zseitrt_001 INTO DATA(xl_zseitrt_001). "
+
+          IF ( wl_note_to_payee CS xl_zseitrt_001-zeetext ).
+
+            IF xl_zseitrt_001-zeecuenta_n IS NOT INITIAL.
+
+              CLEAR lv_attr2.
+
+              SELECT attr2
+                FROM t033f
+                INTO lv_attr2
+                WHERE eigr1 = <fs_febep>-vgint.
+
+                CASE lv_attr2.
+                  WHEN '8'.
+                    MOVE 'D' TO lv_koart.
+                    EXIT.
+                  WHEN '7'.
+                    MOVE 'K' TO lv_koart.
+                    EXIT.
+                ENDCASE.
+              ENDSELECT.
+
+              IF lv_koart EQ 'D'.
+
+                lv_cliente = xl_zseitrt_001-zeecuenta_n.
+
+                lv_importfebep = <fs_febep>-kwbtr. "en clientes el importe es positivo.
+
+                CALL FUNCTION 'Z_SEITR_FBUSQPA' "siempre creada SIN cálculo de coma fija
+                  EXPORTING
+                    i_importe  = lv_importfebep
+                    i_kunnr    = lv_cliente
+                    i_bukrs    = t_avip_in-bukrs
+                  IMPORTING
+                    zfi_docs_t = lt_zfi_docs_t
+                    e_mensaje  = lv_emensaje.
+
+                IF lv_emensaje NE 'E'.
+
+                  LOOP AT lt_zfi_docs_t INTO ls_zfi_docs_t.
+
+                    LOOP AT t_avip_in WHERE bukrs <> space.
+
+                      t_avip_out-koart  = 'D'.
+                      t_avip_out-konto  = lv_cliente.
+                      t_avip_out-bukrs  = t_avip_in-bukrs.
+                      t_avip_out-sfeld  = 'BELNR'.
+                      t_avip_out-swert  = ls_zfi_docs_t-belnr.
+                      t_avip_out-swert+10(4) = ls_zfi_docs_t-gjahr.
+                      t_avip_out-swert+14(1) = ls_zfi_docs_t-umskz.
+
+                      APPEND t_avip_out.
+
+                    ENDLOOP.
+
+                  ENDLOOP.
+
+                ELSE.
+
+                  IF <fs_febep>-intag EQ '903'. "si estamos utilizando el algoritmo 906 -> propuesta tercero.
+
+                    t_avip_out-koart   = 'D'.
+                    t_avip_out-bukrs   =  t_avip_in-bukrs.
+                    t_avip_out-konto   =  lv_cliente.
+                    t_avip_out-sfeld   =  'BELNR'.
+
+                    APPEND t_avip_out.
+
+                  ENDIF.
+
+                ENDIF.
+
+              ENDIF.
+
+
+              IF lv_koart EQ 'K'.
+
+                lv_proveedor = xl_zseitrt_001-zeecuenta_n.
+
+                lv_importfebep = - <fs_febep>-kwbtr. "en proveedores el importe es positivo.
+
+                CALL FUNCTION 'Z_SEITR_FBUSQPA' "siempre creada SIN cálculo de coma fija
+                  EXPORTING
+                    i_importe  = lv_importfebep
+                    i_lifnr    = lv_proveedor
+                    i_bukrs    = t_avip_in-bukrs
+                  IMPORTING
+                    zfi_docs_t = lt_zfi_docs_t
+                    e_mensaje  = lv_emensaje.
+
+                IF lv_emensaje NE 'E'.
+
+                  LOOP AT lt_zfi_docs_t INTO ls_zfi_docs_t.
+
+                    LOOP AT t_avip_in WHERE bukrs <> space.
+
+                      t_avip_out-koart  = 'K'.
+                      t_avip_out-konto  = lv_proveedor.
+                      t_avip_out-bukrs  = t_avip_in-bukrs.
+                      t_avip_out-sfeld  = 'BELNR'.
+                      t_avip_out-swert  = ls_zfi_docs_t-belnr.
+                      t_avip_out-swert+10(4) = ls_zfi_docs_t-gjahr.
+
+                      APPEND t_avip_out.
+
+                    ENDLOOP.
+
+                  ENDLOOP.
+
+                ELSE.
+
+                  IF <fs_febep>-intag EQ '903'. "si estamos utilizando el algoritmo 903 -> propuesta tercero.
+
+                    t_avip_out-koart   = 'K'.
+                    t_avip_out-bukrs   =  t_avip_in-bukrs.
+                    t_avip_out-konto   =  lv_proveedor.
+                    t_avip_out-sfeld   =  'BELNR'.
+
+                    APPEND t_avip_out.
+
+                  ENDIF.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+            EXIT. "encontrado, salimos del loop.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+      CLEAR: tl_zseitrt_001, xl_zseitrt_001.
+
+***** CASO 2: Búsqueda por NIF: Clientes *****
+
+      IF tl_kna1[] IS NOT INITIAL.
+
+        LOOP AT tl_kna1 INTO DATA(xl_kna1).
+
+          IF ( wl_note_to_payee CS xl_kna1-stcd1 ).
+
+            IF xl_kna1-kunnr IS NOT INITIAL.
+
+              CLEAR lv_attr2.
+
+              SELECT attr2
+                FROM t033f
+                INTO lv_attr2
+                WHERE eigr1 = <fs_febep>-vgint.
+
+                CASE lv_attr2.
+                  WHEN '8'.
+                    MOVE 'D' TO lv_koart.
+                    EXIT.
+                  WHEN '7'.
+                    MOVE 'K' TO lv_koart.
+                    EXIT.
+                ENDCASE.
+              ENDSELECT.
+
+              IF lv_koart EQ 'D'.
+
+                lv_cliente = xl_kna1-kunnr.
+
+                lv_importfebep = <fs_febep>-kwbtr. "en clientes el importe es positivo.
+
+                CALL FUNCTION 'Z_SEITR_FBUSQPA' "siempre creada SIN cálculo de coma fija
+                  EXPORTING
+                    i_importe  = lv_importfebep
+                    i_kunnr    = lv_cliente
+                    i_bukrs    = t_avip_in-bukrs
+                  IMPORTING
+                    zfi_docs_t = lt_zfi_docs_t
+                    e_mensaje  = lv_emensaje.
+
+                IF lv_emensaje NE 'E'.
+
+                  LOOP AT lt_zfi_docs_t INTO ls_zfi_docs_t.
+
+                    LOOP AT t_avip_in WHERE bukrs <> space.
+
+                      t_avip_out-koart  = 'D'.
+                      t_avip_out-konto  = lv_cliente.
+                      t_avip_out-bukrs  = t_avip_in-bukrs.
+                      t_avip_out-sfeld  = 'BELNR'.
+                      t_avip_out-swert  = ls_zfi_docs_t-belnr.
+                      t_avip_out-swert+10(4) = ls_zfi_docs_t-gjahr.
+
+                      APPEND t_avip_out.
+
+                    ENDLOOP.
+
+                  ENDLOOP.
+
+                ELSE.
+
+                  IF <fs_febep>-intag EQ '906'. "si estamos utilizando el algoritmo 906 -> propuesta tercero.
+
+                    t_avip_out-koart   = 'D'.
+                    t_avip_out-bukrs   =  t_avip_in-bukrs.
+                    t_avip_out-konto   =  lv_cliente.
+                    t_avip_out-sfeld   =  'BELNR'.
+
+                    APPEND t_avip_out.
+
+                  ENDIF.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+            EXIT. "encontrado, salimos del loop.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+      CLEAR: tl_kna1, xl_kna1.
+
+***** CASO 3: Búsqueda por NIF: Proveedores *****
+
+      IF tl_lfa1[] IS NOT INITIAL.
+
+        LOOP AT tl_lfa1 INTO DATA(xl_lfa1).
+
+          IF ( wl_note_to_payee CS xl_lfa1-stcd1 ).
+
+            IF xl_lfa1-lifnr IS NOT INITIAL.
+
+              CLEAR lv_attr2.
+
+              SELECT attr2
+                FROM t033f
+                INTO lv_attr2
+                WHERE eigr1 = <fs_febep>-vgint.
+
+                CASE lv_attr2.
+                  WHEN '8'.
+                    MOVE 'D' TO lv_koart.
+                    EXIT.
+                  WHEN '7'.
+                    MOVE 'K' TO lv_koart.
+                    EXIT.
+                ENDCASE.
+              ENDSELECT.
+
+              IF lv_koart EQ 'K'.
+
+                lv_proveedor = xl_lfa1-lifnr.
+
+                lv_importfebep = - <fs_febep>-kwbtr. "en proveedores el importe es positivo.
+
+                CALL FUNCTION 'Z_SEITR_FBUSQPA' "siempre creada SIN cálculo de coma fija
+                  EXPORTING
+                    i_importe  = lv_importfebep
+                    i_lifnr    = lv_proveedor
+                    i_bukrs    = t_avip_in-bukrs
+                  IMPORTING
+                    zfi_docs_t = lt_zfi_docs_t
+                    e_mensaje  = lv_emensaje.
+
+                IF lv_emensaje NE 'E'.
+
+                  LOOP AT lt_zfi_docs_t INTO ls_zfi_docs_t.
+
+                    LOOP AT t_avip_in WHERE bukrs <> space.
+
+                      t_avip_out-koart  = 'K'.
+                      t_avip_out-konto  = lv_proveedor.
+                      t_avip_out-bukrs  = t_avip_in-bukrs.
+                      t_avip_out-sfeld  = 'BELNR'.
+                      t_avip_out-swert  = ls_zfi_docs_t-belnr.
+                      t_avip_out-swert+10(4) = ls_zfi_docs_t-gjahr.
+
+                      APPEND t_avip_out.
+
+                    ENDLOOP.
+
+                  ENDLOOP.
+
+                ELSE.
+
+                  IF <fs_febep>-intag EQ '906'. "si estamos utilizando el algoritmo 906 -> propuesta tercero.
+
+                    t_avip_out-koart   = 'K'.
+                    t_avip_out-bukrs   =  t_avip_in-bukrs.
+                    t_avip_out-konto   =  lv_proveedor.
+                    t_avip_out-sfeld   =  'BELNR'.
+
+                    APPEND t_avip_out.
+
+                  ENDIF.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+            EXIT. "encontrado, salimos del loop.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+      CLEAR: tl_lfa1, xl_lfa1.
+
+  ENDCASE.
+
+
+ENDFUNCTION.

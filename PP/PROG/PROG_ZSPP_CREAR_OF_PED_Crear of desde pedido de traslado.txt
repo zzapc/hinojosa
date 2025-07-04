@@ -1,0 +1,1086 @@
+*&---------------------------------------------------------------------*
+*& Report  ZSPP_CREAR_OF_PEDIDO
+*&
+*&---------------------------------------------------------------------*
+REPORT zspp_crear_of_ped.
+
+DATA: zsppt_ofpedsubco TYPE zsppt_ofpedsubco.
+
+DATA it_log TYPE TABLE OF char255.
+
+CONSTANTS c_2003 TYPE werks_d VALUE '2003'.
+CONSTANTS c_2001 TYPE werks_d VALUE '2001'.
+CONSTANTS c_2000 TYPE werks_d VALUE '2000'.
+CONSTANTS c_domain TYPE domname VALUE 'ZSPP_PASO'.
+
+DATA: rg_semis TYPE RANGE OF mtart,
+      rg_pto   TYPE RANGE OF mtart.
+
+DATA it_orders TYPE  zspp_tt_update_ordenes.
+FREE it_orders.
+
+DATA it_pedipos TYPE TABLE OF zsppt_ofpedsubco.
+FREE: rg_semis, rg_pto.
+CONSTANTS: c_pto  TYPE rvari_vnam VALUE 'ZSPP_UPD_MTART_PTE',
+           c_semi TYPE rvari_vnam VALUE 'ZSPP_UPD_MTART_SEM'.
+
+DATA v_idcola TYPE zsppt_ofpedsubco-idcola.
+
+SELECT-OPTIONS: s_ebeln FOR zsppt_ofpedsubco-ebeln,
+                s_ebelp FOR zsppt_ofpedsubco-ebelp,
+                s_matnr FOR zsppt_ofpedsubco-matnr.
+PARAMETERS p_idcola TYPE zwhs_cola-idcola.
+*PARAMETERS p_ebeln TYPE ebeln.
+*PARAMETERS p_ebelp TYPE ebelp.
+*PARAMETERS p_matnr TYPE matnr.
+
+DATA zlog TYPE zlog.
+DEFINE set_log_whs.
+  if not v_idcola is initial.
+    zwhs=>inserta_log( idcola = v_idcola tipo = zlog-msgty mensaje = zlog-message ).
+  elseif not p_idcola is initial.
+    zwhs=>inserta_log( idcola = p_idcola tipo = zlog-msgty mensaje = zlog-message ).
+  endif.
+END-OF-DEFINITION.
+
+START-OF-SELECTION.
+
+
+  DATA lv_valor TYPE string.
+  lv_valor = zcl_ap_parametros=>get_atributo1( clave        = 'ZOFPEDIDO'
+                                               campo        = 'JOB' ).
+
+  IF s_ebeln[] IS INITIAL.
+    DATA(num_jobs) = zsmm_utils=>num_jobs( i_jobname = lv_valor ).
+
+    IF num_jobs > 1  "No ejecutar si ya hay un job en marcha
+   OR ( ( sy-batch = abap_false AND sy-binpt = abap_false ) AND num_jobs >= 1 ). "O si se lanza en online pero existe un job
+      APPEND INITIAL LINE TO it_log ASSIGNING FIELD-SYMBOL(<log>).
+      WRITE |Ya existe una ejecución en job del report.| TO <log>.
+      WRITE <log>.
+      SKIP.
+      APPEND INITIAL LINE TO it_log ASSIGNING <log>.
+      WRITE |Se aborta la ejecución.| TO <log>.
+      WRITE <log>.
+
+
+      RETURN.
+
+    ENDIF.
+  ENDIF.
+
+  DATA lv_fecha_lim TYPE datum.
+  DATA numdias TYPE i.
+
+  DATA(numdiasparam) = zcl_ap_parametros=>get_atributo1( clave        = 'ZOFPEDIDO'
+                                                         campo        = 'DIAS' ).
+  TRY.
+      numdias = numdiasparam.
+    CATCH cx_root.
+      numdias = 0.
+  ENDTRY.
+  "Recuperar sólo las de 2 días atrás
+  lv_fecha_lim = sy-datum - numdias.
+
+  DATA reintentos TYPE i.
+  TRY.
+      reintentos = 1 * zcl_ap_parametros=>get_atributo1(
+                            clave        = 'ZOFPEDIDO'
+                            campo        = 'REINTENTO'
+                        ).
+    CATCH cx_root.
+      reintentos = 5.
+
+  ENDTRY.
+
+  DATA(lo_log) = NEW zcl_seidor_guardar_log( ).
+  DATA(lo_mm) = NEW zsmm_utils( ).
+  DATA wa_ret TYPE bapiret2.
+
+
+  DATA(o_log) = NEW zcl_ap_log( object = 'ZASSEMBLY'
+                                report = 'ZSPP_CREAR_OF_PED' ).
+
+  DATA(l_intentos) = 0.
+  DO.
+* APC20241217 A veces se ha metido en un bucle infinito.
+* Para impedir que eso ocurre intentamos el proceso 100 veces sólo y avisamos para revisar
+    ADD 1 TO l_intentos.
+    IF l_intentos > 100.
+      lo_log->guardar_mensaje(
+        EXPORTING
+          i_type       = 'W'
+          i_id         = '00'
+          i_number     = '398'
+          i_message_v1 = |Salimos por tener más de 100 intentos|  ).
+
+      zlog = o_log->log( msgty = 'E' message = 'Más de 100 intentos. Salimos' ).
+      set_log_whs.
+      EXIT.
+    ENDIF.
+
+    IF s_ebeln[] IS INITIAL.
+      SELECT * INTO TABLE @it_pedipos FROM zsppt_ofpedsubco
+            WHERE paso = '10'
+            AND aedat >= @lv_fecha_lim
+      AND reintento < @reintentos.
+    ELSE.
+      SELECT * INTO TABLE @it_pedipos FROM zsppt_ofpedsubco
+       WHERE ebeln IN @s_ebeln
+         AND ebelp IN @s_ebelp
+         AND matnr IN @s_matnr
+         AND paso = '10'.
+      IF sy-subrc NE 0.
+        IF p_idcola IS INITIAL.
+          MESSAGE 'El pedido seleccionado no está en paso 10' TYPE 'I'.
+          RETURN.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    DESCRIBE TABLE it_pedipos LINES DATA(entradas).
+
+    lo_log->guardar_mensaje(
+      EXPORTING
+        i_type       = 'I'
+        i_id         = '00'
+        i_number     = '398'
+        i_message_v1 = |Recuperadas { entradas } órdenes en paso 10|
+        i_message_v2 = |para crear o modificar|
+        i_message_v3 = ''
+        i_message_v4 = ''
+    ).
+
+    DATA l_clave_bloqueo TYPE sy-cprog.
+    LOOP AT it_pedipos ASSIGNING FIELD-SYMBOL(<p>).
+      l_clave_bloqueo = zcl_ap_string=>get_hash( |OFT-{ <p>-ebeln }-{ <p>-ebelp }-{ <p>-matnr } | ).
+      v_idcola = <p>-idcola.
+      IF zcl_ap_utils=>bloquear_programa( cprog = l_clave_bloqueo intentos = 1 espera = 0 ).
+        zlog = o_log->log( clave = <p>-ebeln msgty = 'W' message = 'Proceso bloqueado 1'
+                           msgv1   = <p>-ebeln msgv2   = <p>-ebelp msgv3   = <p>-matnr msgv4   = <p>-aufnr ).
+        set_log_whs.
+        CONTINUE.
+        RETURN.
+      ENDIF.
+
+      CLEAR wa_ret.
+      "Comprobamos si la pos del pedido se ha borrado a posteriori y continúa en tabla
+      SELECT SINGLE loekz
+        FROM ekpo
+        WHERE ebeln = @<p>-ebeln
+        AND ebelp = @<p>-ebelp
+        AND loekz IN ( 'L', 'X' )
+      INTO @DATA(lv_borrado).
+      IF sy-subrc = 0.
+        PERFORM descarta_necesidad USING <p>-ebeln <p>-ebelp <p>-matnr.
+        zcl_ap_utils=>desbloquear_programa( l_clave_bloqueo ).
+        CONTINUE.
+      ENDIF.
+
+      IF <p>-aufnr IS NOT INITIAL.
+        zspp_utils=>get_of_status(
+          EXPORTING
+            i_aufnr    = <p>-aufnr
+          IMPORTING
+            ot_status  = DATA(status_of)
+*          ot_return  =
+*        CHANGING
+*          co_obj_log =
+        ).
+
+        "Verificamos que la of no esté marcada con PTBO, sino habría que crear una nueva
+
+      ENDIF.
+
+      IF <p>-aufnr IS NOT INITIAL AND NOT line_exists( status_of[ istat = 'I0076' ] ).
+
+        zlog = o_log->log( clave = <p>-ebeln
+                    msgty = 'W'
+                    message = 'Tenemos orden sin petición de borrado. Se modificará'
+                    msgv1   = <p>-ebeln
+                    msgv2   = <p>-ebelp
+                    msgv3   = <p>-matnr
+                    msgv4   = <p>-aufnr ).
+        set_log_whs.
+        lo_log->guardar_mensaje(
+        EXPORTING
+          i_type       = 'I'
+          i_id         = '00'
+          i_number     = '398'
+          i_message_v1 = |Se va a modificar la OF|
+          i_message_v2 = |{ <p>-aufnr ALPHA = OUT }|
+          i_message_v3 = ''
+          i_message_v4 = ''
+      ).
+
+        COMMIT WORK AND WAIT.
+
+        "Hay que lanzar la modificación de la OF
+        lo_mm->modifica_of_subco(
+          EXPORTING
+            i_ebeln = <p>-ebeln
+            i_ebelp = <p>-ebelp
+            i_matnr = <p>-matnr
+*          i_mbdat = w_reparto-mbdat
+*          i_eindt = w_reparto-eindt
+*          i_menge = <bom_pos>-bdmng
+          IMPORTING
+            o_ok    = DATA(ok)
+            wa_ret = wa_ret
+        ).
+
+        lo_log->guardar_mensaje(
+          EXPORTING
+            i_type       = wa_ret-type
+            i_id         = wa_ret-id
+            i_number     = wa_ret-number
+            i_message_v1 = wa_ret-message_v1
+            i_message_v2 = wa_ret-message_v2
+            i_message_v3 = wa_ret-message_v3
+            i_message_v4 = wa_ret-message_v4
+        ).
+
+        IF ok = abap_true.
+          COMMIT WORK AND WAIT.
+
+          zlog = o_log->log( clave = <p>-ebeln
+                      msgty = 'S'
+                      message = 'Se modifica la orden correctamente'
+                      msgv1   = <p>-ebeln
+                      msgv2   = <p>-ebelp
+                      msgv3   = <p>-matnr
+                      msgv4   = <p>-aufnr ).
+          set_log_whs.
+
+          PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr <p>-aufnr '20' wa_ret.
+
+        ELSE.
+          ROLLBACK WORK.
+          PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr <p>-aufnr '10' wa_ret.
+
+          MESSAGE ID wa_ret-id TYPE 'S' NUMBER wa_ret-number WITH wa_ret-message_v1 wa_ret-message_v2 wa_ret-message_v3 wa_ret-message_v4
+          INTO DATA(l_msg).
+          zlog = o_log->log( clave = <p>-ebeln
+                      msgty = 'E'
+                      message = |Error modificando orden { l_msg }|
+                      msgv1   = <p>-ebeln
+                      msgv2   = <p>-ebelp
+                      msgv3   = <p>-matnr
+                      msgv4   = <p>-aufnr ).
+          set_log_whs.
+
+        ENDIF.
+
+        COMMIT WORK AND WAIT.
+
+      ELSE.
+        "Si estamos en PASO 10, comprobamos el caso y creamos la OF
+
+        zlog = o_log->log( clave = <p>-ebeln
+                    msgty = 'I'
+                    message = 'Intentamos crear orden'
+                    msgv1   = <p>-ebeln
+                    msgv2   = <p>-ebelp
+                    msgv3   = <p>-matnr
+                    msgv4   = <p>-aufnr ).
+        set_log_whs.
+
+        lo_mm->get_caso_subco( EXPORTING i_ebeln = <p>-ebeln
+                                         i_ebelp = <p>-ebelp
+                               IMPORTING o_werks = DATA(lv_centro)
+                                         o_bdter = DATA(lv_bdter)
+                                         o_menge = DATA(lv_menge)
+                                         o_vbeln = DATA(lv_vbeln_export)
+                                         o_vbelp = DATA(lv_vbelp_export)
+                                         o_zzped_cliente = DATA(lv_zzped_export)
+                                         o_zzcliente = DATA(lv_zzcliente_export)
+                               RECEIVING o_caso = DATA(lv_caso)  ).
+
+
+        DATA(l_exp) = SWITCH string( lv_caso WHEN '1' THEN 'ENVÍO DE SEMITERMINADO DE XÀTIVA A PERIS VÍA PEDIDO DE SUBCONTRATISTA'
+                                             WHEN '2' THEN 'ENVÍO DE PRODUCTO TERMINADO DE XÀTIVA A PERIS VÍA PEDIDO DE TRASLADO'
+                                             WHEN '3' THEN 'ENVÍO DE PRODUCTO TERMINADO DE XÀTIVA A CENTRO DE MONTAJE VÍA PEDIDO DE TRASLADO'
+                                             ELSE '¡CASO SIN DETERMINAL!' ).
+        zlog = o_log->log( clave = <p>-ebeln
+                    msgty = 'I'
+                    message = |Caso { lv_caso } { l_exp }|
+                    msgv1   = <p>-ebeln
+                    msgv2   = <p>-ebelp
+                    msgv3   = <p>-matnr
+                    msgv4   = <p>-aufnr ).
+        set_log_whs.
+
+        SET PARAMETER ID 'ZVBN' FIELD lv_vbeln_export.
+        SET PARAMETER ID 'ZVBP' FIELD lv_vbelp_export.
+        SET PARAMETER ID 'ZPEDC' FIELD lv_zzped_export.
+        SET PARAMETER ID 'ZCLI' FIELD lv_zzcliente_export.
+        SET PARAMETER ID 'ZEBELN' FIELD <p>-ebeln.
+        SET PARAMETER ID 'ZEBELP' FIELD <p>-ebelp.
+
+        "Se recuperan los parámetros en la user ZXCO1U06 para pasarlos a la OF
+
+        IF lv_caso IS NOT INITIAL.
+
+
+          "Si por algún motivo no recuperamos ningún caso que acople no haremos nada
+          "Recuperamos aquellos que sean semis
+          SELECT t1~matnr, werks, bdmng, bdter, kzear INTO TABLE @DATA(it_semis)
+            FROM resb AS t1 INNER JOIN mara AS t2 ON t1~matnr EQ t2~matnr
+            WHERE ebeln = @<p>-ebeln
+            AND ebelp = @<p>-ebelp
+            AND t1~matnr = @<p>-matnr
+          AND t2~mtart IN @rg_semis.
+
+          IF sy-subrc <> 0.
+
+
+            APPEND INITIAL LINE TO it_semis ASSIGNING FIELD-SYMBOL(<add>).
+            <add>-matnr = <p>-matnr.
+            <add>-werks = lv_centro.
+            <add>-bdmng = lv_menge.
+            <add>-bdter = lv_bdter.
+
+          ENDIF.
+
+          LOOP AT it_semis ASSIGNING FIELD-SYMBOL(<f>).
+            COMMIT WORK AND WAIT.
+
+            DATA: "wa_ret   TYPE bapiret2,
+              lv_aufnr TYPE aufnr,
+              wa_order TYPE  bapi_pp_order_create.
+            CLEAR: wa_ret, lv_aufnr, wa_order.
+
+            "Tenemos que crear la OF
+            wa_order-material = <f>-matnr.
+*            wa_order-material_long = <f>-matnr."SEIDOR Cambios S4
+            wa_order-plant = <f>-werks.
+
+            SELECT SINGLE cuobj INTO @DATA(wa_cuobj)
+              FROM marc
+              WHERE werks EQ  @<f>-werks
+            AND matnr EQ @<f>-matnr.
+
+            "Le pasamos el CUOBJ a la Bapi
+            wa_order-configuration = wa_cuobj.
+
+            wa_order-planning_plant  = <f>-werks.
+            wa_order-quantity = <f>-bdmng.
+
+            SELECT SINGLE auart INTO wa_order-order_type FROM t399x WHERE werks EQ wa_order-plant AND auart LIKE 'Z___'.
+
+            wa_order-basic_end_date = <f>-bdter.
+            wa_order-basic_end_time = '210000'.
+
+            CLEAR: lv_aufnr, wa_ret.
+
+            lo_log->guardar_mensaje(
+              EXPORTING
+                i_type       = 'I'
+                i_id         = '00'
+                i_number     = '398'
+                i_message_v1 = |Se va a crear OF para el pedido|
+                i_message_v2 = |{ <p>-ebeln ALPHA = OUT }|
+                i_message_v3 = 'posición'
+                i_message_v4 = |{ <p>-ebelp ALPHA = OUT }|
+            ).
+
+            CALL FUNCTION 'BAPI_PRODORD_CREATE'
+              EXPORTING
+                orderdata    = wa_order
+              IMPORTING
+                return       = wa_ret
+                order_number = lv_aufnr
+*               ORDER_TYPE   =
+              .
+            IF wa_ret-type IS INITIAL AND lv_aufnr IS NOT INITIAL.
+              CLEAR wa_ret.
+              wa_ret-type = 'S'.
+              wa_ret-id = '00'.
+              wa_ret-number = 398.
+              wa_ret-message_v1 = |Orden { lv_aufnr ALPHA = OUT }|.
+              wa_ret-message_v2 = |creada con éxito.|.
+            ENDIF.
+            lo_log->guardar_mensaje(
+              EXPORTING
+                i_type       = wa_ret-type
+                i_id         = wa_ret-id
+                i_number     = wa_ret-number
+                i_message_v1 = wa_ret-message_v1
+                i_message_v2 = wa_ret-message_v2
+                i_message_v3 = wa_ret-message_v3
+                i_message_v4 = wa_ret-message_v4
+            ).
+
+            IF wa_ret-type <> 'A' AND wa_ret-type <> 'E' AND wa_ret-type <> 'X' AND lv_aufnr IS NOT INITIAL.
+              "La OF Se ha creado satisfactoriamente
+
+*              SET PARAMETER ID 'ZAUF' FIELD lv_aufnr.
+*              PERFORM actualiza_afpo ON COMMIT.
+
+              zlog = o_log->log( clave = <p>-ebeln
+                          msgty = 'S'
+                          message = |Se crea orden para semi { lv_aufnr ALPHA = OUT }|
+                          msgv1   = <p>-ebeln
+                          msgv2   = <p>-ebelp
+                          msgv3   = <f>-matnr
+                          msgv4   = lv_aufnr ).
+              set_log_whs.
+
+              COMMIT WORK.
+
+
+
+              PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr lv_aufnr '20' wa_ret.
+
+              DATA lv_wait TYPE i.
+              DATA(lv_waitchar) = zcl_ap_parametros=>get_atributo1( clave        = 'ZOFPEDIDO'
+                                                                    campo        = 'WAIT' ).
+              TRY.
+                  lv_wait = lv_waitchar.
+                CATCH cx_root.
+                  lv_wait = 2.
+              ENDTRY.
+
+*              DATA espera TYPE i.
+*              GET TIME.
+*              GET TIME STAMP FIELD DATA(inirun).
+*              DO.
+*                GET TIME.
+*                GET TIME STAMP FIELD DATA(finrun).
+*                espera = finrun - inirun.
+*                SELECT SINGLE aufnr FROM aufk INTO @DATA(lv_x) WHERE aufnr = @lv_aufnr.
+*                IF sy-subrc = 0 OR espera >= lv_wait.
+*                  EXIT.
+*                ELSE.
+*                  WAIT UP TO '1' SECONDS.
+*                ENDIF.
+*              ENDDO.
+
+            ELSE.
+
+              ROLLBACK WORK.
+
+              PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr '' '10' wa_ret.
+
+              MESSAGE ID wa_ret-id TYPE 'S' NUMBER wa_ret-number WITH wa_ret-message_v1 wa_ret-message_v2 wa_ret-message_v3 wa_ret-message_v4
+              INTO l_msg.
+
+              zlog = o_log->log( clave = <p>-ebeln
+                          msgty = 'E'
+                          message = |Error creando Orden para semi: { l_msg }|
+                          msgv1   = <p>-ebeln
+                          msgv2   = <p>-ebelp
+                          msgv3   = <p>-matnr
+                          msgv4   = <p>-aufnr ).
+              set_log_whs.
+
+            ENDIF.
+            COMMIT WORK AND WAIT.
+
+          ENDLOOP.
+          IF sy-subrc NE 0.
+            zlog = o_log->log( clave = <p>-ebeln
+                        msgty = 'E'
+                        message = 'No se han recuperado semis'
+                        msgv1   = <p>-ebeln
+                        msgv2   = <p>-ebelp
+                        msgv3   = <p>-matnr
+                        msgv4   = <p>-aufnr ).
+            set_log_whs.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      APPEND INITIAL LINE TO it_orders ASSIGNING FIELD-SYMBOL(<ord>).
+      <ord>-aufnr = lv_aufnr.
+
+      zcl_ap_utils=>desbloquear_programa( l_clave_bloqueo ).
+    ENDLOOP.
+
+    CLEAR it_pedipos.
+
+    IF s_ebeln IS INITIAL.
+      SELECT * INTO TABLE @it_pedipos FROM zsppt_ofpedsubco
+            WHERE paso = '20'
+      AND aedat >= @lv_fecha_lim.
+    ELSE.
+      SELECT * INTO TABLE @it_pedipos FROM zsppt_ofpedsubco
+            WHERE paso = '20'
+      AND ebeln IN @s_ebeln
+        AND ebelp IN @s_ebelp
+        AND matnr IN @s_matnr.
+    ENDIF.
+*          AND reintento < @reintentos.
+
+
+    DESCRIBE TABLE it_pedipos LINES entradas.
+
+    lo_log->guardar_mensaje(
+      EXPORTING
+        i_type       = 'I'
+        i_id         = '00'
+        i_number     = '398'
+        i_message_v1 = |Recuperadas { entradas } órdenes en paso 20|
+        i_message_v2 = |para actualizar datos PP|
+        i_message_v3 = ''
+        i_message_v4 = ''
+    ).
+
+    LOOP AT it_pedipos ASSIGNING <p>.
+      l_clave_bloqueo = zcl_ap_string=>get_hash( |OFT-{ <p>-ebeln }-{ <p>-ebelp }-{ <p>-matnr } | ).
+      v_idcola = <p>-idcola.
+      IF zcl_ap_utils=>bloquear_programa( cprog = l_clave_bloqueo intentos = 2 espera = 1 ).
+        zlog = o_log->log( clave = <p>-ebeln msgty = 'W' message = |Proceso bloqueado 2 { <p>-ebeln } { <p>-ebelp }|
+                           msgv1   = <p>-ebeln msgv2   = <p>-ebelp msgv3   = <p>-matnr msgv4   = <p>-aufnr ).
+        set_log_whs.
+
+        CONTINUE.
+        RETURN.
+      ENDIF.
+
+      zlog = o_log->log( clave = <p>-ebeln
+                  msgty = 'I'
+                  message = 'Se va a procesar orden en paso 20'
+                  msgv1   = <p>-ebeln
+                  msgv2   = <p>-ebelp
+                  msgv3   = <p>-matnr
+                  msgv4   = <p>-aufnr ).
+      set_log_whs.
+
+      APPEND INITIAL LINE TO it_orders ASSIGNING <ord>.
+      <ord>-aufnr = <p>-aufnr.
+
+      lo_mm->get_caso_subco(
+        EXPORTING
+          i_ebeln = <p>-ebeln
+          i_ebelp = <p>-ebelp
+        IMPORTING
+          o_vbeln = DATA(lv_vbeln)
+          o_vbelp = DATA(lv_vbelp)
+          o_zzped_cliente = DATA(lv_zzped)
+          o_zzcliente = DATA(lv_zzcliente)
+        RECEIVING
+          o_caso  = lv_caso
+      ).
+
+      l_exp = SWITCH string( lv_caso WHEN '1' THEN 'ENVÍO DE SEMITERMINADO DE XÀTIVA A PERIS VÍA PEDIDO DE SUBCONTRATISTA'
+                                           WHEN '2' THEN 'ENVÍO DE PRODUCTO TERMINADO DE XÀTIVA A PERIS VÍA PEDIDO DE TRASLADO'
+                                           WHEN '3' THEN 'ENVÍO DE PRODUCTO TERMINADO DE XÀTIVA A CENTRO DE MONTAJE VÍA PEDIDO DE TRASLADO'
+                                           ELSE '¡CASO SIN DETERMINAL!' ).
+
+      zlog = o_log->log( clave = <p>-ebeln
+                  msgty = 'I'
+                  message = |Caso { lv_caso } { l_exp }|
+                  msgv1   = <p>-ebeln
+                  msgv2   = <p>-ebelp
+                  msgv3   = <p>-matnr
+                  msgv4   = <p>-aufnr ).
+      set_log_whs.
+
+      "Chequear si la OF se hubiera borrado
+      zspp_utils=>get_of_status(
+        EXPORTING
+          i_aufnr    = <p>-aufnr
+        IMPORTING
+          ot_status  = status_of
+*              ot_return  =
+*            CHANGING
+*              co_obj_log =
+      ).
+      IF line_exists( status_of[ istat = 'I0076' ] ).
+        zlog = o_log->log( clave = <p>-ebeln
+                    msgty = 'I'
+                    message = |Orden con petición de borrado. Se actualiza a paso 10 para que se reprocese|
+                    msgv1   = <p>-ebeln
+                    msgv2   = <p>-ebelp
+                    msgv3   = <p>-matnr
+                    msgv4   = <p>-aufnr ).
+        set_log_whs.
+
+        wa_ret-type = 'I'.
+        wa_ret-number = 398.
+        wa_ret-id = '00'.
+        wa_ret-message_v1 = 'Esperando crear OF'.
+        PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr '' '10' wa_ret.
+        UPDATE  zsppt_ofpedsubco SET reintento = 1 WHERE ebeln = <p>-ebeln AND ebelp = <p>-ebelp AND matnr = <p>-matnr.
+
+        lo_log->guardar_mensaje(
+          EXPORTING
+            i_type       = wa_ret-type
+            i_id         = wa_ret-id
+            i_number     = wa_ret-number
+            i_message_v1 = wa_ret-message_v1
+            i_message_v2 = wa_ret-message_v2
+            i_message_v3 = wa_ret-message_v3
+            i_message_v4 = wa_ret-message_v4
+        ).
+
+        CONTINUE.
+      ENDIF.
+
+      "Actualizamos los datos de PP (AFKO/AFPO)
+
+*      UPDATE afpo SET kdauf = lv_vbeln
+*                      kdpos = lv_vbelp
+*                      WHERE aufnr = <p>-aufnr.
+*      IF sy-subrc = 0.
+*
+*        UPDATE aufk SET zzped_cliente = lv_zzped
+*                        zzsubco_ebeln = <p>-ebeln
+*                        zzsubco_ebelp = <p>-ebelp
+*                        zzcliente     = lv_zzcliente
+*                  WHERE aufnr         = <p>-aufnr.
+*        IF sy-subrc <> 0.
+*          ROLLBACK WORK.
+*          wa_ret-type = 'E'.
+*          wa_ret-number = '398'.
+*          wa_ret-id = '00'.
+*          wa_ret-message_v1 = 'Error al actualizar tablas AFPO/AUFK'.
+*
+*          PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr <p>-aufnr '20' wa_ret.
+*        ELSE.
+*
+*      COMMIT WORK AND WAIT.
+
+      wa_ret-type = 'S'.
+      wa_ret-number = '398'.
+      wa_ret-id = '00'.
+      wa_ret-message_v1 = 'Datos de tablas AFPO/AUFK actualizadas'.
+
+      PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr <p>-aufnr '30' wa_ret.
+
+      zlog = o_log->log( clave = <p>-ebeln
+                  msgty = 'W'
+                  message = |Se pasa a estado 30, pero esto no hace nada porque está comentado, se hace en la exit|
+                  msgv1   = <p>-ebeln
+                  msgv2   = <p>-ebelp
+                  msgv3   = <p>-matnr
+                  msgv4   = <p>-aufnr ).
+      set_log_whs.
+
+*        ENDIF.
+*
+*      ELSE.
+*        ROLLBACK WORK.
+*        wa_ret-type = 'E'.
+*        wa_ret-number = '398'.
+*        wa_ret-id = '00'.
+*        wa_ret-message_v1 = 'Error al actualizar tablas AFPO/AUFK'.
+*
+*        PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr <p>-aufnr '20' wa_ret.
+*      ENDIF.
+
+      lo_log->guardar_mensaje(
+        EXPORTING
+          i_type       = wa_ret-type
+          i_id         = wa_ret-id
+          i_number     = wa_ret-number
+          i_message_v1 = wa_ret-message_v1
+          i_message_v2 = wa_ret-message_v2
+          i_message_v3 = wa_ret-message_v3
+          i_message_v4 = wa_ret-message_v4
+      ).
+      CLEAR wa_ret.
+
+      COMMIT WORK AND WAIT.
+
+      zcl_ap_utils=>desbloquear_programa( l_clave_bloqueo ).
+    ENDLOOP.
+
+    "Si es en modo online, solo procesar el pedido posición indicado
+*  IF sy-binpt EQ abap_true OR sy-batch EQ abap_true.
+    "Si es en job recuperar todo
+    IF s_ebeln IS INITIAL.
+      SELECT * INTO TABLE @it_pedipos FROM zsppt_ofpedsubco
+            WHERE paso = '30'
+      AND aedat >= @lv_fecha_lim.
+*          AND reintento < @reintentos.
+    ELSE.
+      SELECT * INTO TABLE @it_pedipos FROM zsppt_ofpedsubco
+            WHERE paso = '30'
+      AND ebeln IN @s_ebeln
+        AND ebelp IN @s_ebelp
+        AND matnr IN @s_matnr.
+    ENDIF.
+
+*  ELSE.
+*
+*    SELECT * INTO TABLE @it_pedipos FROM zsppt_ofpedsubco
+*          WHERE ebeln = @p_ebeln
+*          AND ebelp IN @rg_ebelp
+*          AND matnr IN @rg_matnr
+*          AND paso = '30'
+*          AND erdat >= @lv_fecha_lim.
+*
+*  ENDIF.
+
+    CLEAR entradas.
+    DESCRIBE TABLE it_pedipos LINES entradas.
+
+    lo_log->guardar_mensaje(
+      EXPORTING
+        i_type       = 'I'
+        i_id         = '00'
+        i_number     = '398'
+        i_message_v1 = |Recuperadas { entradas } órdenes en paso 30|
+        i_message_v2 = |para actualizar datos EKPO|
+        i_message_v3 = ''
+        i_message_v4 = ''
+    ).
+
+    LOOP AT it_pedipos ASSIGNING <p>.
+      v_idcola = <p>-idcola.
+      zlog = o_log->log( clave = <p>-ebeln
+                  msgty = 'I'
+                  message = 'Se va a procesar orden en paso 30'
+                  msgv1   = <p>-ebeln
+                  msgv2   = <p>-ebelp
+                  msgv3   = <p>-matnr
+                  msgv4   = <p>-aufnr ).
+      set_log_whs.
+
+      APPEND INITIAL LINE TO it_orders ASSIGNING <ord>.
+      <ord>-aufnr = <p>-aufnr.
+
+      UPDATE ekpo SET zzaufnr = <p>-aufnr
+                WHERE ebeln   = <p>-ebeln
+                  AND ebelp   = <p>-ebelp.
+
+      IF sy-subrc <> 0.
+        ROLLBACK WORK.
+        wa_ret-type = 'E'.
+        wa_ret-number = '398'.
+        wa_ret-id = '00'.
+        wa_ret-message_v1 = 'Error al actualizar tabla EKPO'.
+
+        PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr <p>-aufnr '30' wa_ret.
+
+        zlog = o_log->log( clave = <p>-ebeln
+                    msgty = 'E'
+                    message = 'Error al actualizar tabla EKPO'
+                    msgv1   = <p>-ebeln
+                    msgv2   = <p>-ebelp
+                    msgv3   = <p>-matnr
+                    msgv4   = <p>-aufnr ).
+        set_log_whs.
+
+      ELSE.
+
+        COMMIT WORK AND WAIT.
+
+        wa_ret-type = 'S'.
+        wa_ret-number = '398'.
+        wa_ret-id = '00'.
+        wa_ret-message_v1 = 'Datos de tablas PP y MM actualizadas OK'.
+
+        PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr <p>-aufnr '40' wa_ret.
+
+        zlog = o_log->log( clave = <p>-ebeln
+                    msgty = 'S'
+                    message = 'Se actualiza tabla EKPO y se pasa estado 30'
+                    msgv1   = <p>-ebeln
+                    msgv2   = <p>-ebelp
+                    msgv3   = <p>-matnr
+                    msgv4   = <p>-aufnr ).
+        set_log_whs.
+
+      ENDIF.
+
+      lo_log->guardar_mensaje(
+        EXPORTING
+          i_type       = wa_ret-type
+          i_id         = wa_ret-id
+          i_number     = wa_ret-number
+          i_message_v1 = wa_ret-message_v1
+          i_message_v2 = wa_ret-message_v2
+          i_message_v3 = wa_ret-message_v3
+          i_message_v4 = wa_ret-message_v4
+      ).
+      CLEAR wa_ret.
+
+    ENDLOOP.
+
+    SORT it_orders BY aufnr ASCENDING.
+    DELETE ADJACENT DUPLICATES FROM it_orders COMPARING aufnr.
+
+    IF s_ebeln IS INITIAL.
+      SELECT t1~* INTO TABLE @it_pedipos
+        FROM zsppt_ofpedsubco AS t1 INNER JOIN aufk AS t2 ON t1~aufnr = t2~aufnr AND t2~loekz = @abap_false
+          WHERE paso = '99'
+          AND t1~aedat >= @lv_fecha_lim
+          AND t1~aufnr <> @space
+      AND reintento < @reintentos.
+    ELSE.
+      SELECT t1~* INTO TABLE @it_pedipos
+        FROM zsppt_ofpedsubco AS t1 INNER JOIN aufk AS t2 ON t1~aufnr = t2~aufnr AND t2~loekz = @abap_false
+          WHERE paso = '99'
+          AND t1~ebeln IN @s_ebeln
+        AND t1~ebelp IN @s_ebelp
+        AND matnr IN @s_matnr
+      AND t1~aufnr <> @space.
+    ENDIF.
+
+    DESCRIBE TABLE it_pedipos LINES entradas.
+
+    lo_log->guardar_mensaje(
+      EXPORTING
+        i_type       = 'I'
+        i_id         = '00'
+        i_number     = '398'
+        i_message_v1 = |Recuperadas { entradas } órdenes en paso 99|
+        i_message_v2 = |para borrar|
+        i_message_v3 = ''
+        i_message_v4 = ''
+    ).
+
+    LOOP AT it_pedipos ASSIGNING <p>.
+      v_idcola = <p>-idcola.
+      l_clave_bloqueo = zcl_ap_string=>get_hash( |OFT-{ <p>-ebeln }-{ <p>-ebelp }-{ <p>-matnr } | ).
+      IF zcl_ap_utils=>bloquear_programa( cprog = l_clave_bloqueo intentos = 1 espera = 0 ).
+        zlog = o_log->log( clave = <p>-ebeln msgty = 'W' message = 'Proceso bloqueado 3'
+                           msgv1   = <p>-ebeln msgv2   = <p>-ebelp msgv3   = <p>-matnr msgv4   = <p>-aufnr ).
+        set_log_whs.
+
+        CONTINUE.
+        RETURN.
+      ENDIF.
+
+      zlog = o_log->log( clave = <p>-ebeln
+                  msgty = 'I'
+                  message = 'Se va a procesar orden en paso 99'
+                  msgv1   = <p>-ebeln
+                  msgv2   = <p>-ebelp
+                  msgv3   = <p>-matnr
+                  msgv4   = <p>-aufnr ).
+      set_log_whs.
+
+      lo_mm->borrar_of(
+                          EXPORTING
+                            i_aufnr = <p>-aufnr
+                            IMPORTING
+                              o_ok    = ok
+                              ow_ret  = DATA(wa_ret_del)
+                              ot_return	= DATA(lt_return)                      ).
+
+      PERFORM actualizar_estado_tabla USING <p>-ebeln <p>-ebelp <p>-matnr '' '99' wa_ret_del.
+
+
+      DESCRIBE TABLE it_pedipos LINES entradas.
+
+      lo_log->guardar_mensaje(
+        EXPORTING
+          i_type       = wa_ret_del-type
+          i_id         = wa_ret_del-id
+          i_number     = wa_ret_del-number
+          i_message_v1 = wa_ret_del-message_v1
+          i_message_v2 = wa_ret_del-message_v2
+          i_message_v3 = wa_ret_del-message_v3
+          i_message_v4 = wa_ret_del-message_v4
+      ).
+      LOOP AT lt_return INTO wa_ret_del.
+        lo_log->guardar_mensaje(
+          EXPORTING
+            i_type       = wa_ret_del-type
+            i_id         = wa_ret_del-id
+            i_number     = wa_ret_del-number
+            i_message_v1 = wa_ret_del-message_v1
+            i_message_v2 = wa_ret_del-message_v2
+            i_message_v3 = wa_ret_del-message_v3
+            i_message_v4 = wa_ret_del-message_v4
+        ).
+
+        MESSAGE ID wa_ret-id TYPE 'S' NUMBER wa_ret-number WITH wa_ret-message_v1 wa_ret-message_v2 wa_ret-message_v3 wa_ret-message_v4
+        INTO l_msg.
+        zlog = o_log->log( clave = wa_ret_del-type
+                    msgty = 'I'
+                    message = l_msg
+                    msgv1   = <p>-ebeln
+                    msgv2   = <p>-ebelp
+                    msgv3   = <p>-matnr
+                    msgv4   = <p>-aufnr ).
+        set_log_whs.
+
+      ENDLOOP.
+      CLEAR wa_ret_del.
+      COMMIT WORK AND WAIT.
+      zcl_ap_utils=>desbloquear_programa( l_clave_bloqueo ).
+    ENDLOOP.
+
+    IF s_ebeln IS INITIAL.
+      SELECT COUNT(*) FROM zsppt_ofpedsubco
+        WHERE ( ( paso = '99' AND aufnr <> '' AND reintento = 1 )
+        OR ( paso < '40' AND paso <> '10')
+        OR ( paso = '10' AND reintento = 1 ) )
+        AND aedat > @lv_fecha_lim
+      INTO @DATA(salida).
+    ELSE.
+      SELECT COUNT(*) FROM zsppt_ofpedsubco
+        WHERE ( ( paso = '99' AND aufnr <> '' AND reintento = 1 )
+        OR ( paso < '40' AND paso <> '10')
+        OR ( paso = '10' AND reintento = 1 ) )
+        AND ebeln IN @s_ebeln
+        AND ebelp IN @s_ebelp
+        AND matnr IN @s_matnr
+      INTO @salida.
+    ENDIF.
+    IF salida = 0.
+
+      lo_log->guardar_mensaje(
+        EXPORTING
+        i_type       = 'I'
+        i_id         = '00'
+        i_number     = '398'
+        i_message_v1 = 'Fin de la ejecución'
+        i_message_v2 = ''
+        i_message_v3 = ''
+        i_message_v4 = ''
+        ).
+
+      zlog = o_log->log(  msgty = 'I' message = 'No queda nada por procesar' ).
+      set_log_whs.
+
+      EXIT.
+
+    ENDIF.
+
+  ENDDO.
+
+  lo_log->get_bapiret_tab(
+    IMPORTING
+      gt_bapiret = DATA(lt_log_completo)
+  ).
+  DELETE lt_log_completo WHERE type = space.
+  IF p_idcola IS INITIAL.
+    LOOP AT lt_log_completo INTO DATA(wa_log_writes).
+      MESSAGE ID wa_log_writes-id TYPE wa_log_writes-type NUMBER wa_log_writes-number
+      WITH wa_log_writes-message_v1 wa_log_writes-message_v2 wa_log_writes-message_v3 wa_log_writes-message_v4
+      INTO wa_log_writes-message.
+
+      WRITE wa_log_writes-message.
+      SKIP.
+
+    ENDLOOP.
+  ENDIF.
+  lo_log->set_bapiret_tab( lt_bapiret = lt_log_completo ).
+
+  lo_log->guardar_log(
+    EXPORTING
+      objeto    = 'ZPP'
+      subobjeto = 'ZPPCREAOF'
+*    extnumber =     " Log aplicación: Identificación externa
+*  IMPORTING
+*    lognumber =     " Número de LOG
+  ).
+
+  IF it_orders[] IS NOT INITIAL.
+
+    CALL FUNCTION 'ZSPP_ENVIO_ORDERS_BACKGROUND' IN BACKGROUND TASK AS SEPARATE UNIT
+      EXPORTING
+        it_aufnr = it_orders.
+
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  DESCARTA_NECESIDAD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_<PEDPOS>_EBELN  text
+*      -->P_<PEDPOS>_EBELP  text
+*----------------------------------------------------------------------*
+FORM descarta_necesidad  USING    p_ebeln
+                                  p_ebelp
+                                  p_matnr .
+
+*  UPDATE zsppt_ofpedsubco SET aufnr = '-' WHERE ebeln = p_ebeln AND ebelp = p_ebelp.
+*  DELETE FROM zsppt_ofpedsubco WHERE ebeln = p_ebeln AND ebelp = p_ebelp AND matnr = p_matnr.
+  UPDATE zsppt_ofpedsubco SET paso = '99' WHERE ebeln = p_ebeln AND ebelp = p_ebelp AND matnr = p_matnr.
+
+
+  zlog = o_log->log( clave = p_ebeln
+              msgty = 'W'
+              message = 'Pedido borrado, lo descartamos'
+              msgv1   = p_ebeln
+              msgv2   = p_ebelp
+              msgv3   = p_matnr ).
+  set_log_whs.
+
+  COMMIT WORK AND WAIT.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ACTUALIZAR_ESTADO_TABLA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_<P>_EBELN  text
+*      -->P_<P>_EBELP  text
+*      -->P_<P>_MATNR  text
+*      -->P_LV_AUFNR  text
+*      -->P_0525   text
+*      -->P_WA_RET  text
+*----------------------------------------------------------------------*
+FORM actualizar_estado_tabla  USING    p_ebeln TYPE ebeln
+                                       p_ebelp TYPE ebelp
+                                       p_matnr TYPE matnr
+                                       p_aufnr TYPE aufnr
+                                       p_paso TYPE zspp_paso
+                                       p_return TYPE bapiret2.
+
+  SELECT SINGLE * INTO @DATA(wa_registro) FROM zsppt_ofpedsubco
+    WHERE ebeln = @p_ebeln
+    AND ebelp = @p_ebelp
+  AND matnr = @p_matnr.
+
+  IF sy-subrc = 0.
+    IF wa_registro-paso = p_paso.
+      wa_registro-reintento = wa_registro-reintento + 1.
+    ELSE.
+      wa_registro-reintento = 1.
+    ENDIF.
+    wa_registro-paso = p_paso.
+    IF NOT ( p_paso = '99' AND p_return-type = 'E' ).
+      wa_registro-aufnr = p_aufnr.
+    ENDIF.
+    SELECT SINGLE ddtext
+      INTO @wa_registro-texto_paso
+      FROM dd07t
+      WHERE domname = 'ZSPP_PASO'
+      AND domvalue_l = @p_paso
+    AND ddlanguage = @sy-langu.
+
+    IF p_return-type IS NOT INITIAL.
+      MESSAGE ID p_return-id TYPE p_return-type NUMBER p_return-number
+      WITH p_return-message_v1 p_return-message_v2 p_return-message_v3 p_return-message_v4
+      INTO wa_registro-texto_return.
+    ENDIF.
+
+    MODIFY zsppt_ofpedsubco FROM wa_registro.
+    COMMIT WORK AND WAIT.
+
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ACTUALIZA_AFPO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM actualiza_afpo .
+*  GET PARAMETER ID 'ZAUF' FIELD DATA(lv_aufnr).
+*  GET PARAMETER ID 'ZVBN' FIELD DATA(lv_vbeln).
+*  GET PARAMETER ID 'ZVBP' FIELD DATA(lv_vbelp).
+*
+*  IF lv_aufnr IS NOT INITIAL.
+*    SELECT SINGLE * FROM afpo INTO @DATA(wa_afpo) WHERE aufnr = @lv_aufnr.
+*    IF sy-subrc = 0.
+*      wa_afpo-kdauf = lv_vbeln.
+*      wa_afpo-kdpos = lv_vbelp.
+*      MODIFY afpo FROM wa_afpo.
+*    ENDIF.
+*  ENDIF.
+
+ENDFORM.

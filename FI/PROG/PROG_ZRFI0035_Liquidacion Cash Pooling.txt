@@ -1,0 +1,498 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRFI0035
+*&
+*&---------------------------------------------------------------------*
+*& Liquidación Cash Pooling
+*& 79699. Cash Pooling
+*& Javier Calás. 09.11.23
+*&---------------------------------------------------------------------*
+
+REPORT zrfi0035.
+TABLES: bkpf, sscrfields.
+
+
+*********************
+* Tipos de datos
+*********************
+TYPES: BEGIN OF st_contabilizacion,
+         bukrs      TYPE t001-bukrs,
+         budat      TYPE bkpf-budat,
+         intereses  TYPE dmbtr,
+         waers      TYPE waers,
+         semaforo   TYPE icon_d,
+         belnr      TYPE bkpf-belnr,
+         gjahr      TYPE bkpf-gjahr,
+         soc_no_sap TYPE zrfi0035_soc_no_sap,
+         message    TYPE bapiret2-message,
+       END OF st_contabilizacion.
+
+*********************
+* Constantes
+*********************
+CONSTANTS: cg_burks_capital TYPE t001-bukrs VALUE '1000'.
+
+*********************
+* Variables globales
+*********************
+DATA: tg_contabilizacion  TYPE TABLE OF st_contabilizacion.
+DATA: rg_alv  TYPE REF TO cl_salv_table.
+
+
+
+DATA: vg_trimestre TYPE zrfi0035_trimestre,
+      vg_monat     TYPE monat.
+
+*********************
+* Pantalla de selección
+*********************
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-b01.
+SELECT-OPTIONS: s_bukrs   FOR bkpf-bukrs OBLIGATORY.
+PARAMETERS: p_gjahr  TYPE gjahr OBLIGATORY.
+SELECT-OPTIONS: s_monat   FOR vg_monat NO-EXTENSION OBLIGATORY.
+PARAMETERS: p_tinter TYPE p LENGTH 6 DECIMALS 3 OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK b01.
+
+
+
+SELECTION-SCREEN BEGIN OF BLOCK b03 WITH FRAME TITLE text-b03.
+SELECT-OPTIONS: s_buk_ns   FOR bkpf-bukrs NO INTERVALS.
+SELECTION-SCREEN END OF BLOCK b03.
+
+
+
+
+
+SELECTION-SCREEN BEGIN OF BLOCK b02 WITH FRAME TITLE text-b02.
+PARAMETERS: cbx_test AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN END OF BLOCK b02.
+
+
+AT SELECTION-SCREEN ON s_monat.
+  IF s_monat-low IS NOT INITIAL AND s_monat-low NOT BETWEEN 1 AND 12.
+    MESSAGE 'Periodo incorrecto' TYPE 'E'.
+  ENDIF.
+  IF s_monat-high IS NOT INITIAL AND s_monat-high NOT BETWEEN 1 AND 12.
+    MESSAGE 'Periodo incorrecto' TYPE 'E'.
+  ENDIF.
+
+AT SELECTION-SCREEN ON p_tinter.
+  IF p_tinter NOT BETWEEN 0 AND 100.
+    MESSAGE 'El tipo de interés debe estar entre 0 y 100' TYPE 'E'.
+  ENDIF.
+
+AT SELECTION-SCREEN.
+  CHECK sy-ucomm <> '%001'. "Selección valores sociedad
+
+  "Todas las sociedades introducidas deben tener entradas en la tabla ZTFI0005
+  CHECK s_bukrs[] IS NOT INITIAL.
+  SELECT bukrs, butxt
+    INTO TABLE @DATA(tl_t001)
+    FROM t001
+    WHERE bukrs IN @s_bukrs[].
+  IF sy-subrc <> 0.
+    MESSAGE 'No se han encontrado sociedades' TYPE 'E'.
+  ENDIF.
+
+
+  "Sociedades no SAP. Pueden no existir
+  IF s_buk_ns IS NOT INITIAL.
+    LOOP AT s_buk_ns ASSIGNING FIELD-SYMBOL(<fs_buk_ns>) WHERE sign <> 'I' OR option <> 'EQ'.
+      MESSAGE 'No utilice operaciones en la selección de sociedes no SAP (Sólo lista de sociedades)' TYPE 'E'.
+      RETURN.
+    ENDLOOP.
+
+    SELECT bukrs, butxt
+      INTO TABLE @DATA(tl_t001_ns)
+      FROM t001
+      WHERE bukrs IN @s_buk_ns[].
+  ENDIF.
+
+
+  SELECT vgtyp, bukrs, vwezw, hkont
+    INTO TABLE @DATA(tl_ztfi0005)
+    FROM ztfi0005
+    WHERE bukrs IN @s_bukrs[].
+  LOOP AT tl_t001 ASSIGNING FIELD-SYMBOL(<fs_t001>).
+    READ TABLE tl_ztfi0005 TRANSPORTING NO FIELDS WITH KEY bukrs = <fs_t001>-bukrs.
+    IF sy-subrc <> 0.
+      MESSAGE |La sociedad { <fs_t001>-bukrs } no está dada de alta en la tabla ZTFI0005| TYPE 'E'.
+    ENDIF.
+  ENDLOOP.
+
+  READ TABLE tl_t001 TRANSPORTING NO FIELDS WITH KEY bukrs = cg_burks_capital.
+  IF sy-subrc <> 0.
+    MESSAGE |La sociedad { cg_burks_capital } es obligatoria| TYPE 'E'.
+  ENDIF.
+
+
+START-OF-SELECTION.
+  PERFORM f_start_of_selection.
+
+END-OF-SELECTION.
+  PERFORM f_end_of_selection.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_START_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_start_of_selection.
+  CLEAR tg_contabilizacion .
+
+  DATA tl_budat_rg TYPE RANGE OF bkpf-budat.
+  APPEND INITIAL LINE TO tl_budat_rg ASSIGNING FIELD-SYMBOL(<fs_budat_rg>).
+  <fs_budat_rg> = VALUE #( sign = 'I' option = 'BT' ).
+
+  <fs_budat_rg>-low  = <fs_budat_rg>-high = p_gjahr && s_monat-low && '01'.
+  IF s_monat-high IS NOT INITIAL.
+    <fs_budat_rg>-high = p_gjahr && s_monat-high && '01'.
+  ENDIF.
+
+  CALL FUNCTION 'LAST_DAY_OF_MONTHS'
+    EXPORTING
+      day_in            = <fs_budat_rg>-high
+    IMPORTING
+      last_day_of_month = <fs_budat_rg>-high
+    EXCEPTIONS
+      day_in_no_date    = 1
+      OTHERS            = 2.
+
+  "Las sociedades no SAP están indicadas en la sociedad 1000, aquí no tengo nada que hacer
+  SELECT DISTINCT ztfi0005~bukrs, ztfi0005~hkont, t001~waers
+    INTO TABLE @DATA(tl_ztfi0005)
+    FROM ztfi0005 INNER JOIN t001 ON t001~bukrs = ztfi0005~bukrs
+    WHERE ztfi0005~bukrs IN @s_bukrs.
+
+  CHECK tl_ztfi0005 IS NOT INITIAL.
+
+
+
+  "Lectura documentos financieros
+  SELECT bseg~bukrs, bseg~belnr, bseg~gjahr, bseg~buzei, bseg~hkont, bseg~bschl, bseg~dmbtr,
+         bkpf~budat, bkpf~bldat, t001~waers, bseg~vbund
+    INTO TABLE @DATA(tl_bseg)
+    FROM bseg INNER JOIN bkpf ON  bkpf~bukrs = bseg~bukrs AND
+                                  bkpf~belnr = bseg~belnr AND
+                                  bkpf~gjahr = bseg~gjahr
+              INNER JOIN t001 ON t001~bukrs = bseg~bukrs
+    FOR ALL ENTRIES IN @tl_ztfi0005
+    WHERE bseg~bukrs = @tl_ztfi0005-bukrs AND
+          bseg~hkont = @tl_ztfi0005-hkont AND
+          bkpf~budat IN @tl_budat_rg.
+
+
+
+
+  "Inclusión de la deuda acumulada en el cálculo
+  DATA vl_bldat_ant TYPE d.
+  DATA tl_account_balances TYPE TABLE OF bapi3006_4.
+  DATA(vl_monat_ant) = CONV numc2( s_monat-low - 1 ).
+  DATA(vl_gjahr_ant) = p_gjahr.
+  IF vl_monat_ant = '00'.
+    vl_monat_ant = '12'.
+    SUBTRACT 1 FROM vl_gjahr_ant.
+  ENDIF.
+  vl_bldat_ant = vl_gjahr_ant && vl_monat_ant && '01'.
+  CALL FUNCTION 'LAST_DAY_OF_MONTHS'
+    EXPORTING
+      day_in            = vl_bldat_ant
+    IMPORTING
+      last_day_of_month = vl_bldat_ant
+    EXCEPTIONS
+      day_in_no_date    = 1
+      OTHERS            = 2.
+
+  LOOP AT tl_ztfi0005 ASSIGNING FIELD-SYMBOL(<fs_ztfi0005>).
+    CLEAR tl_account_balances.
+    CALL FUNCTION 'BAPI_GL_ACC_GETPERIODBALANCES'
+      EXPORTING
+        companycode      = <fs_ztfi0005>-bukrs
+        glacct           = <fs_ztfi0005>-hkont
+        fiscalyear       = vl_gjahr_ant
+        currencytype     = '10'
+      TABLES
+        account_balances = tl_account_balances.
+    READ TABLE tl_account_balances ASSIGNING FIELD-SYMBOL(<fs_account_balances>) WITH KEY fis_period = vl_monat_ant.
+    IF sy-subrc = 0.
+      APPEND INITIAL LINE TO tl_bseg ASSIGNING FIELD-SYMBOL(<fs_bseg>).
+      <fs_bseg>-bukrs = <fs_ztfi0005>-bukrs.
+      <fs_bseg>-hkont = <fs_ztfi0005>-hkont.
+      <fs_bseg>-budat = <fs_bseg>-bldat = vl_bldat_ant.
+      <fs_bseg>-dmbtr = <fs_account_balances>-balance.
+      <fs_bseg>-waers = <fs_account_balances>-currency.
+      IF <fs_bseg>-bukrs = cg_burks_capital.
+        <fs_bseg>-vbund = |{ <fs_bseg>-hkont+7(3) }0|.  "La sociedad asociada la calculo con los últimos digitos de la cuenta
+      ELSE.
+        <fs_bseg>-vbund = cg_burks_capital.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+
+  DATA: vl_primer_dia_sig_periodo TYPE d,
+        vl_tipo_interes           TYPE p DECIMALS 6,
+        wl_contabilizacion        TYPE st_contabilizacion.
+
+  vl_primer_dia_sig_periodo = <fs_budat_rg>-high + 1.
+
+
+
+
+  DATA vl_soc_asociada TYPE bseg-bukrs.
+  LOOP AT tl_bseg ASSIGNING <fs_bseg>.
+    CLEAR wl_contabilizacion.
+    vl_soc_asociada = |{ <fs_bseg>-vbund ALPHA = OUT }|.
+    IF s_buk_ns[] IS NOT INITIAL AND <fs_bseg>-bukrs = cg_burks_capital AND vl_soc_asociada IN s_buk_ns. "Sociedades no SAP
+      wl_contabilizacion-soc_no_sap = 'X'.
+      wl_contabilizacion-bukrs      = vl_soc_asociada.
+    ELSE.
+      wl_contabilizacion-soc_no_sap = space.
+      wl_contabilizacion-bukrs      = <fs_bseg>-bukrs.
+    ENDIF.
+
+    wl_contabilizacion-budat = <fs_budat_rg>-high.
+    wl_contabilizacion-waers = <fs_bseg>-waers.
+
+    "Intereses = Importe de la posición del documento * (tipo de interés de la pantalla de selección / 365) * número de días.
+    DATA(vl_num_dias)   = vl_primer_dia_sig_periodo - <fs_bseg>-bldat.
+    IF <fs_bseg>-bschl = '50'.
+      MULTIPLY <fs_bseg>-dmbtr BY -1.
+    ENDIF.
+
+    "JCB 28.01.25. Corrección signo sociedades no SAP
+    IF wl_contabilizacion-soc_no_sap = 'X'.
+      MULTIPLY <fs_bseg>-dmbtr BY -1.
+    ENDIF.
+
+
+    vl_tipo_interes               = p_tinter / 100.
+    wl_contabilizacion-intereses  = <fs_bseg>-dmbtr * vl_tipo_interes * vl_num_dias / 365.
+    IF wl_contabilizacion-intereses <> 0.
+      COLLECT wl_contabilizacion INTO tg_contabilizacion.
+    ENDIF.
+  ENDLOOP.
+
+
+
+  """""""""""""""""""""""""""""""
+  " Contabilización
+  """""""""""""""""""""""""""""""
+  CHECK cbx_test = space.
+
+
+  DATA: wl_documentheader    TYPE bapiache09,
+        tl_accountgl         TYPE TABLE OF bapiacgl09,
+        tl_accountreceivable TYPE TABLE OF bapiacar09,
+        tl_accountpayable    TYPE TABLE OF bapiacap09,
+        tl_currencyamount    TYPE TABLE OF bapiaccr09,
+        tl_return            TYPE TABLE OF bapiret2,
+        tl_extension2        TYPE TABLE OF bapiparex.
+
+  CLEAR: wl_documentheader, tl_accountgl, tl_currencyamount, tl_return, tl_extension2.
+
+  "Primero la sociedad 1000
+  wl_documentheader-comp_code   = cg_burks_capital.
+  wl_documentheader-doc_type    = 'SA'.
+  wl_documentheader-ref_doc_no  = 'LIQ CASHPOOLING'.
+  wl_documentheader-doc_date    = wl_documentheader-pstng_date = <fs_budat_rg>-high.
+  wl_documentheader-username    = sy-uname.
+
+
+  "En esta vuelta incluyo las sociedades no SAP
+  LOOP AT tg_contabilizacion ASSIGNING FIELD-SYMBOL(<fs_contabilizacion>) WHERE bukrs <> cg_burks_capital.
+    DATA(vl_tabix) = sy-tabix.
+
+    APPEND INITIAL LINE TO tl_accountpayable ASSIGNING FIELD-SYMBOL(<fs_accountpayable>).
+    <fs_accountpayable>-itemno_acc  = vl_tabix * 20 - 10.
+    <fs_accountpayable>-vendor_no   = |P{ <fs_contabilizacion>-bukrs }|.
+    <fs_accountpayable>-sp_gl_ind   = 'T'.  "CME
+    <fs_accountpayable>-item_text   = 'Liquidación intereses Cash Pooling'.
+    APPEND INITIAL LINE TO tl_currencyamount ASSIGNING FIELD-SYMBOL(<fs_currencyamount>).
+    <fs_currencyamount>-itemno_acc  = <fs_accountpayable>-itemno_acc.
+    <fs_currencyamount>-amt_doccur  = <fs_contabilizacion>-intereses * -1.
+    <fs_currencyamount>-currency    = <fs_contabilizacion>-waers.
+    APPEND INITIAL LINE TO tl_extension2 ASSIGNING FIELD-SYMBOL(<fs_extension2>).
+    <fs_extension2>-structure       = 'POSTING_KEY'.
+    <fs_extension2>-valuepart1      = <fs_accountpayable>-itemno_acc.
+    <fs_extension2>-valuepart2      = COND #( WHEN <fs_contabilizacion>-intereses > 0 THEN '39' ELSE '29' ).
+
+
+    DATA(vl_gl_account) = COND #( WHEN <fs_contabilizacion>-intereses >= 0 THEN '0006620500' ELSE '0007620500' ).
+    APPEND INITIAL LINE TO tl_accountgl ASSIGNING FIELD-SYMBOL(<fs_accountgl>).
+    <fs_accountgl>-itemno_acc  = vl_tabix * 20.
+    <fs_accountgl>-gl_account  = vl_gl_account.
+    <fs_accountgl>-item_text   = 'Liquidación intereses Cash Pooling'.
+    <fs_accountgl>-trade_id    = <fs_contabilizacion>-bukrs.
+    APPEND INITIAL LINE TO tl_currencyamount ASSIGNING <fs_currencyamount>.
+    <fs_currencyamount>-itemno_acc  = <fs_accountgl>-itemno_acc.
+    <fs_currencyamount>-amt_doccur  = <fs_contabilizacion>-intereses.
+    <fs_currencyamount>-currency    = <fs_contabilizacion>-waers.
+    APPEND INITIAL LINE TO tl_extension2 ASSIGNING <fs_extension2>.
+    <fs_extension2>-structure       = 'POSTING_KEY'.
+    <fs_extension2>-valuepart1      = <fs_accountgl>-itemno_acc.
+    <fs_extension2>-valuepart2      = COND #( WHEN <fs_contabilizacion>-intereses > 0 THEN '40' ELSE '50' ).
+  ENDLOOP.
+
+
+  DATA: vl_obj_type TYPE bapiache09-obj_type,
+        vl_obj_key  TYPE bapiache09-obj_key,
+        vl_obj_sys  TYPE bapiache09-obj_sys.
+
+
+  CALL FUNCTION 'BAPI_ACC_DOCUMENT_POST'
+    EXPORTING
+      documentheader    = wl_documentheader
+    IMPORTING
+      obj_type          = vl_obj_type
+      obj_key           = vl_obj_key
+      obj_sys           = vl_obj_sys
+    TABLES
+      accountgl         = tl_accountgl
+      accountreceivable = tl_accountreceivable
+      accountpayable    = tl_accountpayable
+      currencyamount    = tl_currencyamount
+      extension2        = tl_extension2
+      return            = tl_return.
+
+  LOOP AT tl_return ASSIGNING FIELD-SYMBOL(<fs_return>) WHERE type = 'E' AND ( id <> 'RW' OR number <> '609' ).ENDLOOP.
+  IF sy-subrc <> 0.
+    READ TABLE tl_return ASSIGNING <fs_return> WITH KEY type = 'E'.
+  ENDIF.
+  IF sy-subrc <> 0.
+    READ TABLE tl_return ASSIGNING <fs_return> WITH KEY type = 'A'.
+  ENDIF.
+  IF sy-subrc <> 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+    READ TABLE tg_contabilizacion ASSIGNING <fs_contabilizacion> WITH KEY bukrs = cg_burks_capital.
+    IF sy-subrc = 0.
+      <fs_contabilizacion>-belnr  = vl_obj_key(10).
+      <fs_contabilizacion>-gjahr  = vl_obj_key+14(4).
+      <fs_contabilizacion>-semaforo = icon_led_green.
+      MESSAGE s003(zfi001) WITH <fs_contabilizacion>-bukrs <fs_contabilizacion>-belnr <fs_contabilizacion>-gjahr  INTO <fs_contabilizacion>-message.
+    ENDIF.
+
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    READ TABLE tg_contabilizacion ASSIGNING <fs_contabilizacion> WITH KEY bukrs = cg_burks_capital.
+    IF sy-subrc = 0.
+      <fs_contabilizacion>-semaforo = icon_led_red.
+      <fs_contabilizacion>-message   = <fs_return>-message.
+    ENDIF.
+  ENDIF.
+
+
+  "Luego el resto de las sociedades
+  "En esta vuelta excluyo las sociedades no SAP
+  LOOP AT tg_contabilizacion ASSIGNING <fs_contabilizacion> WHERE bukrs       <> cg_burks_capital AND
+                                                                  soc_no_sap  = space.
+    CLEAR: tl_accountpayable, tl_accountgl, tl_currencyamount, tl_return, tl_extension2.
+    CLEAR: vl_obj_type, vl_obj_sys, vl_obj_key.
+
+    wl_documentheader-comp_code   = <fs_contabilizacion>-bukrs.
+
+    APPEND INITIAL LINE TO tl_accountpayable ASSIGNING <fs_accountpayable>.
+    <fs_accountpayable>-itemno_acc  = 10.
+    <fs_accountpayable>-vendor_no   = |P{ cg_burks_capital }|.
+    <fs_accountpayable>-sp_gl_ind   = 'T'.  "CME
+    <fs_accountpayable>-item_text   = 'Liquidación intereses Cash Pooling'.
+    APPEND INITIAL LINE TO tl_currencyamount ASSIGNING <fs_currencyamount>.
+    <fs_currencyamount>-itemno_acc  = <fs_accountpayable>-itemno_acc.
+    <fs_currencyamount>-amt_doccur  = <fs_contabilizacion>-intereses.
+    <fs_currencyamount>-currency    = <fs_contabilizacion>-waers.
+    APPEND INITIAL LINE TO tl_extension2 ASSIGNING <fs_extension2>.
+    <fs_extension2>-structure       = 'POSTING_KEY'.
+    <fs_extension2>-valuepart1      = <fs_accountpayable>-itemno_acc.
+    <fs_extension2>-valuepart2      = COND #( WHEN <fs_contabilizacion>-intereses < 0 THEN '39' ELSE '29' ).
+
+
+    vl_gl_account = COND #( WHEN <fs_contabilizacion>-intereses < 0 THEN '0006620500' ELSE '0007620500' ).
+    APPEND INITIAL LINE TO tl_accountgl ASSIGNING <fs_accountgl>.
+    <fs_accountgl>-itemno_acc  = 20.
+    <fs_accountgl>-gl_account  = vl_gl_account.
+    <fs_accountgl>-item_text   = 'Liquidación intereses Cash Pooling'.
+    <fs_accountgl>-trade_id    = cg_burks_capital.
+    APPEND INITIAL LINE TO tl_currencyamount ASSIGNING <fs_currencyamount>.
+    <fs_currencyamount>-itemno_acc  = <fs_accountgl>-itemno_acc.
+    <fs_currencyamount>-amt_doccur  = <fs_contabilizacion>-intereses  * -1.
+    <fs_currencyamount>-currency    = <fs_contabilizacion>-waers.
+    APPEND INITIAL LINE TO tl_extension2 ASSIGNING <fs_extension2>.
+    <fs_extension2>-structure       = 'POSTING_KEY'.
+    <fs_extension2>-valuepart1      = <fs_accountgl>-itemno_acc.
+    <fs_extension2>-valuepart2      = COND #( WHEN <fs_contabilizacion>-intereses < 0 THEN '40' ELSE '50' ).
+
+
+    CALL FUNCTION 'BAPI_ACC_DOCUMENT_POST'
+      EXPORTING
+        documentheader    = wl_documentheader
+      IMPORTING
+        obj_type          = vl_obj_type
+        obj_key           = vl_obj_key
+        obj_sys           = vl_obj_sys
+      TABLES
+        accountgl         = tl_accountgl
+        accountreceivable = tl_accountreceivable
+        accountpayable    = tl_accountpayable
+        currencyamount    = tl_currencyamount
+        extension2        = tl_extension2
+        return            = tl_return.
+
+    LOOP AT tl_return ASSIGNING <fs_return> WHERE type = 'E' AND ( id <> 'RW' OR number <> '609' ).ENDLOOP.
+    IF sy-subrc <> 0.
+      READ TABLE tl_return ASSIGNING <fs_return> WITH KEY type = 'E'.
+    ENDIF.
+    IF sy-subrc <> 0.
+      READ TABLE tl_return ASSIGNING <fs_return> WITH KEY type = 'A'.
+    ENDIF.
+    IF sy-subrc <> 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+      <fs_contabilizacion>-belnr  = vl_obj_key(10).
+      <fs_contabilizacion>-gjahr  = vl_obj_key+14(4).
+      <fs_contabilizacion>-semaforo = icon_led_green.
+      MESSAGE s003(zfi001) WITH <fs_contabilizacion>-bukrs <fs_contabilizacion>-belnr <fs_contabilizacion>-gjahr  INTO <fs_contabilizacion>-message.
+
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      <fs_contabilizacion>-semaforo = icon_led_red.
+      LOOP AT tl_return ASSIGNING <fs_return> WHERE type CA 'EA'.
+        <fs_contabilizacion>-message   = <fs_return>-message.
+      ENDLOOP.
+    ENDIF.
+  ENDLOOP.
+
+
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_END_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_end_of_selection .
+
+  "Mostrar ALV
+  TRY.
+      cl_salv_table=>factory( IMPORTING r_salv_table = rg_alv
+                              CHANGING  t_table      = tg_contabilizacion ).
+      rg_alv->get_columns( )->set_optimize( abap_false ).
+      rg_alv->get_functions( )->set_all( abap_true ).
+      rg_alv->display( ).
+    CATCH cx_salv_msg
+          cx_salv_wrong_call
+          cx_salv_existing
+          cx_salv_not_found.
+  ENDTRY.
+ENDFORM.

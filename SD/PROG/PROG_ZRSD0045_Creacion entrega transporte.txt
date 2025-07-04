@@ -1,0 +1,568 @@
+***********************************************************************
+* TIPO : LISTADO
+* TITULO : Creación entregas/transporte
+* DESCRIPCION : Creación entregas/transporte
+*
+* AUTOR: Andrés Picazo                                FECHA: 01/10/2024
+* ANALISTA: Andrea Sánchez Balanzá
+*
+***********************************************************************
+REPORT zrsd0045.
+TABLES: likp, rv50a, vttk, lfa1, kna1.
+
+CLASS lcl_event_grid DEFINITION INHERITING FROM zcl_ap_alv_grid_eventos FINAL.
+  PUBLIC SECTION.
+    METHODS: data_changed REDEFINITION,
+      user_command REDEFINITION.
+ENDCLASS.
+
+
+CLASS zcl_report DEFINITION INHERITING FROM zcl_dev FINAL.
+  PUBLIC SECTION.
+    TYPES: BEGIN OF  t_listado,
+             check   TYPE xfeld,
+             lights  TYPE zico_estado_mensaje,
+             matnr   TYPE lips-matnr,
+             maktx   TYPE lips-arktx,
+             lfimg   TYPE lips-lfimg,
+             vrkme   TYPE lips-vrkme,
+             message TYPE bapi_msg,
+           END OF t_listado,
+           tt_listado TYPE STANDARD TABLE OF t_listado.
+
+    DATA i_listado TYPE tt_listado.
+    DATA: o_alv    TYPE REF TO zcl_ap_alv_grid,
+          o_event  TYPE REF TO lcl_event_grid,
+          i_campos TYPE lvc_t_fcat.
+
+    METHODS: status_dynpro_0100,
+      command_dynpro_0100,
+
+      validaciones IMPORTING !mod    TYPE abap_bool DEFAULT ''
+                   CHANGING  listado TYPE t_listado,
+
+      inicio_variables,
+
+      get_valor IMPORTING campo        TYPE any
+                          !sap         TYPE any
+                          descripcion  TYPE any
+                RETURNING VALUE(valor) TYPE string,
+
+      procesar,
+
+      crear_entrega EXPORTING vbeln    TYPE vbeln_vl
+                              !message TYPE bapi_msg,
+
+      picking EXPORTING !message TYPE bapi_msg,
+
+      crear_transporte EXPORTING tknum    TYPE tknum
+                                 !message TYPE bapi_msg,
+
+      modificar_transporte EXPORTING !message TYPE bapi_msg,
+      refrescar_grid.
+
+ENDCLASS.
+
+DATA o_prog TYPE REF TO zcl_report.
+
+CLASS lcl_event_grid IMPLEMENTATION.
+  METHOD user_command.
+    DATA: l_listado TYPE o_prog->t_listado,
+          l_hay_sel TYPE c LENGTH 1.
+
+    CASE e_ucomm.
+      WHEN 'NUEVO'.
+        APPEND l_listado TO o_prog->i_listado.
+
+        o_alv->refrescar_grid( ).
+      WHEN 'BORRAR'.
+        o_alv->comprobar_cambios( ).
+        o_alv->set_marca_filas_sel( EXPORTING validar_seleccion = 'X' CHANGING t_tabla = o_prog->i_listado hay_sel = l_hay_sel ).
+        IF l_hay_sel = 'X'.
+          " TODO: variable is assigned but never used (ABAP cleaner)
+          LOOP AT o_prog->i_listado ASSIGNING FIELD-SYMBOL(<listado>) WHERE check = 'X'.
+            DELETE o_prog->i_listado.
+          ENDLOOP.
+          o_alv->refrescar_grid( ).
+        ENDIF.
+
+      WHEN OTHERS.
+        super->user_command( e_ucomm = e_ucomm ).
+    ENDCASE.
+  ENDMETHOD.
+
+  METHOD data_changed.
+    ini_data_changed( cambios = er_data_changed->mt_good_cells  ).
+
+    LOOP AT i_cambios_celda INTO cambio_celda.
+      AT NEW row_id.
+        READ TABLE o_prog->i_listado INTO DATA(l_listado_ini) INDEX cambio_celda-row_id. "#EC CI_SUBRC
+        DATA(l_listado) = l_listado_ini.
+      ENDAT.
+
+      set_valor_mod( CHANGING datos = l_listado ).
+
+      AT END OF row_id.
+        o_prog->validaciones( EXPORTING mod = 'X' CHANGING listado = l_listado ).
+        MODIFY o_prog->i_listado FROM l_listado INDEX cambio_celda-row_id.
+        actualizar_fila( fila_ini = l_listado_ini fila_fin = l_listado er_data_changed = er_data_changed fila = cambio_celda-row_id ).
+      ENDAT.
+    ENDLOOP.
+  ENDMETHOD.
+ENDCLASS.
+
+
+CLASS zcl_report IMPLEMENTATION.
+  " seleccionar_datos
+
+  METHOD status_dynpro_0100.
+    status_dynpro( EXPORTING cprog = 'ZAP_STATUS' status = 'ST_DYN' CHANGING i_listado = i_listado ).
+    IF inicio IS INITIAL.
+      inicio = 'X'.
+      o_alv->add_button( button = 'F01' text = 'Crear entrega/transporte' icon = icon_execute_object ucomm = 'EJEC' ).
+      o_alv->add_button( button = 'F02' qinfo = 'Limpiar pantalla' icon = icon_create ucomm = 'NUEVO' ).
+      o_alv->add_button( button = 'M01' text = 'Log' ucomm = 'LOG' ).
+      IF usuario_sistemas = 'X'.
+        o_alv->add_button( button = 'M02' text = 'Parámetros' icon = icon_execute_object ucomm = 'PARAM' ).
+      ENDIF.
+
+      o_alv->registrar_mod( ).
+      o_alv->set_layout( no_rowmove = 'X' no_rowins = 'X' ancho_optimizado = '' ).
+      o_alv->quitar_opciones( cl_gui_alv_grid=>mc_fc_refresh ).
+      o_alv->set_campos_tabint( i_listado[] ).
+      o_alv->set_field_quitar( 'CHECK,MESSAGE' ).
+      o_alv->set_field_input( 'MATNR,LFIMG,VRKME' ).
+      o_alv->set_field( campo = 'LFIMG' op = 'NO_CERO' ).
+      o_alv->set_field( campo = 'LIGHTS' op = 'ANCHO' valor = 4 ).
+      o_alv->set_field_dropdown( campo = 'MATNR'  valor = '1'
+                                 tabla = 'ZPARAMETROS'
+                                 campo_desc = 'VALOR2'
+                                 where = |CAMPO = 'PTOEXP_MATERIAL' AND VALOR = '{ likp-vstel }'| ).
+
+      sgpi_texto( 'Generando informe' ).
+      o_alv->show( CHANGING tabla = i_listado ).
+
+      o_alv->set_seleccion( CHANGING t_tabla = i_listado ).
+
+      LOOP AT i_campos ASSIGNING FIELD-SYMBOL(<campo>) WHERE tech = 'X'.
+        zcl_ap_dynpro=>screen_input( campo = <campo>-fieldname variable = '' ).
+      ENDLOOP.
+    ENDIF.
+    lfa1-name1 = get( tabla = 'LFA1' clave = vttk-tdlnr ).
+    kna1-name1 = get( tabla = 'KNA1' clave = likp-kunnr ).
+  ENDMETHOD.
+
+  METHOD command_dynpro_0100.
+
+    IF sy-ucomm = 'REFRESCO'.
+      refrescar_grid( ).
+      CLEAR inicio.
+      status_dynpro_0100( ).
+      RETURN.
+    ENDIF.
+
+    command_dynpro( EXPORTING o_alv = o_alv
+                            CHANGING i_listado = i_listado i_listado_ini = i_listado ).
+
+    CASE ucomm.
+      WHEN 'EJEC'.
+        procesar( ).
+      WHEN 'PARAM'.
+        o_par->mantenimiento( ).
+      WHEN 'NUEVO'.
+        inicio_variables( ).
+      WHEN 'LOG'.
+        SUBMIT (zcl_c=>prog_zlog)                        "#EC CI_SUBMIT
+               VIA SELECTION-SCREEN
+               WITH s_proces = 'ZRSD0045'
+               WITH s_progra = sy-cprog
+               WITH s_fecha  = sy-datum.
+    ENDCASE.
+  ENDMETHOD.
+
+  METHOD validaciones.
+    " TODO: parameter MOD is never used (ABAP cleaner)
+
+    CLEAR: listado-message, listado-lights.
+
+    IF listado-matnr IS INITIAL.
+      CLEAR listado-maktx.
+    ELSE.
+      listado-maktx = get( tabla = 'MAKT' clave = listado-matnr ).
+      IF listado-maktx IS INITIAL.
+        listado-message = 'Material incorrecto'.
+        DATA(l_icono) = icon_red_light.
+      ELSE.
+        IF listado-vrkme IS INITIAL.
+          listado-vrkme = zcl_ap_material=>get_unidad_base( listado-matnr ).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    set_status_list( EXPORTING message = listado-message icono = l_icono CHANGING list = listado ).
+  ENDMETHOD.
+
+  METHOD inicio_variables.
+    CLEAR: likp, vttk, rv50a, inicio,
+           i_campos, i_listado.
+
+    likp-lfart = get_valor( campo = 'CLASE_ENTREGA' sap = 'LIKP-LFART' descripcion = 'clase de entrega' ).
+    likp-vstel = get_valor( campo = 'PUESTO_EXPEDICION' sap = 'LIKP-VSTEL' descripcion = 'puesto de expedición' ).
+    likp-vkorg = get_valor( campo = 'ORG_VENTAS' sap = 'LIKP-VKORG' descripcion = 'organización de ventas' ).
+    rv50a-vtweg = get_valor( campo = 'CANAL' sap = 'RV50A-VTWEG' descripcion = 'canal' ).
+    rv50a-spart = get_valor( campo = 'SECTOR' sap = 'RV50A-SPART' descripcion = 'sector' ).
+    likp-route = get_valor( campo = 'RUTA' sap = 'LIKP-ROUTE' descripcion = 'ruta' ).
+    vttk-tplst       = get_valor( campo = 'PUESTO_PLAN_TRANSP' sap = 'VTTK-TPLST' descripcion = 'puesto planificador de transporte' ).
+    vttk-shtyp       = get_valor( campo = 'CLASE_TRANSPORTE' sap = 'VTTK-SHTYP' descripcion = 'clase de transporte' ).
+    vttk-signi       = get_valor( campo = 'MATRICULA' sap = 'VTTK-SIGNI' descripcion = 'matrícula' ).
+    vttk-tpbez       = get_valor( campo = 'REMOLQUE' sap = 'VTTK-TPBEZ' descripcion = 'remolque' ).
+    vttk-zzconductor = get_valor( campo = 'CONDUCTOR' sap = 'VTTK-ZZCONDUCTOR' descripcion = 'conductor' ).
+    vttk-zzdni       = get_valor( campo = 'DNI' sap = 'VTTK-ZZDNI' descripcion = 'DNI' ).
+    vttk-tdlnr       = get_valor( campo = 'TRANSPORTISTA' sap = 'VTTK-TDLNR' descripcion = 'transportista' ).
+    likp-kunnr = get_valor( campo = 'DESTINATARIO' sap = 'LIKP-KUNNR' descripcion = 'destinatario' ).
+
+    likp-wadat = sy-datum.
+
+
+    refrescar_grid( ).
+
+    DO 20 TIMES.
+      APPEND VALUE #( ) TO i_listado.
+    ENDDO.
+  ENDMETHOD.
+
+  METHOD refrescar_grid.
+    IF NOT o_alv IS INITIAL.
+      o_alv->free( ).
+      CLEAR o_alv.
+    ENDIF.
+
+    o_event = NEW #( boton_refrescar = 'X'
+                             boton_excel     = 'Y'
+                             boton_nuevo     = 'X'
+                             boton_borrar    = 'X'
+                             o_prog          = o_prog ).
+
+    o_alv = NEW #( estructura = ''
+                           o_event    = o_event ).
+
+  ENDMETHOD.
+
+  METHOD get_valor.
+    ASSIGN o_par->i_par[ campo = campo
+                         valor = sy-uname ] TO FIELD-SYMBOL(<par>).
+    IF sy-subrc = 0.
+      valor = <par>-atributo1.
+      IF <par>-atributo2 IS INITIAL.
+        DATA(l_no_cambios) = 'X'.
+      ENDIF.
+      DATA(l_obligatorio) = <par>-atributo3.
+    ELSE.
+      ASSIGN o_par->i_par[ campo = campo
+                           valor = '' ] TO <par>.
+      IF sy-subrc = 0.
+        valor = <par>-atributo1.
+        IF <par>-atributo2 IS INITIAL.
+          l_no_cambios = 'X'.
+        ENDIF.
+        l_obligatorio = <par>-atributo3.
+      ENDIF.
+    ENDIF.
+
+    APPEND VALUE #( fieldname = sap tech = l_no_cambios mac = l_obligatorio reptext = descripcion ) TO i_campos.
+  ENDMETHOD.
+
+  METHOD procesar.
+    LOOP AT i_campos ASSIGNING FIELD-SYMBOL(<campo>) WHERE mac = 'X'.
+      ASSIGN (<campo>-fieldname) TO FIELD-SYMBOL(<fs>).
+      IF <fs> IS INITIAL.
+        MESSAGE |Informe campo { <campo>-reptext }| TYPE 'I'.
+        RETURN.
+      ENDIF.
+    ENDLOOP.
+    IF likp-wadat IS INITIAL.
+      MESSAGE 'Informe fecha de salida de mercancías' TYPE 'I'.
+      RETURN.
+    ENDIF.
+    IF vttk-tdlnr IS INITIAL.
+      MESSAGE 'Informe transportista' TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+    o_alv->comprobar_cambios( ).
+    LOOP AT i_listado ASSIGNING FIELD-SYMBOL(<listado>) WHERE matnr <> ''.
+      IF <listado>-lfimg IS INITIAL.
+        MESSAGE 'Informe cantidad' TYPE 'I'.
+        RETURN.
+      ENDIF.
+      IF <listado>-vrkme IS INITIAL.
+        MESSAGE 'Informe unidad' TYPE 'I'.
+        RETURN.
+      ENDIF.
+    ENDLOOP.
+    IF sy-subrc <> 0.
+      MESSAGE 'Informe materiales' TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+    CLEAR o_log->i_log.
+    IF likp-vbeln IS INITIAL.
+      crear_entrega( IMPORTING vbeln = likp-vbeln
+                               message = DATA(l_message) ).
+    ENDIF.
+*
+*    IF NOT likp-vbeln IS INITIAL.
+*      picking( IMPORTING message = l_message ).
+*    ENDIF.
+*    CHECK l_message IS INITIAL.
+    IF NOT likp-vbeln IS INITIAL AND vttk-tknum IS INITIAL.
+      crear_transporte( IMPORTING tknum = vttk-tknum
+                               message = l_message ).
+    ENDIF.
+    IF NOT vttk-tknum IS INITIAL AND l_message IS INITIAL.
+      modificar_transporte( IMPORTING message = l_message ).
+    ENDIF.
+
+    o_log->show_log( ).
+  ENDMETHOD.
+
+  METHOD crear_entrega.
+    DATA: o_bi      TYPE REF TO zcl_ap_batch_input,
+          l_mensaje TYPE bapireturn1-message.
+
+    CLEAR: vbeln, message.
+
+    o_bi = NEW #( ).
+
+    o_bi->inicio( ).
+
+* Initial Screen: Create Outbound Delivery w/o Order Reference
+    o_bi->dynpro( program = 'SAPMV50A' dynpro = '4002' okcode = '/00' ).
+    o_bi->campos( campo = 'LIKP-VSTEL' valor = likp-vstel ). " Pto.exped./depto.entrada mcía.
+    o_bi->campos( campo = 'LIKP-LFART' valor = likp-lfart ). " Clase de entrega
+    o_bi->campos( campo = 'LIKP-VKORG' valor = likp-vkorg ). " Organización de ventas
+    o_bi->campos( campo = 'RV50A-VTWEG' valor = rv50a-vtweg ). " Canal de distribución
+    o_bi->campos( campo = 'RV50A-SPART' valor = rv50a-spart ). " Sector
+
+* Delivery: Item Overview (Subscreen Container)
+    o_bi->dynpro( program = 'SAPMV50A' dynpro = '1000' okcode = '=POAN_T' ).
+    o_bi->campos( campo = 'KUWEV-KUNNR' valor = likp-kunnr ). " Destinatario de mercancías
+    o_bi->campos( campo = 'LIKP-WADAT' valor = likp-wadat ). " Fecha prevista para movimiento de mercancías
+
+    DATA(i_list) = i_listado.
+    DELETE i_list WHERE matnr IS INITIAL.
+    LOOP AT i_list ASSIGNING FIELD-SYMBOL(<listado>) WHERE matnr <> ''.
+      AT LAST.
+        DATA(l_fin) = 'X'.
+      ENDAT.
+      o_bi->campos( campo = 'LIPS-MATNR(02)' valor = <listado>-matnr ).
+      o_bi->campos( campo = 'LIPSD-G_LFIMG(02)' valor = <listado>-lfimg ).
+      o_bi->campos( campo = 'LIPS-VRKME(02)' valor = <listado>-vrkme ).
+      IF l_fin IS INITIAL.
+        o_bi->dynpro( program = 'SAPMV50A' dynpro = '1000' okcode = '=POAN_T' ).
+      ELSE.
+        o_bi->dynpro( program = 'SAPMV50A' dynpro = '1000' okcode = '=T\04' ).
+      ENDIF.
+    ENDLOOP.
+
+    o_bi->dynpro( program = 'SAPMV50A' dynpro = '1000' okcode = '=SICH_T' ).
+    o_bi->campos( campo = 'LIKP-ROUTE' valor = likp-route ).
+
+    message = o_bi->llamar_transaccion( tcode = 'VL01NO' modo = modo_ct ).
+
+    IF o_bi->msgid = 'VL' AND o_bi->msgno = '311'.
+      vbeln = o_bi->msgv2.
+      __poner_ceros vbeln.
+      CLEAR message.
+      message( p1 = 'Se ha creado entrega' p2 = vbeln type = 'I' postponer = 'X' ).
+    ENDIF.
+
+    IF NOT message IS INITIAL.
+*      MESSAGE |Error creando entrega: { message }| TYPE 'I'.
+      message( p1 = 'Error creando entrega' p2 = message type = 'E' postponer = 'X' ).
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD picking.
+    DATA i_pos TYPE tt_vbpok.
+
+    SELECT posnr AS posnn lfimg AS pikmg FROM lips
+      INTO CORRESPONDING FIELDS OF TABLE i_pos
+     WHERE vbeln = likp-vbeln.
+
+    zcl_ap_entregas=>modificar_ctd_picking( EXPORTING vbeln   = likp-vbeln
+                                                    i_pos   = i_pos
+                                                    commit  = 'X'
+                                          IMPORTING message = message ).
+  ENDMETHOD.
+
+  METHOD crear_transporte.
+    DATA o_bi TYPE REF TO zcl_ap_batch_input.
+
+    o_bi = NEW #( ).
+
+    o_bi->inicio( ).
+
+* Shipment: Initial Screen Create Shipment VT01N
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1010' okcode = '=MM_TKAL' ).
+    o_bi->campos( campo = 'VTTK-TPLST' valor = vttk-tplst ). " Puesto de planificación de transporte
+    o_bi->campos( campo = 'VTTK-SHTYP' valor = vttk-shtyp ). " Clase de transporte
+
+* Shipment: Overview Screen with Tabstrips
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=TABS_OV_ID' ).
+    o_bi->campos( campo = 'VTTK-TDLNR' valor = vttk-tdlnr ). " Número de transportista
+
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=TABS_OV_AI' ).
+    o_bi->campos( campo = 'VTTK-SIGNI' valor = vttk-signi ). " Matrícula
+    o_bi->campos( campo = 'VTTK-TPBEZ' valor = vttk-tpbez ). " Remolque
+
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=MM_LFSL' ).
+    o_bi->campos( campo = 'VTTK-ZZCONDUCTOR' valor = vttk-zzconductor ). " conductor
+    o_bi->campos( campo = 'VTTK-ZZDNI' valor = vttk-zzdni ). " DNI
+
+* SEL_SCREEN 1210 INFO:170002360000000000000000005009539677160
+    o_bi->dynpro( program = 'SAPLV56L' dynpro = '1210' okcode = '=CRET' ).
+    o_bi->campos( campo = 'S_VBELN-LOW' valor = likp-vbeln ).
+
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1040' okcode = '=MM_SICH' ).
+
+    message = o_bi->llamar_transaccion( tcode = 'VT01N' modo = modo_ct ).
+
+    IF o_bi->msgid = 'VW' AND o_bi->msgno = '006'.
+      tknum = o_bi->msgv1.
+      __poner_ceros tknum.
+      CLEAR message.
+* Algunos campos Z se limpian al grabar ¿?
+      UPDATE vttk
+         SET zzconductor = vttk-zzconductor
+             zzdni = vttk-zzdni
+      WHERE tknum = tknum.
+
+      message( p1 = 'Se ha creado transporte' p2 = tknum type = 'I' postponer = 'X' ).
+
+      SELECT SINGLE vbeln FROM vttp
+        INTO likp-vbeln
+       WHERE tknum = tknum
+         AND vbeln = likp-vbeln.
+      IF sy-subrc <> 0.
+        message = 'No se puede asociar entrega a transporte'.
+        message( p1 = message type = 'E' postponer = 'X' ).
+      ENDIF.
+    ENDIF.
+
+    IF NOT message IS INITIAL.
+      message( p1 = 'Error creando transporte' p2 = message type = 'E' postponer = 'X' ).
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD modificar_transporte.
+    DATA o_bi TYPE REF TO zcl_ap_batch_input.
+
+    o_bi = NEW #( ).
+
+    o_bi->inicio( ).
+
+* Shipment: Initial Screen Create Shipment VT01N
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1011' okcode = '=MM_TKAL' ).
+    o_bi->campos( campo = 'VTTK-TKNUM' valor = vttk-tknum ).
+
+* Este bloque no debería hacer falta, pero parece que se pierden datos...
+* Shipment: Overview Screen with Tabstrips
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=TABS_OV_ID' ).
+    o_bi->campos( campo = 'VTTK-TDLNR' valor = vttk-tdlnr ). " Número de transportista
+
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=TABS_OV_AI' ).
+    o_bi->campos( campo = 'VTTK-SIGNI' valor = vttk-signi ). " Matrícula
+    o_bi->campos( campo = 'VTTK-TPBEZ' valor = vttk-tpbez ). " Remolque
+
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=TABS_OV_PR' ).
+    o_bi->campos( campo = 'VTTK-ZZCONDUCTOR' valor = vttk-zzconductor ). " conductor
+    o_bi->campos( campo = 'VTTK-ZZDNI' valor = vttk-zzdni ). " DNI
+
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=TABS_OV_DE' ).
+
+* Shipment: Overview Screen with Tabstrips
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=MM_ST01' ).
+
+* Dialog Box for Quick Entry When Setting Status
+    IF vttk-shtyp = 'Z005'.
+      o_bi->dynpro( program = 'SAPLV56F' dynpro = '0100' okcode = '=ONLI' ).
+    ENDIF.
+
+* Shipment: Overview Screen with Tabstrips
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=MM_ST02' ).
+
+* Shipment: Overview Screen with Tabstrips
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=MM_ST03' ).
+
+* Shipment: Overview Screen with Tabstrips
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=MM_ST04' ).
+
+* Dialog Box for Quick Entry When Setting Status
+    IF vttk-shtyp = 'Z005'.
+      o_bi->dynpro( program = 'SAPLV56F' dynpro = '0100' okcode = '=ONLI' ).
+      o_bi->campos( campo = 'VTTK-ALLOWED_TWGT' valor = '99999' ).
+      o_bi->campos( campo = 'VTTK-SIGNI' valor = vttk-signi ). " Matrícula
+      o_bi->campos( campo = 'VTTK-TPBEZ' valor = vttk-tpbez ). " Remolque
+    ENDIF.
+
+* Shipment: Overview Screen with Tabstrips
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=MM_ST05' ).
+
+* Shipment: Overview Screen with Tabstrips
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=MM_ST06' ).
+
+* Shipment: Overview Screen with Tabstrips
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=MM_ST07' ).
+
+    o_bi->dynpro( program = 'SAPMV56A' dynpro = '1020' okcode = '=MM_SICH' ).
+
+    message = o_bi->llamar_transaccion( tcode = 'VT02N' modo = modo_ct ).
+
+* Algunos campos Z se limpian al grabar ¿?
+    UPDATE vttk
+       SET zzconductor = vttk-zzconductor
+           zzdni = vttk-zzdni
+    WHERE tknum = vttk-tknum.
+
+
+    SELECT SINGLE sttrg stabf FROM vttk
+      INTO CORRESPONDING FIELDS OF vttk
+     WHERE tknum = vttk-tknum.
+
+    IF vttk-sttrg = '7'.
+      IF vttk-stabf = 'X'.
+        CLEAR message.
+        message( p1 =  'Se han cambiado los status del transporte' type = 'S' postponer = 'X' ).
+      ELSE.
+        message = 'No se pudo cambiar fijar el status despacho de expedición del transporte'.
+        message( p1 =  message type = 'W' postponer = 'X' ).
+      ENDIF.
+    ELSE.
+      message( p1 =  message type = 'E' postponer = 'X' ).
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.
+
+INITIALIZATION.
+  o_prog = NEW #( guardar_logz = 'X' ).
+
+START-OF-SELECTION.
+  o_prog->inicio_variables( ).
+
+  CALL SCREEN 0100.
+
+MODULE status_0100 OUTPUT.
+
+  o_prog->status_dynpro_0100( ).
+
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+MODULE user_command_0100 INPUT.
+
+  o_prog->command_dynpro_0100( ).
+
+
+ENDMODULE.

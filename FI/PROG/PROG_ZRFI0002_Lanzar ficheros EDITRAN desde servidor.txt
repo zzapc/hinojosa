@@ -1,0 +1,176 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRFI0002
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT zrfi0002.
+
+DATA: gv_auszfile TYPE febauszf.
+
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-sel.
+PARAMETERS: p_banco TYPE char12,
+            p_datum TYPE datum.
+SELECTION-SCREEN SKIP.
+PARAMETERS p_fiche TYPE text255 MODIF ID no.
+
+SELECTION-SCREEN END OF BLOCK b01.
+SELECTION-SCREEN BEGIN OF BLOCK b02 WITH FRAME TITLE text-ori.
+PARAMETERS: p_file RADIOBUTTON GROUP g DEFAULT 'X' USER-COMMAND g.
+PARAMETERS p_path TYPE pathintern MODIF ID fil.
+
+PARAMETERS: p_ftp  RADIOBUTTON GROUP g.
+PARAMETERS: p_dftp TYPE text50 MODIF ID ftp,
+            p_user TYPE text50 MODIF ID ftp,
+            p_pass TYPE text50 MODIF ID ftp,
+            p_ddir TYPE text100 MODIF ID ftp.
+SELECTION-SCREEN END OF BLOCK b02.
+
+AT SELECTION-SCREEN OUTPUT.
+  CONCATENATE 'EXTRACTO' '_' p_banco '_' p_datum '.txt' INTO p_fiche.
+  zcl_ap_dynpro=>screen_input( group1 = 'NO' variable = '' ).
+  zcl_ap_dynpro=>screen_visible(  group1 = 'FTP' variable = p_ftp ).
+  zcl_ap_dynpro=>screen_visible(  group1 = 'FIL' variable = p_file input = '0' ).
+  LOOP AT SCREEN.
+    IF screen-name = 'P_PASS'.
+      screen-invisible = '1'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+
+  IF p_file = 'X'.
+    CALL FUNCTION 'FILE_GET_NAME_USING_PATH'
+      EXPORTING
+*       CLIENT                     = SY-MANDT
+        logical_path               = 'Z_EDITRAN'
+*       OPERATING_SYSTEM           = SY-OPSYS
+*       PARAMETER_1                = ' '
+*       PARAMETER_2                = ' '
+*       PARAMETER_3                = ' '
+*       USE_BUFFER                 = ' '
+        file_name                  = p_fiche
+*       USE_PRESENTATION_SERVER    = ' '
+*       ELEMINATE_BLANKS           = 'X'
+      IMPORTING
+        file_name_with_path        = p_path
+      EXCEPTIONS
+        path_not_found             = 1
+        missing_parameter          = 2
+        operating_system_not_found = 3
+        file_system_not_found      = 4
+        OTHERS                     = 5.
+    IF sy-subrc = 0.
+      gv_auszfile = p_path.
+    ELSE.
+      MESSAGE |Error { sy-subrc } recuperando ruta de fichero| TYPE 'E'.
+    ENDIF.
+  ENDIF.
+
+AT SELECTION-SCREEN.
+  IF sy-ucomm = 'ONLI'.
+    IF p_banco IS INITIAL.
+      MESSAGE 'Informe banco' TYPE 'E'.
+    ENDIF.
+    IF p_datum IS INITIAL.
+      MESSAGE 'Informe fecha' TYPE 'E'.
+    ENDIF.
+    IF p_ftp = 'X'.
+      IF p_dftp IS INITIAL.
+        MESSAGE 'Informe dirección FTP' TYPE 'E'.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+START-OF-SELECTION.
+
+
+  IF p_ftp = 'X'.
+    DATA(o_ftp) = NEW zcl_ap_ftp( ).
+    o_ftp = NEW #( ).
+    o_ftp->connect( user = p_user password = p_pass host = p_dftp ).
+    IF NOT o_ftp->error_conexion IS INITIAL.
+      o_ftp->disconnect( ).
+      MESSAGE 'Error de conexión FTP' TYPE 'E'.
+    ELSE.
+      TYPES: BEGIN OF t_line,
+               line(1024) TYPE c,
+             END OF t_line.
+      DATA: l_fichero     TYPE string,
+            i_fichero_txt TYPE TABLE OF t_line.
+
+*      IF zcl_ap_ficheros=>ultima_letra_ruta( CONV #( p_ddir ) ) = '/'.
+*        CONCATENATE p_ddir p_fiche INTO l_fichero.
+*      ELSE.
+*        CONCATENATE p_ddir '/' p_fiche INTO l_fichero.
+*      ENDIF.
+
+      o_ftp->download_text_file( EXPORTING fichero = p_fiche
+                                           directorio = p_ddir
+                                           passive_mode = 'X'
+                                 IMPORTING i_tabla = i_fichero_txt  ).
+
+      IF NOT o_ftp->mensaje_error IS INITIAL.
+        o_ftp->disconnect( ).
+        MESSAGE o_ftp->mensaje_error TYPE 'E'.
+      ELSE.
+        zcl_ap_ficheros=>graba_fich_servidor( EXPORTING fichero = p_fiche
+                                              IMPORTING mensaje = DATA(l_msg)
+                                              CHANGING  tabla   = i_fichero_txt ).
+        IF NOT l_msg IS INITIAL.
+          o_ftp->disconnect( ).
+
+          MESSAGE |Error grabando fichero temporal { l_msg }| TYPE 'E'.
+        ELSE.
+          gv_auszfile = p_fiche.
+        ENDIF.
+      ENDIF.
+
+
+
+    ENDIF.
+  ENDIF.
+
+  zcl_ap_ficheros=>leer_xstring( EXPORTING fichero = gv_auszfile
+                                           mostrar_error = ''
+                                           get_string = 'X'
+                                           servidor = 'X'
+                                 IMPORTING string = DATA(string)
+                                           message = l_msg ).
+  IF NOT l_msg IS INITIAL.
+    MESSAGE l_msg TYPE 'E'.
+  ENDIF.
+
+  SUBMIT rfebka00 WITH einlesen EQ 'X'
+                  WITH format EQ 'R'
+                  WITH auszfile EQ gv_auszfile
+                  WITH pcupload EQ ''
+                  WITH mregel EQ '1'
+                  WITH valut_on EQ 'X'
+                  WITH p_koausz EQ 'X'
+                  WITH p_bupro EQ 'X'
+                  WITH p_statik EQ 'X'
+                  AND RETURN.
+
+* BORRAMOS EL FICHERO
+  IF NOT string IS INITIAL.
+* Por si acaso hacemos una copia temporal
+    zcl_ap_cache=>set_cache( clave = 'EDITRAN'
+                             subclave = gv_auszfile
+                             string = string
+                             max_duracion = 60 ).
+  ENDIF.
+  DELETE DATASET  gv_auszfile.
+
+  IF p_ftp = 'X'.
+    IF NOT p_ddir IS INITIAL.
+      o_ftp->cd( p_ddir ).
+    ENDIF.
+
+    IF o_ftp->delete( fichero = p_fiche ) = ''.
+      MESSAGE |Error borrando fichero del FTP { o_ftp->mensaje_error-line }| TYPE 'I'.
+    ENDIF.
+    o_ftp->disconnect( ).
+
+  ENDIF.

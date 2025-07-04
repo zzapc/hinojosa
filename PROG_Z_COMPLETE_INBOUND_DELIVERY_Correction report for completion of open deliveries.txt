@@ -1,0 +1,736 @@
+*$*$----------------------------------------------------------------$*$*
+*$ Correction Inst.         0120061532 0000479457                     $*
+*$--------------------------------------------------------------------$*
+*$ Valid for       :                                                  $*
+*$ Software Component   SAP_APPL   SAP Application                    $*
+*$  Release 470          All Support Package Levels                   $*
+*$  Release 500          Fm SAPKH50001                                $*
+*$  Release 600          Fm SAPKH60001                                $*
+*$  Release 602          All Support Package Levels                   $*
+*$  Release 603          All Support Package Levels                   $*
+*$  Release 604          Fm SAPKH60401                                $*
+*$  Release 605          All Support Package Levels                   $*
+*$  Release 606          Fm SAPKH60601                                $*
+*$  Release 616          All Support Package Levels                   $*
+*$  Release 617          Fm SAPKH61701                                $*
+*$  Release 618          All Support Package Levels                   $*
+*$--------------------------------------------------------------------$*
+*$ Changes/Objects Not Contained in Standard SAP System               $*
+*$*$----------------------------------------------------------------$*$*
+*&--------------------------------------------------------------------*
+*& Object          REPS Z_COMPLETE_INBOUND_DELIVERY
+*& Object Header   PROG Z_COMPLETE_INBOUND_DELIVERY
+*&--------------------------------------------------------------------*
+...
+*&---------------------------------------------------------------------*
+*& Report  Z_COMPLETE_INBOUND_DELIVERY                                 *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+
+report z_complete_inbound_delivery.
+
+tables: likp.
+constants: gc_max_rows like sy-dbcnt value 50.
+
+data: gt_likp      type standard table of likp         with header line,
+      gt_xlips     type standard table of lipsvb       with header line,
+      gt_xvbuk     type standard table of vbukvb       with header line,
+      gt_xvbup     type standard table of vbupvb       with header line,
+      gt_xvbfa     type standard table of vbfavb       with header line,
+      gt_gdrc      type standard table of shp_idx_gdrc with header line,
+      gf_counter_not_rel type i,
+      gf_counter_error   type i,
+      gf_counter_success type i,
+      gf_total           type i,
+      gf_subrc        like sy-subrc,
+      gc_cursor       type cursor.
+
+selection-screen begin of block select with frame title gc_t001.
+select-options: s_vbeln for likp-vbeln.
+selection-screen end of block select.
+
+selection-screen begin of block complete with frame title gc_t002.
+parameters: p_comple as checkbox default 'X'.
+selection-screen end of block complete.
+
+selection-screen begin of block control with frame title gc_t003.
+parameters: p_detail as checkbox default space.
+parameters: p_test   as checkbox default 'X'.
+selection-screen end of block control.
+
+initialization.
+
+  gc_t001 = 'Selection of deliveries with document number'.
+  gc_t002 = 'Correct only complete goods receipts'.
+  gc_t003 = 'Program control'.
+
+start-of-selection.
+
+  if p_comple eq space.
+    format color col_negative inverse on.
+    write: /'Deliveries belonging to open business',
+            'processes will be corrected'.
+    format color col_background inverse off.
+    uline.
+  endif.
+
+  open cursor with hold gc_cursor for
+              select * from shp_idx_gdrc
+                       where vbeln in s_vbeln.
+  do.
+    fetch next cursor gc_cursor
+               into table gt_gdrc
+               package size gc_max_rows.
+    if sy-subrc ne 0.
+      close cursor gc_cursor.
+      exit.
+    endif.
+
+    perform data_selection_basic tables gt_gdrc
+                                        gt_likp
+                                        gt_xvbuk
+                                        gt_xlips
+                                        gt_xvbup.
+
+    perform consistency_check tables gt_gdrc
+                                     gt_likp
+                                     gt_xvbuk
+                                     gt_xlips
+                                     gt_xvbup.
+
+    loop at gt_gdrc.
+
+      if p_detail ne space.
+        write: / gt_gdrc-vbeln color col_heading.
+      else.
+        write: / gt_gdrc-vbeln.
+      endif.
+      hide gt_gdrc-vbeln.
+      perform read_and_compare_po_history tables   gt_xlips
+                                                   gt_xvbup
+                                          using    gt_gdrc-vbeln
+                                                   p_comple
+                                          changing gf_subrc.
+      case gf_subrc.
+        when 4.
+          write: 'No correction possible.' color col_negative.
+          if p_detail ne space.
+            perform write_error_log tables gt_xlips
+                                    using  gt_gdrc-vbeln.
+          endif.
+          perform ignore_document tables gt_likp
+                                         gt_xvbuk
+                                         gt_xlips
+                                         gt_xvbup
+                                  using  gt_gdrc-vbeln.
+          delete gt_gdrc.
+          add 1 to gf_counter_error.
+        when 8.
+          write: 'Not relevant.' color col_normal.
+          if p_detail ne space.
+            perform write_error_log tables gt_xlips
+                                    using  gt_gdrc-vbeln.
+          endif.
+          perform ignore_document tables gt_likp
+                                         gt_xvbuk
+                                         gt_xlips
+                                         gt_xvbup
+                                  using  gt_gdrc-vbeln.
+          delete gt_gdrc.
+          add 1 to gf_counter_not_rel.
+        when 0.
+          write: 'To be corrected.' color col_positive.
+          if p_detail ne space.
+            perform write_error_log tables gt_xlips
+                                    using  gt_gdrc-vbeln.
+          endif.
+          add 1 to gf_counter_success.
+      endcase.
+    endloop.
+
+*   Reset update indicators used for log only
+    gt_xlips-updkz = space.
+    modify gt_xlips from gt_xlips transporting updkz
+                                  where updkz ne 'U'.
+
+*   Stop processing of current package if no relevant delivery left
+    check not gt_gdrc[] is initial.
+
+    perform data_selection_vbfa tables gt_gdrc
+                                       gt_xvbfa.
+
+    perform status_calculation tables gt_likp
+                                      gt_xlips
+                                      gt_xvbuk
+                                      gt_xvbup
+                                      gt_xvbfa.
+*   After the processing of this routine CT_GDRC contains only entries
+*   that should be DELETED from the due index because the related
+*   inbound delivery is no longer relevant for GR
+    perform update_due_index tables gt_gdrc
+                                    gt_xvbuk.
+
+*   Delete unchanged GT_XLIPS entries
+    delete gt_xlips where updkz eq space.
+
+    if p_test eq space.
+      perform database_update tables gt_xlips
+                                     gt_xvbuk
+                                     gt_xvbup
+                                     gt_gdrc.
+    endif.
+
+  enddo.
+  uline.
+  gf_total = gf_counter_not_rel + gf_counter_error + gf_counter_success.
+  write: / 'Total number of processed deliveries:', gf_total.
+  write: / 'Number of not-relevant deliveries   :',
+            gf_counter_not_rel color col_normal.
+  write: / 'Number of not-correctable deliveries:',
+            gf_counter_error   color col_negative.
+  write: / 'Number of correctable deliveries    :',
+            gf_counter_success color col_positive.
+  uline.
+  if p_test eq space.
+    write: /'Deliveries corrected on database.'.
+  else.
+    write: /'Test run, no database update.'.
+  endif.
+
+end-of-selection.
+
+at line-selection.
+
+  call function 'RV_CALL_DISPLAY_TRANSACTION'
+    exporting
+      vbeln = gt_gdrc-vbeln.
+
+*&---------------------------------------------------------------------*
+*&      Form  data_selection_basic
+*&---------------------------------------------------------------------*
+form data_selection_basic
+     tables it_gdrc  structure shp_idx_gdrc
+            ct_likp  structure likp
+            ct_xvbuk structure vbukvb
+            ct_xlips structure lipsvb
+            ct_xvbup structure vbupvb.
+
+  select * from likp
+           into table ct_likp
+           for all entries in it_gdrc
+           where vbeln eq it_gdrc-vbeln.
+  sort ct_likp by mandt vbeln.
+
+  select * from vbuk
+           into corresponding fields of table ct_xvbuk
+           for all entries in it_gdrc
+           where vbeln eq it_gdrc-vbeln.
+  sort ct_xvbuk by mandt vbeln.
+
+  select * from lips
+           into corresponding fields of table ct_xlips
+           for all entries in it_gdrc
+           where vbeln eq it_gdrc-vbeln.
+  sort ct_xlips by mandt vbeln posnr.
+
+  select * from vbup
+           into corresponding fields of table ct_xvbup
+           for all entries in it_gdrc
+           where vbeln eq it_gdrc-vbeln.
+  sort ct_xvbup by mandt vbeln posnr.
+
+endform.                    " data_selection_basic
+
+*&---------------------------------------------------------------------*
+*&      Form  ignore_document
+*&---------------------------------------------------------------------*
+form ignore_document
+     tables ct_likp  structure likp
+            ct_xvbuk structure vbukvb
+            ct_xlips structure lipsvb
+            ct_xvbup structure vbupvb
+     using  if_vbeln like      likp-vbeln.
+
+  field-symbols: <ls_xlips> type lipsvb.
+
+  read table ct_likp with key vbeln = if_vbeln
+                     binary search
+                     transporting no fields.
+  if sy-subrc eq 0.
+    delete ct_likp index sy-tabix.
+  endif.
+
+  read table ct_xvbuk with key vbeln = if_vbeln
+                      binary search
+                      transporting no fields.
+  if sy-subrc eq 0.
+    delete ct_xvbuk index sy-tabix.
+  endif.
+
+  read table ct_xlips with key vbeln = if_vbeln
+                      binary search
+                      transporting no fields.
+  if sy-subrc eq 0.
+    loop at ct_xlips assigning <ls_xlips>
+                     from sy-tabix.
+      if <ls_xlips>-vbeln ne if_vbeln.
+        exit.
+      endif.
+      delete ct_xlips.
+    endloop.
+  endif.
+
+  read table ct_xvbup with key vbeln = if_vbeln
+                      binary search
+                      transporting no fields.
+  if sy-subrc eq 0.
+    loop at ct_xvbup from sy-tabix.
+      if ct_xvbup-vbeln ne if_vbeln.
+        exit.
+      endif.
+      delete ct_xvbup.
+    endloop.
+  endif.
+
+
+endform.                    " ignore_document
+*&---------------------------------------------------------------------*
+*&      Form  consistency_check
+*&---------------------------------------------------------------------*
+form consistency_check
+     tables ct_gdrc  structure shp_idx_gdrc
+            ct_likp  structure likp
+            ct_xvbuk structure vbukvb
+            ct_xlips structure lipsvb
+            ct_xvbup structure vbupvb.
+
+  loop at ct_gdrc.
+    read table ct_xvbuk with key vbeln = ct_gdrc-vbeln
+                        binary search.
+    if sy-subrc ne 0.
+      perform ignore_document tables ct_likp
+                                     ct_xvbuk
+                                     ct_xlips
+                                     ct_xvbup
+                              using  ct_gdrc-vbeln.
+      delete ct_gdrc.
+      continue.
+    else.
+      if ct_xvbuk-wbstk ne 'A'.
+        perform ignore_document tables ct_likp
+                                       ct_xvbuk
+                                       ct_xlips
+                                       ct_xvbup
+                                using  ct_gdrc-vbeln.
+        delete ct_gdrc.
+        continue.
+      endif.
+    endif.
+    read table ct_likp with key vbeln = ct_gdrc-vbeln
+                       binary search.
+    if sy-subrc ne 0.
+      perform ignore_document tables ct_likp
+                                     ct_xvbuk
+                                     ct_xlips
+                                     ct_xvbup
+                              using  ct_gdrc-vbeln.
+      delete ct_gdrc.
+      continue.
+    endif.
+  endloop.
+
+endform.                    " consistency_check
+*&---------------------------------------------------------------------*
+*&      Form  read_and_compare_po_history
+*&---------------------------------------------------------------------*
+form read_and_compare_po_history
+     tables   ct_xlips    structure lipsvb
+              it_xvbup    structure vbupvb
+     using    if_vbeln    like      likp-vbeln
+              if_complete type c
+     changing cf_subrc    like      sy-subrc.
+
+  data: lt_xekbes type standard table of ekbes with header line,
+        lf_ebeln like ekpo-ebeln,
+        lf_ebelp like ekpo-ebelp,
+        ls_ekpo  like ekpo.
+
+  data: begin of lt_admin occurs 0,
+          posnr like lips-posnr,
+          updkz like lipsd-updkz,
+        end   of lt_admin.
+
+  field-symbols: <ls_xlips> type lipsvb.
+
+  read table ct_xlips with key vbeln = if_vbeln
+                      binary search
+                      transporting no fields.
+  loop at ct_xlips assigning <ls_xlips>
+                   from sy-tabix.
+    if <ls_xlips>-vbeln ne if_vbeln.
+      exit.
+    endif.
+    do 1 times.
+      if <ls_xlips>-vgtyp ne 'V'.
+*       Item is not related to a purchase order
+        <ls_xlips>-updkz = 'B'.
+        exit.
+      endif.
+      read table it_xvbup with key vbeln = <ls_xlips>-vbeln
+                                   posnr = <ls_xlips>-posnr
+                          binary search.
+      if sy-subrc ne 0.
+*       Inconsistency
+        <ls_xlips>-updkz = 'S'.
+        exit.
+      endif.
+      if it_xvbup-wbsta ca 'BC'.
+*       Item is partially or completely posted GR
+        <ls_xlips>-updkz = 'C'.
+        exit.
+      endif.
+      if it_xvbup-wbsta eq space.
+*       Item is not relevant for goods movement
+        <ls_xlips>-updkz = 'N'.
+        exit.
+      endif.
+      if it_xvbup-lvsta eq 'B'.
+*       Open transfer order exists for delivery item
+        <ls_xlips>-updkz = 'O'.
+        exit.
+      endif.
+      if it_xvbup-kosta ca 'BC'.
+*       Item is completely or partially put away
+        <ls_xlips>-updkz = 'K'.
+        exit.
+      endif.
+      if <ls_xlips>-hupos ne space.
+*       Item is HU managed
+        <ls_xlips>-updkz = 'H'.
+        exit.
+      endif.
+      lf_ebeln = <ls_xlips>-vgbel.
+      lf_ebelp = <ls_xlips>-vgpos.
+      refresh lt_xekbes.
+      call function 'ME_READ_HISTORY'
+        exporting
+          ebeln  = lf_ebeln
+          ebelp  = lf_ebelp
+          webre  = space
+        tables
+          xekbes = lt_xekbes.
+
+      read table lt_xekbes with key ebelp = lf_ebelp.
+
+      if lt_xekbes-wemng eq 0.
+        <ls_xlips>-updkz = 'I'.
+        exit.
+      else.
+        call function 'ME_EKPO_SINGLE_READ'
+          exporting
+            pi_ebeln         = lf_ebeln
+            pi_ebelp         = lf_ebelp
+          importing
+            po_ekpo          = ls_ekpo
+          exceptions
+            no_records_found = 1
+            others           = 2.
+        if sy-subrc ne 0.
+*         Inconsistency
+          <ls_xlips>-updkz = 'R'.
+          exit.
+        else.
+*         PO item completely posted GR -> delivery item must be set to
+*         non-WE relevant.
+          if lt_xekbes-wemng ge ls_ekpo-menge or
+             if_complete eq space.
+            <ls_xlips>-updkz = 'U'.
+            <ls_xlips>-komkz = space.
+            <ls_xlips>-nowab = 'X'.
+            exit.
+          else.
+*           PO item is partially posted GR, do not correct delivery
+            <ls_xlips>-updkz = 'T'.
+            exit.
+          endif.
+        endif.
+      endif.
+    enddo.
+
+    lt_admin-posnr = <ls_xlips>-posnr.
+    lt_admin-updkz = <ls_xlips>-updkz.
+    append lt_admin.
+  endloop.
+
+* The update indicator now reflects the status of the delivery items:
+* U Item has to be set to non-GR relevant
+*
+* S Inconsistency: Item has no VBUP entry
+* R Inconsistency: No EKPO record
+* C Item is completely or partially posted GR in LE
+* I Items is posted neither in MM nor in LE
+* N Item is not relevant for GR in LE
+* T Related PO item is partially posted GR
+* B Item is not refering to a purchase order
+* O Item is assigned to an open WM transfer order
+* H Item is HU managed and therefore not correctable
+* K Item is completely or partially put away
+*
+* A correction is necessary only if
+* - at least one item has update indicator U
+* - all other items have update indicators U, B, N or I
+  loop at lt_admin transporting no fields
+                   where updkz na 'UNIB'.
+    exit.
+  endloop.
+  if sy-subrc eq 0.
+*   UPDKZ is R, S, C, T, O, H
+    cf_subrc = 4.  "Error, do not correct delivery
+  else.
+    loop at lt_admin transporting no fields
+                     where updkz eq 'U'.
+      exit.
+    endloop.
+    if sy-subrc eq 0.
+*     At least one item must be updated, all others are not yet posted
+*     or not relevant
+      cf_subrc = 0.    "Delivery can be updated
+    else.
+*     Delivery consist only of non-relevant or not posted items
+*     (UPDKZ N or I)
+      cf_subrc = 8.    "Delivery is not relevant
+    endif.
+  endif.
+
+endform.                    " read_and_compare_po_history
+*&---------------------------------------------------------------------*
+*&      Form  write_error_log
+*&---------------------------------------------------------------------*
+form write_error_log
+     tables  it_xlips structure lipsvb
+     using   if_vbeln like      likp-vbeln.
+
+  field-symbols: <ls_xlips> type lipsvb.
+
+  read table it_xlips with key vbeln = if_vbeln
+                      binary search
+                      transporting no fields.
+  loop at it_xlips assigning <ls_xlips>
+                   from sy-tabix.
+    if <ls_xlips>-vbeln ne if_vbeln.
+      exit.
+    endif.
+*   The update indicator now reflects the status of the delivery items:
+*   U Item has to be set to non-GR relevant
+*
+*   S Inconsistency: Item has no VBUP entry
+*   R Inconsistency: No EKPO record
+*   C Item is completely or partially posted GR in LE
+*   I Items is posted neither in MM nor in LE
+*   N Item is not relevant for GR in LE
+*   T Related PO item is partially posted GR
+*   B Item is not refering to a purchase order
+*   O Item is assigned to an open WM transfer order
+*   H Item is HU managed and therefore not correctable
+*   K Item is completely or partially put away
+    case <ls_xlips>-updkz.
+      when 'R'.
+        format color col_negative inverse on.
+        write: /5 <ls_xlips>-posnr, 'Related PO item does not exist',
+               '(PO', <ls_xlips>-vgbel, <ls_xlips>-posnr, ')'.
+        format color col_background inverse off.
+      when 'S'.
+        format color col_negative inverse on.
+        write: /5 <ls_xlips>-posnr, 'VBUP entry does not exist'.
+        format color col_background inverse off.
+      when 'C'.
+        format color col_negative inverse on.
+        write: /5 <ls_xlips>-posnr, 'Item is already posted GR in LE'.
+        format color col_background inverse off.
+      when 'O'.
+        format color col_negative inverse on.
+        write: /5 <ls_xlips>-posnr,
+               'Item is assigned to an open WM transfer order'.
+        format color col_background inverse off.
+      when 'H'.
+        format color col_negative inverse on.
+        write: /5 <ls_xlips>-posnr,
+               'Item is related to HU managed storage location'.
+        format color col_background inverse off.
+      when 'K'.
+        format color col_negative inverse on.
+        write: /5 <ls_xlips>-posnr,
+               'Item is completely or partially put away'.
+        format color col_background inverse off.
+      when 'T'.
+        format color col_negative inverse on.
+        write: /5 <ls_xlips>-posnr, 'Item is partially posted GR in MM',
+               '(PO', <ls_xlips>-vgbel, <ls_xlips>-posnr, ')'.
+        format color col_background inverse off.
+      when 'N'.
+        write: /5 <ls_xlips>-posnr, 'Item is not relevant for GR'.
+      when 'I'.
+        write: /5 <ls_xlips>-posnr, 'Item is not yet posted GR'.
+      when 'B'.
+        write: /5 <ls_xlips>-posnr, 'Item is not related to a PO'.
+      when 'U'.
+        format color col_positive inverse on.
+        write: /5 <ls_xlips>-posnr, 'GR status will be corrected.'.
+        format color col_background inverse off.
+    endcase.
+    hide gt_gdrc-vbeln.
+  endloop.
+
+endform.                    " write_error_log
+*&---------------------------------------------------------------------*
+*&      Form  data_selection_vbfa
+*&---------------------------------------------------------------------*
+form data_selection_vbfa
+     tables it_gdrc  structure shp_idx_gdrc
+            ct_xvbfa structure vbfavb.
+
+  select * from vbfa
+           into corresponding fields of table ct_xvbfa
+           for all entries in gt_gdrc
+           where vbelv eq gt_gdrc-vbeln.
+
+  sort ct_xvbfa by mandt vbelv posnv vbeln posnn vbtyp_n.
+
+endform.                    " data_selection_vbfa
+*&---------------------------------------------------------------------*
+*&      Form  status_calculation
+*&---------------------------------------------------------------------*
+form status_calculation
+     tables it_likp  structure likp
+            it_xlips structure lipsvb
+            ct_xvbuk structure vbukvb
+            ct_xvbup structure vbupvb
+            it_xvbfa structure vbfavb.
+
+  data: lt_yvbuk  type standard table of vbukvb with header line,
+        lt_yvbup  type standard table of vbupvb with header line,
+*       lt_xvbuv  type standard table of vbuv   with header line,
+        lt_xvbuv  type standard table of vbuvvb with header line,
+        lt_xvbapf type standard table of vbapf  with header line.
+
+  loop at it_likp.
+
+    refresh lt_xvbapf.
+    call function 'RV_XVBAPF_CREATE'
+      exporting
+        vbeln   = it_likp-vbeln
+      tables
+        fxvbapf = lt_xvbapf
+        fxvbfa  = it_xvbfa.
+
+    read table it_xlips with key vbeln = it_likp-vbeln
+                        binary search
+                        transporting no fields.
+    loop at it_xlips from sy-tabix.
+      if it_xlips-vbeln ne it_likp-vbeln.
+        exit.
+      endif.
+      call function 'LIPS_STATUS_MAINTAIN'
+        exporting
+          f_likp  = it_likp
+          f_posnr = it_xlips-posnr
+        tables
+          fxlips  = it_xlips
+          fxvbapf = lt_xvbapf
+          fxvbup  = ct_xvbup
+          fyvbup  = lt_yvbup.
+    endloop.
+
+  endloop.
+
+* Update of header status
+  call function 'RV_XVBUK_MAINTAIN'
+    exporting
+      f_vbeln                  = it_likp-vbeln
+      f_vbtyp                  = it_likp-vbtyp
+      f_xvbuv_beruecksichtigen = space
+    tables
+      fxvbuk                   = ct_xvbuk
+      fxvbup                   = ct_xvbup
+      fxvbuv                   = lt_xvbuv
+      fyvbuk                   = lt_yvbuk.
+
+* Remove unchanged XVBUK entries
+  loop at ct_xvbuk.
+    read table lt_yvbuk with key mandt = ct_xvbuk-mandt
+                                 vbeln = ct_xvbuk-vbeln
+                        binary search
+                        transporting no fields.
+    if sy-subrc ne 0.
+      delete ct_xvbuk.
+    endif.
+  endloop.
+
+* Remove unchanged XVBUP entries
+  loop at ct_xvbup.
+    read table lt_yvbup with key mandt = ct_xvbup-mandt
+                                 vbeln = ct_xvbup-vbeln
+                                 posnr = ct_xvbup-posnr
+                        binary search
+                        transporting no fields.
+    if sy-subrc ne 0.
+      delete ct_xvbup.
+    endif.
+  endloop.
+
+endform.                    " status_calculation
+*&---------------------------------------------------------------------*
+*&      Form  database_update
+*&---------------------------------------------------------------------*
+form database_update
+     tables it_xlips structure lipsvb
+            it_xvbuk structure vbukvb
+            it_xvbup structure vbupvb
+            it_gdrc  structure shp_idx_gdrc.
+
+  if not gt_xlips[] is initial.
+    update lips from table it_xlips.
+  endif.
+  if not gt_xvbuk[] is initial.
+    update vbuk from table it_xvbuk.
+  endif.
+  if not gt_xvbup[] is initial.
+    update vbup from table it_xvbup.
+  endif.
+  if not gt_gdrc[] is initial.
+    delete shp_idx_gdrc from table gt_gdrc.
+  endif.
+
+  call function 'DB_COMMIT'.
+
+endform.                    " database_update
+*&---------------------------------------------------------------------*
+*&      Form  update_due_index
+*&---------------------------------------------------------------------*
+form update_due_index
+     tables ct_gdrc  structure shp_idx_gdrc
+            it_xvbuk structure vbukvb.
+
+* After the processing of this routine CT_GDRC contains only entries
+* that should be DELETED from the due index because the related
+* inbound delivery is no longer relevant for GR
+  loop at ct_gdrc.
+    read table it_xvbuk with key vbeln = ct_gdrc-vbeln
+               binary search.
+    if sy-subrc ne 0.
+*     Original GR status remained unchanged -> Index must also remain
+      delete ct_gdrc.
+    else.
+*     Delivery is still relevant for GR -> Index must remain
+      if it_xvbuk-wbstk ca 'AB'.
+        delete ct_gdrc.
+      endif.
+    endif.
+  endloop.
+
+endform.                    " update_due_index
+...
+*&--------------------------------------------------------------------*

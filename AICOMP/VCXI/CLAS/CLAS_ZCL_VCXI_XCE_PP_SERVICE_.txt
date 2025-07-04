@@ -1,0 +1,152 @@
+
+class ZCL_VCXI_XCE_PP_SERVICE definition
+  public
+  final
+  create private .
+
+public section.
+
+  class-methods GET_PRT
+    importing
+      !IF_MATNR type MATNR
+      !IF_WERKS type WERKS_D
+    returning
+      value(RT_PRT) type ZVCXI_XCE_PP_TT_PRT
+    raising
+      /VCXI/CX_CKX .
+protected section.
+private section.
+endclass. "ZCL_VCXI_XCE_PP_SERVICE definition
+class ZCL_VCXI_XCE_PP_SERVICE implementation.
+  method GET_PRT.
+
+    types:
+      begin of YS_MATWRK,
+        MATNR type MATNR,
+        WERKS type WERKS_D,
+      end of YS_MATWRK .
+    types:
+      YT_MATWRK type sorted table of YS_MATWRK with unique key MATNR WERKS .
+
+    data: LF_WRK02 type WERKS_D.
+    data: LS_PRT type ZVCXI_XCE_PP_S_PRT.
+    data: LT_STPOX    type table of STPOX,
+          LT_EXPRT    type /VCXI/VKCR_TT_PRT,
+          LT_SUBLEVEL type YT_MATWRK.
+
+
+***------------------------------------------------------------------------------------------------
+*** Configuration Object
+    select single CUOBJ
+           into @data(LF_CUOBJ)
+           from MARC
+          where MATNR eq @IF_MATNR
+           and  WERKS eq @IF_WERKS.
+    check SY-SUBRC eq 0.
+
+*** Get BOM/Routing of Configuration
+    /VCXI/CL_VKCR_GATEWAY=>GET_BOMRTE( exporting IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LF_CUOBJ )
+                                       importing ET_PRT   = LT_EXPRT ).
+
+*** Routing Assignments
+    select * into table @data(LT_MAPL)
+             from MAPL
+            where MATNR eq @IF_MATNR
+             and  WERKS eq @IF_WERKS.
+
+*** Filter PRT based on Routing Assignments
+    loop at LT_EXPRT into data(LS_EXPRT).
+      if LINE_EXISTS( LT_MAPL[ PLNTY = LS_EXPRT-PLNTY
+                               PLNNR = LS_EXPRT-PLNNR
+                               PLNAL = LS_EXPRT-PLNAL ] ).
+        LS_PRT = corresponding #( LS_EXPRT ).
+        LS_PRT-WERKS = IF_WERKS.
+        insert LS_PRT into table RT_PRT.
+      endif.
+    endloop.
+
+***------------------------------------------------------------------------------------------------
+*** Get BOM Assignments
+    select *
+           into table @data(LT_MAST)
+           from MAST
+           where MATNR eq @IF_MATNR
+            and  WERKS eq @IF_WERKS.
+
+    loop at LT_MAST into data(LS_MAST).
+***   Search LL Material
+      refresh LT_STPOX.
+      call function 'CS_BOM_EXPL_MAT_V2'
+        exporting
+          AUSKZ                 = ABAP_FALSE
+          BREMS                 = 'X'
+          CAPID                 = '    '
+          DATUV                 = SY-DATUM
+          MEHRS                 = ABAP_FALSE
+          MTNRV                 = LS_MAST-MATNR
+          STLAL                 = LS_MAST-STLAL
+          STLAN                 = LS_MAST-STLAN
+          SVWVO                 = 'X'
+          WERKS                 = LS_MAST-WERKS
+          VRSVO                 = 'X'
+        tables
+          STB                   = LT_STPOX
+        exceptions
+          ALT_NOT_FOUND         = 1
+          CALL_INVALID          = 2
+          MATERIAL_NOT_FOUND    = 3
+          MISSING_AUTHORIZATION = 4
+          NO_BOM_FOUND          = 5
+          NO_PLANT_DATA         = 6
+          NO_SUITABLE_BOM_FOUND = 7
+          CONVERSION_ERROR      = 8
+          others                = 9.
+      if SY-SUBRC ne 0.
+        /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+      endif.
+
+***   Add Materials to return table
+      loop at LT_STPOX into data(LS_STPOX)
+                      where DISST is not initial
+                       and  IDNRK ne IF_MATNR.
+
+***     Consider Special Procurement Type
+        if LS_STPOX-SOBSL is not initial.
+          select single WRK02
+                 into LF_WRK02
+                 from T460A
+                where WERKS eq LS_STPOX-WERKS
+                 and  SOBSL eq LS_STPOX-SOBSL.
+          if SY-SUBRC ne 0.
+            /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+          endif.
+          if LF_WRK02 is not initial.
+            LS_STPOX-WERKS = LF_WRK02.
+          endif.
+        endif.
+
+***     Collect Sub-Levels
+        insert value #( MATNR = LS_STPOX-IDNRK
+                        WERKS = LS_STPOX-WERKS ) into table LT_SUBLEVEL.
+      endloop.
+    endloop.
+
+***------------------------------------------------------------------------------------------------
+*** Get Sub-Level Configurations
+    if LT_SUBLEVEL is not initial.
+      select MATNR, WERKS
+             into table @LT_SUBLEVEL
+             from MARC
+             for all entries in @LT_SUBLEVEL
+            where MATNR eq @LT_SUBLEVEL-MATNR
+             and  WERKS eq @LT_SUBLEVEL-WERKS
+             and  CUOBJ ne @SPACE.
+
+      loop at LT_SUBLEVEL into data(LS_SUBLEVEL).
+        append lines of GET_PRT( IF_MATNR = LS_SUBLEVEL-MATNR
+                                 IF_WERKS = LS_SUBLEVEL-WERKS ) to RT_PRT.
+      endloop.
+    endif.
+
+  endmethod.
+endclass. "ZCL_VCXI_XCE_PP_SERVICE implementation

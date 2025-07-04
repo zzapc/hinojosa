@@ -1,0 +1,191 @@
+FUNCTION zswm_check_ui5_bin.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(TCODE) TYPE  TCODE
+*"     VALUE(UNAME) TYPE  SY-UNAME DEFAULT SY-UNAME
+*"     VALUE(CADENA) TYPE  BARCODE OPTIONAL
+*"     VALUE(LGPLA) TYPE  LGPLA OPTIONAL
+*"  EXPORTING
+*"     VALUE(OK) TYPE  FLAG
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_TT
+*"     VALUE(REG_UBICACION) TYPE  ZSWM_UI5_LAGP_STR
+*"----------------------------------------------------------------------
+  PERFORM break USING 'ZSWM_CHECK_UI5_BIN'.
+
+  DATA lagp           TYPE lagp.
+  DATA verif          TYPE lagp_verif.
+  DATA data_u         TYPE zswm_data_ui5_eeeoo_str.
+  DATA reg_parametros TYPE zswm_data_ui5_param_str.
+  CLEAR reg_ubicacion.
+  if lgpla is INITIAL.
+  CHECK cadena IS NOT INITIAL.
+  WHILE cadena+0(1) EQ space.
+    cadena = cadena+1.
+  ENDWHILE.
+  verif = cadena.
+  TRANSLATE verif TO UPPER CASE.
+  endif.
+  CALL FUNCTION 'ZSWM_GET_DATA_USER_UI5'
+    EXPORTING
+      uname      = uname
+*     STATU      = 'X'
+      tcode      = tcode
+      no_gen_log = abap_true
+    IMPORTING
+      data_user  = data_u
+*     ERROR      =
+*     TT_LOG     =
+    .
+*
+
+  CALL FUNCTION 'ZSWM_GET_PARAM_UI5'
+    EXPORTING
+      data_user  = data_u
+      tcode      = tcode
+      no_gen_log = abap_true
+    IMPORTING
+      r_param    = reg_parametros
+*     ERROR      =
+*     TT_LOG     =
+    .
+* Rervisamos rango de inventario
+  IF tcode EQ 'ZWM_RF_UI5_PIN_001'.
+    SELECT SINGLE nukiv INTO @DATA(nukiv) FROM t340d WHERE lgnum EQ @data_u-lgnum.
+    SELECT COUNT( * ) FROM nriv WHERE object     EQ 'LVS_IVNUM'
+                                  AND subobject  EQ data_u-lgnum
+                                  AND nrrangenr  EQ nukiv.
+    IF sy-subrc NE 0.
+*      No hay rango de inventarios para número de almacén &
+      PERFORM mensaje USING 'E' 'ZSWM_UI5' '091' data_u-lgnum space space space CHANGING tt_log[].
+
+      MOVE abap_true TO error.
+    ENDIF.
+  ENDIF.
+  IF error NE abap_true.
+    if lgpla is INITIAL.
+    SELECT * INTO TABLE @DATA(tt_bin) FROM lagp WHERE lgnum EQ @data_u-lgnum
+                                                  AND ( lgpla EQ @verif
+                                                     OR verif EQ @verif ).
+    else.
+      verif = lgpla.
+    SELECT * INTO TABLE tt_bin FROM lagp WHERE lgnum EQ data_u-lgnum
+                                                  AND lgpla eq lgpla.
+    endif.
+    IF sy-subrc NE 0.
+*    La ubicación & no existe en el número de almacén &
+      PERFORM mensaje USING 'E' 'ZSWM_UI5' '044' verif data_u-lgnum space space CHANGING tt_log[].
+      MOVE abap_true TO error.
+    ELSE.
+*    La ubicación &/& pertenece a un tipo de almcén & no inventariable
+      if tcode ne 'ZWM_RF_UI5_PIN_001'.
+        clear reg_parametros-rr_lgtyp[]. Clear reg_parametros-rr_lgtyp.
+      endif.
+      DATA lgtyp TYPE lagp-lgtyp.
+
+       LOOP AT tt_bin INTO DATA(rt_bin) WHERE NOT lgtyp IN reg_parametros-rr_lgtyp.
+        DELETE tt_bin INDEX sy-tabix.
+        lgtyp = rt_bin-lgtyp.
+      ENDLOOP.
+      IF tt_bin[] IS INITIAL.
+        PERFORM mensaje USING 'E' 'ZSWM_UI5' '045' rt_bin-lgnum rt_bin-lgpla rt_bin-lgtyp space CHANGING tt_log[].
+        MOVE abap_true TO error.
+      ELSE.
+        DESCRIBE TABLE tt_bin LINES DATA(n_lin).
+        IF n_lin > 1.
+*         El código leído & para el nº de almacén & corresponde a varias ubicacio..
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '046' verif data_u-lgnum space space CHANGING tt_log[].
+          MOVE abap_true TO error.
+        ELSE.
+          READ TABLE tt_bin INTO rt_bin INDEX 1.
+          MOVE-CORRESPONDING rt_bin TO reg_ubicacion.
+          IF ( rt_bin-skzua EQ abap_true
+            OR rt_bin-skzue EQ abap_true
+            OR rt_bin-skzsa EQ abap_true
+            OR rt_bin-skzse EQ abap_true
+            OR rt_bin-skzsi EQ abap_true )
+          AND tcode EQ 'ZWM_RF_UI5_PIN_001'. " inventario
+*           047 La ubicación &/& tiene bloqueos (imposible inventariar)
+            PERFORM mensaje USING 'E' 'ZSWM_UI5' '047' rt_bin-lgnum rt_bin-lgpla space space CHANGING tt_log[].
+            MOVE abap_true TO error.
+          ELSE.
+            IF tcode EQ 'ZWM_RF_UI5_PIN_001'.
+              SELECT COUNT( * ) FROM zswm_ui5_ivnum WHERE lgnum       EQ data_u-lgnum
+                                                      AND lgtyp       EQ reg_ubicacion-lgtyp
+                                                      AND lgpla       EQ reg_ubicacion-lgpla
+                                                      AND lvorm       NE abap_true
+                                                      AND ivnum_close NE abap_true.
+              IF sy-subrc EQ 0.
+*                La ubicación &/&/& ya tiene un inventario en curso
+                PERFORM mensaje USING 'E' 'ZSWM_UI5' '092' rt_bin-lgnum rt_bin-lgtyp rt_bin-lgpla  space CHANGING tt_log[].
+                MOVE abap_true TO error.
+              ENDIF.
+            ENDIF.
+            IF error NE abap_true.
+              MOVE abap_true TO ok.
+              SELECT SINGLE ltypt INTO reg_ubicacion-ltypt  FROM t301t WHERE lgnum EQ rt_bin-lgnum
+                                                                         AND lgtyp EQ rt_bin-lgtyp
+                                                                         AND spras EQ sy-langu.
+
+              IF reg_ubicacion-lgber IS NOT INITIAL.
+                SELECT SINGLE lbert INTO reg_ubicacion-lbert FROM t302t WHERE lgnum EQ reg_ubicacion-lgnum
+                                                                          AND lgtyp EQ reg_ubicacion-lgtyp
+                                                                          AND lgber EQ reg_ubicacion-lgber
+                                                                          AND spras EQ sy-langu.
+
+              ENDIF.
+              IF reg_ubicacion-lptyp IS NOT INITIAL.
+                SELECT SINGLE ptypt INTO reg_ubicacion-ptypt FROM t303t WHERE lgnum EQ reg_ubicacion-lgnum
+                                                                          AND lptyp EQ reg_ubicacion-lptyp
+                                                                          AND spras EQ sy-langu.
+              ENDIF.
+              select SINGLE ivnum into reg_ubicacion-IVNUM
+                                       from ZSWM_UI5_IVNUM where lgnum       eq reg_ubicacion-lgnum
+                                                             and lgtyp       eq reg_ubicacion-lgtyp
+                                                             and lgpla       eq reg_ubicacion-lgpla
+                                                             and lvorm       ne abap_true
+                                                             and IVNUM_CLOSE ne abap_true.
+              if sy-subrc ne 0.
+                clear reg_ubicacion-IVNUM.
+              endif.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+* add jtm 10.11.2022
+  check ERROR ne abap_true
+    and tcode eq 'ZWM_RF_UI5_PIN_001'.
+  data etenr like ZSWM_UI5_INV_UBI-etenr.
+  DATA ZSWM_UI5_INV_UBI type ZSWM_UI5_INV_UBI.
+  select etenr into ETENR up to 1 ROWS from ZSWM_UI5_INV_UBI
+                                        where lgnum eq data_u-lgnum
+                                          and lgtyp eq reg_ubicacion-lgtyp
+                                          and lgpla eq reg_ubicacion-lgpla
+                                         ORDER BY etenr DESCENDING.
+  ENDSELECT.
+  if sy-subrc ne 0.
+    clear etenr.
+  else.
+    add 1 to etenr.
+  endif.
+  clear ZSWM_UI5_INV_UBI.
+  ZSWM_UI5_INV_UBI-mandt    = sy-mandt.
+  ZSWM_UI5_INV_UBI-lgnum    = data_u-LGNUM.
+  ZSWM_UI5_INV_UBI-lgtyp    = reg_ubicacion-lgtyp.
+  ZSWM_UI5_INV_UBI-lgpla    = reg_ubicacion-lgpla.
+  ZSWM_UI5_INV_UBI-etenr    = etenr.
+  ZSWM_UI5_INV_UBI-statu    = 'I'.
+*  ZSWM_UI5_INV_UBI-operario = operario.
+  ZSWM_UI5_INV_UBI-erdat    =
+  ZSWM_UI5_INV_UBI-aedat    = sy-datum.
+  ZSWM_UI5_INV_UBI-erzet    =
+  ZSWM_UI5_INV_UBI-aezet    = sy-uzeit.
+  ZSWM_UI5_INV_UBI-ernam    =
+  ZSWM_UI5_INV_UBI-aenam    = sy-uname.
+  insert into ZSWM_UI5_INV_UBI VALUES ZSWM_UI5_INV_UBI.
+  commit WORK and WAIT.
+* fin de add jtm 10.11.2022
+ENDFUNCTION.

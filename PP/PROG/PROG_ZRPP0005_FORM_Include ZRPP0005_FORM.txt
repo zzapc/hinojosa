@@ -1,0 +1,557 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0005_FORM
+*&---------------------------------------------------------------------*
+
+
+*&---------------------------------------------------------------------*
+*&      Form  ORDEN_LIBERADA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM orden_liberada .
+
+  DATA: ls_header LIKE bapi_alm_order_header_e.
+  DATA: ls_ret TYPE bapiret2 OCCURS 0 WITH HEADER LINE.
+  DATA: lv_objnr LIKE aufk-objnr.
+  DATA: lt_status LIKE jstat OCCURS 0.
+  DATA: ls_status TYPE jstat.
+
+  DATA: LV_aufnr TYPE AUFK-AUFNR.
+
+  " ini cgijon: 21.03.17 - Ticket 25469 - SOLO NOTIFICAR ÓRDENES ZI02
+  SELECT SINGLE aufnr INTO lv_aufnr
+       FROM aufk
+       WHERE aufnr = p_aufnr  AND
+             auart = 'ZI01'. "cgijon: 21.03.17 - Ticket 25469 - SOLO NOTIFICAR ÓRDENES ZI02
+
+  IF lv_aufnr IS INITIAL.
+    MESSAGE e000 WITH 'Únicamente se permite notificar órdenes de rollo'.
+  ELSE.   " FIN cgijon: 21.03.17 - Ticket 25469 - SOLO NOTIFICAR ÓRDENES ZI02
+
+* Chequeamos el status de la orden
+    CLEAR lv_objnr.
+    SELECT SINGLE objnr INTO lv_objnr
+    FROM aufk
+    WHERE aufnr = p_aufnr.
+
+    CALL FUNCTION 'STATUS_READ'
+      EXPORTING
+        client           = sy-mandt
+        objnr            = lv_objnr
+*       ONLY_ACTIVE      = ' '
+*   IMPORTING
+*       OBTYP            =
+*       STSMA            =
+*       STONR            =
+      TABLES
+        status           = lt_status
+      EXCEPTIONS
+        object_not_found = 1
+        OTHERS           = 2.
+
+    READ TABLE lt_status INTO ls_status
+    WITH KEY stat = 'I0002'.
+    IF sy-subrc = 0.
+      IF ls_status-inact = 'X'.
+        MESSAGE e011 WITH p_aufnr.
+      ENDIF.
+    ELSE.
+      MESSAGE e011 WITH p_aufnr.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " ORDEN_LIBERADA
+
+*&---------------------------------------------------------------------*
+*&      Form  ALTA_STOCK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alta_stock .
+
+  DATA: ls_header  TYPE bapi2017_gm_head_01,
+        lt_return  LIKE bapiret2 OCCURS 0,
+        ls_return  TYPE bapiret2,
+        lt_item    LIKE bapi2017_gm_item_create OCCURS 0,
+        ls_item    TYPE bapi2017_gm_item_create,
+        ls_headret TYPE bapi2017_gm_head_ret.
+
+  DATA: ls_afko TYPE afko.
+  DATA: ls_aufk TYPE aufk.
+  DATA: ls_afpo TYPE afpo.
+
+  CLEAR: gv_mblnr,
+         gv_mjahr,
+         lt_item,
+         ls_header,
+         ls_item,
+         ls_afko,
+         ls_aufk,
+         ls_afpo.
+
+  REFRESH: lt_item,
+           lt_return.
+
+* cabecera
+  ls_header-pstng_date = sy-datum.
+  ls_header-doc_date   = sy-datum.
+  ls_header-pr_uname = sy-uname.
+
+*recuperar datos orden
+  SELECT SINGLE * INTO ls_afko
+  FROM afko
+  WHERE aufnr = p_aufnr.
+
+  SELECT SINGLE * INTO ls_aufk
+  FROM aufk
+  WHERE aufnr = p_aufnr.
+
+  SELECT SINGLE * INTO ls_afpo
+  FROM afpo
+  WHERE aufnr = p_aufnr
+  AND posnr = '0001'.
+
+* posicion
+  ls_item-material = ls_afko-plnbez.
+  ls_item-plant = ls_aufk-werks.
+  ls_item-stge_loc = ls_afpo-lgort.
+  ls_item-move_type = '101'.
+  ls_item-entry_qnt = p_menge.
+  ls_item-entry_uom = 'KG'.
+  ls_item-orderid = p_aufnr.
+  ls_item-mvt_ind = 'F'.
+  APPEND ls_item TO lt_item.
+
+
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header  = ls_header
+      goodsmvt_code    = '02'
+*     TESTRUN          = ' '
+*     GOODSMVT_REF_EWM =
+    IMPORTING
+      goodsmvt_headret = ls_headret
+      materialdocument = gv_mblnr
+      matdocumentyear  = gv_mjahr
+    TABLES
+      goodsmvt_item    = lt_item
+*     GOODSMVT_SERIALNUMBER         =
+      return           = lt_return
+*     GOODSMVT_SERV_PART_DATA       =
+*     EXTENSIONIN      =
+    .
+
+  READ TABLE lt_return INTO ls_return
+  WITH KEY type = 'E'.
+  IF sy-subrc <> 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+
+* GUARDAR LOGS CON EL PEDIDO DE COMPRAS CREADO
+    CLEAR gs_messages.
+    gs_messages-type = 'S'.
+    gs_messages-number = '012'.
+    gs_messages-id = 'ZPP'.
+    gs_messages-message_v1 = gv_mblnr.
+    gs_messages-message_v2 = gv_mjahr.
+*    gs_messages-id = .
+*    gs_messages-id = .
+    APPEND gs_messages TO gt_messages.
+
+  ELSE.
+
+    gv_error = 'X'.
+
+* REGISTRAR ERROR EN CASO DE NO CREACION DEL PEDIDO DE COMPRAS
+    LOOP AT lt_return INTO ls_return WHERE type  = 'E'.
+      CLEAR gs_messages.
+      gs_messages = ls_return.
+      APPEND gs_messages TO gt_messages.
+    ENDLOOP.
+
+  ENDIF.
+
+
+
+ENDFORM.                    " ALTA_STOCK
+
+*&---------------------------------------------------------------------*
+*&      Form  CLASIFICAR_LOTE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM clasificar_lote .
+
+  DATA: lv_object            TYPE objnum,
+        ls_alloc_values_num  TYPE bapi1003_alloc_values_num,
+        ls_alloc_values_char TYPE bapi1003_alloc_values_char,
+        ls_return            TYPE bapiret2.
+
+  DATA: lt_alloc_values_num  TYPE tt_bapi1003_alloc_values_num,
+        lt_alloc_values_char TYPE tt_bapi1003_alloc_values_char,
+        lt_alloc_values_curr TYPE tt_bapi1003_alloc_values_curr,
+        lt_return            TYPE bapiret2_tab.
+
+  DATA: lv_matnr TYPE matnr,
+        lv_charg TYPE charg_d.
+
+
+  CLEAR: lv_object, lt_alloc_values_num, lt_alloc_values_char, lt_alloc_values_curr, lt_return.
+  CLEAR: ls_alloc_values_num, ls_alloc_values_char, ls_return.
+  REFRESH: lt_alloc_values_num, lt_alloc_values_char, lt_alloc_values_curr, lt_return.
+  CLEAR: lv_matnr, lv_charg.
+
+
+  SELECT SINGLE matnr charg INTO (lv_matnr, lv_charg)
+  FROM mseg
+  WHERE mblnr = gv_mblnr
+  AND mjahr   = gv_mjahr.
+
+  gv_charg = lv_charg.
+
+  CONCATENATE lv_matnr lv_charg INTO lv_object.
+
+  " DIAMETRO:
+  CLEAR ls_alloc_values_num.
+  ls_alloc_values_num-charact = 'Z_DIAMETRO1'.
+  ls_alloc_values_num-value_from = p_diam.
+*    ls_alloc_values_char-value_neutral = ps_datos-de_bobina.
+  APPEND ls_alloc_values_num TO lt_alloc_values_num.
+
+
+  " TORNADAS:
+  CLEAR ls_alloc_values_num.
+  ls_alloc_values_num-charact = 'Z_TORNADAS'.
+  ls_alloc_values_num-value_from = p_torn.
+  APPEND ls_alloc_values_num TO lt_alloc_values_num.
+
+*   "FECHA DE FABRICACION:
+*  CLEAR ls_alloc_values_char.
+*  ls_alloc_values_char-charact = 'LOBM_HSDAT'.
+**  ls_alloc_values_char-value_char = p_ffab.
+*  WRITE sy-datum TO ls_alloc_values_char-value_char.
+*  APPEND ls_alloc_values_char TO lt_alloc_values_char.
+
+  " HORA DE FABRICACION:
+  CLEAR ls_alloc_values_char.
+  ls_alloc_values_char-charact = 'Z_HORA'.
+*  ls_alloc_values_char-value_char = p_ffab.
+  WRITE sy-uzeit TO ls_alloc_values_char-value_char.
+  APPEND ls_alloc_values_char TO lt_alloc_values_char.
+
+  " PESO:
+  CLEAR ls_alloc_values_num.
+  ls_alloc_values_num-charact = 'Z_PESO1'.
+  ls_alloc_values_num-value_from = p_menge.
+*    ls_alloc_values_char-value_neutral = ps_datos-de_bobina.
+  APPEND ls_alloc_values_num TO lt_alloc_values_num.
+
+
+
+  CALL FUNCTION 'BAPI_OBJCL_CHANGE'
+    EXPORTING
+      objectkey          = lv_object
+      objecttable        = 'MCH1'
+      classnum           = 'Z_ROLLO'
+      classtype          = '023'
+*     STATUS             = '1'
+*     STANDARDCLASS      =
+*     CHANGENUMBER       =
+*     KEYDATE            = SY-DATUM
+*     NO_DEFAULT_VALUES  = ' '
+*   IMPORTING
+*     CLASSIF_STATUS     =
+    TABLES
+      allocvaluesnumnew  = lt_alloc_values_num
+      allocvaluescharnew = lt_alloc_values_char
+      allocvaluescurrnew = lt_alloc_values_curr
+      return             = lt_return.
+
+  CLEAR ls_return.
+  READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+  IF ls_return IS NOT INITIAL. " Error act. característica
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+*       IMPORTING
+*         RETURN        =
+      .
+
+    gv_error = 'X'.
+
+* REGISTRAR ERROR EN CASO DE NO CREACION DEL PEDIDO DE COMPRAS
+    LOOP AT lt_return INTO ls_return WHERE type  = 'E'.
+      CLEAR gs_messages.
+      gs_messages = ls_return.
+      APPEND gs_messages TO gt_messages.
+    ENDLOOP.
+
+  ELSE.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+
+* GUARDAR LOGS CON EL PEDIDO DE COMPRAS CREADO
+    READ TABLE lt_return INTO ls_return
+    WITH KEY type = 'S'.
+    CLEAR gs_messages.
+    gs_messages = ls_return.
+    APPEND gs_messages TO gt_messages.
+
+  ENDIF.
+
+ENDFORM.                    " CLASIFICAR_LOTE
+
+*&---------------------------------------------------------------------*
+*&      Form  NOTIFICAR_ORDEN
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM notificar_orden .
+
+* NOTIFICACIONES
+*&---------------------------------------------------------------------*
+  DATA:  lti_detail TYPE TABLE OF bapi_coru_return WITH HEADER LINE,
+         ls_return1 TYPE          bapiret1.
+  DATA: ls_return TYPE bapiret2.
+  DATA: ls_ret2 TYPE bapiret1.
+
+  DATA: lti_times   TYPE TABLE OF bapi_pi_timeticket1 WITH HEADER LINE,
+        lti_goodmov TYPE TABLE OF bapi2017_gm_item_create WITH HEADER LINE,
+        lti_link    TYPE TABLE OF bapi_link_conf_goodsmov WITH HEADER LINE.
+  DATA: ls_propose TYPE bapi_pp_conf_prop.
+
+  DATA: ls_afko TYPE afko.
+  DATA: ls_aufk TYPE aufk.
+  DATA: ls_afpo TYPE afpo.
+
+* GST - 20/03/2015 ->
+  DATA: lv_gamng TYPE          gamng,
+        lv_rsnum TYPE          rsnum,
+        ls_resb  TYPE          resb,
+        lti_resb TYPE TABLE OF resb.
+* GST - 20/03/2015 <-
+
+*recuperar datos orden
+  SELECT SINGLE * INTO ls_afko
+  FROM afko
+  WHERE aufnr = p_aufnr.
+
+  SELECT SINGLE * INTO ls_aufk
+  FROM aufk
+  WHERE aufnr = p_aufnr AND
+        auart = 'ZI01'. "cgijon: 21.03.17 - Ticket 25469 - SOLO NOTIFICAR ÓRDENES ZI01
+
+  " ini cgijon: 21.03.17 - Ticket 25469 - SOLO NOTIFICAR ÓRDENES ZI01
+  IF ls_aufk IS INITIAL.
+    gv_error = 'X'.
+
+    CLEAR gs_messages.
+    gs_messages-type = 'E'.
+    gs_messages-id = 'ZPP'.
+    gs_messages-number = '123'.
+*    gs_messages-message = 'La orden no corresponde con la clase ZI01'.
+
+    APPEND gs_messages TO gt_messages.
+  ELSE.
+    " fin cgijon: 21.03.17 - Ticket 25469 - SOLO NOTIFICAR ÓRDENES ZI01
+    SELECT SINGLE * INTO ls_afpo
+      FROM afpo
+      WHERE aufnr = p_aufnr
+        AND posnr = '0001'.
+
+
+*   Recuperamos los datos de la notificación
+    CLEAR: ls_return, lti_times.
+    lti_times-orderid        = p_aufnr.
+    lti_times-phase          = '0040'.
+    lti_times-fin_conf       = '1'.
+    lti_times-plant          = ls_aufk-werks.
+    lti_times-yield          = p_menge.
+    lti_times-conf_quan_unit = ls_afko-gmein.
+    lti_times-clear_res      = 'X'.
+    APPEND lti_times.
+
+    CLEAR ls_propose.
+    ls_propose-goodsmovement = 'X'.
+    ls_propose-quantity = 'X'.
+    ls_propose-activity = 'X'.
+*  ls_propose-date_and_time = 'X'.
+    ls_propose-personnel = 'X'.
+    CLEAR ls_ret2.
+
+*   Recuperamos los datos de la BAPI que notifica
+    CALL FUNCTION 'BAPI_PROCORDCONF_GET_TT_PROP'
+      EXPORTING
+        propose            = ls_propose
+      IMPORTING
+        return             = ls_ret2
+      TABLES
+        timetickets        = lti_times
+        goodsmovements     = lti_goodmov
+        link_conf_goodsmov = lti_link.
+
+    LOOP AT lti_times.
+      lti_times-exec_fin_date   = sy-datum.
+      lti_times-exec_fin_time   = sy-uzeit.
+      lti_times-exec_start_date = ls_afko-ftrmi.
+
+      lti_times-conf_activity1 = (  lti_times-conf_activity1 * p_menge ) /  lti_times-yield.
+      lti_times-conf_activity2 = (  lti_times-conf_activity2 * p_menge ) /  lti_times-yield.
+*    lti_times-conf_activity3 = (  lti_times-conf_activity3 * p_menge ) /  lti_times-yield.
+      lti_times-conf_activity3 = p_menge.
+      lti_times-yield =  p_menge.
+
+      MODIFY lti_times.
+    ENDLOOP.
+
+*    GST - 20/03/2015 ->
+    " Recuperamos la reserva y la cantidad total para calcular la proporción:
+    CLEAR: lv_gamng, lv_rsnum.
+    SELECT SINGLE gamng rsnum INTO (lv_gamng, lv_rsnum)
+      FROM caufv
+      WHERE aufnr = p_aufnr.
+
+    REFRESH: lti_resb.
+    CLEAR: lti_resb, ls_resb.
+    SELECT * INTO CORRESPONDING FIELDS OF TABLE lti_resb
+      FROM resb
+      WHERE rsnum = lv_rsnum
+      AND rgekz = 'X'.
+
+    LOOP AT lti_goodmov.
+      CLEAR ls_resb.
+      READ TABLE lti_resb INTO ls_resb WITH KEY rsnum = lti_goodmov-reserv_no
+                                                rspos = lti_goodmov-res_item
+                                                matnr = lti_goodmov-material
+                                                werks = lti_goodmov-plant.
+      IF ls_resb IS NOT INITIAL.
+        lti_goodmov-entry_qnt = ( ls_resb-bdmng * p_menge ) / lv_gamng.
+        MODIFY lti_goodmov.
+      ENDIF.
+    ENDLOOP.
+*   GST - 20/03/2015 <-
+
+
+    CALL FUNCTION 'BAPI_PROCORDCONF_CREATE_TT'
+*   EXPORTING
+*     POST_WRONG_ENTRIES             = '0'
+*     TESTRUN                        =
+      IMPORTING
+        return             = ls_return1
+      TABLES
+        timetickets        = lti_times
+        goodsmovements     = lti_goodmov
+        link_conf_goodsmov = lti_link
+*       CHARACTERISTICS_WIPBATCH       =
+*       LINK_CONF_CHAR_WIPBATCH        =
+        detail_return      = lti_detail.
+
+    READ TABLE lti_detail WITH KEY type = 'E'.
+    IF sy-subrc = 0.
+
+      gv_error = 'X'.
+
+* REGISTRAR ERROR EN CASO DE NO CREACION DEL PEDIDO DE COMPRAS
+*    LOOP AT lt_return INTO ls_return WHERE type  = 'E'.
+      CLEAR gs_messages.
+      gs_messages = lti_detail.
+      APPEND gs_messages TO gt_messages.
+*    ENDLOOP.
+
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+
+* GUARDAR LOGS CON EL PEDIDO DE COMPRAS CREADO
+*    READ TABLE lt_return INTO ls_return
+*    WITH KEY type = 'S'.
+      CLEAR gs_messages.
+      gs_messages = lti_detail.
+      APPEND gs_messages TO gt_messages.
+
+    ENDIF.
+  ENDIF. ""cgijon: 21.03.17 - Ticket 25469 - SOLO NOTIFICAR ÓRDENES ZI01
+ENDFORM.                    " NOTIFICAR_ORDEN
+
+*&---------------------------------------------------------------------*
+*&      Form  IMPRIMIR_ETIQUETA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM imprimir_etiqueta .
+
+  DATA: ls_rollo TYPE zspp_etiq_rollo.
+
+  CLEAR: ls_rollo.
+
+  ls_rollo-diametro = p_diam.
+  ls_rollo-charg = gv_charg.
+  ls_rollo-tornada = p_torn.
+  ls_rollo-aufnr = p_aufnr.
+  ls_rollo-peso = p_menge.
+
+  SELECT SINGLE afko~plnbez
+          INTO ls_rollo-matnr
+  FROM aufk
+  INNER JOIN afko ON afko~aufnr = aufk~aufnr
+  WHERE aufk~aufnr = p_aufnr.
+
+
+  CALL FUNCTION 'ZMFPP_ETIQ_ROLLO'
+    EXPORTING
+      i_rollo    = ls_rollo
+      i_nodialog = 'X'.
+
+
+ENDFORM.                    " IMPRIMIR_ETIQUETA
+
+*&---------------------------------------------------------------------*
+*&      Form  MOSTRAR_LOG
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM mostrar_log .
+
+  CALL FUNCTION 'C14ALD_BAPIRET2_SHOW'
+    TABLES
+      i_bapiret2_tab = gt_messages.
+
+ENDFORM.                    " MOSTRAR_LOG
+
+*&---------------------------------------------------------------------*
+*&      Form  CLEAN_VBLES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM clean_vbles .
+
+  CLEAR: p_aufnr, p_menge, p_ktext, p_diam, p_torn, gv_mjahr, gv_mblnr,
+         gt_messages, gv_charg.
+  CLEAR: gv_error.
+  REFRESH gt_messages.
+
+
+ENDFORM.                    " CLEAN_VBLES

@@ -1,0 +1,555 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPI_0002_FORM
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  SELECCIONAR_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM seleccionar_datos .
+
+  DATA: ls_bsid TYPE bsid,
+        lt_bsid LIKE bsid OCCURS 0.
+
+  DATA: lv_index LIKE sy-tabix,
+        lv_togru LIKE knb1-togru.
+
+* SELECCIONAMOS TODOS LOS DOCUMENTOS DEL DIA
+  SELECT * APPENDING CORRESPONDING FIELDS OF TABLE gt_datos
+  FROM bsid
+  WHERE cpudt IN p_fecha
+  AND bukrs IN s_bukrs.
+
+  SELECT * APPENDING CORRESPONDING FIELDS OF TABLE gt_datos
+  FROM bsad
+  WHERE cpudt IN p_fecha
+  AND bukrs IN s_bukrs.
+
+* FILTRAMOS PARA QUEDARNOS CON LOS CLIENTES
+  SORT gt_datos BY kunnr bukrs ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM gt_datos COMPARING kunnr bukrs.
+
+  CLEAR: gt_bkpf, gt_bseg, gt_bkpf_comp, gt_bseg_comp.
+  REFRESH: gt_bkpf, gt_bseg, gt_bkpf_comp, gt_bseg_comp.
+
+  LOOP AT gt_datos INTO gs_datos.
+
+    CLEAR: lt_bsid.
+    REFRESH lt_bsid.
+    SELECT * INTO CORRESPONDING FIELDS OF TABLE lt_bsid
+      FROM bsid
+      WHERE kunnr = gs_datos-kunnr
+      AND bukrs   = gs_datos-bukrs.
+
+* EN CASO DE QUE NO TENGA PARTIDAS ABIERTAS ENVIAMOS UN IDOC CON UN DOCUMENTO COMPENSADO
+* E IMPORTE 0 PARA QUE EL OTRO SISTEMA SEPA QUE NO LE QUEDA NADA PENDIENTE
+    IF sy-subrc <> 0.
+      PERFORM seleccionar_compensada.
+    ENDIF.
+
+* FILTRAMOS PARA QUEDARNOS CON LOS CLIENTES
+    SORT lt_bsid BY belnr gjahr bukrs ASCENDING.
+    DELETE ADJACENT DUPLICATES FROM lt_bsid COMPARING belnr gjahr bukrs.
+
+    LOOP AT lt_bsid INTO ls_bsid.
+
+      SELECT * APPENDING CORRESPONDING FIELDS OF TABLE gt_bkpf
+        FROM bkpf
+        WHERE bukrs = ls_bsid-bukrs
+        AND belnr = ls_bsid-belnr
+        AND gjahr = ls_bsid-gjahr.
+
+      SELECT * APPENDING CORRESPONDING FIELDS OF TABLE gt_bseg
+       FROM bseg
+       WHERE bukrs = ls_bsid-bukrs
+       AND belnr = ls_bsid-belnr
+       AND gjahr = ls_bsid-gjahr
+       AND koart = 'D'
+       AND augbl = ''.
+*       AND buzei = ls_bsid-buzei.
+
+    ENDLOOP.
+  ENDLOOP.
+
+
+** -> 12/06/2015 PARA LOS APUNTES QUE EN LA PARTIDA ABIERTA NO VIENE LA DIVISION INFORMADA
+** BUSCAMOS EL MAESTRO DEL CLIENTE PARA AVERIGUAR A LA DIVISION A LA QUE PERTENECE
+** SOLO PARA LA SOCIEDAD 2000
+  LOOP AT gt_bseg INTO gs_bseg WHERE bukrs = '2000' AND gsber IS INITIAL.
+    lv_index = sy-tabix.
+
+    CLEAR lv_togru.
+    SELECT SINGLE togru INTO lv_togru
+     FROM knb1
+     WHERE kunnr = gs_bseg-kunnr
+     AND bukrs = gs_bseg-bukrs.
+
+    IF sy-subrc = 0.
+      CASE lv_togru.
+        WHEN 'XATI'.
+          gs_bseg-gsber = 'HIXA'.
+          MODIFY gt_bseg FROM gs_bseg INDEX lv_index.
+        WHEN 'PACS'.
+          gs_bseg-gsber = 'HIPA'.
+          MODIFY gt_bseg FROM gs_bseg INDEX lv_index.
+        WHEN OTHERS.
+      ENDCASE.
+    ENDIF.
+  ENDLOOP.
+
+** <- 12/06/2015
+
+* IEG - SOTHIS - 08/11/2019 - Quitamos posibles documentos duplicados y posiciones
+  SORT gt_bkpf BY bukrs belnr gjahr.
+  DELETE ADJACENT DUPLICATES FROM gt_bkpf COMPARING bukrs belnr gjahr.
+
+  SORT gt_bseg BY bukrs belnr gjahr buzei.
+  DELETE ADJACENT DUPLICATES FROM gt_bseg COMPARING bukrs belnr gjahr buzei.
+* IEG - SOTHIS - 08/11/2019 - Quitamos posibles documentos duplicados y posiciones
+
+ENDFORM.                    " SELECCIONAR_DATOS
+
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_IDOC
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_idoc .
+
+  DATA: ls_edidc TYPE edidc,
+        ls_edidd TYPE edidd.
+  DATA: lti_edidc  LIKE edidc OCCURS 0,
+        lti_edidd  LIKE edidd OCCURS 0,
+        ls_e1fikpf TYPE e1fikpf,
+        ls_e1fiseg TYPE e1fiseg,
+        ls_e1fisec TYPE e1fisec,
+        ls_e1fiset TYPE e1fiset,
+        ls_e1fise2 TYPE e1fise2,
+        ls_e1finbu TYPE e1finbu.
+  DATA: i_sndpor  TYPE ediusndpor,
+        lv_logsys TYPE logsys.
+  DATA: lv_dias TYPE i.
+
+  SORT gt_bkpf BY bukrs budat.
+
+  LOOP AT gt_bkpf INTO gs_bkpf.
+
+* Registro de control
+* ---------------------------------------------------------------------
+    CLEAR ls_edidc.
+    ls_edidc-direct = '1'.
+
+*   Receptor del IDOC (en este caso PI)
+    CASE sy-sysid.
+      WHEN 'HED'.
+        ls_edidc-rcvpor = 'HPD_001'.
+        ls_edidc-rcvprt = 'LS'.
+        ls_edidc-rcvprn = 'HPDCLNT001'. "lv_logsys.
+      WHEN 'HEQ'.
+        ls_edidc-rcvpor = 'HPD_001'.
+        ls_edidc-rcvprt = 'LS'.
+        ls_edidc-rcvprn = 'HPDCLNT001'. "lv_logsys.
+      WHEN 'HEP'.
+        ls_edidc-rcvpor = 'HPP_001'.
+        ls_edidc-rcvprt = 'LS'.
+        ls_edidc-rcvprn = 'HPPCLNT001'. "lv_logsys.
+      WHEN OTHERS.
+    ENDCASE.
+
+
+
+*   Emisor del IDOC (siempre será SAP en los Idocs de salida)
+    ls_edidc-sndprt = 'LS'.
+    CONCATENATE 'SAP' sy-sysid INTO ls_edidc-sndpor.
+    SELECT SINGLE logsys INTO ls_edidc-sndprn
+        FROM  t000
+        WHERE mandt = sy-mandt.
+
+
+* Variante del mensaje
+* ---------------------------------------------------------------------
+    IF gs_bkpf-bukrs = '2040'.
+      ls_edidc-mescod = 'A40'.
+    ELSEIF gs_bkpf-bukrs = '2041'.
+      ls_edidc-mescod = 'A41'.
+    ENDIF.
+* ---------------------------------------------------------------------
+
+*   Tipo del Idoc
+    ls_edidc-mestyp = 'FIDCC1'.
+    ls_edidc-idoctp = 'FIDCCP02'.
+*  ls_edidc-rcvpfc = 'RE'.
+
+
+* Segmentos del Idoc
+* ---------------------------------------------------------------------
+* E1FIKPF: Cabecera docum.FI (BKPF)
+    CLEAR: ls_edidd, ls_e1fikpf.
+    MOVE-CORRESPONDING gs_bkpf TO ls_e1fikpf.
+    ls_edidd-segnam     = 'E1FIKPF'.
+    ls_edidd-sdata      = ls_e1fikpf.
+    APPEND ls_edidd TO lti_edidd.
+
+    LOOP AT gt_bseg INTO gs_bseg WHERE bukrs = gs_bkpf-bukrs
+                                   AND belnr = gs_bkpf-belnr
+                                   AND gjahr = gs_bkpf-gjahr.
+
+* E1FISEG: Posición documento FI (BSEG)
+      CLEAR: ls_edidd, ls_e1fiseg.
+      MOVE-CORRESPONDING gs_bseg TO ls_e1fiseg.
+
+* calcular el plazo con las fechas de vencimiento
+      CLEAR lv_dias.
+      CALL FUNCTION 'DAYS_BETWEEN_TWO_DATES'
+        EXPORTING
+          i_datum_bis             = gs_bseg-fdtag
+          i_datum_von             = sy-datum
+*         I_KZ_EXCL_VON           = '0'
+*         I_KZ_INCL_BIS           = '0'
+*         I_KZ_ULT_BIS            = ' '
+*         I_KZ_ULT_VON            = ' '
+*         I_STGMETH               = '0'
+*         I_SZBMETH               = '1'
+        IMPORTING
+          e_tage                  = lv_dias
+        EXCEPTIONS
+          days_method_not_defined = 1
+          OTHERS                  = 2.
+
+      IF lv_dias <= 0.
+        ls_e1fiseg-xref2 = '0'.
+      ELSEIF lv_dias >= 1 AND lv_dias <= 15.
+        ls_e1fiseg-xref2 = '15'.
+      ELSEIF lv_dias >= 16 AND lv_dias <= 30.
+        ls_e1fiseg-xref2 = '30'.
+      ELSEIF lv_dias >= 31 AND lv_dias <= 60.
+        ls_e1fiseg-xref2 = '60'.
+      ELSEIF lv_dias >= 61 AND lv_dias <= 90.
+        ls_e1fiseg-xref2 = '90'.
+      ELSEIF lv_dias >= 91.
+        ls_e1fiseg-xref2 = '+90'.
+      ENDIF.
+
+      ls_edidd-segnam     = 'E1FISEG'.
+      ls_edidd-sdata      = ls_e1fiseg.
+      APPEND ls_edidd TO lti_edidd.
+
+* E1FINBU: Libro auxiliar FI  (FI-AP-AR) (BSEG)
+      CLEAR: ls_edidd, ls_e1finbu.
+      ls_e1finbu-zfbdt = gs_bseg-zfbdt.
+      ls_e1finbu-skfbt = gs_bseg-skfbt.
+      ls_e1finbu-rebzg = gs_bseg-rebzg.
+      ls_e1finbu-landl = gs_bseg-landl.
+      ls_e1finbu-lifnr = gs_bseg-lifnr.
+      ls_e1finbu-kunnr = gs_bseg-kunnr.
+      ls_e1finbu-umskz = gs_bseg-umskz.
+      ls_e1finbu-zlsch = gs_bseg-zlsch.
+*      IF ls_e1finbu-zlsch IS INITIAL.
+*        ls_e1finbu-zlsch = gs_bseg-umskz.
+*      ENDIF.
+      ls_edidd-segnam     = 'E1FINBU'.
+      ls_edidd-sdata      = ls_e1finbu.
+      APPEND ls_edidd TO lti_edidd.
+
+    ENDLOOP.
+
+
+* Generamos el Idoc
+* ---------------------------------------------------------------------
+    CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE'
+      EXPORTING
+        master_idoc_control            = ls_edidc
+      TABLES
+        communication_idoc_control     = lti_edidc
+        master_idoc_data               = lti_edidd
+      EXCEPTIONS
+        error_in_idoc_control          = 1
+        error_writing_idoc_status      = 2
+        error_in_idoc_data             = 3
+        sending_logical_system_unknown = 4
+        OTHERS                         = 5.
+
+* Si hay errores cargamos el mensaje
+    IF sy-subrc <> 0.
+      es_return-type        = sy-msgty.
+      es_return-number      = sy-msgno.
+      es_return-id          = sy-msgid.
+      es_return-message_v1  = sy-msgv1.
+      es_return-message_v2  = sy-msgv2.
+      es_return-message_v3  = sy-msgv3.
+      es_return-message_v4  = sy-msgv4.
+      APPEND es_return.
+
+* Si no hay errores, cargamos un mensaje y el número del Idoc
+    ELSE.
+      READ TABLE lti_edidc INTO ls_edidc INDEX 1.
+      CHECK sy-subrc = 0.
+      e_docnum = ls_edidc-docnum.
+      es_return-type        = 'S'.
+      es_return-number      = '003'.
+*    es_return-id          = 'ZIDOCS'.
+      es_return-message_v1  = e_docnum.
+    ENDIF.
+
+* Hacemos un COMMIT para el Idoc
+    CALL FUNCTION 'DEQUEUE_ALL'.
+    COMMIT WORK AND WAIT.
+
+    CLEAR: ls_edidc, lti_edidc, lti_edidd.
+    REFRESH: lti_edidc, lti_edidd.
+
+  ENDLOOP.
+
+ENDFORM.                    " CREAR_IDOC
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECCIONAR_COMPENSADA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM seleccionar_compensada .
+
+  DATA: lv_index LIKE sy-tabix,
+        lv_togru LIKE knb1-togru.
+
+  SELECT * APPENDING CORRESPONDING FIELDS OF TABLE gt_bkpf_comp
+    FROM bkpf
+    WHERE bukrs = gs_datos-bukrs
+    AND belnr = gs_datos-belnr
+    AND gjahr = gs_datos-gjahr.
+
+  SELECT * APPENDING CORRESPONDING FIELDS OF TABLE gt_bseg_comp
+   FROM bseg
+   WHERE bukrs = gs_datos-bukrs
+   AND belnr = gs_datos-belnr
+   AND gjahr = gs_datos-gjahr
+   AND koart = 'D'.
+*   AND augbl = ''.
+
+** -> 09/06/2017
+** BUSCAMOS EL MAESTRO DEL CLIENTE PARA AVERIGUAR A LA DIVISION A LA QUE PERTENECE
+** SOLO PARA LA SOCIEDAD 2000
+  LOOP AT gt_bseg_comp INTO gs_bseg WHERE bukrs = '2000' AND gsber IS INITIAL.
+    lv_index = sy-tabix.
+
+    CLEAR lv_togru.
+    SELECT SINGLE togru INTO lv_togru
+      FROM knb1
+      WHERE kunnr = gs_bseg-kunnr
+      AND bukrs = gs_bseg-bukrs.
+
+    IF sy-subrc = 0.
+      CASE lv_togru.
+        WHEN 'XATI'.
+          gs_bseg-gsber = 'HIXA'.
+          MODIFY gt_bseg_comp FROM gs_bseg INDEX lv_index.
+        WHEN 'PACS'.
+          gs_bseg-gsber = 'HIPA'.
+          MODIFY gt_bseg_comp FROM gs_bseg INDEX lv_index.
+        WHEN OTHERS.
+      ENDCASE.
+    ENDIF.
+  ENDLOOP.
+** -> 09/06/2017
+
+
+
+ENDFORM.                    " SELECCIONAR_COMPENSADA
+
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_IDOC_COMPENSADO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_idoc_compensado .
+
+  DATA: ls_edidc TYPE edidc,
+        ls_edidd TYPE edidd.
+  DATA: lti_edidc  LIKE edidc OCCURS 0,
+        lti_edidd  LIKE edidd OCCURS 0,
+        ls_e1fikpf TYPE e1fikpf,
+        ls_e1fiseg TYPE e1fiseg,
+        ls_e1fisec TYPE e1fisec,
+        ls_e1fiset TYPE e1fiset,
+        ls_e1fise2 TYPE e1fise2,
+        ls_e1finbu TYPE e1finbu.
+  DATA: i_sndpor  TYPE ediusndpor,
+        lv_logsys TYPE logsys.
+  DATA: lv_dias TYPE i.
+
+  SORT gt_bkpf_comp BY bukrs budat.
+
+  LOOP AT gt_bkpf_comp INTO gs_bkpf_comp.
+
+* Registro de control
+* ---------------------------------------------------------------------
+    CLEAR ls_edidc.
+    ls_edidc-direct = '1'.
+
+*   Receptor del IDOC (en este caso PI)
+    CASE sy-sysid.
+      WHEN 'HED'.
+        ls_edidc-rcvpor = 'HPD_001'.
+        ls_edidc-rcvprt = 'LS'.
+        ls_edidc-rcvprn = 'HPDCLNT001'. "lv_logsys.
+      WHEN 'HEQ'.
+        ls_edidc-rcvpor = 'HPD_001'.
+        ls_edidc-rcvprt = 'LS'.
+        ls_edidc-rcvprn = 'HPDCLNT001'. "lv_logsys.
+      WHEN 'HEP'.
+        ls_edidc-rcvpor = 'HPP_001'.
+        ls_edidc-rcvprt = 'LS'.
+        ls_edidc-rcvprn = 'HPPCLNT001'. "lv_logsys.
+      WHEN OTHERS.
+    ENDCASE.
+
+
+
+*   Emisor del IDOC (siempre será SAP en los Idocs de salida)
+    ls_edidc-sndprt = 'LS'.
+    CONCATENATE 'SAP' sy-sysid INTO ls_edidc-sndpor.
+    SELECT SINGLE logsys INTO ls_edidc-sndprn
+        FROM  t000
+        WHERE mandt = sy-mandt.
+
+*   Tipo del Idoc
+    ls_edidc-mestyp = 'FIDCC1'.
+    ls_edidc-idoctp = 'FIDCCP02'.
+*  ls_edidc-rcvpfc = 'RE'.
+
+
+* Segmentos del Idoc
+* ---------------------------------------------------------------------
+* E1FIKPF: Cabecera docum.FI (BKPF)
+    CLEAR: ls_edidd, ls_e1fikpf.
+    gs_bkpf_comp-blart = 'DR'.
+    MOVE-CORRESPONDING gs_bkpf_comp TO ls_e1fikpf.
+    ls_edidd-segnam     = 'E1FIKPF'.
+    ls_edidd-sdata      = ls_e1fikpf.
+    APPEND ls_edidd TO lti_edidd.
+
+    LOOP AT gt_bseg_comp INTO gs_bseg_comp WHERE bukrs = gs_bkpf_comp-bukrs
+                                   AND belnr = gs_bkpf_comp-belnr
+                                   AND gjahr = gs_bkpf_comp-gjahr.
+
+* E1FISEG: Posición documento FI (BSEG)
+      CLEAR: ls_edidd, ls_e1fiseg.
+      CLEAR gs_bseg_comp-dmbtr.
+      gs_bseg_comp-fdtag = sy-datum.
+      MOVE-CORRESPONDING gs_bseg_comp TO ls_e1fiseg.
+
+** calcular el plazo con las fechas de vencimiento
+*      CLEAR lv_dias.
+*      CALL FUNCTION 'DAYS_BETWEEN_TWO_DATES'
+*        EXPORTING
+*          i_datum_bis             = gs_bseg_comp-fdtag
+*          i_datum_von             = sy-datum
+**         I_KZ_EXCL_VON           = '0'
+**         I_KZ_INCL_BIS           = '0'
+**         I_KZ_ULT_BIS            = ' '
+**         I_KZ_ULT_VON            = ' '
+**         I_STGMETH               = '0'
+**         I_SZBMETH               = '1'
+*        IMPORTING
+*          e_tage                  = lv_dias
+*        EXCEPTIONS
+*          days_method_not_defined = 1
+*          OTHERS                  = 2.
+*
+*      IF lv_dias <= 0.
+*        ls_e1fiseg-xref2 = '0'.
+*      ELSEIF lv_dias >= 1 AND lv_dias <= 15.
+*        ls_e1fiseg-xref2 = '15'.
+*      ELSEIF lv_dias >= 16 AND lv_dias <= 30.
+*        ls_e1fiseg-xref2 = '30'.
+*      ELSEIF lv_dias >= 31 AND lv_dias <= 60.
+*        ls_e1fiseg-xref2 = '60'.
+*      ELSEIF lv_dias >= 61 AND lv_dias <= 90.
+*        ls_e1fiseg-xref2 = '90'.
+*      ELSEIF lv_dias >= 91.
+*        ls_e1fiseg-xref2 = '+90'.
+*      ENDIF.
+
+      ls_edidd-segnam     = 'E1FISEG'.
+      ls_edidd-sdata      = ls_e1fiseg.
+      APPEND ls_edidd TO lti_edidd.
+
+* E1FINBU: Libro auxiliar FI  (FI-AP-AR) (BSEG)
+      CLEAR: ls_edidd, ls_e1finbu.
+      ls_e1finbu-zfbdt = gs_bseg_comp-zfbdt.
+      ls_e1finbu-skfbt = gs_bseg_comp-skfbt.
+      ls_e1finbu-rebzg = gs_bseg_comp-rebzg.
+      ls_e1finbu-landl = gs_bseg_comp-landl.
+      ls_e1finbu-lifnr = gs_bseg_comp-lifnr.
+      ls_e1finbu-kunnr = gs_bseg_comp-kunnr.
+      ls_e1finbu-umskz = gs_bseg_comp-umskz.
+      ls_e1finbu-zlsch = 'E'.
+*      IF ls_e1finbu-zlsch IS INITIAL.
+*        ls_e1finbu-zlsch = gs_bseg-umskz.
+*      ENDIF.
+      ls_edidd-segnam     = 'E1FINBU'.
+      ls_edidd-sdata      = ls_e1finbu.
+      APPEND ls_edidd TO lti_edidd.
+
+    ENDLOOP.
+
+
+* Generamos el Idoc
+* ---------------------------------------------------------------------
+    CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE'
+      EXPORTING
+        master_idoc_control            = ls_edidc
+      TABLES
+        communication_idoc_control     = lti_edidc
+        master_idoc_data               = lti_edidd
+      EXCEPTIONS
+        error_in_idoc_control          = 1
+        error_writing_idoc_status      = 2
+        error_in_idoc_data             = 3
+        sending_logical_system_unknown = 4
+        OTHERS                         = 5.
+
+* Si hay errores cargamos el mensaje
+    IF sy-subrc <> 0.
+      es_return-type        = sy-msgty.
+      es_return-number      = sy-msgno.
+      es_return-id          = sy-msgid.
+      es_return-message_v1  = sy-msgv1.
+      es_return-message_v2  = sy-msgv2.
+      es_return-message_v3  = sy-msgv3.
+      es_return-message_v4  = sy-msgv4.
+      APPEND es_return.
+
+* Si no hay errores, cargamos un mensaje y el número del Idoc
+    ELSE.
+      READ TABLE lti_edidc INTO ls_edidc INDEX 1.
+      CHECK sy-subrc = 0.
+      e_docnum = ls_edidc-docnum.
+      es_return-type        = 'S'.
+      es_return-number      = '003'.
+*    es_return-id          = 'ZIDOCS'.
+      es_return-message_v1  = e_docnum.
+    ENDIF.
+
+* Hacemos un COMMIT para el Idoc
+    CALL FUNCTION 'DEQUEUE_ALL'.
+    COMMIT WORK AND WAIT.
+
+    CLEAR: ls_edidc, lti_edidc, lti_edidd.
+    REFRESH: lti_edidc, lti_edidd.
+
+  ENDLOOP.
+
+ENDFORM.                    " CREAR_IDOC_COMPENSADO

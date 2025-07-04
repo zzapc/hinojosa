@@ -1,0 +1,288 @@
+FUNCTION z_scm042_liberar_stock.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IT_ITEM) TYPE  BAPIMEPOITEM_TP
+*"     VALUE(IT_EXIDV) TYPE  HUM_EXIDV_T
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_TT
+*"----------------------------------------------------------------------
+* Liberar stock de pedido cliente.
+* Adaptación de la lógica del programa de referencia:
+* -ZSWMSD0011 - Liberar asignación stock
+*--------------------------------------------------------------------*
+  CONSTANTS: c_stock_especial_cartera_ped   TYPE mska-sobkz VALUE 'E',
+             c_status_tratado_completamente TYPE vbup-gbsta VALUE 'C'.
+
+  TYPES: BEGIN OF ty_total_mat,
+           matnr          TYPE matnr,
+           charg          TYPE charg_d,
+           werks          TYPE vbap-werks,
+           lgort          TYPE vbap-lgort,
+           vrkme          TYPE vrkme,
+           lfimg          TYPE lfimg,
+           lfimg_liberado TYPE lfimg,
+         END OF ty_total_mat,
+         ty_tab_total_mat TYPE TABLE OF ty_total_mat.
+
+  DATA: tg_data TYPE zwm_t_sd0011.
+
+  DATA: lt_total_mat  TYPE ty_tab_total_mat.
+  DATA: ls_total_mat  TYPE ty_total_mat.
+
+  DATA: lr_werks TYPE RANGE OF vbap-werks,
+        lr_matnr TYPE RANGE OF vbap-matnr,
+        lr_charg TYPE RANGE OF vbap-charg.
+*        lr_lgort TYPE RANGE OF vbap-lgort.
+
+  DATA: wa_werks LIKE LINE OF lr_werks,
+        wa_matnr LIKE LINE OF lr_matnr,
+        wa_charg LIKE LINE OF lr_charg.
+*        wa_lgort LIKE LINE OF lr_lgort.
+
+
+  ">Datos de posición con los que se va a crear el pedido traslado:
+  IF it_item IS INITIAL.
+    "No se ha liberado stock pedido cliente, sin datos items de selección."
+    PERFORM fill_return USING 'W' 'ZSCM042' '053' space space space space CHANGING et_return. "Warning.
+  ENDIF.
+  IF it_exidv IS INITIAL.
+    "No se ha liberado stock pedido cliente, sin datos UAs de selección."
+    PERFORM fill_return USING 'W' 'ZSCM042' '054' space space space space CHANGING et_return. "Warning.
+  ENDIF.
+  IF it_item IS INITIAL OR it_exidv IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  LOOP AT it_item INTO DATA(ls_item).
+    lr_matnr = VALUE #( BASE lr_matnr ( sign = 'I' option = 'EQ' low = ls_item-material ) ).
+    lr_charg = VALUE #( BASE lr_charg ( sign = 'I' option = 'EQ' low = ls_item-batch ) ).
+    lr_werks = VALUE #( BASE lr_werks ( sign = 'I' option = 'EQ' low = ls_item-plant ) ).
+*    lr_lgort = VALUE #( BASE lr_lgort ( sign = 'I' option = 'EQ' low = ls_item-suppl_stloc ) ).
+
+    ls_total_mat-matnr = ls_item-material.
+    ls_total_mat-charg = ls_item-batch.
+    ls_total_mat-werks = ls_item-plant.
+    ls_total_mat-lgort = ls_item-suppl_stloc.
+    ls_total_mat-vrkme = ls_item-po_unit.
+    ls_total_mat-lfimg = ls_item-quantity.
+    COLLECT ls_total_mat INTO lt_total_mat.
+    CLEAR ls_total_mat.
+  ENDLOOP.
+  SORT lt_total_mat BY matnr charg.
+
+  SORT lr_matnr BY low.
+  DELETE ADJACENT DUPLICATES FROM lr_matnr COMPARING low.
+
+  SORT lr_charg BY low.
+  DELETE ADJACENT DUPLICATES FROM lr_charg COMPARING low.
+
+  SORT lr_werks BY low.
+  DELETE ADJACENT DUPLICATES FROM lr_werks COMPARING low.
+
+*  SORT lr_lgort BY low.
+*  DELETE ADJACENT DUPLICATES FROM lr_lgort COMPARING low.
+
+  "Datos stock libre, para posibles chequeos.
+  SELECT matnr, werks, lgort, charg, clabs
+    INTO TABLE @DATA(lt_mchb)
+    FROM mchb
+    FOR ALL ENTRIES IN @lt_total_mat
+    WHERE matnr EQ @lt_total_mat-matnr
+      AND werks EQ @lt_total_mat-werks
+      AND lgort EQ @lt_total_mat-lgort
+      AND charg EQ @lt_total_mat-charg
+      AND lvorm EQ @space.
+  "<
+
+*--------------------------------------------------------------------*
+  "Obtener datos:
+  "Equivalente a: FORM f_obtener_datos
+*--------------------------------------------------------------------*
+*  SELECT mska~matnr, mska~werks, vbap~vbeln, vbap~posnr, vbuk~gbstk, vbap~abgru, vbap~kwmeng,
+*         vbup~gbsta, mska~kalab, vbap~vrkme, mska~charg, mska~lgort, vbep~lifsp
+  SELECT vbap~vbeln, vbap~posnr, mska~matnr, mska~werks, mska~lgort, mska~charg,
+         vbuk~gbstk, vbap~abgru, vbap~kwmeng,
+         vbup~gbsta, mska~kalab, vbap~vrkme, vbep~lifsp
+    INTO TABLE @DATA(tl_vbap)
+    FROM vbap INNER JOIN mska ON mska~vbeln = vbap~vbeln AND
+                                 mska~posnr = vbap~posnr
+              INNER JOIN vbak ON vbak~vbeln = vbap~vbeln
+              INNER JOIN vbuk ON vbuk~vbeln = vbap~vbeln
+              INNER JOIN vbup ON vbup~vbeln = vbap~vbeln AND
+                                 vbup~posnr = vbap~posnr
+              INNER JOIN vbep ON vbep~vbeln = vbap~vbeln AND
+                                 vbep~posnr = vbap~posnr
+    WHERE mska~werks IN @lr_werks
+      AND mska~sobkz = @c_stock_especial_cartera_ped " solo pedidos de MTO
+      AND mska~charg IN @lr_charg   "*Lote.
+**      AND vbak~vkorg IN @s_vkorg
+**      AND vbak~vtweg IN @s_vtweg
+**      AND vbap~abgru IN @s_abgru
+**      AND vbak~spart IN @s_spart
+**      AND vbak~auart IN @s_auart
+**      AND vbak~vbeln IN @s_vbeln
+      AND vbap~matnr IN @lr_matnr
+**      AND vbup~gbsta IN @s_gbsta
+**      AND vbuk~gbstk IN @s_gbstk
+**      AND vbep~lifsp IN @s_lifsp
+      AND ( vbup~gbsta = @c_status_tratado_completamente OR vbep~lifsp = 'ZS' )
+      AND mska~kalab > 0. "stock libre asignado al pedidos es <> 0
+
+  IF tl_vbap IS NOT INITIAL.
+
+    ">Corregir duplicidades por VBEP.
+    SORT tl_vbap BY vbeln posnr matnr werks lgort charg.
+    DELETE ADJACENT DUPLICATES FROM tl_vbap COMPARING vbeln posnr matnr werks lgort charg.
+    "<
+
+    SELECT matnr, maktx
+      INTO TABLE @DATA(tl_makt)
+      FROM makt
+      FOR ALL ENTRIES IN @tl_vbap
+      WHERE matnr = @tl_vbap-matnr AND
+            spras = @sy-langu.
+
+    SELECT werks, lgort, lgnum
+      INTO TABLE @DATA(tl_t320)
+      FROM t320
+      FOR ALL ENTRIES IN @tl_vbap
+      WHERE werks = @tl_vbap-werks AND
+            lgort = @tl_vbap-lgort.
+
+    SELECT abgru, bezei
+      INTO TABLE @DATA(tl_tvagt)
+      FROM tvagt
+      FOR ALL ENTRIES IN @tl_vbap
+      WHERE abgru = @tl_vbap-abgru AND
+            spras = @sy-langu.
+
+    SELECT lifsp, vtext
+      INTO TABLE @DATA(tl_tvlst)
+      FROM tvlst
+      FOR ALL ENTRIES IN @tl_vbap
+      WHERE lifsp = @tl_vbap-lifsp AND
+            spras = @sy-langu.
+  ENDIF.
+
+  DATA wl_data LIKE LINE OF tg_data.
+  LOOP AT tl_vbap ASSIGNING FIELD-SYMBOL(<fs_vbap>).
+    CLEAR wl_data.
+    wl_data = CORRESPONDING #( <fs_vbap> ).
+
+
+    READ TABLE tl_makt ASSIGNING FIELD-SYMBOL(<fs_makt>) WITH KEY matnr = wl_data-matnr.
+    IF sy-subrc = 0.
+      wl_data-maktx = <fs_makt>-maktx.
+    ENDIF.
+    READ TABLE tl_t320 ASSIGNING FIELD-SYMBOL(<fs_t320>) WITH KEY werks = wl_data-werks
+                                                                  lgort = wl_data-lgort.
+    IF sy-subrc = 0.
+      wl_data-lgnum = <fs_t320>-lgnum.
+    ENDIF.
+    READ TABLE tl_tvlst ASSIGNING FIELD-SYMBOL(<fs_tvlst>) WITH KEY lifsp = wl_data-lifsp.
+    IF sy-subrc = 0.
+      wl_data-vtext = <fs_tvlst>-vtext.
+    ENDIF.
+
+    wl_data-sonum+0(10) = wl_data-vbeln.
+    wl_data-sonum+10(6) = wl_data-posnr.
+
+    APPEND wl_data TO tg_data.
+  ENDLOOP.
+
+  IF tg_data IS NOT INITIAL.
+    SELECT *
+      INTO TABLE @DATA(tl_lqua)
+      FROM lqua
+      FOR ALL ENTRIES IN @tg_data
+      WHERE lgnum = @tg_data-lgnum AND
+            matnr = @tg_data-matnr AND
+            charg = @tg_data-charg AND
+            werks = @tg_data-werks AND
+            lgort = @tg_data-lgort AND
+            bestq = @space        AND
+            sonum = @tg_data-sonum AND
+            verme > 0             AND
+            sobkz = @c_stock_especial_cartera_ped   AND
+*            lgtyp IN ( '200', '201', '120', '230' ).
+            lgtyp NOT LIKE '9%'.
+  ENDIF.
+
+  LOOP AT tg_data ASSIGNING FIELD-SYMBOL(<fs_data>).
+    LOOP AT tl_lqua ASSIGNING FIELD-SYMBOL(<fs_lqua>) WHERE lgnum = <fs_data>-lgnum AND
+                                                            matnr = <fs_data>-matnr AND
+                                                            charg = <fs_data>-charg AND
+                                                            werks = <fs_data>-werks AND
+                                                            lgort = <fs_data>-lgort AND
+                                                            sonum = <fs_data>-sonum.
+      ">********************************************************
+      "Solo las UAs indicadas, de la entrega actual.
+      IF NOT line_exists( it_exidv[ exidv = <fs_lqua>-lenum ] ).
+        CONTINUE.
+      ENDIF.
+      "<********************************************************
+
+      APPEND INITIAL LINE TO <fs_data>-tt_lenum ASSIGNING FIELD-SYMBOL(<fs_lenum>).
+      <fs_lenum>-lenum = <fs_lqua>-lenum.
+
+      ADD <fs_lqua>-verme TO <fs_data>-ctdwm.
+    ENDLOOP.
+    <fs_data>-n_mat = lines( <fs_data>-tt_lenum ).
+    IF <fs_data>-n_mat > 0.
+      <fs_data>-procesable = 'X'.
+    ENDIF.
+  ENDLOOP.
+
+*--------------------------------------------------------------------*
+  "Contabilizar:
+  "Equivalente a: FORM f_contabilizar
+*--------------------------------------------------------------------*
+  DATA wl_zssdd005_str TYPE zssdd005_str.
+  DATA: tl_log_aux TYPE bapiret2_t,
+        tl_log     TYPE bapiret2_t.
+
+  LOOP AT tg_data ASSIGNING <fs_data> WHERE procesable = 'X'.
+    CHECK <fs_data>-tt_lenum IS NOT INITIAL.
+    CLEAR tl_log_aux.
+
+    wl_zssdd005_str-vgbel = <fs_data>-vbeln.
+    wl_zssdd005_str-vgpos = <fs_data>-posnr.
+    wl_zssdd005_str-gbstk = <fs_data>-gbstk.
+    wl_zssdd005_str-gbsta = <fs_data>-gbsta.
+    wl_zssdd005_str-abgru = <fs_data>-abgru.
+
+    CALL FUNCTION 'ZSWM_CHANGE_SONUM_LENUM'
+      EXPORTING
+        tt_lenum  = <fs_data>-tt_lenum
+        reg_traza = wl_zssdd005_str
+        testrun   = ' '
+      IMPORTING
+        tt_log    = tl_log_aux.
+    APPEND LINES OF tl_log_aux TO tl_log.
+
+
+    IF tl_log_aux IS NOT INITIAL.
+      DATA(vl_extnumber) =  CONV balnrext( <fs_data>-vbeln && <fs_data>-posnr && <fs_data>-matnr && <fs_data>-charg ).
+      CALL FUNCTION 'ZMFFI_GUARDAR_LOG'
+        EXPORTING
+          objeto    = 'ZSWMSD0011'
+          subobjeto = 'ZSWMSD0011'
+          mensajes  = tl_log_aux
+          extnumber = vl_extnumber.
+    ENDIF.
+  ENDLOOP.
+
+  ">
+  IF tl_log IS INITIAL.
+*     MESSAGE 'Proceso terminado correctamente' TYPE 'S'.
+    "Stock pedido cliente liberado".
+    PERFORM fill_return USING 'S' 'ZSCM042' '051' space space space space CHANGING et_return.
+  ELSE.
+*     MESSAGE 'Proceso terminado. Revise log ZSWMSD0011' TYPE 'W'.
+    "Error liberando stock pedido cliente. Revise log ZSWMSD0011".
+    PERFORM fill_return USING 'W' 'ZSCM042' '052' space space space space CHANGING et_return. "Warning.
+  ENDIF.
+  "<
+
+ENDFUNCTION.

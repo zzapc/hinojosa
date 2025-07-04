@@ -1,0 +1,340 @@
+FUNCTION zui5_cm_salida_mercancias.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_VBELN) TYPE  VBELN_VL
+*"     VALUE(I_POSITIONS) TYPE  ZSUITT_CM_POSICIONES_ENTREGA
+*"     VALUE(I_PACKING) TYPE  FLAG DEFAULT 'X'
+*"     VALUE(I_HU_ST_INIT) TYPE  HU_ST_INIT DEFAULT 'B'
+*"     VALUE(I_NUM_PALLETS) TYPE  ZUI5_CM_NUM_PALLETS OPTIONAL
+*"  EXPORTING
+*"     VALUE(O_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+  CONSTANTS: v_veces TYPE i VALUE 5.
+
+  DATA: lt_prot TYPE TABLE OF prott.
+
+  DATA: ls_vbkok       TYPE vbkok,
+        lt_vbpok_tab   TYPE TABLE OF vbpok,
+        verko_tab      TYPE TABLE OF  verko,
+        verpo_tab      TYPE TABLE OF  verpo,
+        headerproposal TYPE  bapihuhdrproposal,
+        hukey          TYPE  bapihukey-hu_exid,
+        huheader       TYPE  bapihuheader,
+        itemsproposal  TYPE TABLE OF  bapihuitmproposal,
+        return         TYPE bapiret2_t,
+        ls_td100       TYPE scx_t100key.
+
+  DATA vl_stat_lote TYPE zui5_cm_sm_status.
+
+  DATA: lv_error TYPE xfeld.
+
+  ls_vbkok-wadat_ist = sy-datum.
+  ls_vbkok-vbeln_vl  = i_vbeln.
+  ls_vbkok-komue = 'X'.
+*  ls_vbkok-wabuc = 'X'.
+
+  IF i_num_pallets IS NOT INITIAL.
+    ls_vbkok-anzpk = i_num_pallets.
+  ENDIF.
+
+**** REFRESH HU PACKING
+  CALL FUNCTION 'HU_PACKING_REFRESH'.
+
+**** REFRESH DELIVERY BUFFER
+  CALL FUNCTION 'LE_DELIVERY_REFRESH_BUFFER'
+    EXCEPTIONS
+      no_key_specified = 0
+      OTHERS           = 0.
+
+**** POST
+  SELECT a~vbeln, b~posnr, b~lfimg, b~meins, b~werks, b~lgort, b~matnr, b~charg, a~vkorg, a~lfart
+    FROM likp AS a
+    INNER JOIN lips AS b ON b~vbeln = a~vbeln
+    INTO TABLE @DATA(lt_lips)
+    WHERE a~vbeln = @i_vbeln.
+  IF sy-subrc = 0.
+
+    LOOP AT lt_lips INTO DATA(ls_lips).
+      DATA(lv_tabix) = sy-tabix.
+      CALL FUNCTION 'ZUI5_CM_STATUS_LOTE'
+        EXPORTING
+          i_werks  = ls_lips-werks
+          i_lgort  = ls_lips-lgort
+          i_charg  = ls_lips-charg
+        IMPORTING
+          o_status = vl_stat_lote
+*         O_STATUS_TEXT       =
+*         O_LOTE_2D           =
+*         O_LOTE_3D           =
+        .
+
+      APPEND INITIAL LINE TO lt_vbpok_tab ASSIGNING FIELD-SYMBOL(<ls_vbpok>).
+      <ls_vbpok>-vbeln = <ls_vbpok>-vbeln_vl = ls_lips-vbeln.
+      <ls_vbpok>-posnn = <ls_vbpok>-posnr_vl = ls_lips-posnr.
+      <ls_vbpok>-pikmg = ls_lips-lfimg.
+      <ls_vbpok>-lfimg = ls_lips-lfimg.
+      <ls_vbpok>-lgmng = ls_lips-lfimg.
+      <ls_vbpok>-meins = ls_lips-meins.
+      <ls_vbpok>-matnr = ls_lips-matnr.
+      <ls_vbpok>-werks = ls_lips-werks.
+      <ls_vbpok>-lgort = ls_lips-lgort.
+*      <ls_vbpok>-charg = ls_lips-charg.
+
+      IF ( vl_stat_lote = '00' OR vl_stat_lote = '01' ) AND i_packing IS NOT INITIAL.
+        "Guardamos NumPallet, CajasxPallet y marcamos el flag ZZMONTAJE en LIPS para lotes 3D
+        READ TABLE i_positions INTO DATA(ls_position) WITH KEY vbeln = ls_lips-vbeln posnr = ls_lips-posnr.
+        IF sy-subrc NE 0.
+          READ TABLE i_positions INTO ls_position WITH KEY matnr = ls_lips-matnr charg = ls_lips-charg lfimg = ls_lips-lfimg.
+          IF sy-subrc NE 0.
+            READ TABLE i_positions INTO ls_position INDEX lv_tabix.
+
+          ENDIF.
+        ENDIF.
+        IF sy-subrc = 0.
+          UPDATE lips SET zzcantpal = ls_position-num_pallets
+                          zzcanxpal = ls_position-cajas_pallets
+                          zzmontaje = 'X'
+                          WHERE vbeln = ls_lips-vbeln AND posnr = ls_lips-posnr.
+          COMMIT WORK.
+        ENDIF.
+        CONTINUE.
+      ENDIF.
+
+      IF i_packing IS NOT INITIAL.
+        "Añadimos el Packing
+        READ TABLE i_positions INTO ls_position WITH KEY vbeln = ls_lips-vbeln posnr = ls_lips-posnr.
+        IF sy-subrc NE 0.
+          READ TABLE i_positions INTO ls_position WITH KEY matnr = ls_lips-matnr charg = ls_lips-charg lfimg = ls_lips-lfimg..
+          IF sy-subrc NE 0.
+            READ TABLE i_positions INTO ls_position INDEX lv_tabix.
+
+          ENDIF.
+        ENDIF.
+        IF sy-subrc = 0.
+          "Calculamos los pallets que hemos de añadir al packing
+          DATA(lv_cant_pendiente) = ls_lips-lfimg.
+          DO ls_position-num_pallets TIMES.
+
+            CLEAR: return.
+            headerproposal-hu_status_init = i_hu_st_init.
+            headerproposal-hu_exid_type = 'F'.
+            CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+              EXPORTING
+                input        = ls_position-tipo_pallet
+              IMPORTING
+                output       = headerproposal-pack_mat
+              EXCEPTIONS
+                length_error = 1
+                OTHERS       = 2.
+            IF sy-subrc <> 0.
+* Implement suitable error handling here
+            ENDIF.
+*          headerproposal-content = ls_position-matnr.
+
+            "Calculamos la cantidad por embalaje que debe ir.
+*          APPEND INITIAL LINE TO itemsproposal ASSIGNING FIELD-SYMBOL(<ls_itemproposal>).
+*          <ls_itemproposal>-hu_item_type = '1'.
+*          <ls_itemproposal>-pack_qty    = ls_position-cajas_pallets.
+*          <ls_itemproposal>-base_unit_qty    = ls_position-meins.
+*          <ls_itemproposal>-material    = ls_lips-matnr.
+*          <ls_itemproposal>-batch    = ls_lips-charg.
+*          <ls_itemproposal>-plant    = ls_lips-werks.
+*          <ls_itemproposal>-stge_loc    = ls_lips-lgort.
+
+            CALL FUNCTION 'BAPI_HU_CREATE'
+              EXPORTING
+                headerproposal = headerproposal
+              IMPORTING
+                huheader       = huheader
+                hukey          = hukey
+              TABLES
+*               itemsproposal  = itemsproposal
+*               ITEMSSERIALNO  =
+                return         = return
+*               HUITEM         =
+              .
+            APPEND LINES OF return TO o_return.
+
+            READ TABLE return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+            IF sy-subrc NE 0.
+              CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                EXPORTING
+                  wait = 'X'.
+
+              CLEAR return.
+              WAIT UP TO 1 SECONDS.
+
+              " Set connection to the outbound delivery type (pack_mat_object)
+              IF ls_lips-lfart = 'ZLR'.
+                huheader-pack_mat_object = '03'. " entrega de devolución
+                huheader-item_categ = 'ZHUD'.
+              ELSEIF ls_lips-lfart CP 'ZNL*'. "MTS 03.10.2024 Añadimos todas las clases de entregas de Traslado
+                huheader-pack_mat_object = '01'. " entrega Traslado
+                huheader-item_categ = 'ZHUN'.
+              ELSE.
+                huheader-pack_mat_object = '01'.
+                " PMP 23.09.2024 Ajuste tipo posición partición en regularizado
+                IF ls_position-regularizado EQ 'X'.
+                  huheader-item_categ = 'ZHUN'.
+                ELSE.
+                  huheader-item_categ = 'ZHUP'.
+                ENDIF.
+*                huheader-item_categ = 'ZHUP'.
+              ENDIF.
+
+              huheader-pack_mat_obj_key = i_vbeln.
+              huheader-salesorg = ls_lips-vkorg.
+              huheader-dc_custom_mat = '10'.
+
+
+              REFRESH return.
+              CALL FUNCTION 'BAPI_HU_CHANGE_HEADER'
+                EXPORTING
+                  hukey     = huheader-hu_exid
+                  huchanged = huheader
+                IMPORTING
+                  huheader  = huheader
+                TABLES
+                  return    = return.
+              APPEND LINES OF return TO o_return.
+
+              READ TABLE return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+              IF sy-subrc NE 0.
+                CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                  EXPORTING
+                    wait = 'X'.
+
+                APPEND INITIAL LINE TO verko_tab ASSIGNING FIELD-SYMBOL(<ls_verko>).
+                <ls_verko>-exidv = hukey.
+                <ls_verko>-venum = huheader-hu_id.
+                <ls_verko>-vhilm = headerproposal-pack_mat.
+
+                "Calculamos la cantidad por embalaje que debe ir.
+                APPEND INITIAL LINE TO verpo_tab ASSIGNING FIELD-SYMBOL(<ls_verpo>).
+                <ls_verpo>-exidv_ob = hukey.
+                <ls_verpo>-exidv    = hukey.
+                <ls_verpo>-venum = huheader-hu_id.
+                <ls_verpo>-velin    = '1'.
+                <ls_verpo>-vbeln    = i_vbeln.
+                <ls_verpo>-posnr =    ls_lips-posnr.
+                IF lv_cant_pendiente < ls_position-cajas_pallets.
+                  <ls_verpo>-tmeng    = lv_cant_pendiente.
+                ELSE.
+                  <ls_verpo>-tmeng    = ls_position-cajas_pallets.
+                ENDIF.
+
+                lv_cant_pendiente = lv_cant_pendiente - ls_position-cajas_pallets.
+
+                <ls_verpo>-matnr    = ls_lips-matnr.
+                <ls_verpo>-charg    = ls_lips-charg.
+                <ls_verpo>-werks    = ls_lips-werks.
+                <ls_verpo>-lgort    = ls_lips-lgort.
+              ELSE.
+                CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+
+              ENDIF.
+            ELSE.
+              CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+
+            ENDIF.
+          ENDDO.
+        ENDIF.
+
+      ENDIF.
+    ENDLOOP.
+
+    READ TABLE return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc NE 0 AND  ( ( NOT verko_tab IS INITIAL  AND i_packing IS NOT INITIAL ) OR ( verko_tab IS INITIAL AND lt_vbpok_tab IS NOT INITIAL ) ) .
+      DO v_veces TIMES.
+        CLEAR: lt_prot.
+        CALL FUNCTION 'WS_DELIVERY_UPDATE_2'
+          EXPORTING
+            vbkok_wa               = ls_vbkok
+            delivery               = i_vbeln
+            update_picking         = 'X'
+            synchron               = 'X'
+            commit                 = 'X'
+            nicht_sperren_1        = 'X'
+            if_error_messages_send = 'X'
+          IMPORTING
+            ef_error_any           = lv_error
+          TABLES
+            vbpok_tab              = lt_vbpok_tab
+            verko_tab              = verko_tab
+            verpo_tab              = verpo_tab
+            prot                   = lt_prot
+          EXCEPTIONS
+            error_message          = 1
+            OTHERS                 = 2.
+
+        IF ( ( sy-msgid = 'ME' AND sy-msgno = '006' ) OR ( sy-msgid = 'M3' AND sy-msgno = '897' ) ) AND sy-msgty = 'E'. "M3897
+          WAIT UP TO 1 SECONDS.
+          CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        ELSE.
+          EXIT.
+        ENDIF.
+      ENDDO.
+**** CHECK RESULT AND SAVE
+      DATA(lv_subrc) = sy-subrc.
+      READ TABLE lt_prot INTO DATA(ls_prot) WITH KEY msgty = 'E'.
+      IF sy-subrc = 0 OR lv_subrc IS NOT INITIAL.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        APPEND INITIAL LINE TO o_return ASSIGNING FIELD-SYMBOL(<ls_return>).
+        <ls_return>-id = sy-msgid.
+        <ls_return>-type = sy-msgty.
+        <ls_return>-number = sy-msgno.
+        <ls_return>-message_v1 = sy-msgv1.
+        <ls_return>-message_v2 = sy-msgv2.
+        <ls_return>-message_v3 = sy-msgv3.
+        <ls_return>-message_v4 = sy-msgv4.
+
+        "Borramos las HU creadas
+        IF i_packing IS NOT INITIAL.
+          LOOP AT verko_tab INTO DATA(ls_verko).
+            CALL FUNCTION 'BAPI_HU_DELETE'
+              EXPORTING
+                hukey  = ls_verko-exidv
+              TABLES
+                return = return.
+            APPEND LINES OF return TO o_return.
+
+            READ TABLE return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+            IF sy-subrc NE 0.
+              CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                EXPORTING
+                  wait = 'X'.
+            ELSE.
+              CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+            ENDIF.
+          ENDLOOP.
+
+          APPEND INITIAL LINE TO o_return ASSIGNING <ls_return>.
+          <ls_return>-id = sy-msgid.
+          <ls_return>-type = sy-msgty.
+          <ls_return>-number = sy-msgno.
+          <ls_return>-message_v1 = sy-msgv1.
+          <ls_return>-message_v2 = sy-msgv2.
+          <ls_return>-message_v3 = sy-msgv3.
+          <ls_return>-message_v4 = sy-msgv4.
+        ENDIF.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+      ENDIF.
+      LOOP AT lt_prot INTO ls_prot.
+        APPEND INITIAL LINE TO o_return ASSIGNING <ls_return>.
+        <ls_return>-id = ls_prot-msgid.
+        <ls_return>-type = ls_prot-msgty.
+        <ls_return>-number = ls_prot-msgno.
+        <ls_return>-message_v1 = ls_prot-msgv1.
+        <ls_return>-message_v2 = ls_prot-msgv2.
+        <ls_return>-message_v3 = ls_prot-msgv3.
+        <ls_return>-message_v4 = ls_prot-msgv4.
+      ENDLOOP.
+
+    ENDIF.
+  ENDIF.
+
+ENDFUNCTION.

@@ -1,0 +1,442 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZXF05U01
+*&---------------------------------------------------------------------*
+*"----------------------------------------------------------------------
+*"*"Lokale Schnittstelle:
+*"       IMPORTING
+*"             VALUE(I_LFA1) LIKE  LFA1 STRUCTURE  LFA1
+*"             VALUE(I_LFB1) LIKE  LFB1 STRUCTURE  LFB1
+*"             VALUE(I_LFM1) LIKE  LFM1 STRUCTURE  LFM1
+*"             VALUE(I_ADDRHANDLE) LIKE  ADDR1_SEL-ADDRHANDLE
+*"                             OPTIONAL
+*"       TABLES
+*"              T_LFBK STRUCTURE  LFBK OPTIONAL
+*"              T_LFB5 STRUCTURE  LFB5 OPTIONAL
+*"              T_LFZA STRUCTURE  LFZA OPTIONAL
+*"              T_LFBW STRUCTURE  LFBW OPTIONAL
+*"              T_LFAS STRUCTURE  LFAS OPTIONAL
+*"              T_LFAT STRUCTURE  LFAT OPTIONAL
+*"              T_LFLR STRUCTURE  LFLR OPTIONAL
+*"              T_LFM2 STRUCTURE  LFM2 OPTIONAL
+*"              T_WYT1 STRUCTURE  WYT1 OPTIONAL
+*"              T_WYT1T STRUCTURE  WYT1T OPTIONAL
+*"              T_WYT3 STRUCTURE  WYT3 OPTIONAL
+*"----------------------------------------------------------------------
+* EBA 20/07/2014.
+*  Clientes y proveedores de grupo sólo se deben contabilizar en cuntas de grupo
+IF NOT i_lfb1-akont IS INITIAL AND i_lfb1-lifnr(1) = 'P'.
+  IF i_lfb1-akont NE '0004330000' AND i_lfb1-akont NE '0004030000'.
+*    MESSAGE e055(ZSD). "ERROR.
+    MESSAGE w055(zsd). "WARNING.
+  ENDIF.
+ENDIF.
+
+**** VALIDACION CUENTAS DE PROVEEDOR POR GRUPO DE CUENTAS. LER 23.11.23 - 80113
+IF NOT i_lfb1-akont IS INITIAL.
+  CASE i_lfa1-ktokk.
+    WHEN 'ZPRO' OR  'ZTRA' OR  'ZCPD' OR  'ZCOM'.
+      IF i_lfb1-akont NE '0004000000'.
+        MESSAGE e050(zfi).
+      ENDIF.
+    WHEN 'ZGRU'.
+      IF i_lfb1-akont NE '0004030000'.
+        MESSAGE e050(zfi).
+      ENDIF.
+    WHEN 'ZAFG'.
+      IF i_lfb1-akont NE '0005520000'.
+        MESSAGE e050(zfi).
+      ENDIF.
+    WHEN 'ZEMP'. "85122 - 03.09.24 - permitir cuenta gestion tarjetas CB"
+      IF i_lfb1-akont NE '0004600010'.
+        IF i_lfb1-bukrs = '2040' AND i_lfb1-akont = '0005660000'.
+          "Permitir la cuenta 0005660000 para sociedad 2040"
+        ELSE.
+          MESSAGE e050(zfi).
+        ENDIF.
+      ENDIF.
+  ENDCASE.
+ENDIF.
+
+**** FIN VALIDACION 80113
+
+** SOTHIS ******
+* SE FILTRA POR GRUPO DE CUENTAS
+DATA: ls_lfa1 TYPE lfa1,
+      ls_t005 TYPE t005,
+      ls_lfbk TYPE lfbk.
+TABLES: lfa1, lfb1.
+DATA: ls_fi0001 TYPE ztfi0001.
+
+DATA: ls_lfas  TYPE lfas,
+      lfas_aux TYPE lfas.
+
+* FILTRAR POR GRUPO DE CUENTAS
+IF i_lfa1-ktokk = 'ZCOM' OR i_lfa1-ktokk = 'ZPRO' OR i_lfa1-ktokk = 'ZTRA'. " OR i_lfa1-ktokk = 'ZEMP'
+
+  "VERIFICAMOS SI ES NECESARIO EL NIF COMUNITARIO
+  SELECT SINGLE * INTO ls_t005
+    FROM t005
+    WHERE land1 = i_lfa1-land1.
+
+  IF ls_t005-xegld = 'X' AND i_lfa1-stceg IS INITIAL.
+    MESSAGE e108(zfi) WITH i_lfa1-stcd1.
+  ENDIF.
+
+
+* COMPROBAR SI EXISTE ALGUN PROVEEDOR CON ESE NIF
+  IF i_lfa1-stcd1 IS NOT INITIAL.
+    SELECT * FROM lfa1
+     UP TO 1 ROWS
+     WHERE lifnr NE i_lfa1-lifnr
+       AND stcd1 = i_lfa1-stcd1
+       AND ktokk <> 'ZDIR'
+       AND ktokk <> 'ZBAN'
+       AND ktokk <> 'ZAFG'
+* Ticket 74976 Se excluye del chequeo los proveedores del grupo. 16.01.2023
+       AND ktokk <> 'ZGRU'.
+    ENDSELECT.
+
+    IF sy-subrc = 0.
+      SELECT * UP TO 1 ROWS
+        FROM lfb1
+        WHERE lifnr EQ lfa1-lifnr.
+      ENDSELECT.
+
+      MESSAGE e006(zfi) WITH i_lfa1-stcd1 lfa1-lifnr lfb1-bukrs.
+
+    ELSE.
+      "COMPROBAR IBAN
+      IF i_lfb1-zwels = 'S' OR i_lfb1-zwels = 'R' OR i_lfb1-zwels = 'I'.
+        SELECT SINGLE *
+        FROM lfb1
+        WHERE lifnr = i_lfa1-lifnr.
+        IF sy-subrc <> 0.
+
+          CLEAR  ls_lfbk.
+          READ TABLE t_lfbk INTO  ls_lfbk
+          INDEX 1.
+          IF sy-subrc = 0.
+            IF ls_lfbk-banks IS INITIAL OR ls_lfbk-bankl IS INITIAL OR ls_lfbk-bankn IS INITIAL.
+              MESSAGE e009(zfi) WITH i_lfb1-zwels.
+            ENDIF.
+          ELSE.
+            SELECT SINGLE * INTO ls_lfbk
+            FROM lfbk
+            WHERE lifnr = i_lfa1-lifnr.
+            IF ls_lfbk-banks IS INITIAL OR ls_lfbk-bankl IS INITIAL OR ls_lfbk-bankn IS INITIAL.
+              MESSAGE e009(zfi) WITH i_lfb1-zwels.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+* VALIDACION DEL GRUPO DE TESORERIA DE ACREEDORES
+      IF NOT i_lfb1 IS INITIAL.
+
+        IF i_lfb1-fdgrv(2) = 'PR' AND i_lfa1-ktokk <> 'ZGRU' .
+          IF i_lfb1-fdgrv <> 'PR-PAPEL'.
+            CLEAR ls_fi0001.
+            SELECT SINGLE * INTO ls_fi0001
+              FROM ztfi0001
+              WHERE zrelacion = 'K'
+              AND zwels = i_lfb1-zwels
+              AND fdgrv = i_lfb1-fdgrv.
+            IF sy-subrc <> 0.
+              MESSAGE e011(zfi) WITH i_lfb1-fdgrv.
+            ELSE.
+              IF ls_fi0001-hbkid <> 'DUMMY'.
+                IF ls_fi0001-hbkid(4) <> i_lfb1-hbkid(4).
+                  MESSAGE e011(zfi) WITH i_lfb1-fdgrv.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+
+          ENDIF.
+        ELSE.
+          MESSAGE e013(zfi) WITH i_lfb1-fdgrv.
+        ENDIF.
+      ENDIF.
+
+    ENDIF.
+  ELSEIF i_lfa1-land1 = 'ES'.
+    MESSAGE e016(zfi) WITH lfa1-lifnr.
+  ENDIF.
+
+
+*  IF i_lfa1-land1 = 'ES'.
+  "VERIFICAMOS SI ES NECESARIO EL NIF COMUNITARIO
+  CLEAR ls_t005.
+  SELECT SINGLE * INTO ls_t005
+    FROM t005
+    WHERE land1 = i_lfa1-land1.
+
+  CLEAR ls_lfas.
+  READ TABLE t_lfas INTO ls_lfas WITH KEY land1 = 'ES'.
+
+
+  IF ls_t005-xegld = 'X' AND i_lfa1-stceg IS INITIAL.
+    MESSAGE e108(zfi) WITH i_lfa1-stcd1.
+
+  ELSEIF ls_t005-xegld = 'X'.
+    "NIF de Residentes:
+    SELECT * FROM lfa1
+      UP TO 1 ROWS
+      WHERE lifnr NE i_lfa1-lifnr
+*80974 LER modificacion validacion NIF com. se excluyen grupos de cuentas.
+      AND ktokk <> 'ZDIR'
+      AND ktokk <> 'ZBAN'
+      AND ktokk <> 'ZAFG'
+      AND ktokk <> 'ZGRU'
+*fin modificacion 80974
+      AND stceg = i_lfa1-stceg.
+    ENDSELECT.
+
+    IF sy-subrc = 0.
+      SELECT * UP TO 1 ROWS
+        FROM lfb1
+        WHERE lifnr EQ lfa1-lifnr.
+      ENDSELECT.
+
+      MESSAGE e106(zfi) WITH i_lfa1-stceg lfa1-lifnr lfb1-bukrs.
+    ELSE.
+
+      CLEAR lfas_aux.
+      SELECT SINGLE * FROM lfas
+        INTO lfas_aux
+        WHERE lifnr NE i_lfa1-kunnr
+        AND land1 = 'ES'
+        AND stceg = i_lfa1-stceg.
+
+      IF sy-subrc = 0.
+        SELECT * UP TO 1 ROWS
+          FROM lfb1
+          WHERE lifnr EQ lfas_aux-lifnr.
+        ENDSELECT.
+
+        MESSAGE e106(zfi) WITH i_lfa1-stceg lfas_aux-lifnr lfb1-bukrs.
+      ENDIF.
+    ENDIF.
+
+  ELSE.
+    IF i_lfa1-kunnr IS NOT INITIAL. "cgijon - 09.03.22 - sat 7000045859 ticket 70944
+      SELECT * FROM lfa1
+       UP TO 1 ROWS
+       WHERE ( kunnr NE i_lfa1-kunnr AND
+             kunnr <> '' ) AND  "cgijon - 09.03.22 - sat 7000045859 ticket 70944
+             stceg = i_lfa1-stceg
+*85235 se incluye la verificacion del que el NIF comunitario sea distinto de vacío.
+            AND stceg <> ''.
+      ENDSELECT.
+
+      IF sy-subrc = 0.
+        SELECT * UP TO 1 ROWS
+        FROM lfb1
+          WHERE lifnr EQ lfa1-lifnr.
+        ENDSELECT.
+
+        MESSAGE e106(zfi) WITH i_lfa1-stceg lfa1-lifnr lfb1-bukrs.
+      ENDIF.
+    ENDIF. "cgijon - 09.03.22 - sat 7000045859 ticket 70944
+  ENDIF.
+*  ENDIF.
+
+ENDIF.
+
+*--> INI FCARDONA 21.09.2021 - 67171 Informe INTRASTAT en SAP
+*
+* En este punto se van a introducir validaciones para campos
+* obligatorios de INTRASTAT
+
+"Compruebo:
+" - Que se ha rellenado el país del proveedor
+" - Que el pais no es España
+IF ( i_lfa1-land1 IS NOT INITIAL AND i_lfa1-land1 NE 'ES' ).
+
+  "Compruebo si es pais del proveedor es de la UE
+  SELECT SINGLE xegld
+    FROM t005
+    INTO @DATA(lv_xegld)
+   WHERE land1 = @i_lfa1-land1.
+
+  "Compruebo si es de la UE
+  IF ( lv_xegld IS NOT INITIAL ).
+
+    "Compruebo que se hayan rellenado datos de compra
+    IF ( i_lfm1 IS NOT INITIAL ).
+
+      "Compruebo que se rellene INCOTERM.
+      IF ( i_lfm1-inco1 IS INITIAL ).
+        MESSAGE e036(zfi).
+      ENDIF.
+
+      "Compruebo que se rellene modo transporte frontera.
+      IF ( i_lfm1-expvz IS INITIAL ).
+        MESSAGE e037(zfi).
+      ENDIF.
+
+    ENDIF. "Fin datos de compra
+
+  ENDIF. "Fin chequeo UE
+
+ENDIF.
+
+*<-- FIN FCARDONA 21.09.2021 - 67171 Informe INTRASTAT en SAP
+
+******FI LER 69889 21.01.2022 VALIDACION DEL MAIL DE CONFIRMING PARA PROVEEDORES CON CONFIRMING ESTANDARIZADO
+
+* ini cgijon - 03.02.22 - SAT 7000045712 - ticket 70853
+* en la creación de un acreedor, si la via de pago es W y la sociedad es la que hay en el set de datos
+* ZFI_SOC_CONFIRMING_STD, emitiremos un mensaje informativo a modo de popup que diga:
+* Por favor, asegúrese de rellenar email y “CONFIRMING” en datos generales
+DATA: rg_bukrs  TYPE RANGE OF t001-bukrs,
+      rwa_bukrs LIKE LINE OF rg_bukrs.
+
+DATA: rg_vp  TYPE RANGE OF lfb1-zwels,
+      rwa_vp LIKE LINE OF rg_vp.
+
+DATA l_answer(1).
+
+IF sy-tcode = 'FK01' OR sy-tcode = 'XK01' OR sy-tcode = 'XK02' OR sy-tcode = 'FK02'.
+  SELECT  * FROM setleaf
+    INTO TABLE @DATA(t_setleaf)
+    WHERE setname = 'ZFI_SOC_CONFIRMING_STD'.
+
+
+  SELECT  * FROM setleaf
+   INTO TABLE @DATA(t_setleaf_vp)
+   WHERE setname = 'ZFI_VP_CONFIRMING_STD'.
+
+  LOOP AT t_setleaf INTO DATA(wa_setleaf).
+    rwa_bukrs-sign = wa_setleaf-valsign.
+    rwa_bukrs-option = wa_setleaf-valoption.
+    rwa_bukrs-low = wa_setleaf-valfrom.
+    rwa_bukrs-high = wa_setleaf-valto.
+    APPEND rwa_bukrs TO  rg_bukrs.
+  ENDLOOP.
+
+
+  LOOP AT t_setleaf_vp INTO DATA(wa_setleaf_vp).
+    rwa_vp-sign = wa_setleaf_vp-valsign.
+    rwa_vp-option = wa_setleaf_vp-valoption.
+    rwa_vp-low = wa_setleaf_vp-valfrom.
+    rwa_vp-high = wa_setleaf_vp-valto.
+    APPEND rwa_vp TO  rg_vp.
+  ENDLOOP.
+
+
+  IF i_lfb1-zwels IN rg_vp AND i_lfb1-bukrs IN rg_bukrs.
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        titlebar       = 'Aviso'
+*       DIAGNOSE_OBJECT             = ' '
+        text_question  = 'Por favor, asegúrese de rellenar email y “CONFIRMING” en datos generales'
+        text_button_1  = 'Continuar'
+*       ICON_BUTTON_1  = ' '
+        text_button_2  = 'Corregir'
+*       ICON_BUTTON_2  = ' '
+*       DEFAULT_BUTTON = '1'
+*       DISPLAY_CANCEL_BUTTON       = 'X'
+*       USERDEFINED_F1_HELP         = ' '
+*       START_COLUMN   = 25
+*       START_ROW      = 6
+*       POPUP_TYPE     =
+*       IV_QUICKINFO_BUTTON_1       = ' '
+*       IV_QUICKINFO_BUTTON_2       = ' '
+      IMPORTING
+        answer         = l_answer
+*     TABLES
+*       PARAMETER      =
+      EXCEPTIONS
+        text_not_found = 1
+        OTHERS         = 2.
+    IF sy-subrc <> 0.
+* Implement suitable error handling here
+    ENDIF.
+
+    "l_answer = 1 (Sí)  ó l_answer = A (cancelar) -> sigue con el proceso y graba los datos
+    "l_answer = Corregir -> que se pare el proceso de grabar datos y te deje meter el mail antes de guardar
+    IF l_answer <> '1' AND l_answer <> 'A'.
+      MESSAGE e042(zfi) DISPLAY LIKE 'S'. "Por favor, asegúrese de rellenar email y “CONFIRMING” en datos generales
+    ENDIF.
+
+*    MESSAGE i042(zfi) DISPLAY LIKE 'S'. "Por favor, asegúrese de rellenar email y “CONFIRMING” en datos generales
+  ENDIF.
+ENDIF.
+* fin cgijon - 03.02.22 - SAT 7000045712 - ticket 70853
+
+*DATA: lv_addrnumber TYPE AD_ADDRNUM,
+*      lv_remark    TYPE AD_REMARK2,
+*      lv_smtp_addr TYPE ad_smtpadr.
+*
+*
+*
+*IF i_lfb1-zwels EQ 'K' and i_lfb1-bukrs EQ '2040'.
+*
+*  SELECT SINGLE ADRNR
+*      INTO lv_ADDRNUMBER
+*      FROM lfa1
+*      WHERE lifnr EQ i_lfb1-lifnr.
+*    IF sy-subrc EQ 0.
+*
+**        CALL FUNCTION 'ADDR_GET_COMPLETE'
+**       EXPORTING
+**         ADDRNUMBER                    = lv_ADDRNUMBER
+***         ADDRHANDLE                    =
+***         ARCHIVE_HANDLE                =
+***         IV_CURRENT_COMM_DATA          = 'X'
+***         BLK_EXCPT                     =
+**       IMPORTING
+**         ADSMTP                         = ls_ADSMTP
+***         ADDR1_COMPLETE                =
+***       EXCEPTIONS
+***         PARAMETER_ERROR               = 1
+***         ADDRESS_NOT_EXIST             = 2
+***         INTERNAL_ERROR                = 3
+***         WRONG_ACCESS_TO_ARCHIVE       = 4
+***         ADDRESS_BLOCKED               = 5
+***         OTHERS                        = 6
+***     IF SY-SUBRC <> 0.
+***       Implement suitable error handling here
+***        SELECT SINGLE a~smtp_addr
+***        INTO lv_smtp_addr
+***        FROM ADR6 AS a
+***          INNER JOIN ADRT AS b
+***            ON a~addrnumber EQ b~addrnumber
+***            AND a~consnumber EQ b~consnumber
+***            WHERE a~addrnumber EQ lv_addrnumber
+***            AND b~remark EQ 'CONFIRMING'.
+***
+***          IF sy-subrc NE 0 OR lv_smtp_addr IS INITIAL.
+***          MESSAGE e039(ZFI) WITH i_lfb1-lifnr.
+***
+***          ENDIF.
+***          ENDIF.
+**    ENDIF.
+*
+**FIN MODIFICACION FI LER 69889 21.01.2022 VALIDACION DEL MAIL CONFIRMING PROVEEDORES
+
+*** 81389 CONCUR: VALIDACION EN ACREEDOR EMPLEADO ZEMP DE NUMERO DE CTA ANTERIOR COMO ORDEN DE CO "Z022".
+
+IF sy-tcode = 'FK01' OR sy-tcode = 'FK02'.
+  IF i_lfa1-ktokk = 'ZEMP'.
+    CASE i_lfb1-bukrs.
+      WHEN '1000'.
+        IF NOT i_lfb1-altkn IS INITIAL.
+          DATA vl_aufnr_in TYPE aufk-aufnr.
+          vl_aufnr_in = |{ i_lfb1-altkn ALPHA = IN }|.
+
+          SELECT SINGLE aufnr
+            INTO @DATA(lv_aufnr)
+            FROM coas
+            WHERE aufnr = @vl_aufnr_in
+            AND auart = 'Z022'.
+          IF sy-subrc <> 0.
+            MESSAGE e112(zfi) WITH 'Indique una orden de CO válida.'.
+          ENDIF.
+        ELSE.
+          MESSAGE e111(zfi) WITH 'Indique orden de CO en el campo num cta anterior.'.
+        ENDIF.
+    ENDCASE.
+  ENDIF.
+ENDIF.
+
+*** FIN VALIDACION 81389 CONCUR.

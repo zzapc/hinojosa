@@ -1,0 +1,3419 @@
+*&---------------------------------------------------------------------*
+*&  Include           MZ_WM_RF_I01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0010  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0010 INPUT.
+  CASE ok_code.
+
+    WHEN 'OK'.
+      CLEAR ok_code.
+      IF NOT gs_vttk-tknum IS INITIAL.
+* chequeamos que existe el transporte
+        SELECT SINGLE * INTO gs_vttk FROM vttk WHERE tknum = gs_vttk-tknum.
+        IF NOT sy-subrc IS INITIAL.
+*El transporte & no existe.
+          g_message_number = '001'.
+          g_message_type = 'E'.
+          g_msgv1 = gs_vttk-tknum.
+          PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+        ELSE.
+          IF gs_vttk-stlad = abap_true.
+*El transporte & se ha procesado completamente.
+            g_message_number = '002'.
+            g_message_type = 'E'.
+            g_msgv1 = gs_vttk-tknum.
+            CLEAR gs_vttk.
+            PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+    WHEN 'PENDIENTES'.
+      CLEAR ok_code.
+* listamos los transportes pendientes
+      PERFORM listar_pendientes.
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&  Include           MZ_WM_RF_I01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0010  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0011 INPUT.
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+      IF NOT gs_likp-vbeln IS INITIAL.
+* chequeamos que existe la entrega saliente
+        SELECT SINGLE * INTO gs_likp FROM likp WHERE vbeln = gs_likp-vbeln.
+        IF NOT sy-subrc IS INITIAL.
+*          el albarán & no existe.
+          g_message_number = '003'.
+          g_message_type = 'A'.
+          WRITE gs_likp-vbeln TO g_msgv1 NO-ZERO.
+          PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+        ELSE.
+******* INI GAP WM16 Bernabeu  /  RGUILLOT 27-3-19
+
+          "KYV/RDM - 20210208 - Riesgos Laborales - BEG
+          PERFORM f_handle_rlab USING gs_likp-vbeln CHANGING gv_ret_bool.
+          IF gv_ret_bool = abap_true.
+            RETURN.
+          ENDIF.
+          "KYV/RDM - 20210208 - Riesgos Laborales - END
+
+
+*    Activación o desactivación de funcionalidad
+          oo_descarga->check_funcionalidad( EXPORTING func = 'PESO_ALBARAN'
+                                         EXCEPTIONS inactive = 1 ).
+
+          IF gt_select_list-zzpeso_alb IS INITIAL
+          AND sy-subrc = 0.
+            CALL SCREEN '0076'.
+          ENDIF.
+
+          " INS - cvivo - 60831 Cambiamos la lógica, la actual no detecta bien cuándo se ha leído o no
+          oo_descarga->get_paper( gs_likp-vbeln ). " cargamos datos de albarán de papelera
+
+          READ TABLE oo_descarga->paper INTO DATA(l_paper) WITH KEY descargada = space.
+          IF sy-subrc NE 0.
+            g_message_number = '004'.
+            g_message_type = 'E'.
+            WRITE gs_likp-vbeln TO g_msgv1 NO-ZERO.
+            PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+          ENDIF.
+
+          oo_descarga->get_entrega_paper( l_paper-vgbel ). " recuperamos entrega y dígito de control
+*          PERFORM get_valid_batchs_new.
+
+* recuperamos el digito de control para el proveedor.
+*          PERFORM recupera_dc.
+
+          IF NOT oo_descarga->paper IS INITIAL.
+            CLEAR gs_dlv.
+            CLEAR g_bobina.
+* Llamamos la pantalla de lectura de bobinas.
+            CALL SCREEN '0012'.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+ENDMODULE.
+MODULE user_command_0013 INPUT.
+
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+      IF NOT gs_ekko-ebeln IS INITIAL.
+* chequeamos que existe la entrega saliente
+        SELECT SINGLE * INTO gs_ekko FROM ekko WHERE ebeln = gs_ekko-ebeln
+          AND bukrs EQ oo_descarga->parametros-bukrs. " cvivo - 65163
+        IF NOT sy-subrc IS INITIAL.
+*          el pedido & no existe.
+          g_message_number = '012'.
+          g_message_type = 'A'.
+          g_msgv1 = gs_ekko-ebeln.
+          PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+        ELSE.
+
+*--> Ini - FCARDONA - 30.06.2021 - Error pedido de papelera: No dejamos descargas de papelera por sin reetiquetaje
+
+          IF ( gs_ekko-bsart EQ 'ZINT' AND gs_ekko-lifnr CA 'P3' ).
+
+            g_message_number = '091'.
+            g_message_type = 'E'.
+            g_msgv1 = gs_ekko-ebeln.
+            PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 space space space.
+
+          ENDIF.
+
+*<-- Fin - FCARDONA - 30.06.2021 - Error pedido de papelera: No dejamos descargas de papelera por sin reetiquetaje
+
+*** --> INI FCARDONA 25.09.2023 - Bug lectura cuando proveedor no compatible.
+
+          IF ( gs_param-tcode EQ 'ZWM_RF_004' ). "Sin reetiquetaje
+
+            DATA: lv_lifnr TYPE lifnr.
+
+            CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+              EXPORTING
+                input  = gs_ekko-lifnr
+              IMPORTING
+                output = lv_lifnr.
+
+
+            SELECT COUNT(*) UP TO 1 ROWS
+              FROM tvarvc
+             WHERE name EQ 'ZWM_DC'
+               AND low  EQ lv_lifnr.
+            "AND high NE space. "FCARDONA 17.10.2023 Bug proveedor no compatible
+
+            IF ( sy-subrc NE 0 ).
+
+              g_message_number = '092'.
+              g_message_type = 'E'.
+              g_msgv1 = gs_ekko-ebeln.
+              PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 space space space.
+
+            ENDIF.
+
+          ENDIF.
+
+*** <-- FIN FCARDONA 25.09.2023 - Bug lectura cuando proveedor no compatible.
+
+          "KYV/RDM - 20210208 - Riesgos Laborales - BEG
+          PERFORM f_handle_rlab USING gs_ekko-ebeln CHANGING gv_ret_bool.
+          IF gv_ret_bool = abap_true.
+            RETURN.
+          ENDIF.
+          "KYV/RDM - 20210208 - Riesgos Laborales - END
+
+
+
+          CLEAR gt_dlv.
+* ini - cvivo - 05.12.2018 pedir nota de entrega
+
+** KYVOR(AG) - INI - 28.07.2019 - No transporte
+          IF g_no_transporte IS NOT INITIAL.
+            PERFORM pedir_nota_entrega_no_trans USING gs_ekko-ebeln.
+          ELSE.
+** KYVOR(AG) - FIM - 28.07.2019
+
+            PERFORM pedir_nota_entrega USING gs_vttk-tknum
+                                             gs_ekko-ebeln.
+
+** KYVOR(AG) - INI - 28.07.2019 - No transporte
+          ENDIF.
+** KYVOR(AG) - FIM - 28.07.2019
+
+
+          IF gs_likp-verur IS NOT INITIAL.
+* fin - cvivo - 05.12.2018 pedir nota de entrega
+* recuperamos las posiciones del pedido de las que se puede hacer entrada.
+            PERFORM get_valid_items_from_po
+            USING abap_false. "Kyvor - RDM - 20190911
+* recuperamos el digito de control
+            PERFORM recupera_dc_saica.
+            CLEAR gt_ztmm0002.
+            SELECT * INTO TABLE gt_ztmm0002 FROM ztmm0002.
+*          IF NOT gt_ekko IS INITIAL.
+* ini cvivo - WM CB 16.04.2019
+*    Activación o desactivación de funcionalidad
+            oo_descarga->check_funcionalidad( EXPORTING func = 'OTROS_PROV_SKIP_DETALLE'
+                                           EXCEPTIONS inactive = 1 ).
+*
+*            READ TABLE gt_func INTO ls_func
+*            WITH KEY func = 'OTROS_PROV_SKIP_DETALLE'
+*                    (gv_lgnum_lg) = 'X'.
+
+            IF sy-subrc EQ 0 AND sy-tcode EQ 'ZWM_RF_009'. " directamente a listado de propuesta
+              CLEAR ok_code.
+              CALL SCREEN '9996'. " lista de posiciones pedido con botones fin y descargados
+            ELSE.
+* Llamamos la pantalla de lectura de bobinas.
+              CALL SCREEN '0014'.
+            ENDIF.
+* fin cvivo - WM CB 16.04.2019
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    WHEN 'BACK'.
+      PERFORM listar_pendientes.
+      LEAVE TO SCREEN 0.
+
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_9997  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_9997 INPUT.
+  CASE ok_code.
+    WHEN 'BACK'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      CASE g_local_previous_screen.
+        WHEN 0014.
+          CLEAR: gs_em_po, g_fefco.
+          LEAVE TO SCREEN 0.
+        WHEN OTHERS.
+          LEAVE TO SCREEN 0.
+      ENDCASE.
+    WHEN 'NEXT'.
+      g_partial_list = g_partial_list + 1.
+      g_next_line = g_partial_list * 8 + 1.
+      IF g_next_line > g_lines_list.
+        g_partial_list = g_partial_list - 1.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ENDIF.
+    WHEN 'BEFORE'.
+      IF g_partial_list LE 0.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ELSE.
+        g_partial_list = g_partial_list - 1.
+      ENDIF.
+    WHEN 'LEIDOS'. " cvivo - WM CB
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      CLEAR ok_code.
+      PERFORM listar_palets_descargados USING abap_true.
+    WHEN 'FIN'. " cvivo - WM CB
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      CLEAR ok_code.
+      PERFORM fin_descarga_saica.
+    WHEN 'BOTTOM1'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      READ TABLE gt_select_list INDEX g_index_bottom1.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+    WHEN 'BOTTOM2'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      READ TABLE gt_select_list INDEX g_index_bottom2.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+    WHEN 'BOTTOM3'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      READ TABLE gt_select_list INDEX g_index_bottom3.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+    WHEN 'BOTTOM4'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      READ TABLE gt_select_list INDEX g_index_bottom4.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+    WHEN 'BOTTOM5'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      READ TABLE gt_select_list INDEX g_index_bottom5.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+    WHEN 'BOTTOM6'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      READ TABLE gt_select_list INDEX g_index_bottom6.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+    WHEN 'BOTTOM7'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      READ TABLE gt_select_list INDEX g_index_bottom7.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+    WHEN 'BOTTOM8'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      READ TABLE gt_select_list INDEX g_index_bottom8.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+    WHEN 'LIST'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      PERFORM next_process_from_list.
+    WHEN 'OK'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      READ TABLE gt_select_list INDEX g_option.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+
+    WHEN OTHERS.
+      CASE g_option.
+        WHEN '01'.
+          CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+          READ TABLE gt_select_list INDEX g_index_bottom1.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '02'.
+          CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+          READ TABLE gt_select_list INDEX g_index_bottom2.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '03'.
+          CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+          READ TABLE gt_select_list INDEX g_index_bottom3.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '04'.
+          CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+          READ TABLE gt_select_list INDEX g_index_bottom4.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '05'.
+          CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+          READ TABLE gt_select_list INDEX g_index_bottom5.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '06'.
+          CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+          READ TABLE gt_select_list INDEX g_index_bottom6.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '07'.
+          CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+          READ TABLE gt_select_list INDEX g_index_bottom7.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '08'.
+          CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+          READ TABLE gt_select_list INDEX g_index_bottom8.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+      ENDCASE.
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0012  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0012 INPUT.
+** KYVOR(AG) - INI - 28.07.2019 - Quitar la funcionalidad del botón Grabar,
+** al leer la ubicación destino ya debe de hacerse la OT.
+** Ahora lo hace cuando se da a a grabar.
+  DATA lv_error TYPE xfeld.
+** KYVOR(AG) - FIM - 28.07.2019
+
+  CASE ok_code.
+    WHEN 'OK'.
+      " cvivo - 60831 - 06.05.2020 Nueva lógica
+      CLEAR ok_code.
+      oo_descarga->enter_bobina_paper( g_bobina ).
+*
+*** KYVOR(AG) - INI - 28.07.2019 - Quitar la funcionalidad del botón Grabar,
+*** al leer la ubicación destino ya debe de hacerse la OT.
+*** Ahora lo hace cuando se da a a grabar.
+*      descarga->check_funcionalidad( EXPORTING func = 'NO_TRANSPORTE' EXCEPTIONS inactive = 1 ).
+*      IF sy-subrc IS INITIAL.
+*        FREE lv_error.
+*        CLEAR ok_code.
+*        PERFORM enter_em_papeleras_no_transp CHANGING lv_error.
+*        IF lv_error IS INITIAL.
+*          ok_code = 'SAVE'.
+*          PERFORM grabar_em_papeleras_no_transp.
+*          CLEAR ok_code.
+*        ENDIF.
+*      ELSE.
+*** KYVOR(AG) - FIM - 28.07.2019
+*
+*        CLEAR ok_code.
+*        PERFORM enter_em_papeleras.
+*
+*** KYVOR(AG) - INI - 28.07.2019 - Quitar la funcionalidad del botón Grabar,
+*      ENDIF.
+*** KYVOR(AG) - FIM - 28.07.2019
+*
+*   " cvivo - 60831 - 06.05.2020 Se elimina el grabar pues ahora en cada lectura se genera la OT
+*    WHEN 'SAVE'.
+*      PERFORM grabar_em_papeleras.
+*      CLEAR ok_code.
+
+    WHEN 'FIN' OR 'FINALB'.
+      CLEAR ok_code.
+      LOOP AT oo_descarga->descarga INTO DATA(ls_dlv) WHERE lvsta <> 'C' AND " cvivo - 60831 - 06.05.2020
+                                             lvsta <> space AND
+                                             lfimg <> 0 AND
+                                             read = abap_false.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc IS INITIAL.
+        g_message_number = '043'.
+        g_message_type = 'W'.
+        g_msgv1 = gs_dlv-vbeln.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+        IF ok_code = 'NEXT'.
+          oo_descarga->fin_descarga_paper( ).
+*          PERFORM fin_descarga.
+        ENDIF.
+      ELSE.
+        oo_descarga->fin_descarga_paper( ).
+*        PERFORM fin_descarga.
+      ENDIF.
+
+    WHEN 'LEIDOS'.
+      CLEAR ok_code.
+      " cvivo - 60831 - 06.05.2020 Nueva lógica
+      oo_descarga->leidos_paper( ).
+*      PERFORM listar_palets_papeleras.
+
+  ENDCASE.
+ENDMODULE.
+MODULE user_command_0014 INPUT.
+
+  DATA: ls_lqua TYPE lqua.
+
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+      PERFORM enter_em_saica.
+
+*** INI FCARDONA 05.03.2021 - 62805 - WM ER Reubicar directo en EM
+
+**" Comento para reestructurar la lógica.
+*
+*** KYVOR(AG) - ADD - 10.08.2019 - Quitar "SAVE"
+*      IF g_nuevas_func_em_sin IS NOT INITIAL
+*        AND g_no_transporte IS NOT INITIAL.
+*
+*        PERFORM grabar_em_saica_no_trans.
+*
+*** recuperamos las posiciones del pedido de las que se puede hacer entrada.
+*        IF g_fefco IS NOT INITIAL
+*         OR sy-tcode = 'ZWM_RF_009'. " KYV - 20191204
+*          .
+*          PERFORM get_valid_items_from_po USING abap_true.
+*          IF g_local_previous_screen EQ '9996'.
+*            CLEAR g_bobina.
+*            CLEAR g_fefco.
+*            CLEAR ok_code.
+*            LEAVE TO SCREEN 0.
+*          ENDIF.
+*        ENDIF.
+*      ELSEIF g_nuevas_func_em_sin IS NOT INITIAL
+*        AND g_no_transporte IS INITIAL.
+*
+*        PERFORM grabar_em_saica.
+*        IF g_fefco IS NOT INITIAL.
+*          PERFORM get_valid_items_from_po
+*            USING abap_false. "Kyvor - RDM - 20190911
+*          CLEAR g_bobina.
+*          CLEAR g_fefco.
+*          CLEAR ok_code.
+*          IF g_local_previous_screen EQ '9996'.
+*            LEAVE TO SCREEN 0.
+*          ENDIF.
+*        ENDIF.
+*      ENDIF.
+*** KYVOR(AG) - END - 10.08.2019
+*
+
+      "Chequeo funcionalidad EM sin botón
+      IF ( g_nuevas_func_em_sin IS NOT INITIAL ).
+        DATA vl_notransporte TYPE xflag.
+        "Chequeo si funcionalidad transporte
+        IF ( g_no_transporte IS NOT INITIAL ). "No transporte
+
+          CALL FUNCTION 'Z_WM_RF_VALIDAR_LECTURA'
+            EXPORTING
+              p_em_po         = gs_em_po
+              p_vttk          = gs_vttk
+              p_ekko          = gs_ekko
+              p_likp          = gs_likp
+              p_notransporte  = vl_notransporte
+              p_bobina        = g_bobina
+              p_fefco         = g_fefco
+              p_lgnum         = gs_param-lgnum
+              p_nlpla         = gs_reubic-nlpla
+            EXCEPTIONS
+              bobina_ya_leida = 1
+              OTHERS          = 2.
+          IF sy-subrc <> 0.
+            g_message_number = '010'.
+            g_message_type = 'W'.
+            g_msgv1 = g_bobina.
+            CLEAR: g_msgv2, g_msgv3, g_msgv4.
+            PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+          ELSE.
+
+            PERFORM get_ubicacion_en_descarga USING g_bobina.
+
+            vl_notransporte = 'X'.
+            CALL FUNCTION 'Z_WM_RF_NUEVA_LECTURA'
+              EXPORTING
+                p_em_po        = gs_em_po
+                p_vttk         = gs_vttk
+                p_ekko         = gs_ekko
+                p_likp         = gs_likp
+                p_notransporte = vl_notransporte
+                p_bobina       = g_bobina
+                p_fefco        = g_fefco
+                p_lgnum        = gs_param-lgnum
+                p_nlpla        = gs_reubic-nlpla.
+            "
+            " SEIS 27.05.22
+            " Comentamos estas acciones, ya que las haremos al cerrar la carga.
+            "
+*          PERFORM grabar_em_saica_no_trans.
+*
+*          PERFORM ubicar_en_descarga USING ls_lqua-lenum.
+          ENDIF. " Validación bobina ya leída.
+**        recuperamos las posiciones del pedido de las que se puede hacer entrada.
+          IF ( g_fefco IS NOT INITIAL OR sy-tcode = 'ZWM_RF_009' ). " KYV - 20191204
+
+            PERFORM get_valid_items_from_po USING abap_true.
+
+          ENDIF.
+
+        ELSE. "Si transporte
+          CLEAR vl_notransporte.
+
+          CALL FUNCTION 'Z_WM_RF_VALIDAR_LECTURA'
+            EXPORTING
+              p_em_po         = gs_em_po
+              p_vttk          = gs_vttk
+              p_ekko          = gs_ekko
+              p_likp          = gs_likp
+              p_notransporte  = vl_notransporte
+              p_bobina        = g_bobina
+              p_fefco         = g_fefco
+              p_lgnum         = gs_param-lgnum
+              p_nlpla         = gs_reubic-nlpla
+            EXCEPTIONS
+              bobina_ya_leida = 1
+              OTHERS          = 2.
+          IF sy-subrc <> 0.
+            g_message_number = '010'.
+            g_message_type = 'W'.
+            g_msgv1 = g_bobina.
+            CLEAR: g_msgv2, g_msgv3, g_msgv4.
+            PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+          ELSE.
+
+            PERFORM get_ubicacion_en_descarga USING g_bobina.
+
+            CALL FUNCTION 'Z_WM_RF_NUEVA_LECTURA'
+              EXPORTING
+                p_em_po        = gs_em_po
+                p_vttk         = gs_vttk
+                p_ekko         = gs_ekko
+                p_likp         = gs_likp
+                p_notransporte = vl_notransporte
+                p_bobina       = g_bobina
+                p_fefco        = g_fefco
+                p_lgnum        = gs_param-lgnum
+                p_nlpla        = gs_reubic-nlpla.
+            "
+            " SEIS 27.05.22
+            " Comentamos estas acciones, ya que las haremos al cerrar la carga.
+            "
+*          PERFORM grabar_em_saica.
+*
+*          PERFORM ubicar_en_descarga USING g_bobina.
+          ENDIF. " Validación bobina ya leída.
+          IF ( g_fefco IS NOT INITIAL ).
+            PERFORM get_valid_items_from_po USING abap_false. "Kyvor - RDM - 20190911
+          ENDIF.
+
+        ENDIF. "Fin chequeo transporte
+
+
+
+        IF ( gs_em_po-menge_input IS NOT INITIAL ).
+
+          CLEAR: gs_em_po, g_bobina, g_fefco, ok_code.
+
+        ENDIF.
+
+
+        IF g_local_previous_screen EQ '9996'.
+          LEAVE TO SCREEN 0.
+        ENDIF.
+
+      ENDIF.
+
+*** FIN FCARDONA 05.03.2021 - 62805 - WM ER Reubicar directo en EM
+
+    WHEN 'SELECT'.
+      CLEAR ok_code.
+      PERFORM lista_materiales_po.
+
+    WHEN 'CLEAR'.
+      CLEAR ok_code.
+      CLEAR gs_em_po.
+      CLEAR g_bobina.
+      CLEAR g_fefco.
+    WHEN 'LEIDOS'.
+      CLEAR ok_code.
+
+** KYVOR(AG) - ADD - 10.08.2019 - Quitar "SAVE"
+      IF g_nuevas_func_em_sin IS NOT INITIAL
+        AND g_no_transporte IS NOT INITIAL.
+        PERFORM listar_palets_descarg_no_trans USING abap_true.
+      ELSE.
+** KYVOR(AG) - END - 10.08.2019 - Quitar "SAVE"
+
+        PERFORM listar_palets_descargados USING abap_true.
+
+** KYVOR(AG) - ADD - 10.08.2019 - Quitar "SAVE"
+      ENDIF.
+** KYVOR(AG) - END - 10.08.2019
+
+    WHEN 'SAVE'.
+      CALL FUNCTION 'Z_WM_RF_VALIDAR_LECTURA'
+        EXPORTING
+          p_em_po         = gs_em_po
+          p_vttk          = gs_vttk
+          p_ekko          = gs_ekko
+          p_likp          = gs_likp
+          p_notransporte  = vl_notransporte
+          p_bobina        = g_bobina
+          p_fefco         = g_fefco
+          p_lgnum         = gs_param-lgnum
+          p_nlpla         = gs_reubic-nlpla
+        EXCEPTIONS
+          bobina_ya_leida = 1
+          OTHERS          = 2.
+      IF sy-subrc <> 0.
+        g_message_number = '010'.
+        g_message_type = 'W'.
+        g_msgv1 = g_bobina.
+        CLEAR: g_msgv2, g_msgv3, g_msgv4.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ELSE.
+        CLEAR vl_notransporte.
+
+        PERFORM get_ubicacion_en_descarga USING g_bobina.
+
+        CALL FUNCTION 'Z_WM_RF_NUEVA_LECTURA'
+          EXPORTING
+            p_em_po        = gs_em_po
+            p_vttk         = gs_vttk
+            p_ekko         = gs_ekko
+            p_likp         = gs_likp
+            p_notransporte = vl_notransporte
+            p_bobina       = g_bobina
+            p_fefco        = g_fefco
+            p_lgnum        = gs_param-lgnum
+            p_nlpla        = gs_reubic-nlpla.
+        "
+        " SEIS 27.05.22
+        " Comentamos estas acciones, ya que las haremos al cerrar la carga.
+        "
+        "PERFORM grabar_em_saica.
+      ENDIF.
+* recuperamos las posiciones del pedido de las que se puede hacer entrada.
+      PERFORM get_valid_items_from_po
+      USING abap_false. "Kyvor - RDM - 20190911
+      CLEAR g_bobina.
+      CLEAR g_fefco.
+      CLEAR ok_code.
+      IF g_local_previous_screen EQ '9996'.
+        LEAVE TO SCREEN 0.
+      ENDIF.
+
+    WHEN 'FIN'.
+      CLEAR ok_code.
+
+** KYVOR(AG) - ADD - 10.08.2019 - Quitar "SAVE"
+      IF g_nuevas_func_em_sin IS NOT INITIAL
+        AND g_no_transporte IS NOT INITIAL.
+        PERFORM fin_descarga_saica_no_transp.
+      ELSE.
+** KYVOR(AG) - END - 10.08.2019 - Quitar "SAVE"
+
+        PERFORM fin_descarga_saica.
+
+** KYVOR(AG) - ADD - 10.08.2019 - Quitar "SAVE"
+      ENDIF.
+** KYVOR(AG) - END - 10.08.2019
+
+
+*         INI GAP WM16 - Bernabeu  / RGUILLOT 1-4-19
+
+**    Activación o desactivación de funcionalidad
+*      READ TABLE gt_func INTO DATA(ls_func)
+*      WITH KEY func = 'CAMBIA_ACCION_FINALIZAR'
+*              (gv_lgnum_lg) = 'X'.
+*
+*      IF sy-subrc = 0.
+*        PERFORM listar_palets_descargados.
+*      ELSE.
+*        PERFORM fin_descarga_saica.
+*      ENDIF.
+
+*         FIN GAP WM16 - Bernabeu  / RGUILLOT 1-4-19
+    WHEN 'BACK'.
+      IF NOT gs_em_po-matnr IS INITIAL.
+*Lectura pendiente de confirmar ¿desea salir sin confirmar?
+        g_message_number = '042'.
+        g_message_type = 'W'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+        IF ok_code = 'NEXT'.
+          LEAVE TO SCREEN 0.
+        ENDIF.
+      ELSE.
+        LEAVE TO SCREEN 0.
+      ENDIF.
+*  g_local_previous_screen =
+  ENDCASE.
+ENDMODULE.
+MODULE user_command_0016 INPUT.
+  CASE ok_code.
+    WHEN 'ANT'.
+      CLEAR ok_code.
+      SUBTRACT 1 FROM g_index.
+      READ TABLE gt_em_puerto INTO gs_em_puerto INDEX g_index.
+    WHEN 'SELECT'.
+      CLEAR ok_code.
+      IF gs_em_puerto-read = abap_true.
+        CLEAR gs_em_puerto-read.
+      ELSE.
+        gs_em_puerto-read = abap_true.
+      ENDIF.
+      MODIFY gt_em_puerto FROM gs_em_puerto
+                          TRANSPORTING read
+                          WHERE matnr = gs_em_puerto-matnr AND
+                                charg = gs_em_puerto-charg.
+      IF g_index < g_lineas.
+        ADD 1 TO g_index.
+        READ TABLE gt_em_puerto INTO gs_em_puerto INDEX g_index.
+      ENDIF.
+*      PERFORM listar_bobinas_puerto.
+*      g_local_previous_screen = sy-dynnr.
+*      CLEAR g_partial_list.
+*      LEAVE TO SCREEN 0.
+
+    WHEN 'SIG'.
+      CLEAR ok_code.
+      ADD 1 TO g_index.
+      READ TABLE gt_em_puerto INTO gs_em_puerto INDEX g_index.
+    WHEN 'SAVE'.
+      CLEAR ok_code.
+      PERFORM grabar_puerto USING abap_false.
+    WHEN 'FIN'.
+      CLEAR ok_code.
+* NAC -> Añadido
+      PERFORM lista_confirmados.
+
+      PERFORM grabar_puerto USING abap_true.
+    WHEN 'CONFIRMADO'.
+      CLEAR ok_code.
+      PERFORM lista_confirmados.
+    WHEN 'BACK'.
+      PERFORM listar_bobinas_puerto.
+      g_local_previous_screen = sy-dynnr.
+      CLEAR g_partial_list.
+      LEAVE TO SCREEN 0.
+  ENDCASE.
+ENDMODULE.
+
+
+*&---------------------------------------------------------------------*
+*&      Module  EXIT_COMMANDS  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE exit_commands INPUT.
+  CASE g_previous_screen.
+    WHEN OTHERS.
+      CASE g_message_number.
+        WHEN '008'.
+          LEAVE TO TRANSACTION 'LM01'.
+        WHEN OTHERS.
+          LEAVE TO SCREEN 0.
+      ENDCASE.
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  RF_PARAM  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE rf_param OUTPUT.
+  DATA: l_condition TYPE char20.
+
+  CREATE OBJECT oo_descarga. " instanciamos esta descarga " cvivo - 60831
+  oo_descarga->get_parametros( ).
+
+  CLEAR g_multi. " limpiamos la variable global - cvivo
+
+  CHECK gs_param IS INITIAL AND gs_lrf IS INITIAL AND gt_func[] IS INITIAL. " para no repetir la selección cada vez
+
+  SELECT SINGLE * FROM lrf_wkqu INTO gs_lrf " 11.03.2019 - cvivo - WM CB
+    WHERE bname EQ sy-uname
+      AND statu NE space.
+
+  g_lgnum = gs_lrf-lgnum. " 11.03.2019 - cvivo - WM CB
+
+  SELECT SINGLE werks FROM t320 " 11.03.2019 - cvivo - WM CB
+    INTO g_werks
+    WHERE lgnum EQ g_lgnum.
+
+  SELECT SINGLE * FROM zwm_param INTO gs_param
+    WHERE tcode = sy-tcode
+      AND lgnum = g_lgnum.    " 11.03.2019 - cvivo - WM CB
+
+  " cvivo 58105 - Incluir log
+  CONCATENATE 'ZWM_' g_lgnum INTO g_log-object.
+  g_log-subobject = 'ITS'.
+  g_log-aldate     = sy-datum.
+  g_log-altime     = sy-uzeit.
+  g_log-aluser     = sy-uname.
+  g_log-alprog     = sy-repid.
+  g_log-altcode    = sy-tcode.
+
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log                 = g_log
+    IMPORTING
+      e_log_handle            = g_log_handle
+    EXCEPTIONS
+      log_header_inconsistent = 1
+      OTHERS                  = 2.
+
+  CONCATENATE 'LG' g_lgnum ' NE space'  INTO l_condition.
+
+  IF g_lgnum IS NOT INITIAL.
+    SELECT * FROM zwm_rf_func INTO TABLE gt_func " 11.03.2019 - cvivo - WM CB
+      WHERE (l_condition).
+
+*         INI GENERAL RF / RGUILLOT 25-3-19
+*    Se guarda en variable global la concatenación para luego
+*    hacer los 'n' read table
+
+    CONCATENATE 'LG' g_lgnum INTO gv_lgnum_lg.
+    CONDENSE gv_lgnum_lg.
+  ENDIF.
+*         FIN GENERAL RF  / RGUILLOT 25-3-19
+
+** KYVOR(AG) - INI - 28.07.2019 - Ativar novas funcionalidades
+** No transporte
+  FREE g_no_transporte.
+  FREE g_bt_grabar_zroja.
+  FREE g_bt_grabar_ubicar.
+  FREE g_bt_grabar_reubicar.
+  FREE g_trasp_libre_segundas.
+  FREE g_nuevas_func_segunda.
+  FREE g_nuevas_func_em_sin.
+  FREE g_trasp_bloq_segundas.
+  FREE g_ajustar_cantidad_bloq.
+
+  READ TABLE gt_func TRANSPORTING NO FIELDS
+   WITH KEY func = gc_func-no_transporte
+            (gv_lgnum_lg) = 'X'.
+  IF sy-subrc EQ 0.
+    g_no_transporte = abap_true.
+  ENDIF.
+
+** No Botón de gravar UBICAR
+  READ TABLE gt_func TRANSPORTING NO FIELDS
+  WITH KEY func = gc_func-no_boton_grabar_ubicar
+           (gv_lgnum_lg) = 'X'.
+  IF sy-subrc EQ 0.
+    g_bt_grabar_ubicar = abap_true.
+  ENDIF.
+
+** No Botón de gravar REUBICAR
+  READ TABLE gt_func TRANSPORTING NO FIELDS
+  WITH KEY func = gc_func-no_boton_grabar_reubicar
+           (gv_lgnum_lg) = 'X'.
+  IF sy-subrc EQ 0.
+    g_bt_grabar_reubicar = abap_true.
+  ENDIF.
+
+** No Botón de gravar ZONA ROJA
+  READ TABLE gt_func TRANSPORTING NO FIELDS
+  WITH KEY func = gc_func-no_boton_grabar_zroja
+           (gv_lgnum_lg) = 'X'.
+  IF sy-subrc EQ 0.
+    g_bt_grabar_zroja = abap_true.
+  ENDIF.
+
+** Traspaso libre SEGUNDAS
+  READ TABLE gt_func TRANSPORTING NO FIELDS
+  WITH KEY func = gc_func-traspaso_libre_segundas
+           (gv_lgnum_lg) = 'X'.
+  IF sy-subrc EQ 0.
+    g_trasp_libre_segundas = abap_true.
+  ENDIF.
+
+** Traspaso Bloqueado SEGUNDAS
+  READ TABLE gt_func TRANSPORTING NO FIELDS
+  WITH KEY func = gc_func-traspaso_bloqueado_segundas
+           (gv_lgnum_lg) = 'X'.
+  IF sy-subrc EQ 0.
+    g_trasp_bloq_segundas = abap_true.
+  ENDIF.
+
+** Nuevas funcionalidades em SEGUNDAS
+  READ TABLE gt_func TRANSPORTING NO FIELDS
+  WITH KEY func = gc_func-nuevas_funcio_em_segunda
+           (gv_lgnum_lg) = 'X'.
+  IF sy-subrc EQ 0.
+    g_nuevas_func_segunda = abap_true.
+  ENDIF.
+
+** Nuevas funcionalidades EM Sin reetiq
+  READ TABLE gt_func TRANSPORTING NO FIELDS
+  WITH KEY func = gc_func-nuevas_func_em_sin
+           (gv_lgnum_lg) = 'X'.
+  IF sy-subrc EQ 0.
+    g_nuevas_func_em_sin = abap_true.
+  ENDIF.
+
+** Nuevas funcionalidades EM Sin reetiq
+  READ TABLE gt_func TRANSPORTING NO FIELDS
+  WITH KEY func = gc_func-ajustar_cantidad_bloq
+           (gv_lgnum_lg) = 'X'.
+  IF sy-subrc EQ 0.
+    g_ajustar_cantidad_bloq = abap_true.
+  ENDIF.
+** KYVOR(AG) - FIM - 28.07.2019 - Ativar novas funcionalidades
+
+  "KYV/RDM - 20210208 - Cuestionario Riesgos - BEG
+
+  READ TABLE gt_func TRANSPORTING NO FIELDS
+  WITH KEY func = gc_func-cuestionario_riesgos
+           (gv_lgnum_lg) = 'X'.
+  IF sy-subrc EQ 0.
+    g_cuestionario_riesgos = abap_true.
+  ENDIF.
+
+  "KYV/RDM - 20210208 - Cuestionario Riesgos - END
+
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  SCREEN_ATR_0014  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE screen_atr_0014 OUTPUT.
+  LOOP AT SCREEN.
+    CASE screen-name.
+      WHEN 'G_BOBINA'.
+        IF sy-tcode = 'ZWM_RF_009'. " descarga otros
+          screen-input = 0.
+          screen-invisible = 1.
+        ELSE.
+          IF g_bobina IS INITIAL.
+            screen-input = 1.
+*            screen-invisible = 0.
+          ELSE.
+            screen-input = 0.
+*            screen-invisible = 1.
+          ENDIF.
+        ENDIF.
+      WHEN 'GS_EM_PO-MENGE_INPUT'.
+        IF g_fefco IS INITIAL AND
+           NOT gs_em_po-matnr IS INITIAL.
+          screen-input = 1.
+        ENDIF.
+      WHEN 'G_FEFCO'.
+        IF gt_em_po[] IS INITIAL. " si no se han detectado posiciones pendientes, no se permite introducir bobina, sólo pulsar botones
+          screen-invisible = 1.
+          screen-active = 0.
+        ELSE.
+          IF sy-tcode = 'ZWM_RF_009'. " descarga otros
+            IF NOT gs_em_po-matnr IS INITIAL.
+              screen-invisible = 1.
+              screen-active = 0.
+            ENDIF.
+          ELSE.
+            IF g_bobina IS INITIAL OR
+               NOT gs_em_po-matnr IS INITIAL.
+              screen-invisible = 1.
+              screen-active = 0.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      WHEN 'B_SAVE'.
+** KYVOR(AG) - ADD - 10.08.2019
+        IF g_nuevas_func_em_sin IS NOT INITIAL.
+          screen-invisible = 1.
+          screen-active = 0.
+        ELSE.
+** KYVOR(AG) - END - 10.08.2019
+
+          IF NOT gs_em_po-matnr IS INITIAL AND
+             NOT gs_em_po-menge_input IS INITIAL.
+            screen-invisible = 0.
+            screen-active = 1.
+          ELSE.
+            screen-invisible = 1.
+            screen-active = 0.
+          ENDIF.
+
+** KYVOR(AG) - ADD - 10.08.2019
+        ENDIF.
+** KYVOR(AG) - END - 10.08.2019
+
+      WHEN 'B_LIMPIAR'.
+** KYVOR(AG) - ADD - 10.08.2019
+        IF g_nuevas_func_em_sin IS NOT INITIAL.
+          screen-invisible = 1.
+          screen-active = 0.
+        ELSE.
+** KYVOR(AG) - END - 10.08.2019
+
+          IF NOT g_fefco IS INITIAL OR
+             NOT g_bobina IS INITIAL.
+            screen-invisible = 0.
+            screen-active = 1.
+          ELSE.
+            screen-invisible = 1.
+            screen-active = 0.
+          ENDIF.
+
+** KYVOR(AG) - ADD - 10.08.2019
+        ENDIF.
+** KYVOR(AG) - END - 10.08.2019
+
+      WHEN 'B_SELECCIONA'.
+        IF sy-tcode <> 'ZWM_RF_009'.
+          IF g_bobina IS NOT INITIAL AND gs_em_po-matnr IS INITIAL.
+            screen-invisible = 0.
+            screen-active = 1.
+          ELSE.
+            screen-invisible = 1.
+            screen-active = 0.
+          ENDIF.
+        ELSE.
+          IF g_local_previous_screen EQ '9996'.
+            screen-invisible = 1.
+            screen-active = 0.
+          ELSE.
+            screen-invisible = 0.
+            screen-active = 1.
+          ENDIF.
+        ENDIF.
+    ENDCASE.
+    MODIFY SCREEN.
+  ENDLOOP.
+  IF g_bobina IS INITIAL.
+    SET CURSOR FIELD 'G_BOBINA'.
+  ELSE.
+    SET CURSOR FIELD 'G_FEFCO'.
+  ENDIF.
+
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0015  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0015 INPUT.
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+* recuperamos las bobinas
+      IF g_xblnr IS NOT INITIAL.
+        PERFORM recupera_bobinas_puerto.
+      ELSEIF g_licha IS NOT INITIAL.
+        PERFORM recupera_bobinas_exterior.
+      ENDIF.
+* Llamamos la pantalla de confirmacion de bobinas.
+      g_index = 1.
+      IF NOT gt_em_puerto IS INITIAL.
+        DESCRIBE TABLE gt_em_puerto LINES  g_lineas.
+        PERFORM listar_bobinas_puerto.
+        CLEAR g_partial_list.
+        DO.
+          g_local_previous_screen = sy-dynnr.
+          CALL SCREEN 9997.
+          IF ok_code = 'BACK'.
+            EXIT.
+          ENDIF.
+          READ TABLE gt_em_puerto INTO gs_em_puerto INDEX g_select_object.
+          CALL SCREEN '0016'.
+        ENDDO.
+      ENDIF.
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  CHECK_CTD  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE check_ctd INPUT.
+
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0040  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0040 INPUT.
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+      PERFORM chequear_ubicacion.
+
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+ENDMODULE.
+
+
+
+
+MODULE user_command_0041 INPUT.
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+      PERFORM ok_ajuste_ubicacion.
+    WHEN 'SAVE'.
+      CLEAR ok_code.
+      g_message1 = 'Se va realizar el ajuste'.
+      g_message2 = '¿Desea continuar?'.
+      CALL SCREEN 9998.
+*      PERFORM ajustar_ubicacion.
+    WHEN 'LECTURAS'.
+      CLEAR ok_code.
+      PERFORM mostrar_lecturas.
+
+    WHEN 'BACK'.
+      CLEAR ok_code.
+      PERFORM bloquear_ubicacion USING space '1'.
+      LEAVE TO SCREEN 0.
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0043  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0043 INPUT.
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+      PERFORM ok_buscar_ua.
+    WHEN 'CONF'.
+      PERFORM confirmar_linv.
+    WHEN 'ANT'.
+      CLEAR ok_code.
+      CLEAR gs_linv.
+      SUBTRACT 1 FROM g_index_linp.
+      READ TABLE gt_linp INTO gs_linp INDEX g_index_linp.
+    WHEN 'SIG'.
+      CLEAR ok_code.
+      CLEAR gs_linv.
+      ADD 1 TO g_index_linp.
+      READ TABLE gt_linp INTO gs_linp INDEX g_index_linp.
+    WHEN 'SAVE'.
+      CLEAR ok_code.
+      PERFORM chequear_recuento.
+    WHEN 'NUEVA'.
+      CLEAR ok_code.
+      CLEAR gs_linv.
+      sw_nueva = abap_true.
+    WHEN 'BACK'.
+      CLEAR ok_code.
+      IF sw_nueva = abap_true.
+        CLEAR sw_nueva.
+        CLEAR gs_linv.
+      ELSE.
+*        PERFORM bloquear_ubicacion USING space '1'.
+        LEAVE TO SCREEN 0.
+      ENDIF.
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMANDS_WARNING  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_commands_warning INPUT.
+  IF gs_param-tcode = 'ZWM_RF_012'.
+    CASE ok_code.
+      WHEN 'NEXT'.
+        PERFORM ajustar_ubicacion.
+    ENDCASE.
+    CLEAR: g_message1, g_message2.
+  ENDIF.
+  LEAVE TO SCREEN 0.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0051  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0051 INPUT.
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+      IF NOT g_lenum IS INITIAL.
+        PERFORM ok_ua_aprovisionamiento.
+      ENDIF.
+      IF NOT g_lgpla IS INITIAL. " cvivo - al leer UA, directamente confirmar
+        PERFORM save_ap.
+      ENDIF.
+    WHEN 'STOCK'.
+      PERFORM lista_stock.
+*    WHEN 'SAVE'.
+*      CLEAR ok_code.
+*      IF sw_ctd = abap_true.
+*        PERFORM modificar_ctd_nt.
+*      ELSE.
+*        PERFORM save_ap.
+*      ENDIF.
+    WHEN 'CTD'.
+      CLEAR ok_code.
+*      sw_ctd = abap_true.
+      PERFORM modificar_ctd_nt. " cvivo - no pasamos cantidad nueva, así se borra
+    WHEN 'BACK'.
+      CLEAR ok_code.
+      CLEAR sw_confirmado.
+      IF sw_ctd = abap_true.
+        CLEAR sw_ctd.
+      ELSE.
+        PERFORM listar_necesidades_pendientes.
+        LEAVE TO SCREEN 0.
+      ENDIF.
+    WHEN 'REUBICAR'.
+      PERFORM reubicar.
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0073  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0073 INPUT.
+
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+      IF NOT gs_likp-verur IS INITIAL.
+        LEAVE TO SCREEN 0.
+      ENDIF.
+    WHEN 'BACK'.
+      CLEAR gs_likp-verur.
+      LEAVE SCREEN.
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  VERUR  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE verur INPUT.
+
+  TRANSLATE gs_likp-verur TO UPPER CASE. " cvivo - 60014 - no se admiten minúsculas en los no.albaran
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+    EXPORTING
+      input  = gs_likp-verur
+    IMPORTING
+      output = gs_likp-verur.
+
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0074  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0074 INPUT.
+
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+      IF NOT gs_oper-operario IS INITIAL.
+        SET PARAMETER ID 'ZNUM_OPER' FIELD gs_oper-operario.
+
+        CLEAR gs_login.
+        gs_login-usuario = sy-uname.
+        gs_login-fecha = sy-datum.
+        gs_login-hora = sy-uzeit.
+        gs_login-lgnum = g_lgnum.
+        gs_login-operario = gs_oper-operario.
+        MODIFY zwm_rf_login FROM gs_login.
+        COMMIT WORK AND WAIT.
+
+        LEAVE TO SCREEN 0.
+      ENDIF.
+*    WHEN 'BACK'.
+*      LEAVE SCREEN.
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0075  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0075 INPUT.
+
+  IF gs_prl_log-operario IS INITIAL.
+    GET PARAMETER ID 'ZNUM_OPER' FIELD gs_prl_log-operario.
+  ENDIF.
+  gs_prl_log-lgnum = g_lgnum.
+  gs_prl_log-usuario = sy-uname.
+  gs_prl_log-fecha = sy-datum.
+  gs_prl_log-hora = sy-uzeit.
+  gs_prl_log-id = gs_prl-id.
+
+  CASE ok_code.
+    WHEN 'OK'.
+      CLEAR ok_code.
+      IF gs_prl_log-respuesta IS INITIAL. " es ok
+        gs_prl_log-respuesta = 'Sí'.
+      ENDIF.
+
+      MODIFY zwm_rf_prl_log FROM gs_prl_log.
+      COMMIT WORK AND WAIT.
+
+      LEAVE TO SCREEN 0.
+    WHEN 'NOK'.
+      CLEAR ok_code.
+      gs_prl_log-respuesta = 'No'.
+      MODIFY zwm_rf_prl_log FROM gs_prl_log.
+      COMMIT WORK AND WAIT.
+
+      g_message_number = '070'.
+      g_message_type = 'A'.
+      PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+*      MESSAGE a070(zwm_rf).
+
+*    WHEN 'BACK'.
+*      LEAVE SCREEN.
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+
+ENDMODULE.
+
+MODULE user_command_0090 INPUT.
+
+  IF gs_rlab_log-operario IS INITIAL.
+    GET PARAMETER ID 'ZNUM_OPER' FIELD gs_rlab_log-operario.
+  ENDIF.
+  gs_rlab_log-lgnum = g_lgnum.
+  gs_rlab_log-usuario = sy-uname.
+  gs_rlab_log-fecha = sy-datum.
+  gs_rlab_log-hora = sy-uzeit.
+  gs_rlab_log-id = gs_rlab-id.
+
+  CASE ok_code.
+    WHEN 'ZOK'.
+      CLEAR ok_code.
+      IF gs_rlab_log-respuesta IS INITIAL. " es ok
+        gs_rlab_log-respuesta = zcl_wm_rlab_dao=>gc_y.
+      ENDIF.
+      zcl_wm_rlab_dao=>get_instance( )->create_log_entry(
+        EXPORTING
+          is_data   = gs_rlab_log
+*          iv_commit = ABAP_TRUE
+      ).
+    WHEN 'ZNOK'.
+      CLEAR ok_code.
+      gs_rlab_log-respuesta = zcl_wm_rlab_dao=>gc_n.
+      zcl_wm_rlab_dao=>get_instance( )->create_log_entry(
+        EXPORTING
+          is_data   = gs_rlab_log
+*          iv_commit = ABAP_TRUE
+      ).
+
+    WHEN OTHERS.
+      CLEAR ok_code.
+  ENDCASE.
+
+ENDMODULE.
+
+
+*&---------------------------------------------------------------------*
+*&      Module  NUM_OPERARIO  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE num_operario INPUT.
+
+  SELECT SINGLE @abap_true FROM zwm_rf_oper
+    WHERE lgnum EQ @g_lgnum
+      AND operario EQ @gs_oper-operario
+    INTO @DATA(result).
+
+  IF sy-subrc NE 0.
+    MESSAGE e068(zwm_rf) WITH gs_oper-operario g_lgnum.
+  ENDIF.
+
+ENDMODULE.
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0077  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0077 INPUT.
+
+  CASE ok_code.
+    WHEN 'BACK'.
+      CLEAR gt_po_list[]. " cvivo - WM CB - por si volvemos a 9996
+      CASE g_local_previous_screen.
+        WHEN OTHERS.
+          LEAVE TO SCREEN 0.
+      ENDCASE.
+    WHEN 'NEXT'.
+      g_partial_list = g_partial_list + 1.
+      g_next_line = g_partial_list * 8 + 1.
+      IF g_next_line > g_lines_list.
+        g_partial_list = g_partial_list - 1.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ENDIF.
+    WHEN 'BEFORE'.
+      IF g_partial_list LE 0.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ELSE.
+        g_partial_list = g_partial_list - 1.
+      ENDIF.
+*    WHEN 'BOTTOM1'.
+*      READ TABLE gt_select_list INDEX g_index_bottom1.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+*    WHEN 'BOTTOM2'.
+*      READ TABLE gt_select_list INDEX g_index_bottom2.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+*    WHEN 'BOTTOM3'.
+*      READ TABLE gt_select_list INDEX g_index_bottom3.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+*    WHEN 'BOTTOM4'.
+*      READ TABLE gt_select_list INDEX g_index_bottom4.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+*    WHEN 'BOTTOM5'.
+*      READ TABLE gt_select_list INDEX g_index_bottom5.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+*    WHEN 'BOTTOM6'.
+*      READ TABLE gt_select_list INDEX g_index_bottom6.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+    WHEN 'LIST'.
+      PERFORM next_process_from_list.
+    WHEN 'OK'.
+      READ TABLE gt_select_list INDEX g_option.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+
+**         INI GAP WM16 - Bernabeu  / RGUILLOT 1-4-19
+*    WHEN 'FIN'.
+*      break developer.
+*
+**    Activación o desactivación de funcionalidad
+**      clear: ls_func.
+*      READ TABLE gt_func INTO DATA(ls_func)
+*      WITH KEY func = 'CAMBIA_ACCION_FINALIZAR'
+*              (gv_lgnum_lg) = 'X'.
+*
+*      IF sy-subrc = 0.
+*        REFRESH: gt_sel_list_final.
+*
+**      Se prepara la tabla global con los datos que se van a mostrar
+*        clear: ls_sel_list_final.
+*
+*        LOOP AT gt_select_list .
+*          CLEAR: ls_sel_list_final.
+*          MOVE-CORRESPONDING gt_select_list TO ls_sel_list_final.
+*          ls_sel_list_final-tknum = gs_vttk-tknum.
+*          ls_sel_list_final-codigo_bobina = gt_select_list-obj_numberc.
+*
+*          CONDENSE ls_sel_list_final-codigo_bobina.
+*          APPEND ls_sel_list_final TO gt_sel_list_final.
+*        ENDLOOP.
+*
+*
+**        Acaba de hacer la parte que quedaba, tanto si ha venido
+**        confirmando o no
+*        PERFORM fin_transporte.
+*
+*
+*      ELSE.
+**        No se muestra el listado detalle de descarga y hace lo que ya hacía
+**        anteriormente
+*        CASE sy-tcode.
+*          WHEN 'ZWM_RF_009'.  " “Otros proveedores”
+*            PERFORM fin_descarga_saica.
+**        WHEN .
+*          WHEN OTHERS.
+*        ENDCASE.
+*      ENDIF.
+*
+**         FIN GAP WM16 - Bernabeu  / RGUILLOT 1-4-19
+
+
+    WHEN OTHERS.
+      CASE g_option.
+        WHEN '01'.
+          READ TABLE gt_select_list INDEX g_index_bottom1.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '02'.
+          READ TABLE gt_select_list INDEX g_index_bottom2.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '03'.
+          READ TABLE gt_select_list INDEX g_index_bottom3.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '04'.
+          READ TABLE gt_select_list INDEX g_index_bottom4.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '05'.
+          READ TABLE gt_select_list INDEX g_index_bottom5.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '06'.
+          READ TABLE gt_select_list INDEX g_index_bottom6.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '07'.
+          READ TABLE gt_select_list INDEX g_index_bottom7.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '08'.
+          READ TABLE gt_select_list INDEX g_index_bottom8.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+      ENDCASE.
+  ENDCASE.
+ENDMODULE.
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0078  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0078 INPUT.
+
+*  DATA: ls_sel_list_final TYPE gtyp_sel_list_final.
+
+  CASE ok_code.
+    WHEN 'BACK'.
+      CASE g_local_previous_screen.
+        WHEN OTHERS.
+          LEAVE TO SCREEN 0.
+      ENDCASE.
+    WHEN 'NEXT'.
+      g_partial_list = g_partial_list + 1.
+      g_next_line = g_partial_list * 8 + 1.
+      IF g_next_line > g_lines_list.
+        g_partial_list = g_partial_list - 1.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ENDIF.
+    WHEN 'BEFORE'.
+      IF g_partial_list LE 0.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ELSE.
+        g_partial_list = g_partial_list - 1.
+      ENDIF.
+*    WHEN 'BOTTOM1'.
+*      READ TABLE gt_select_list INDEX g_index_bottom1.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+*    WHEN 'BOTTOM2'.
+*      READ TABLE gt_select_list INDEX g_index_bottom2.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+*    WHEN 'BOTTOM3'.
+*      READ TABLE gt_select_list INDEX g_index_bottom3.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+*    WHEN 'BOTTOM4'.
+*      READ TABLE gt_select_list INDEX g_index_bottom4.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+*    WHEN 'BOTTOM5'.
+*      READ TABLE gt_select_list INDEX g_index_bottom5.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+*    WHEN 'BOTTOM6'.
+*      READ TABLE gt_select_list INDEX g_index_bottom6.
+*      g_select_object = gt_select_list-obj_number.
+*      PERFORM next_process_from_list.
+    WHEN 'LIST'.
+      PERFORM next_process_from_list.
+    WHEN 'OK'.
+      READ TABLE gt_select_list INDEX g_option.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM next_process_from_list.
+
+    WHEN 'FIN'.
+*      break developer.
+      IF sy-tcode = 'ZWM_RF_008'.  " Descargas Puerto
+        PERFORM fin_descarga_puerto USING abap_true.
+      ELSE.
+        IF sy-tcode = 'ZWM_RF_001'.  " Descargas Papeleras
+          PERFORM grabar_em_papeleras.
+        ENDIF.
+        PERFORM fin_transporte_new USING abap_false.
+      ENDIF.
+
+
+    WHEN OTHERS.
+      CASE g_option.
+        WHEN '01'.
+          READ TABLE gt_select_list INDEX g_index_bottom1.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '02'.
+          READ TABLE gt_select_list INDEX g_index_bottom2.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '03'.
+          READ TABLE gt_select_list INDEX g_index_bottom3.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '04'.
+          READ TABLE gt_select_list INDEX g_index_bottom4.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '05'.
+          READ TABLE gt_select_list INDEX g_index_bottom5.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '06'.
+          READ TABLE gt_select_list INDEX g_index_bottom6.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '07'.
+          READ TABLE gt_select_list INDEX g_index_bottom7.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+        WHEN '08'.
+          READ TABLE gt_select_list INDEX g_index_bottom8.
+          g_select_object = gt_select_list-obj_number.
+          PERFORM next_process_from_list.
+      ENDCASE.
+  ENDCASE.
+ENDMODULE.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0080  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0080 INPUT.
+  DATA: gramaje_listado TYPE bool VALUE abap_false.
+
+* NAC -> Añadido numeración en botones.
+* En caso que se haya introducido un número y no se ha pulsado el botón.
+  IF  g_option EQ 01.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom1.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM1'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ELSEIF g_option EQ 02.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom2.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM2'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ELSEIF g_option EQ 03.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom3.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM3'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+
+  ELSEIF g_option EQ 04.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom4.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM4'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ELSEIF g_option EQ 05.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom5.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM5'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ELSEIF g_option EQ 06.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom6.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM6'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ELSEIF g_option EQ 07.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom7.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM7'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ELSEIF g_option EQ 08.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom8.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM8'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ELSEIF g_option EQ 09.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom9.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM9'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ELSEIF g_option EQ 10.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom10.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM10'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ELSEIF g_option EQ 11.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom11.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM11'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ELSEIF g_option EQ 12.
+    g_partial_list2 = g_partial_list.
+    CLEAR: ls_mara_mard_red, g_partial_list.
+    READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom12.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+    ok_code = 'BOTTOM12'.
+    gramaje_listado = abap_true.
+    boton_pulsado = abap_false .
+    PERFORM listar_gramaje.
+  ENDIF.
+
+* NAC -> Si se selecciona algun numero, el OK_CODE -> OK
+  IF g_option IS NOT INITIAL AND g_option GT 12.
+    ok_code = 'OK'.
+  ENDIF.
+
+
+
+
+  IF gramaje_listado EQ abap_false.
+
+    CASE ok_code.
+* Si se elige un botón que no está en la primera pag.
+      WHEN 'OK'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_option.
+        g_select_object = ls_mara_mard_red-wgbez60.
+
+
+        ok_code = 'BOTTOM'.
+        IF g_option+0(1) EQ 0.
+          SHIFT g_option LEFT BY 1 PLACES.
+          CONCATENATE  ok_code g_option  INTO ok_code.
+        ELSE.
+          CONCATENATE  ok_code g_option  INTO ok_code.
+        ENDIF.
+
+        PERFORM listar_gramaje.
+
+
+      WHEN 'BACK'.
+* NAC -> Set a 0 partial list para que muestre la
+* primera página al volver a la pantalla.
+        g_partial_list = 0.
+        CASE g_local_previous_screen.
+          WHEN OTHERS.
+            LEAVE TO SCREEN 0.
+        ENDCASE.
+      WHEN 'NEXT'.
+        g_partial_list = g_partial_list + 1.
+
+        g_next_line = g_partial_list * 12 + 1.
+        IF g_next_line > g_lines_list.
+          g_partial_list = g_partial_list - 1.
+
+          g_message_number = '041'.
+          g_message_type = 'A'.
+          PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+        ENDIF.
+      WHEN 'BEFORE'.
+        IF g_partial_list LE 0.
+          g_message_number = '041'.
+          g_message_type = 'A'.
+          PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+        ELSE.
+          IF g_partial_list2 IS INITIAL.
+            g_partial_list = g_partial_list - 1.
+          ELSE.
+            g_partial_list = g_partial_list2 - 1.
+          ENDIF.
+        ENDIF.
+      WHEN 'BOTTOM1'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom1.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM2'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom2.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM3'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom3.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM4'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom4.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM5'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom5.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM6'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom6.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM7'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom7.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM8'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom8.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM9'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom9.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM10'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom10.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM11'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom11.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'BOTTOM12'.
+        g_partial_list2 = g_partial_list.
+        CLEAR: ls_mara_mard_red, g_partial_list.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_index_bottom12.
+        g_select_object = ls_mara_mard_red-wgbez60.
+        PERFORM listar_gramaje.
+      WHEN 'LIST'.
+        PERFORM next_process_from_list.
+      WHEN 'OK'.
+        CLEAR: ls_mara_mard_red.
+        READ TABLE gt_mara_mard_red INTO ls_mara_mard_red INDEX g_option.
+        g_select_object = gt_select_list-obj_number.
+        PERFORM listar_gramaje.
+    ENDCASE.
+
+  ELSE.
+    gramaje_listado = abap_false.
+  ENDIF.
+
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0081  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0081 INPUT.
+
+* NAC -> Gestión del numero introducido, si lo hay
+  IF g_option EQ 01.
+    CLEAR: ls_gramajes.
+    gt_gramajes_aux[] = gt_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom1.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+*    gramaje_ancho_largo_listado = abap_true.
+*    boton_pulsado = abap_false.
+    PERFORM listar_gramaje_ancho_largo.
+  ELSEIF g_option EQ 02.
+    CLEAR: ls_gramajes.
+    gt_gramajes_aux[] = gt_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom2.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+*    gramaje_ancho_largo_listado = abap_true.
+*    boton_pulsado = abap_false.
+    PERFORM listar_gramaje_ancho_largo.
+  ELSEIF g_option EQ 03.
+    CLEAR: ls_gramajes.
+    gt_gramajes_aux[] = gt_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom3.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+*    gramaje_ancho_largo_listado = abap_true.
+*    boton_pulsado = abap_false.
+    PERFORM listar_gramaje_ancho_largo.
+  ELSEIF g_option EQ 04.
+    CLEAR: ls_gramajes.
+    gt_gramajes_aux[] = gt_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom4.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+*    gramaje_ancho_largo_listado = abap_true.
+*    boton_pulsado = abap_false.
+    PERFORM listar_gramaje_ancho_largo.
+  ELSEIF g_option EQ 05.
+    CLEAR: ls_gramajes.
+    gt_gramajes_aux[] = gt_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom5.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+*    gramaje_ancho_largo_listado = abap_true.
+*    boton_pulsado = abap_false.
+    PERFORM listar_gramaje_ancho_largo.
+  ELSEIF g_option EQ 06.
+    CLEAR: ls_gramajes.
+    gt_gramajes_aux[] = gt_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom6.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+*    gramaje_ancho_largo_listado = abap_true.
+*    boton_pulsado = abap_false.
+    PERFORM listar_gramaje_ancho_largo.
+  ELSEIF g_option EQ 07.
+    CLEAR: ls_gramajes.
+    gt_gramajes_aux[] = gt_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom7.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+*    gramaje_ancho_largo_listado = abap_true.
+*    boton_pulsado = abap_false.
+    PERFORM listar_gramaje_ancho_largo.
+  ELSEIF g_option EQ 08.
+    CLEAR: ls_gramajes.
+    gt_gramajes_aux[] = gt_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom8.
+    g_select_object = ls_mara_mard_red-wgbez60.
+
+*    gramaje_ancho_largo_listado = abap_true.
+*    boton_pulsado = abap_false.
+    PERFORM listar_gramaje_ancho_largo.
+  ENDIF.
+
+
+
+  CASE ok_code.
+    WHEN 'BACK'.
+* NAC -> Clear para que no salte dos pantallas atras.
+      CLEAR ok_code.
+
+      IF g_partial_list2 IS NOT INITIAL.
+        g_partial_list = g_partial_list2.
+      ENDIF.
+      CASE g_local_previous_screen.
+        WHEN OTHERS.
+          LEAVE TO SCREEN 0.
+      ENDCASE.
+    WHEN 'NEXT'.
+      g_partial_list = g_partial_list + 1.
+      g_next_line = g_partial_list * 8 + 1.
+      IF g_next_line > g_lines_list.
+        g_partial_list = g_partial_list - 1.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ENDIF.
+    WHEN 'BEFORE'.
+      IF g_partial_list LE 0.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ELSE.
+        g_partial_list = g_partial_list - 1.
+      ENDIF.
+    WHEN 'BOTTOM1'.
+      CLEAR: ls_gramajes.
+      gt_gramajes_aux[] = gt_gramajes.
+      READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom1.
+      g_select_object = ls_mara_mard_red-wgbez60.
+      PERFORM listar_gramaje_ancho_largo.
+
+      gramaje_ancho_largo_listado = abap_false  .
+      boton_pulsado = abap_true .
+    WHEN 'BOTTOM2'.
+      CLEAR: ls_gramajes.
+      gt_gramajes_aux[] = gt_gramajes.
+      READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom2.
+      g_select_object = ls_mara_mard_red-wgbez60.
+      PERFORM listar_gramaje_ancho_largo.
+
+      gramaje_ancho_largo_listado = abap_false  .
+      boton_pulsado = abap_true .
+    WHEN 'BOTTOM3'.
+      CLEAR: ls_gramajes.
+      gt_gramajes_aux[] = gt_gramajes.
+      READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom3.
+      g_select_object = ls_mara_mard_red-wgbez60.
+      PERFORM listar_gramaje_ancho_largo.
+
+      gramaje_ancho_largo_listado = abap_false  .
+      boton_pulsado = abap_true .
+    WHEN 'BOTTOM4'.
+      CLEAR: ls_gramajes.
+      gt_gramajes_aux[] = gt_gramajes.
+      READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom4.
+      g_select_object = ls_mara_mard_red-wgbez60.
+      PERFORM listar_gramaje_ancho_largo.
+
+      gramaje_ancho_largo_listado = abap_false  .
+      boton_pulsado = abap_true .
+    WHEN 'BOTTOM5'.
+      CLEAR: ls_gramajes.
+      gt_gramajes_aux[] = gt_gramajes.
+      READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom5.
+      g_select_object = ls_mara_mard_red-wgbez60.
+      PERFORM listar_gramaje_ancho_largo.
+
+      gramaje_ancho_largo_listado = abap_false  .
+      boton_pulsado = abap_true .
+    WHEN 'BOTTOM6'.
+      CLEAR: ls_gramajes.
+      gt_gramajes_aux[] = gt_gramajes.
+      READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom6.
+      g_select_object = ls_mara_mard_red-wgbez60.
+      PERFORM listar_gramaje_ancho_largo.
+
+      gramaje_ancho_largo_listado = abap_false  .
+      boton_pulsado = abap_true .
+    WHEN 'BOTTOM7'.
+      CLEAR: ls_gramajes.
+      gt_gramajes_aux[] = gt_gramajes.
+      READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom7.
+      g_select_object = ls_mara_mard_red-wgbez60.
+      PERFORM listar_gramaje_ancho_largo.
+
+      gramaje_ancho_largo_listado = abap_false  .
+      boton_pulsado = abap_true .
+    WHEN 'BOTTOM8'.
+      CLEAR: ls_gramajes.
+      gt_gramajes_aux[] = gt_gramajes.
+      READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom8.
+      g_select_object = ls_mara_mard_red-wgbez60.
+      PERFORM listar_gramaje_ancho_largo.
+
+      gramaje_ancho_largo_listado = abap_false  .
+      boton_pulsado = abap_true .
+    WHEN 'LIST'.
+      PERFORM next_process_from_list.
+    WHEN 'OK'.
+      CLEAR: ls_gramajes.
+      READ TABLE gt_gramajes INTO ls_gramajes INDEX g_option.
+      g_select_object = gt_select_list-obj_number.
+      PERFORM listar_gramaje_ancho_largo.
+  ENDCASE.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0082  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0082 INPUT.
+  DATA: ua_listadas TYPE bool VALUE abap_false.
+* NAC -> Gestión del numero introducido, si lo hay
+  IF g_option EQ 01.
+    CLEAR: ls_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom1.
+    g_select_object = ls_mara_mard_red-wgbez60.
+    CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+    SEPARATED BY space.
+
+    ua_listadas = abap_true.
+    PERFORM listar_uas.
+  ELSEIF g_option EQ 02.
+    CLEAR: ls_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom2.
+    g_select_object = ls_mara_mard_red-wgbez60.
+    CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+    SEPARATED BY space.
+
+    ua_listadas = abap_true.
+    PERFORM listar_uas.
+  ELSEIF g_option EQ 03.
+    CLEAR: ls_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom3.
+    g_select_object = ls_mara_mard_red-wgbez60.
+    CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+    SEPARATED BY space.
+
+    ua_listadas = abap_true.
+    PERFORM listar_uas.
+  ELSEIF g_option EQ 04.
+    CLEAR: ls_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom4.
+    g_select_object = ls_mara_mard_red-wgbez60.
+    CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+    SEPARATED BY space.
+
+    ua_listadas = abap_true.
+    PERFORM listar_uas.
+  ELSEIF g_option EQ 05.
+    CLEAR: ls_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom5.
+    g_select_object = ls_mara_mard_red-wgbez60.
+    CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+    SEPARATED BY space.
+
+    ua_listadas = abap_true.
+    PERFORM listar_uas.
+  ELSEIF g_option EQ 06.
+    CLEAR: ls_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom6.
+    g_select_object = ls_mara_mard_red-wgbez60.
+    CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+    SEPARATED BY space.
+
+    ua_listadas = abap_true.
+    PERFORM listar_uas.
+  ELSEIF g_option EQ 07.
+    CLEAR: ls_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom7.
+    g_select_object = ls_mara_mard_red-wgbez60.
+    CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+    SEPARATED BY space.
+
+    ua_listadas = abap_true.
+    PERFORM listar_uas.
+  ELSEIF g_option EQ 08.
+    CLEAR: ls_gramajes.
+    READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom8.
+    g_select_object = ls_mara_mard_red-wgbez60.
+    CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+    SEPARATED BY space.
+
+    ua_listadas = abap_true.
+    PERFORM listar_uas.
+  ENDIF.
+* NAC <- Gestión del numero introducido, si lo hay
+
+
+
+* NAC -> Para controlar el flujo de vuelta en las pantallas.
+  IF ua_listadas = abap_false.
+
+    CASE ok_code.
+      WHEN 'BACK'.
+* NAC -*
+        CLEAR ok_code.
+
+        gt_gramajes[] = gt_gramajes_aux[].
+        CASE g_local_previous_screen.
+          WHEN OTHERS.
+            LEAVE TO SCREEN 0.
+        ENDCASE.
+      WHEN 'NEXT'.
+        g_partial_list = g_partial_list + 1.
+        g_next_line = g_partial_list * 8 + 1.
+        IF g_next_line > g_lines_list.
+          g_partial_list = g_partial_list - 1.
+          g_message_number = '041'.
+          g_message_type = 'A'.
+          PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+        ENDIF.
+      WHEN 'BEFORE'.
+        IF g_partial_list LE 0.
+          g_message_number = '041'.
+          g_message_type = 'A'.
+          PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+        ELSE.
+          g_partial_list = g_partial_list - 1.
+        ENDIF.
+      WHEN 'BOTTOM1'.
+        CLEAR: ls_gramajes.
+        READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom1.
+        g_select_object = ls_mara_mard_red-wgbez60.
+
+
+*      CONCATENATE g_subtitulo ls_gramajes-txt_boton INTO g_subtitulo
+        CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+        SEPARATED BY space.
+
+
+
+        PERFORM listar_uas.
+      WHEN 'BOTTOM2'.
+        CLEAR: ls_gramajes.
+        READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom2.
+        g_select_object = ls_mara_mard_red-wgbez60.
+
+
+*      CONCATENATE g_subtitulo ls_gramajes-txt_boton INTO g_subtitulo
+        CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+        SEPARATED BY space.
+
+
+        PERFORM listar_uas.
+      WHEN 'BOTTOM3'.
+        CLEAR: ls_gramajes.
+        READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom3.
+        g_select_object = ls_mara_mard_red-wgbez60.
+
+
+*      CONCATENATE g_subtitulo ls_gramajes-txt_boton INTO g_subtitulo
+        CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+        SEPARATED BY space.
+
+
+        PERFORM listar_uas.
+      WHEN 'BOTTOM4'.
+        CLEAR: ls_gramajes.
+        READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom4.
+        g_select_object = ls_mara_mard_red-wgbez60.
+
+
+*      CONCATENATE g_subtitulo ls_gramajes-txt_boton INTO g_subtitulo
+        CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+        SEPARATED BY space.
+
+
+        PERFORM listar_uas.
+      WHEN 'BOTTOM5'.
+        CLEAR: ls_gramajes.
+        READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom5.
+        g_select_object = ls_mara_mard_red-wgbez60.
+
+
+*      CONCATENATE g_subtitulo ls_gramajes-txt_boton INTO g_subtitulo
+        CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+        SEPARATED BY space.
+
+
+        PERFORM listar_uas.
+      WHEN 'BOTTOM6'.
+        CLEAR: ls_gramajes.
+        READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom6.
+        g_select_object = ls_mara_mard_red-wgbez60.
+
+*      CONCATENATE g_subtitulo ls_gramajes-txt_boton INTO g_subtitulo
+        CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+        SEPARATED BY space.
+
+
+        PERFORM listar_uas.
+      WHEN 'BOTTOM7'.
+        CLEAR: ls_gramajes.
+        READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom7.
+        g_select_object = ls_mara_mard_red-wgbez60.
+
+*      CONCATENATE g_subtitulo ls_gramajes-txt_boton INTO g_subtitulo
+        CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+        SEPARATED BY space.
+
+
+        PERFORM listar_uas.
+      WHEN 'BOTTOM8'.
+        CLEAR: ls_gramajes.
+        READ TABLE gt_gramajes INTO ls_gramajes INDEX g_index_bottom8.
+        g_select_object = ls_mara_mard_red-wgbez60.
+
+*      CONCATENATE g_subtitulo ls_gramajes-txt_boton INTO g_subtitulo
+        CONCATENATE g_subtitulo ls_gramajes-txt_boton_sin_ceros INTO g_subtitulo
+        SEPARATED BY space.
+
+
+        PERFORM listar_uas.
+      WHEN 'LIST'.
+        PERFORM next_process_from_list.
+      WHEN 'OK'.
+        CLEAR: ls_gramajes.
+        READ TABLE gt_gramajes INTO ls_gramajes INDEX g_option.
+        g_select_object = gt_select_list-obj_number.
+
+        IF g_subtitulo_uas IS NOT INITIAL.
+          g_subtitulo = g_subtitulo_uas.
+        ELSE.
+          CONCATENATE g_subtitulo ls_gramajes-txt_boton INTO g_subtitulo
+          SEPARATED BY space.
+        ENDIF.
+
+        PERFORM listar_uas.
+    ENDCASE.
+
+  ELSE.
+    ua_listadas = abap_false.
+  ENDIF.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0084  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0084 INPUT.
+  DATA: id_aux_84 LIKE id.
+
+  CASE sy-ucomm.
+    WHEN 'NEXT'.
+      ADD 1 TO gv_pagina_actual_grid_0084 .
+
+      g_partial_list_0084  = g_partial_list_0084  + 1.
+
+      g_next_line_0084  = g_partial_list_0084  * gc_lineas_grid_0084  + 1.
+
+*        Para controlar los registros de las subscreen
+      id_aux_84 = id.
+      id = id + gc_lineas_grid_0084 .
+
+      IF id GT g_lines_list_0084 .
+        id = id_aux_84.
+      ENDIF.
+
+      IF g_next_line_0084  > g_lines_list_0084 .
+        SUBTRACT 1 FROM gv_pagina_actual_grid_0084 .
+        g_partial_list_0084  = g_partial_list_0084  - 1.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ENDIF.
+    WHEN 'PREV'.
+      SUBTRACT 1 FROM gv_pagina_actual_grid_0084  .
+      IF g_partial_list_0084  LE 0.
+        ADD 1 TO gv_pagina_actual_grid_0084  .
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ELSE.
+        g_partial_list_0084  = g_partial_list_0084  - 1.
+
+*        Para controlar los registros de las subscreen
+        id = id - gc_lineas_grid_0084 .
+
+        IF id LT 1.
+          id = 1.
+        ENDIF.
+      ENDIF.
+
+
+    WHEN 'REUB'.
+
+      CALL TRANSACTION 'ZWM_RF_003'.
+
+    WHEN OTHERS.
+
+  ENDCASE.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0084  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0086 INPUT.
+  DATA: id_aux_86 LIKE id.
+
+  CASE sy-ucomm.
+    WHEN 'NEXT'.
+*      ADD 1 TO gv_pagina_actual_grid .
+      ADD 1 TO gv_pagina_actual_grid_0086 .
+*      g_partial_list = g_partial_list + 1.
+      g_partial_list_0086 = g_partial_list_0086 + 1.
+*      g_next_line = g_partial_list * gc_lineas_grid + 1.
+*      g_next_line = g_partial_list * gc_lineas_grid_0086 + 1.
+*      g_next_line_0086 = g_partial_list * gc_lineas_grid_0086 + 1.
+      g_next_line_0086 = g_partial_list_0086 * gc_lineas_grid_0086 + 1.
+
+*        Para controlar los registros de las subscreen
+      id_aux_86 = id.
+*      id = id + gc_lineas_grid.
+      id = id + gc_lineas_grid_0086.
+
+      IF id GT g_lines_list_0086.
+        id = id_aux_86.
+      ENDIF.
+
+*      IF g_next_line > g_lines_list.
+      IF g_next_line_0086 > g_lines_list_0086.
+*        SUBTRACT 1 FROM gv_pagina_actual_grid .
+        SUBTRACT 1 FROM gv_pagina_actual_grid_0086 .
+*        g_partial_list = g_partial_list - 1.
+        g_partial_list_0086 = g_partial_list_0086 - 1.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ENDIF.
+    WHEN 'PREV'.
+*      SUBTRACT 1 FROM gv_pagina_actual_grid .
+      SUBTRACT 1 FROM gv_pagina_actual_grid_0086 .
+*      IF g_partial_list LE 0.
+      IF g_partial_list_0086 LE 0.
+*        ADD 1 TO gv_pagina_actual_grid .
+        ADD 1 TO gv_pagina_actual_grid_0086 .
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ELSE.
+*        g_partial_list = g_partial_list - 1.
+        g_partial_list_0086 = g_partial_list_0086 - 1.
+
+*        Para controlar los registros de las subscreen
+*        id = id - gc_lineas_grid.
+        id = id - gc_lineas_grid_0086.
+        IF id LT 1.
+          id = 1.
+        ENDIF.
+      ENDIF.
+
+
+    WHEN 'REUB'.
+
+      CALL TRANSACTION 'ZWM_RF_003'.
+
+    WHEN OTHERS.
+
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  LECTURA_SELECCIONADO  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE lectura_seleccionado INPUT.
+  IF gt_grid_uas-flag EQ 'X'.
+    CLEAR: gs_grid_uas_sel.
+    gs_grid_uas_sel = gt_grid_uas.
+  ENDIF.
+ENDMODULE.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0083  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0083 INPUT.
+
+  DATA: id_aux_83 LIKE id.
+
+  CASE sy-ucomm.
+    WHEN 'BACK'.
+*      *      CLEAR: gv_sumado_pagina.
+      CLEAR: gv_sumado_pagina_0084.
+      gv_pagina_actual_grid_0084 = 1.
+      id = 1.
+
+*      g_subtitulo_uas = g_subtitulo.
+      CLEAR: g_partial_list_0084, g_subtitulo.
+
+      CASE g_local_previous_screen.
+        WHEN OTHERS.
+          LEAVE TO SCREEN 0.
+      ENDCASE.
+  ENDCASE.
+ENDMODULE.
+
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0085  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0085 INPUT.
+
+  CASE sy-ucomm.
+    WHEN 'BACK'.
+*      CLEAR: gv_sumado_pagina.
+      CLEAR: gv_sumado_pagina_0086.
+*      gv_pagina_actual_grid = 1.
+      gv_pagina_actual_grid_0086 = 1.
+      id = 1.
+
+*      g_subtitulo_uas = g_subtitulo.
+
+*      CLEAR: g_partial_list, g_subtitulo.
+      CLEAR: g_partial_list_0086, g_subtitulo.
+
+      CASE g_local_previous_screen.
+        WHEN OTHERS.
+          LEAVE TO SCREEN 0.
+      ENDCASE.
+
+  ENDCASE.
+ENDMODULE.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Module  LECTURA_SELECCIONADO_CONFIRM  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE lectura_seleccionado_confirm INPUT.
+  IF gt_grid_lconfirm-flag EQ 'X'.
+    CLEAR: gs_grid_lconfirm.
+    gs_grid_lconfirm = gt_grid_lconfirm.
+  ENDIF.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0089  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0089 INPUT.
+*DATA: id_aux like id.
+  CASE sy-ucomm.
+    WHEN 'BACK'.
+*      CLEAR:  gv_sumado_pagina.
+      CLEAR:  gv_sumado_pagina_0091.
+*      gv_pagina_actual_grid = 1.
+      gv_pagina_actual_grid_0091 = 1.
+      id = 1.
+
+*      g_subtitulo_uas = g_subtitulo.
+*      CLEAR: g_partial_list, g_subtitulo.
+      CLEAR: g_partial_list_0091, g_subtitulo.
+
+      CASE g_local_previous_screen.
+        WHEN OTHERS.
+          LEAVE TO SCREEN 0.
+      ENDCASE.
+
+
+    WHEN 'FIN'.
+*      gv_pagina_actual_grid = 1.
+      gv_pagina_actual_grid_0091 = 1.
+      IF sy-tcode = 'ZWM_RF_008'.  " Descargas Puerto
+        PERFORM fin_descarga_puerto USING abap_true.
+      ELSE.
+        IF sy-tcode = 'ZWM_RF_001'.  " Descargas Papeleras
+          PERFORM grabar_em_papeleras.
+        ENDIF.
+        PERFORM fin_transporte_new USING abap_false.
+      ENDIF.
+
+  ENDCASE.
+ENDMODULE.
+
+** KYVOR(AG) - INI - 02.08.2019 - Detalhe SEGUNDAS
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_9986  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_9986 INPUT.
+*  DATA: id_aux_86 LIKE id.
+
+  CASE sy-ucomm.
+    WHEN 'NEXT'.
+*      ADD 1 TO gv_pagina_actual_grid .
+      ADD 1 TO gv_pagina_actual_grid_0086 .
+*      g_partial_list = g_partial_list + 1.
+      g_partial_list_0086 = g_partial_list_0086 + 1.
+*      g_next_line = g_partial_list * gc_lineas_grid + 1.
+*      g_next_line = g_partial_list * gc_lineas_grid_0086 + 1.
+*      g_next_line_0086 = g_partial_list * gc_lineas_grid_0086 + 1.
+      g_next_line_0086 = g_partial_list_0086 * gc_lineas_grid_0086 + 1.
+
+*        Para controlar los registros de las subscreen
+      id_aux_86 = id.
+*      id = id + gc_lineas_grid.
+      id = id + gc_lineas_grid_0086.
+
+      IF id GT g_lines_list_0086.
+        id = id_aux_86.
+      ENDIF.
+
+*      IF g_next_line > g_lines_list.
+      IF g_next_line_0086 > g_lines_list_0086.
+*        SUBTRACT 1 FROM gv_pagina_actual_grid .
+        SUBTRACT 1 FROM gv_pagina_actual_grid_0086 .
+*        g_partial_list = g_partial_list - 1.
+        g_partial_list_0086 = g_partial_list_0086 - 1.
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ENDIF.
+    WHEN 'PREV'.
+*      SUBTRACT 1 FROM gv_pagina_actual_grid .
+      SUBTRACT 1 FROM gv_pagina_actual_grid_0086 .
+*      IF g_partial_list LE 0.
+      IF g_partial_list_0086 LE 0.
+*        ADD 1 TO gv_pagina_actual_grid .
+        ADD 1 TO gv_pagina_actual_grid_0086 .
+        g_message_number = '041'.
+        g_message_type = 'A'.
+        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+      ELSE.
+*        g_partial_list = g_partial_list - 1.
+        g_partial_list_0086 = g_partial_list_0086 - 1.
+
+*        Para controlar los registros de las subscreen
+*        id = id - gc_lineas_grid.
+        id = id - gc_lineas_grid_0086.
+        IF id LT 1.
+          id = 1.
+        ENDIF.
+      ENDIF.
+
+
+    WHEN 'REUB'.
+
+      CALL TRANSACTION 'ZWM_RF_003'.
+
+    WHEN OTHERS.
+
+  ENDCASE.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_9985  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_9985 INPUT.
+
+  CASE sy-ucomm.
+    WHEN 'BACK'.
+*      CLEAR: gv_sumado_pagina.
+      CLEAR: gv_sumado_pagina_0086.
+*      gv_pagina_actual_grid = 1.
+      gv_pagina_actual_grid_0086 = 1.
+      id = 1.
+
+*      g_subtitulo_uas = g_subtitulo.
+
+*      CLEAR: g_partial_list, g_subtitulo.
+      CLEAR: g_partial_list_0086, g_subtitulo.
+
+      CASE g_local_previous_screen.
+        WHEN OTHERS.
+          LEAVE TO SCREEN 0.
+      ENDCASE.
+
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_9989  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_9989 INPUT.
+*DATA: id_aux like id.
+  CASE sy-ucomm.
+    WHEN 'BACK'.
+*      CLEAR:  gv_sumado_pagina.
+      CLEAR:  gv_sumado_pagina_0091.
+*      gv_pagina_actual_grid = 1.
+      gv_pagina_actual_grid_0091 = 1.
+      id = 1.
+
+*      g_subtitulo_uas = g_subtitulo.
+*      CLEAR: g_partial_list, g_subtitulo.
+      CLEAR: g_partial_list_0091, g_subtitulo.
+
+      CASE g_local_previous_screen.
+        WHEN OTHERS.
+          LEAVE TO SCREEN 0.
+      ENDCASE.
+
+
+    WHEN 'FIN'.
+*      gv_pagina_actual_grid = 1.
+      gv_pagina_actual_grid_0091 = 1.
+      IF sy-tcode = 'ZWM_RF_008'.  " Descargas Puerto
+        PERFORM fin_descarga_puerto USING abap_true.
+      ELSEIF sy-tcode = 'ZWM_RF_001'.  " Descargas Papeleras
+        oo_descarga->contabilizar( ).
+      ELSE.
+        PERFORM fin_transporte_new USING abap_true.
+      ENDIF.
+
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Form  GRABAR_EM_SAICA_NO_TRANS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM grabar_em_saica_no_trans .
+
+  DATA l_tanum TYPE tanum.
+  DATA lt_items TYPE TABLE OF l03b_delit.
+  DATA ls_item TYPE l03b_delit.
+  DATA ls_header_action TYPE bapishipmentheaderaction.
+  DATA lt_dlv_inb TYPE TABLE OF lips.
+  DATA ls_dlv_inb TYPE lips.
+  DATA lr_dlv_inb LIKE LINE OF gr_dlv_inb.
+  DATA l_add_to_tr.
+
+  CHECK NOT gs_em_po-menge_input IS INITIAL.
+
+* cheuqemos si hay que crear entrega.
+  SELECT SINGLE lips~vbeln INTO g_vbeln_inb
+         FROM   vbuk INNER JOIN lips ON
+                vbuk~vbeln = lips~vbeln
+         WHERE lips~vgbel = gs_ekko-ebeln AND
+               lips~vgpos = gs_em_po-ebelp AND
+               vbuk~wbstk <> 'C'.
+
+  IF NOT sy-subrc IS INITIAL.
+    PERFORM create_dlv_inbound_from_po USING gs_ekko-ebeln
+                                             gs_likp-verur  CHANGING lt_dlv_inb.
+    READ TABLE lt_dlv_inb INTO ls_dlv_inb INDEX 1.
+    lr_dlv_inb = 'IEQ'.
+    lr_dlv_inb-low = ls_dlv_inb-vbeln.
+    COLLECT lr_dlv_inb INTO gr_dlv_inb.
+    l_add_to_tr = abap_true.
+  ELSE.
+    SELECT * INTO TABLE lt_dlv_inb FROM lips WHERE vbeln = g_vbeln_inb .
+    lr_dlv_inb = 'IEQ'.
+    lr_dlv_inb-low = g_vbeln_inb.
+    COLLECT lr_dlv_inb INTO gr_dlv_inb.
+  ENDIF.
+
+  READ TABLE lt_dlv_inb INTO ls_dlv_inb WITH KEY vgbel = gs_em_po-ebeln
+                                                 vgpos = gs_em_po-ebelp
+                                                 uecha = space. " cvivo - 05.03.2019 - no seleccionar partición lotes
+  IF sy-subrc EQ 0.
+* si la cantidad de entrega ya no admite mas bobinas, la ampliamos
+    IF   ls_dlv_inb-lfimg < gs_em_po-menge_input.
+      ls_dlv_inb-lfimg = ls_dlv_inb-lfimg  + ( gs_em_po-menge_input - ls_dlv_inb-lfimg ) + 1.
+      PERFORM change_dlv_inbound USING ls_dlv_inb.
+    ENDIF.
+
+    ls_item-posnr = ls_dlv_inb-posnr.
+    ls_item-anfme = gs_em_po-menge_input.
+    ls_item-altme = gs_em_po-meins.
+    ls_item-charg = gs_em_po-charg.
+    IF NOT g_bobina IS INITIAL.
+      ls_item-nlenr = g_bobina.
+    ENDIF.
+
+* ini - cvivo - WM CB Detectar tipo de UA en materia prima
+    SELECT SINGLE @abap_true FROM mara
+      WHERE matnr EQ @ls_dlv_inb-matnr
+        AND zzlargo GT 0
+        INTO @DATA(check).
+
+    IF sy-subrc EQ 0.
+      ls_item-letyp =  'PL'.
+    ELSE.
+      ls_item-letyp =  'BB'.
+    ENDIF.
+* ini - cvivo - WM CB Detectar tipo de UA en materia prima
+
+    APPEND ls_item TO lt_items.
+    PERFORM create_ot_dn TABLES lt_items
+                         USING ls_dlv_inb-vbeln
+                               l_add_to_tr
+                         CHANGING l_tanum.
+*    IF NOT l_tanum IS INITIAL AND
+    IF l_add_to_tr = abap_true. " cvivo - 55810 - la asignación se verifica dentro de la rutina
+* añadimos la entrega al transporte
+      PERFORM add_dlv_to_tr USING gs_vttk-tknum
+                                  ls_dlv_inb-vbeln.
+
+    ENDIF.
+
+    IF l_tanum IS NOT INITIAL.
+      g_msgid = '00'.
+      g_message_type = 'S'.
+      g_message_number = '398'.
+      g_msgv1 = 'Cantidad introducida correctamente'.
+      g_msgv2 = ls_dlv_inb-vbeln.
+      " PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4. "Kyvor(RDM) - 20190916
+      FREE gs_em_po-menge_input.
+      " RDM - Kyvor - 20190906
+      IF sy-tcode NE 'ZWM_RF_009'.
+        CLEAR: g_bobina, gs_em_po-matnr.
+      ENDIF.
+      " RDM - Kyvor - 20190906
+    ENDIF.
+  ELSE. " cvivo - 05.03.2019 - no seleccionar partición lotes
+    READ TABLE lt_dlv_inb INTO ls_dlv_inb WITH KEY vgbel = gs_em_po-ebeln
+                                                   vgpos = gs_em_po-ebelp.
+
+    g_message_type = 'A'.
+    g_message_number = '000'.
+    g_msgv1 = 'No se encuentra el material en la entrega'.
+    g_msgv2 = ls_dlv_inb-vbeln.
+    PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+  ENDIF.
+
+
+  IF ( g_bobina IS INITIAL AND l_tanum IS NOT INITIAL ).
+
+    SELECT SINGLE nlenr
+      FROM ltap
+      INTO g_bobina
+     WHERE lgnum EQ gs_param-lgnum
+       AND tanum EQ l_tanum
+       AND tapos EQ '1'.
+
+  ENDIF.
+
+ENDFORM.
+** KYVOR(AG) - FIM - 02.08.2019 - Detalhe SEGUNDAS
+*&---------------------------------------------------------------------*
+*&      Form  LISTAR_PALETS_DESCARG_NO_TRANS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM listar_palets_descarg_no_trans USING display TYPE flag. " cvivo - 15.01.2020 Incidencia Pacs (usar form para cargar datos sin cargar pantalla)
+
+  DATA l_ctd_char TYPE char18.
+  DATA: ls_sel_list_final LIKE LINE OF gt_sel_list_final.
+  DATA lr_dlv_inb LIKE LINE OF gr_dlv_inb.
+  DATA lr_ebelp TYPE RANGE OF ekpo-ebelp.
+
+  DATA: lv_verur TYPE verur_vl.
+
+  "
+  " SEIS 27.05.22 Adaptaciones para buscar en tabla Z.
+  "
+  IF g_no_transporte IS INITIAL.
+    SELECT *
+    FROM zwm_rf_em_lect
+    INTO TABLE @DATA(tl_zwm_rf_em_lect)
+    WHERE tknum = @gs_vttk-tknum " AND
+*          finalizado = ''.
+      AND finalizado = @abap_false.
+  ELSE.
+
+*** --> INI FCARDONA 20.10.2023 - Bug descargadas PACS
+
+* """"" Comento por cambio de lógica
+*
+*      SELECT *
+*      FROM zwm_rf_em_lect
+*      INTO CORRESPONDING FIELDS OF TABLE tl_zwm_rf_em_lect
+*      WHERE ebeln = gs_ekko-ebeln " AND
+**            finalizado = ''.
+*      AND finalizado = abap_false.
+
+    "Buscamos si nota de entrega
+    IF ( gs_likp-verur IS NOT INITIAL ).
+
+      SELECT *
+      FROM zwm_rf_em_lect
+      INTO CORRESPONDING FIELDS OF TABLE tl_zwm_rf_em_lect
+     WHERE verur EQ gs_likp-verur
+       AND finalizado = abap_false.
+
+    ELSE. "Si no se encuentra por pedido
+
+      SELECT *
+       FROM zwm_rf_em_lect
+       INTO CORRESPONDING FIELDS OF TABLE tl_zwm_rf_em_lect
+      WHERE ebeln = gs_ekko-ebeln
+        AND finalizado = abap_false.
+
+    ENDIF.
+
+*** <-- FIN FCARDONA 20.10.2023 - Bug descargadas PACS
+
+  ENDIF.
+  DATA vl_lecturas TYPE i.
+  vl_lecturas = lines( tl_zwm_rf_em_lect ).
+  IF vl_lecturas > 0.
+
+    CHECK display IS NOT INITIAL.
+
+    READ TABLE gt_vttk ASSIGNING FIELD-SYMBOL(<fs_vttk>)
+    WITH KEY tknum = gs_vttk-tknum.
+    IF <fs_vttk> IS ASSIGNED.
+      CLEAR <fs_vttk>-zzpeso_alb.
+    ENDIF.
+
+    "
+    " Nuevo cálculo según tabla Z
+    "
+    CLEAR: gt_select_list[],gt_select_list.
+    REFRESH: gt_sel_list_final.
+    SORT tl_zwm_rf_em_lect BY bobina.
+    LOOP AT tl_zwm_rf_em_lect ASSIGNING FIELD-SYMBOL(<fs_lectura>).
+      gt_select_list-cod = 'ST'.
+      gt_select_list-obj_number = sy-tabix.
+      gt_select_list-obj_numberc = <fs_lectura>-bobina .
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = gt_select_list-obj_numberc
+        IMPORTING
+          output = gt_select_list-obj_numberc.
+      WRITE <fs_lectura>-menge_input TO l_ctd_char DECIMALS 0.
+      CONDENSE l_ctd_char.
+      CONCATENATE <fs_lectura>-charg '-' l_ctd_char <fs_lectura>-meins INTO gt_select_list-obj_number_alt SEPARATED BY space.
+      gt_select_list-zzpeso_alb = <fs_lectura>-menge_input.
+      gt_select_list-matnr = <fs_lectura>-matnr.
+      gt_select_list-dtmeg = <fs_lectura>-meins.
+      IF <fs_vttk> IS ASSIGNED.
+        ADD gt_select_list-zzpeso_alb TO <fs_vttk>-zzpeso_alb.
+      ENDIF.
+
+*          Se añaden estos campos, para preparar listado cuando se finaliza
+      CLEAR: ls_sel_list_final.
+      MOVE-CORRESPONDING gt_select_list TO ls_sel_list_final.
+      ls_sel_list_final-tknum = gs_vttk-tknum.
+      ls_sel_list_final-codigo_bobina = gt_select_list-obj_numberc.
+
+      CONDENSE ls_sel_list_final-codigo_bobina.
+      APPEND ls_sel_list_final TO gt_sel_list_final.
+
+*           FIN GAP WM16 - Bernabeu  / RGUILLOT 28-3-19
+      APPEND gt_select_list.
+    ENDLOOP.
+    CLEAR g_partial_list.
+    CLEAR g_partial_list_0086.
+    CLEAR g_partial_list_0091.
+
+*           INI GAP WM16 - Bernabeu  / RGUILLOT 28-3-19
+
+*      Activación o desactivación de funcionalidad
+    READ TABLE gt_func INTO DATA(ls_func2)
+    WITH KEY func = 'CAMBIA_LIST_BULTOS_LEIDOS'
+            (gv_lgnum_lg) = 'X'.
+
+    IF sy-subrc = 0.
+      IF sy-ucomm = 'FIN'.
+*            CALL SCREEN 0078. " SIN GRID
+        CALL SCREEN 0089. " CON GRID
+      ELSE.
+*            Estoy sólo listando
+*            CALL SCREEN 0077. " SIN GRID
+*            CALL SCREEN 0085. " CON GRID
+        CALL SCREEN 0085. " CON GRID
+      ENDIF.
+
+    ELSE.
+      CALL SCREEN 9997.
+    ENDIF.
+  ELSE.
+    "
+    " SEIS 27.05.22
+    " Calculo antiguo. Ver de borrar al final.
+    "
+
+    IF gr_dlv_inb[] IS INITIAL.
+*   cheuqemos si hay que crear entrega.
+      "KYV/RDM - 20191118 BEG
+      IF gs_em_po-ebelp IS NOT INITIAL.
+        lr_ebelp = VALUE #( ( sign = 'I' option = 'EQ' low = gs_em_po-ebelp ) ).
+      ENDIF.
+      "KYV/RDM - 20191118 END
+      SELECT SINGLE lips~vbeln INTO g_vbeln_inb
+             FROM   vbuk INNER JOIN lips ON
+                    vbuk~vbeln = lips~vbeln
+             WHERE lips~vgbel = gs_ekko-ebeln AND
+                   "lips~vgpos = gs_em_po-ebelp AND "KYV/RDM - 20191118
+                   lips~vgpos IN lr_ebelp AND "KYV/RDM - 20191118
+                   vbuk~wbstk <> 'C'.
+
+      IF sy-subrc IS INITIAL.
+        lr_dlv_inb = 'IEQ'.
+        lr_dlv_inb-low = g_vbeln_inb.
+        COLLECT lr_dlv_inb INTO gr_dlv_inb.
+      ENDIF.
+    ENDIF.
+
+    CHECK gr_dlv_inb[] IS NOT INITIAL.
+    CHECK display IS NOT INITIAL.
+
+*  buscamos las entregas asociadas al transporte
+    SELECT * INTO TABLE @DATA(lt_vbfa)
+             FROM vbfa WHERE vbelv IN @gr_dlv_inb AND
+                             vbtyp_n = 'Q'.
+*   buscamos las UAs descargadas para esas enregas en la lqua
+    IF NOT lt_vbfa IS INITIAL.
+      SELECT * INTO TABLE @DATA(lt_lqua)
+               FROM lqua FOR ALL ENTRIES IN @lt_vbfa
+               WHERE lgnum = @gs_param-lgnum AND
+                     vbeln = @lt_vbfa-vbelv AND
+                      verme > 0.
+      IF  sy-subrc IS INITIAL.
+        CLEAR: gt_select_list[],gt_select_list.
+*           INI GAP WM16 - Bernabeu  / RGUILLOT 28-3-19
+        REFRESH: gt_sel_list_final.
+*           FIN GAP WM16 - Bernabeu  / RGUILLOT 28-3-19
+        SORT lt_lqua BY lenum.
+        DELETE ADJACENT DUPLICATES FROM lt_lqua COMPARING lenum.
+        LOOP AT lt_lqua INTO DATA(ls_stock).
+          gt_select_list-cod = 'ST'.
+          gt_select_list-obj_number = sy-tabix.
+          gt_select_list-obj_numberc = ls_stock-lenum .
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+            EXPORTING
+              input  = gt_select_list-obj_numberc
+            IMPORTING
+              output = gt_select_list-obj_numberc.
+          WRITE ls_stock-verme TO l_ctd_char DECIMALS 0.
+          CONDENSE l_ctd_char.
+          CONCATENATE ls_stock-charg '-' l_ctd_char ls_stock-meins INTO gt_select_list-obj_number_alt SEPARATED BY space.
+
+*           INI GAP WM16 - Bernabeu  / RGUILLOT 28-3-19
+*          se añaden estos campos en esta tabla interna para reutilizarla
+          gt_select_list-zzpeso_alb = ls_stock-gesme.
+          gt_select_list-matnr = ls_stock-matnr.
+          gt_select_list-dtmeg = ls_stock-meins.
+
+*          Se añaden estos campos, para preparar listado cuando se finaliza
+          CLEAR: ls_sel_list_final.
+          MOVE-CORRESPONDING gt_select_list TO ls_sel_list_final.
+          ls_sel_list_final-tknum = gs_vttk-tknum.
+          ls_sel_list_final-codigo_bobina = gt_select_list-obj_numberc.
+
+          CONDENSE ls_sel_list_final-codigo_bobina.
+          APPEND ls_sel_list_final TO gt_sel_list_final.
+
+*           FIN GAP WM16 - Bernabeu  / RGUILLOT 28-3-19
+          APPEND gt_select_list.
+        ENDLOOP.
+        CLEAR g_partial_list.
+        CLEAR g_partial_list_0086.
+        CLEAR g_partial_list_0091.
+
+*           INI GAP WM16 - Bernabeu  / RGUILLOT 28-3-19
+
+*      Activación o desactivación de funcionalidad
+        READ TABLE gt_func INTO DATA(ls_func)
+        WITH KEY func = 'CAMBIA_LIST_BULTOS_LEIDOS'
+                (gv_lgnum_lg) = 'X'.
+
+        IF sy-subrc = 0.
+          IF sy-ucomm = 'FIN'.
+*            CALL SCREEN 0078. " SIN GRID
+            CALL SCREEN 0089. " CON GRID
+          ELSE.
+*            Estoy sólo listando
+*            CALL SCREEN 0077. " SIN GRID
+*            CALL SCREEN 0085. " CON GRID
+            CALL SCREEN 0085. " CON GRID
+          ENDIF.
+
+        ELSE.
+          CALL SCREEN 9997.
+        ENDIF.
+
+*           FIN GAP WM16 - Bernabeu  / RGUILLOT 28-3-19
+
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+
+FORM ubicar_en_descarga USING uv_lenum TYPE lenum.
+
+  DATA: lt_bdcdata     TYPE TABLE OF bdcdata,
+        ls_bdcdata     LIKE LINE OF lt_bdcdata,
+        ls_options     TYPE ctu_params,
+        lv_tvarvc_name TYPE tvarvc-name.
+
+  "Chequeo funcionalidad
+  READ TABLE gt_func TRANSPORTING NO FIELDS WITH KEY func = gc_func-rf_ubicar_en_descarga (gv_lgnum_lg) = 'X'.
+
+  CHECK sy-subrc = 0.
+
+  "Chequeo UA
+  CHECK uv_lenum IS NOT INITIAL.
+
+  SELECT SINGLE lgnum, lenum, zeugn
+    FROM lqua
+   WHERE lgnum EQ @g_lgnum
+     AND bdatu EQ @sy-datum
+     AND lenum EQ @uv_lenum
+    INTO @DATA(ls_lqua).
+
+  CHECK sy-subrc EQ 0.
+
+  CONCATENATE 'ZWM_RF_UBICAR_EN_DESCARGA_' g_lgnum INTO lv_tvarvc_name.
+
+  "Controlamos excepciones en la tabla tvarvc
+  SELECT SINGLE *
+    FROM tvarvc
+    WHERE name EQ @lv_tvarvc_name
+      AND low  EQ @sy-tcode
+      INTO @DATA(tvarvc).
+
+  "Si la tcode está en la tabla
+  IF ( sy-subrc EQ 0 ).
+
+    "Si el valor high viene informado --> SEGUNDAS
+    "Se hace por papeleras
+    IF ( tvarvc-high IS NOT INITIAL AND tvarvc-high = 'SEGUNDA' ).
+      IF ( ls_lqua-zeugn IS NOT INITIAL AND ls_lqua-zeugn = 'SEGUNDA' ).
+        EXIT.
+      ENDIF.
+    ELSE.
+      EXIT.
+    ENDIF.
+
+  ENDIF.
+
+  CLEAR ls_bdcdata.
+  ls_bdcdata-program  = 'SAPMZ_WM_RF'.
+  ls_bdcdata-dynpro   = '0020'.
+  ls_bdcdata-dynbegin = 'X'.
+  APPEND ls_bdcdata TO lt_bdcdata.
+
+  CLEAR ls_bdcdata.
+  ls_bdcdata-fnam = 'BDC_CURSOR'.
+  ls_bdcdata-fval = 'G_LENUM'.
+  APPEND ls_bdcdata TO lt_bdcdata.
+
+  CLEAR ls_bdcdata.
+  ls_bdcdata-fnam = 'G_LENUM'.
+  ls_bdcdata-fval = uv_lenum.
+  APPEND ls_bdcdata TO lt_bdcdata.
+
+  ls_options-dismode = 'E'.
+
+  CALL TRANSACTION 'ZWM_RF_003' USING lt_bdcdata OPTIONS FROM ls_options.
+
+ENDFORM.
+FORM get_ubicacion_en_descarga USING uv_lenum TYPE lenum.
+  "
+  " Comprobar que tenemos cantidad a ubicar.
+  "
+  CHECK NOT gs_em_po-menge_input IS INITIAL.
+
+  DATA: lv_tvarvc_name TYPE tvarvc-name.
+
+  "Chequeo funcionalidad
+  READ TABLE gt_func TRANSPORTING NO FIELDS WITH KEY func = gc_func-rf_ubicar_en_descarga (gv_lgnum_lg) = 'X'.
+
+  CHECK sy-subrc = 0.
+
+*  "Chequeo UA
+*  CHECK uv_lenum IS NOT INITIAL.
+*
+*  SELECT SINGLE lgnum, lenum, zeugn
+*    FROM lqua
+*   WHERE lgnum EQ @g_lgnum
+*     AND bdatu EQ @sy-datum
+*     AND lenum EQ @uv_lenum
+*    INTO @DATA(ls_lqua).
+*
+*  CHECK sy-subrc EQ 0.
+
+  SELECT SINGLE *
+    FROM ekko
+    INTO @DATA(wl_ekko)
+    WHERE ebeln = @gs_em_po-ebeln.
+  IF sy-subrc <> 0.
+    CLEAR wl_ekko.
+  ENDIF.
+
+  CONCATENATE 'ZWM_RF_UBICAR_EN_DESCARGA_' g_lgnum INTO lv_tvarvc_name.
+
+  "Controlamos excepciones en la tabla tvarvc
+  SELECT SINGLE *
+    FROM tvarvc
+    WHERE name EQ @lv_tvarvc_name
+      AND low  EQ @sy-tcode
+      INTO @DATA(tvarvc).
+
+  "Si la tcode está en la tabla
+  IF ( sy-subrc EQ 0 ).
+
+    "Si el valor high viene informado --> SEGUNDAS
+    "Se hace por papeleras
+    IF ( tvarvc-high IS NOT INITIAL AND tvarvc-high = 'SEGUNDA' ).
+*      IF ( ls_lqua-zeugn IS NOT INITIAL AND ls_lqua-zeugn = 'SEGUNDA' ).
+*        EXIT.
+*      ENDIF.
+      IF wl_ekko-zzsegcal = '2'.
+        EXIT.
+      ENDIF.
+    ELSE.
+      EXIT.
+    ENDIF.
+
+  ENDIF.
+
+  "
+  " Cálculamos datos.
+  "
+  CLEAR gs_reubic.
+  CLEAR gt_reubic.
+  FREE gt_reubic.
+  gs_reubic-lgnum = g_lgnum.
+  gs_reubic-lenum = uv_lenum.
+  gs_reubic-matnr = gs_em_po-matnr.
+  PERFORM get_makt USING gs_em_po-matnr.
+*GS_MAKT-MAKTX
+  gs_reubic-charg = gs_em_po-charg.
+*GS_REUBIC-LGPLA
+  gs_reubic-verme = gs_em_po-menge_input.
+  gs_reubic-verme_wm = gs_em_po-menge_input.
+  gs_reubic-meins_wm = gs_em_po-meins.
+  APPEND gs_reubic TO gt_reubic.
+*GS_REUBIC-NLPLA_PROP
+*GS_REUBIC-PESO_LIBRE
+*GS_REUBIC-PESO_UM
+  PERFORM get_ubic_prop.
+  "
+  " Mostrar dynpro solicitud ubicación.
+  "
+  CALL SCREEN 0101.
+ENDFORM.
+FORM get_ubicacion_en_interco USING p_lgnum TYPE lgnum CHANGING p_nlpla TYPE lgpla.
+
+  DATA: lv_tvarvc_name TYPE tvarvc-name.
+
+  "Chequeo funcionalidad
+  READ TABLE gt_func TRANSPORTING NO FIELDS WITH KEY func = gc_func-rf_ubicar_en_descarga (gv_lgnum_lg) = 'X'.
+
+  CHECK sy-subrc = 0.
+
+*  "Chequeo UA
+*  CHECK uv_lenum IS NOT INITIAL.
+*
+*  SELECT SINGLE lgnum, lenum, zeugn
+*    FROM lqua
+*   WHERE lgnum EQ @g_lgnum
+*     AND bdatu EQ @sy-datum
+*     AND lenum EQ @uv_lenum
+*    INTO @DATA(ls_lqua).
+*
+*  CHECK sy-subrc EQ 0.
+
+  SELECT SINGLE *
+    FROM ekko
+    INTO @DATA(wl_ekko)
+    WHERE ebeln = @gs_em_po-ebeln.
+  IF sy-subrc <> 0.
+    CLEAR wl_ekko.
+  ENDIF.
+
+  CONCATENATE 'ZWM_RF_UBICAR_EN_DESCARGA_' p_lgnum INTO lv_tvarvc_name.
+
+  "Controlamos excepciones en la tabla tvarvc
+  SELECT SINGLE *
+    FROM tvarvc
+    WHERE name EQ @lv_tvarvc_name
+      AND low  EQ @sy-tcode
+      INTO @DATA(tvarvc).
+
+  "Si la tcode está en la tabla
+  IF ( sy-subrc EQ 0 ).
+
+    "Si el valor high viene informado --> SEGUNDAS
+    "Se hace por papeleras
+    IF ( tvarvc-high IS NOT INITIAL AND tvarvc-high = 'SEGUNDA' ).
+*      IF ( ls_lqua-zeugn IS NOT INITIAL AND ls_lqua-zeugn = 'SEGUNDA' ).
+*        EXIT.
+*      ENDIF.
+      IF wl_ekko-zzsegcal = '2'.
+        EXIT.
+      ENDIF.
+    ELSE.
+      EXIT.
+    ENDIF.
+
+  ENDIF.
+
+  "
+  " Cálculamos datos.
+  "
+  CLEAR gs_reubic.
+  CLEAR gt_reubic.
+  FREE gt_reubic.
+  gs_reubic-lgnum = g_lgnum.
+  gs_reubic-lenum = gs_dlv-charg.
+  gs_reubic-matnr = gs_dlv-matnr.
+  PERFORM get_makt USING gs_dlv-matnr.
+*GS_MAKT-MAKTX
+  gs_reubic-charg = gs_dlv-charg.
+*GS_REUBIC-LGPLA
+  gs_reubic-verme = gs_dlv-lgmng.
+  gs_reubic-verme_wm = gs_dlv-lgmng.
+  gs_reubic-meins_wm = gs_dlv-meins.
+*GS_REUBIC-NLPLA_PROP
+*GS_REUBIC-PESO_LIBRE
+*GS_REUBIC-PESO_UM
+  APPEND gs_reubic TO gt_reubic.
+  PERFORM get_ubic_prop.
+  CLEAR p_nlpla.
+  "
+  " Mostrar dynpro solicitud ubicación.
+  "
+  CALL SCREEN 0101.
+
+  p_nlpla = gs_reubic-nlpla.
+ENDFORM.

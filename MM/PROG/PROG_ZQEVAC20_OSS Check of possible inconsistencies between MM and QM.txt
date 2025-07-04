@@ -1,0 +1,585 @@
+
+REPORT zqevac20 LINE-SIZE 255 NO STANDARD PAGE HEADING.
+*&---------------------------------------------------------------------*
+*& Report  ZQEVAC20
+*&
+*&---------------------------------------------------------------------*
+* Check programm: compare inspection lot quantity via Q-stock quantity *
+*&---------------------------------------------------------------------*
+
+TABLES: qmat,
+        jest,
+        mara,
+        marc,
+        mard,
+        mkol,
+        mska,
+        mspr,
+        mchb,
+        qals,
+        t001l.
+
+
+*----------------------------------------------------------------------*
+INCLUDE <icon>.
+CONSTANTS:
+  c_prueflos       LIKE qals-prueflos   VALUE '999999999999',
+  c_q_best         LIKE qals-insmk      VALUE 'X',
+  c_kreuz          LIKE qm00-qkz        VALUE 'X'.
+*----------------------------------------------------------------------*
+SELECT-OPTIONS material FOR qmat-matnr MATCHCODE OBJECT mat1.
+SELECT-OPTIONS werk FOR qmat-werks.
+*----------------------------------------------------------------------*
+
+DATA:
+* inspection types
+  g_insp_types     LIKE tq32 OCCURS 0,
+* Table of materials
+  BEGIN OF g_mattab OCCURS 0,
+    matnr     LIKE qmat-matnr,
+    werks     LIKE qmat-werks,
+  END OF g_mattab,
+* Table of quantities
+  BEGIN OF g_besttab OCCURS 0,
+    matnr     LIKE qals-matnr,
+    werks     LIKE qals-werkvorg,
+    lgort     LIKE qals-lagortvorg,
+    charg     LIKE qals-charg,
+    sobkz     LIKE qals-sobkz,
+    lifnr     LIKE qals-lifnr,       "für SOBKZ = K
+    pspnr     LIKE qals-ps_psp_pnr,  "für SOBKZ = Q
+    kdauf     LIKE qals-kdauf,       "für SOBKZ = E
+    kdpos     LIKE qals-kdpos,       "für SOBKZ = E
+    mm_menge  LIKE qals-lmengezub,
+    qm_menge  LIKE qals-lmengezub,
+    meins     LIKE qals-mengeneinh,
+    prueflos  LIKE qals-prueflos,    "early inspection
+    ok        LIKE qm00-qkz,
+  END OF g_besttab,
+* storage locations
+  g_sloc_tab       TYPE STANDARD TABLE OF t001l,
+  gv_ewm_active    TYPE /spe/ctrl_is_active,
+*
+  g_field(30),
+  g_new_icon       LIKE icon_checked  VALUE  icon_checked,
+  g_ok             LIKE qm00-qkz,
+  g_data_available LIKE qm00-qkz,
+*
+  g_listi          LIKE sy-listi,
+  g_lilli          LIKE sy-lilli,
+*
+  end_of_data.
+*----------------------------------------------------------------------*
+************************************************************************
+
+START-OF-SELECTION.
+* Make sure that the report is running only once in a system
+  DATA:
+    l_message  LIKE sy-msgv1 VALUE 'Report is in usage by &'."#EC NOTEXT
+
+  CALL FUNCTION 'ENQUEUE_EQQALS1'
+    EXPORTING
+      prueflos     = c_prueflos
+    EXCEPTIONS
+      foreign_lock = 1.
+
+  IF NOT sy-subrc IS INITIAL.
+    REPLACE '&' WITH sy-msgv1 INTO l_message.
+    MESSAGE i208(00) WITH l_message.
+    SUBMIT (sy-repid) VIA SELECTION-SCREEN.
+  ENDIF.
+
+* possible inxpection types
+  SELECT * INTO TABLE g_insp_types FROM tq32
+         WHERE herkunft IN ('01', '04', '05', '08', '09').
+
+* read QMAT
+  SELECT  DISTINCT matnr werks
+          INTO CORRESPONDING FIELDS OF TABLE g_mattab
+          FROM qmat
+          FOR ALL ENTRIES IN  g_insp_types
+          WHERE  matnr       IN material
+          AND    werks       IN werk
+          AND    aktiv       = c_kreuz
+          AND    art         = g_insp_types-art
+          AND    afr         = space.            "HUM
+
+* read storage locations
+  IF NOT g_mattab[] IS INITIAL.
+    SELECT * FROM t001l INTO t001l
+             FOR ALL ENTRIES IN g_mattab
+             WHERE werks = g_mattab-werks.
+
+*     check stock is not EWM relevant
+     gv_ewm_active =
+     /spe/cl_ctrl=>is_ewm(         i_plant    = t001l-werks
+                                   i_stloc    = t001l-lgort ).
+*     add stock into table
+*     in case it is not HU revant and not EWM relevant
+      IF    t001l-xhupf   IS INITIAL
+        AND gv_ewm_active IS INITIAL.
+        APPEND t001l TO g_sloc_tab.
+      ENDIF.
+    ENDSELECT.
+  ENDIF.
+*
+  LOOP AT g_mattab.
+*
+    REFRESH g_besttab. CLEAR g_besttab.
+*----------------------------------------------------------------------*
+*   Q-stock of materials
+    IF NOT g_sloc_tab[] IS INITIAL.
+      PERFORM mm_best_lesen.
+    ENDIF.
+*----------------------------------------------------------------------*
+*   quantities of inspection lots
+    PERFORM lose_lesen.
+*   evaluate lots
+    LOOP AT g_besttab.
+      IF g_besttab-mm_menge NE g_besttab-qm_menge.
+*       different quatity. write info
+        WRITE:/(3) icon_change AS ICON HOTSPOT,
+               4 g_besttab-matnr,
+                 g_besttab-werks,
+                 g_besttab-lgort,
+                 g_besttab-charg,
+                 g_besttab-sobkz,
+                 g_besttab-mm_menge,                    "#EC UOM_IN_MES
+                 g_besttab-qm_menge,                    "#EC UOM_IN_MES
+                 g_besttab-lifnr,
+                 g_besttab-pspnr,
+                 g_besttab-kdauf,
+                 g_besttab-kdpos NO-ZERO.
+        HIDE: g_besttab.
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+* Initialize workarea
+  CLEAR g_besttab.
+
+************************************************************************
+END-OF-SELECTION.
+  IF g_data_available IS INITIAL.
+    WRITE: /20 icon_checked AS ICON,
+          'No differences between QM quantities and' NO-GAP, "#EC NOTEXT
+          ' MM quatities found'.                             "#EC NOTEXT
+  ENDIF.
+************************************************************************
+TOP-OF-PAGE.
+  ULINE.
+ WRITE:/'   Material          Plnt SLoc Batch      ' NO-GAP,"#EC NOTEXT
+          'S      MM-Quantity       QM-Quantity  ' NO-GAP,  "#EC NOTEXT
+          'Vendor     Project       Customer order'.        "#EC NOTEXT
+  ULINE.
+  MOVE c_kreuz TO g_data_available.
+
+************************************************************************
+AT LINE-SELECTION.
+  MOVE: sy-listi TO g_listi,
+        sy-lilli TO g_lilli.
+  GET CURSOR FIELD g_field.
+  CHECK g_field EQ 'ICON_CHANGE'.
+  CHECK g_besttab-ok IS INITIAL.
+* select line  -> g_besttab filled
+  IF g_besttab-mm_menge LT g_besttab-qm_menge.
+*   more QM quantity
+    PERFORM lose_korrigieren USING g_besttab-ok.
+  ELSE.
+*   more MM quantity
+    PERFORM bestand_korrigieren USING g_besttab-ok.
+  ENDIF.
+  IF g_besttab-ok NE space.
+*
+    READ LINE g_lilli INDEX g_listi.
+    MOVE 'X' TO g_besttab-ok.
+*   MODIFY LINE G_LILLI INDEX G_LISTI
+*          FIELD VALUE G_BESTTAB.
+*   change Icon to ok
+    TRANSLATE g_new_icon USING '@ '.
+    CONDENSE  g_new_icon NO-GAPS.
+    MODIFY LINE g_lilli INDEX g_listi
+           FIELD VALUE icon_change FROM g_new_icon.
+  ENDIF.
+  CLEAR g_besttab.
+************************************************************************
+*&---------------------------------------------------------------------*
+*&      Form  LOSE_LESEN
+*&---------------------------------------------------------------------*
+*    get the lots
+*----------------------------------------------------------------------*
+FORM lose_lesen.
+  DATA: l_objnr LIKE qals-objnr,
+        l_inact LIKE jest-inact,
+        l_xchpf LIKE qals-xchpf,
+        l_lifnr LIKE qals-lifnr,
+        l_kdauf LIKE qals-kdauf,
+        l_kdpos LIKE qals-kdpos,
+        l_pspnr LIKE qals-ps_psp_pnr,
+        l_stat18 LIKE qals-stat18,
+        l_prueflos LIKE qals-prueflos.
+
+  CLEAR g_besttab.
+
+*
+  SELECT    matnr werkvorg lagortvorg charg sobkz objnr
+            lifnr ps_psp_pnr kdauf kdpos  lmengezub xchpf
+            stat18 prueflos
+         INTO (g_besttab-matnr,g_besttab-werks,
+               g_besttab-lgort,g_besttab-charg,
+               g_besttab-sobkz,l_objnr,
+               l_lifnr,l_pspnr,l_kdauf,l_kdpos,
+               g_besttab-qm_menge,l_xchpf,
+               l_stat18,l_prueflos) FROM qals
+         FOR ALL ENTRIES IN g_sloc_tab
+         WHERE matnr      EQ g_mattab-matnr
+           AND werkvorg   EQ g_mattab-werks
+           AND werkvorg   EQ g_sloc_tab-werks
+           AND stat01     EQ c_kreuz
+           AND insmk      EQ c_q_best
+           AND stat34     EQ space
+           AND lmengezub  GT 0
+           AND lagortvorg EQ g_sloc_tab-lgort.
+    SELECT SINGLE inact FROM jest INTO l_inact
+           WHERE objnr EQ l_objnr
+             AND stat  EQ 'I0203'
+             AND inact EQ space.
+*   lot only relevant with active JEST-entry which is not active
+    IF sy-subrc IS INITIAL.
+      SELECT SINGLE inact FROM jest INTO l_inact
+             WHERE objnr EQ l_objnr
+               AND stat  EQ 'I0220'
+               AND inact EQ space.
+      IF NOT sy-subrc IS INITIAL.
+*       lot quantity is not comlete posted (redundant to STAT34)
+*       special stock ?
+        CLEAR: g_besttab-lifnr,
+               g_besttab-pspnr,
+               g_besttab-kdauf,
+               g_besttab-kdpos.
+        CASE g_besttab-sobkz.
+          WHEN space.
+          WHEN 'K'. MOVE l_lifnr TO g_besttab-lifnr.
+          WHEN 'Q'. MOVE l_pspnr TO g_besttab-pspnr.
+          WHEN 'E'.
+            MOVE l_kdauf TO g_besttab-kdauf.
+            MOVE l_kdpos TO g_besttab-kdpos.
+        ENDCASE.
+        IF    l_stat18 EQ 'Y'             "early insp.lot without batch
+          AND l_xchpf NE space
+          AND g_besttab-charg IS INITIAL .
+
+          MOVE l_prueflos TO g_besttab-prueflos.
+        ELSE.
+          CLEAR g_besttab-prueflos.
+        ENDIF.
+        COLLECT g_besttab.
+      ENDIF.
+    ENDIF.
+
+
+  ENDSELECT.
+
+ENDFORM.                               " LOSE_LESEN
+*&---------------------------------------------------------------------*
+*&      Form  MM_BEST_LESEN
+*&---------------------------------------------------------------------*
+*       Quantity per Material/Plant
+*----------------------------------------------------------------------*
+FORM mm_best_lesen.
+  DATA:
+    l_xchar    LIKE marc-xchar.
+
+  SELECT SINGLE xchar INTO (l_xchar) FROM marc
+         WHERE matnr   EQ g_mattab-matnr
+           AND werks   EQ g_mattab-werks.
+
+  IF l_xchar IS INITIAL.
+*   not batch controlled
+    CLEAR g_besttab.
+    MOVE-CORRESPONDING g_mattab TO g_besttab.
+    SELECT insme lgort INTO (g_besttab-mm_menge,g_besttab-lgort)
+           FROM mard
+           FOR ALL ENTRIES IN g_sloc_tab
+           WHERE matnr   EQ g_mattab-matnr
+             AND werks   EQ g_mattab-werks
+             AND werks   EQ g_sloc_tab-werks
+             AND lgort   EQ g_sloc_tab-lgort.
+      APPEND g_besttab.
+    ENDSELECT.
+
+  ELSE.
+* Batch controlled
+    CLEAR g_besttab.
+    MOVE-CORRESPONDING g_mattab TO g_besttab.
+    SELECT cinsm lgort charg
+           INTO (g_besttab-mm_menge,g_besttab-lgort,
+                 g_besttab-charg)
+           FROM mchb
+           FOR ALL ENTRIES IN g_sloc_tab
+           WHERE matnr   EQ g_mattab-matnr
+             AND werks   EQ g_mattab-werks
+             AND werks   EQ g_sloc_tab-werks
+             AND lgort   EQ g_sloc_tab-lgort.
+      APPEND g_besttab.
+    ENDSELECT.
+
+  ENDIF.
+* consignment stock
+  CLEAR g_besttab.
+  MOVE-CORRESPONDING g_mattab TO g_besttab.
+
+  SELECT sinsm lgort charg sobkz lifnr
+      INTO (g_besttab-mm_menge,g_besttab-lgort,
+            g_besttab-charg,g_besttab-sobkz,g_besttab-lifnr)
+      FROM mkol
+      FOR ALL ENTRIES IN g_sloc_tab
+      WHERE matnr   EQ g_mattab-matnr
+        AND werks   EQ g_mattab-werks
+        AND werks   EQ g_sloc_tab-werks
+        AND lgort   EQ g_sloc_tab-lgort.
+    APPEND g_besttab.
+  ENDSELECT.
+* sales order stock
+  CLEAR g_besttab.
+  MOVE-CORRESPONDING g_mattab TO g_besttab.
+
+  SELECT kains lgort charg sobkz vbeln posnr
+      INTO (g_besttab-mm_menge,g_besttab-lgort,
+            g_besttab-charg,g_besttab-sobkz,
+           g_besttab-kdauf,g_besttab-kdpos)
+      FROM mska
+      FOR ALL ENTRIES IN g_sloc_tab
+      WHERE matnr   EQ g_mattab-matnr
+        AND werks   EQ g_mattab-werks
+        AND werks   EQ g_sloc_tab-werks
+        AND lgort   EQ g_sloc_tab-lgort.
+    APPEND g_besttab.
+  ENDSELECT.
+* project stock
+  CLEAR g_besttab.
+  MOVE-CORRESPONDING g_mattab TO g_besttab.
+
+  SELECT prins lgort charg sobkz pspnr
+      INTO (g_besttab-mm_menge,g_besttab-lgort,
+      g_besttab-charg,g_besttab-sobkz,g_besttab-pspnr)
+      FROM mspr
+      FOR ALL ENTRIES IN g_sloc_tab
+      WHERE matnr   EQ g_mattab-matnr
+        AND werks   EQ g_mattab-werks
+        AND werks   EQ g_sloc_tab-werks
+        AND lgort   EQ g_sloc_tab-lgort.
+    APPEND g_besttab.
+  ENDSELECT.
+
+ENDFORM.                               " MM_BEST_LESEN
+
+*&---------------------------------------------------------------------*
+*&      Form  LOSE_KORRIGIEREN
+*&---------------------------------------------------------------------*
+*   Reduce open quantity for lot and update
+*----------------------------------------------------------------------*
+FORM lose_korrigieren USING p_ok LIKE qm00-qkz.
+  DATA:
+    l_subrc LIKE sy-subrc,
+    l_meins LIKE mara-meins,
+    l_kunnr LIKE qals-kunnr,           "Dummy
+    l_difmg LIKE qals-lmengezub.
+*
+  CLEAR p_ok.
+* get unit of measure
+  PERFORM hole_mara_meins USING g_besttab-matnr
+                          CHANGING l_meins.
+
+  l_difmg = g_besttab-qm_menge - g_besttab-mm_menge.
+*                      -> subtract
+  CALL FUNCTION 'QELA_LOT_QUANTITY_CORRECTIONS'
+       EXPORTING
+            i_matnr      =  g_besttab-matnr
+            i_charg      =  g_besttab-charg
+            i_difmg      =  l_difmg
+            i_meins      =  l_meins
+            i_werks      =  g_besttab-werks
+            i_lgort      =  g_besttab-lgort
+            i_sobkz      =  g_besttab-sobkz
+            i_kdauf      =  g_besttab-kdauf
+            i_kdpos      =  g_besttab-kdpos
+            i_lifnr      =  g_besttab-lifnr
+            i_ps_psp_pnr =  g_besttab-pspnr
+            i_kunnr      =  l_kunnr
+            i_insp_lot   =  g_besttab-prueflos
+*           I_WINX1_30   = 2
+*           I_WINX2_30   = 75
+*           I_WINY1_30   = 5
+*           I_WINY2_30   = 15
+       IMPORTING
+            e_subrc      = l_subrc.
+*       EXCEPTIONS
+*            no_authority  = 1.
+  IF NOT sy-subrc IS INITIAL.                            "#EC *
+    MESSAGE ID sy-msgid TYPE 'I' NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    EXIT.
+  ENDIF.
+
+  CASE l_subrc.
+    WHEN 0.
+      " Nothing to do
+    WHEN 4.
+      MESSAGE I164(QA).
+
+    WHEN 8.
+      MESSAGE I077(QA) WITH g_besttab-matnr
+                            g_besttab-charg
+                            g_besttab-werks
+                            g_besttab-lgort.
+
+    WHEN 12.
+      MESSAGE I078(QA) WITH g_besttab-matnr
+                            g_besttab-charg
+                            g_besttab-werks
+                            g_besttab-prueflos.
+
+    WHEN OTHERS.
+  ENDCASE.
+
+* if o.k.  ->  save !
+  IF l_subrc IS INITIAL.
+    COMMIT WORK AND WAIT.
+    MOVE c_kreuz TO p_ok.
+  ENDIF.
+
+ENDFORM.                    " LOSE_KORRIGIEREN
+
+*&---------------------------------------------------------------------*
+*&      Form  HOLE_MARA_MEINS
+*&---------------------------------------------------------------------*
+*       Get        unit
+*----------------------------------------------------------------------*
+*      --> P_MATNR
+*      <-- P_MEINS
+*----------------------------------------------------------------------*
+FORM hole_mara_meins USING    p_matnr
+                     CHANGING p_meins.
+  STATICS:
+    s_matnr  LIKE mara-matnr,
+    s_meins  LIKE mara-meins.
+  IF p_matnr NE s_matnr.
+    MOVE p_matnr TO s_matnr.
+    SELECT SINGLE meins INTO (s_meins) FROM mara
+                  WHERE matnr EQ s_matnr.
+  ENDIF.
+  MOVE s_meins TO p_meins.
+ENDFORM.                    " HOLE_MARA_MEINS
+
+*&---------------------------------------------------------------------*
+*&      Form  bestand_korrigieren
+*&---------------------------------------------------------------------*
+*       Special routine for quantity correction in quality stock
+*----------------------------------------------------------------------*
+FORM bestand_korrigieren USING p_ok LIKE qm00-qkz.
+
+  DATA:
+    l_meins  LIKE mara-meins,
+    l_difmg  LIKE qals-lmengezub,
+    l_rmqed  LIKE rmqed,
+    l_qals   LIKE qals.
+*
+  CLEAR p_ok.
+*
+  l_difmg = g_besttab-mm_menge - g_besttab-qm_menge.
+
+* get unit of measure
+  PERFORM hole_mara_meins USING g_besttab-matnr
+                          CHANGING l_meins.
+*
+  DATA:
+    l_text(80),
+    l_imkpf    LIKE imkpf,
+    l_imseg    LIKE imseg,
+    l_imsegtab LIKE imseg OCCURS 1,
+    l_emkpf    LIKE emkpf,
+    l_emseg    LIKE emseg,
+    l_emsegtab LIKE emseg OCCURS 1,
+    p_t156     LIKE t156.
+*   material doc. header
+  MOVE : sy-datum TO l_imkpf-bldat,
+         sy-datum TO l_imkpf-budat,
+         'Correction doc. through QM'(111) TO l_imkpf-bktxt."#EC NOTEXT
+*
+*   Canc÷l-posting for quality -> unrestricted (check TQ07M)
+  MOVE: '321'             TO l_imseg-bwart.
+
+* Check IF p_t156-KZGRU is '+' and fill imseg-grund with 0001
+  SELECT SINGLE * FROM t156 INTO p_t156
+                  WHERE bwart  EQ '321'.
+  IF p_t156-KZGRU EQ '+' AND sy-subrc EQ 0.
+    MOVE: '0001' TO l_imseg-grund.
+  ENDIF.
+
+*   additional fields
+  MOVE : g_besttab-matnr    TO l_imseg-matnr,
+         g_besttab-werks    TO l_imseg-werks,
+         l_meins            TO l_imseg-erfme,
+         l_difmg            TO l_imseg-erfmg,
+         g_besttab-charg    TO l_imseg-charg,
+         g_besttab-lgort    TO l_imseg-lgort,
+         g_besttab-sobkz    TO l_imseg-sobkz,
+         g_besttab-lifnr    TO l_imseg-lifnr,
+         g_besttab-pspnr    TO l_imseg-mat_pspnr,
+         g_besttab-kdauf    TO l_imseg-mat_kdauf,
+         g_besttab-kdpos    TO l_imseg-mat_kdpos.
+*
+  APPEND l_imseg TO l_imsegtab.
+*
+* Temporary deactivation of QM in MM !
+  CALL FUNCTION 'QAAT_QM_ACTIVE_INACTIVE'
+    EXPORTING
+      aktiv = space.
+  CALL FUNCTION 'MB_CREATE_GOODS_MOVEMENT'
+    EXPORTING
+      imkpf = l_imkpf
+      xallp = c_kreuz
+      xallr = c_kreuz
+      ctcod = 'MB11'
+      xqmcl = c_kreuz
+    IMPORTING
+      emkpf = l_emkpf
+    TABLES
+      imseg = l_imsegtab
+      emseg = l_emsegtab.
+* Reactivation of QM in MM !
+  CALL FUNCTION 'QAAT_QM_ACTIVE_INACTIVE'
+    EXPORTING
+      aktiv = c_kreuz.
+*   Check posting
+  IF    NOT l_emkpf-subrc LE 1.
+    IF NOT l_emkpf-msgno IS INITIAL.
+      MESSAGE ID l_emkpf-msgid  TYPE 'I' NUMBER l_emkpf-msgno
+        WITH l_emkpf-msgv1 l_emkpf-msgv2 l_emkpf-msgv3 l_emkpf-msgv4.
+*     Error
+      EXIT.
+    ENDIF.
+    LOOP AT l_emsegtab INTO l_emseg.
+      IF NOT l_emseg-msgno IS INITIAL.
+*       Error in stock posting
+        MESSAGE ID l_emseg-msgid  TYPE 'I' NUMBER l_emseg-msgno
+          WITH l_emseg-msgv1 l_emseg-msgv2 l_emseg-msgv3 l_emseg-msgv4.
+*       Error
+        EXIT.
+      ENDIF.
+    ENDLOOP.
+  ELSE.
+*   o.k., -> save !
+    CALL FUNCTION 'MB_POST_GOODS_MOVEMENT'.
+    COMMIT WORK AND WAIT.
+    MOVE c_kreuz TO p_ok.
+  ENDIF.
+ENDFORM.                    " bestand_korrigieren.
+.
+*&---------------------------------------------------------------------*
+*& Report  ZQEVAC20
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*

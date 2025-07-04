@@ -1,0 +1,457 @@
+***********************************************************************
+* TIPO : LISTADO
+* TITULO : Procesamiento mensajes de entrada pendientes
+* DESCRIPCION : Procesamiento mensajes de entrada pendientes
+*
+* AUTOR: Andrés Picazo                                FECHA: 19/05/2014
+* ANALISTA: Alfredo García
+*
+* MODIFICACIONES
+*
+***********************************************************************
+REPORT zwhs_in_proc.
+
+*------INCLUDES--------------------------------------------------------*
+
+*------TABLAS/ESTRUCTURAS----------------------------------------------*
+TABLES: zwhs_monitor_sel, zwhs_interlocuto, sscrfields.
+
+*------TABLAS INTERNAS-------------------------------------------------*
+TYPES: t_listado TYPE zwhs_monitor.
+DATA: i_listado   TYPE TABLE OF t_listado,
+      i_list_mail TYPE TABLE OF t_listado,
+      l_listado   TYPE t_listado.
+
+FIELD-SYMBOLS <listado> TYPE t_listado.
+
+*----------------------------------------------------------------------*
+* CLASS lcl_alv DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv DEFINITION INHERITING FROM zcl_ap_alv_check.
+  PUBLIC SECTION.
+    METHODS: handle_double_click REDEFINITION.
+    METHODS: handle_user_command REDEFINITION.
+    METHODS: top_of_page REDEFINITION.
+ENDCLASS. "lcl_alv DEFINITION
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report DEFINITION INHERITING FROM zcl_ap_dev.
+  PUBLIC SECTION.
+    METHODS: main.
+
+    METHODS:  listado,
+      seleccionar_datos,
+      ejecutar,
+      enviar_mail.
+
+ENDCLASS.                    "REPORT DEFINITION
+
+
+*------VARIABLES-------------------------------------------------------*
+DATA: o_prog TYPE REF TO zcl_report,
+      o_alv  TYPE REF TO lcl_alv.
+
+*------PARAMETER/SELECT-OPTIONS EN PANTALLA----------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK 001 WITH FRAME.
+PARAMETERS: p_idcli LIKE zwhs_interlocuto-idcliente DEFAULT 'WHS' OBLIGATORY.
+SELECT-OPTIONS: s_idcola FOR zwhs_monitor_sel-idcola,
+                s_idmsg  FOR zwhs_monitor_sel-idmsg,
+                s_estado FOR zwhs_monitor_sel-estado,
+                s_objkey FOR zwhs_monitor_sel-objkey,
+                s_fechac FOR zwhs_monitor_sel-fecha_creacion,
+                s_usuari FOR zwhs_monitor_sel-usuario,
+                s_entre  FOR zwhs_monitor_sel-entrega,
+                s_matnr  FOR zwhs_monitor_sel-matnr,
+                s_charg  FOR zwhs_monitor_sel-charg,
+                s_exidv  FOR zwhs_monitor_sel-exidv,
+                s_pendi  FOR zwhs_monitor_sel-pendiente,
+                s_e_s    FOR zwhs_monitor_sel-e_s.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS: p_ejec AS CHECKBOX,
+            p_mail TYPE string.
+SELECTION-SCREEN: SKIP 1.
+PARAMETERS: p_vari LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK 001.
+SELECTION-SCREEN: FUNCTION KEY 2,
+                  FUNCTION KEY 3,
+                  FUNCTION KEY 4.
+
+
+************************************************************************
+*
+* LOGICA DEL PROGRAMA
+*
+************************************************************************
+
+*----------------------------------------------------------------------*
+* CLASS lcl_alv IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv IMPLEMENTATION.
+  METHOD handle_double_click.
+    DATA: l_existe,
+          i_fichero TYPE TABLE OF string,
+          l_fichero TYPE string.
+
+    READ TABLE i_listado INTO l_listado INDEX row.
+    IF sy-subrc = 0.
+      CASE column.
+        WHEN 'FICHERO'.
+          IF NOT l_listado-fichero IS INITIAL.
+            IF zcl_ap_ficheros=>existe( l_listado-fichero ) = 'X'.
+              l_existe = 'X'.
+              zcl_ap_ficheros=>ver_fichero_texto( l_listado-fichero ).
+            ENDIF.
+          ENDIF.
+          IF l_existe IS INITIAL.
+            zcl_ap_string=>string2tabla( EXPORTING string = l_listado-contenido_ficher
+                                                   longitud = 10000
+                                         CHANGING  tabla = i_fichero ).
+
+            l_fichero = zcl_ap_documentos=>get_directorio_temporal( ).
+            l_fichero = zcl_ap_ficheros=>concat_ruta( directorio = l_fichero
+                                                 fichero    = 'mensaje.txt' ).
+            zcl_ap_ficheros=>grabar_fichero( EXPORTING fichero = l_fichero
+                                             CHANGING  tabla   = i_fichero ).
+            zcl_ap_ficheros=>ver_fichero_texto( l_fichero ).
+          ENDIF.
+        WHEN 'MATNR' OR 'MAKTX'.
+          zcl_ap_material=>visualizar( l_listado-matnr ).
+        WHEN 'CHARG'.
+          zcl_ap_clas_lote=>ver_mat_lote( matnr = l_listado-matnr
+                                         charg = l_listado-charg ).
+        WHEN 'EXIDV'.
+          zcl_ap_hu=>visualizar( exidv = l_listado-exidv ).
+        WHEN 'ENTREGA'.
+          zcl_ap_entregas=>visualizar( l_listado-entrega ).
+        WHEN OTHERS.
+          zwhs=>muestra_msg( idcola = l_listado-idcola editar = 'X' ).
+      ENDCASE.
+    ENDIF.
+  ENDMETHOD. "handle_double_click
+  METHOD handle_user_command.
+    DATA: l_row TYPE i.
+
+    CASE e_salv_function.
+      WHEN 'EXCEL'.
+        exportar_excel( ).
+      WHEN 'CREAR'..
+        get_seleccion( ).
+        o_prog->ejecutar( ).
+        refresh( ).
+
+      WHEN OTHERS.
+    ENDCASE.
+  ENDMETHOD. "handle_USER_COMMAND
+  METHOD top_of_page.
+    CLEAR o_content.
+
+    o_top_page->set_titulo( sy-title ).
+
+    o_top_page->add_rango_auto( ).
+*    o_top_page->add_rango( texto = 'Centro' rango = s_vbeln[] ).
+    o_top_page->crea_info_seleccion( ).
+
+    o_content = o_top_page->get_grid( ).
+
+  ENDMETHOD.                    "top_of_page
+ENDCLASS. "lcl_alv IMPLEMENTATION
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report IMPLEMENTATION.
+  METHOD main.
+
+
+    seleccionar_datos( ).
+
+    IF p_ejec = 'X'.
+      ejecutar( ).
+
+      IF NOT p_mail IS INITIAL.
+        CLEAR i_list_mail.
+        LOOP AT i_listado ASSIGNING <listado> WHERE lights = zcl_ap_alv=>c_sem_rojo.
+          APPEND <listado> TO i_list_mail.
+        ENDLOOP.
+        IF sy-subrc = 0.
+          enviar_mail( ).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    IF NOT i_listado IS INITIAL OR sy-batch IS INITIAL.
+      listado( ).
+    ENDIF.
+
+  ENDMETHOD.                    "REPORT
+
+  METHOD seleccionar_datos.
+
+    sgpi_texto( 'Leyendo datos' ).
+
+    i_listado = zwhs=>select_cola( idcliente   = p_idcli
+                                   r_idcola    = s_idcola[]
+                                   r_idmsg     = s_idmsg[]
+                                   r_estado    = s_estado[]
+                                   r_objkey    = s_objkey[]
+                                   r_fechac    = s_fechac[]
+                                   r_usuario   = s_usuari[]
+                                   r_pendiente = s_pendi[]
+                                   r_entrega   = s_entre[]
+                                   r_matnr     = s_matnr[]
+                                   r_charg     = s_charg[]
+                                   r_exidv     = s_exidv[]
+                                   r_e_s       = s_e_s[] ).
+
+    LOOP AT i_listado ASSIGNING <listado>.
+      <listado>-check = p_ejec.
+    ENDLOOP.
+    sgpi_texto( texto1 = 'Fin selección mensajes' texto2 = lines( i_listado ) ).
+
+** Aprovechamos este trabajo que siempre está corriendo para actualizar el lote previamente creado
+*    DATA: i_verdu TYPE TABLE OF zmigo_badi_verdu,
+*          l_ctd_bd TYPE mengv13.
+*
+*    sgpi_texto( 'Seleccionando Lotes verduras pendientes' ).
+*    FIELD-SYMBOLS <verdu> TYPE zmigo_badi_verdu.
+*    SELECT * FROM zmigo_badi_verdu
+*      INTO TABLE i_verdu
+*     WHERE lote_act = ''
+*       AND peso_medio_pes NE 0.
+*
+*    LOOP AT i_verdu ASSIGNING <verdu>.
+*
+*      l_ctd_bd = zcl_ap_clas_lote=>get_caract_mat_lote( matnr  = <verdu>-matnr
+*                                                        charg  = <verdu>-charg
+*                                                        caract = 'PESO_X_ENVASE'
+*                                                        opt    = 'X'
+*                                                         ).
+*
+*      IF l_ctd_bd = 0.
+*        zcl_ap_clas_lote=>set_caract_mat_lote( matnr  = <verdu>-matnr
+*                                               charg  = <verdu>-charg
+*                                               caract = 'PESO_X_ENVASE'
+*                                               valor  = <verdu>-peso_medio_pes ).
+*
+*        l_ctd_bd = zcl_ap_clas_lote=>get_caract_mat_lote( matnr  = <verdu>-matnr
+*                                                          charg  = <verdu>-charg
+*                                                          caract = 'PESO_X_ENVASE'
+*                                                          opt    = 'X'
+*                                                           ).
+*      ENDIF.
+*
+*      IF l_ctd_bd NE 0.
+*        UPDATE zmigo_badi_verdu
+*           SET lote_act = 'X'
+*               WHERE  mblnr  = <verdu>-mblnr
+*               AND    mjahr  = <verdu>-mjahr
+*               AND    zeile  = <verdu>-zeile.
+*      ENDIF.
+*    ENDLOOP.
+*    sgpi_texto( 'Fin proceso lotes verduras pendientes' ).
+
+  ENDMETHOD.                    "seleccionar_datos
+
+  METHOD ejecutar.
+    DATA: l_cola      TYPE zwhs_cola,
+          l_regenerar.
+
+    LOOP AT i_listado ASSIGNING <listado> WHERE check = 'X'.
+
+      sgpi_texto( texto1 = 'Procesando mensaje' texto2 = <listado>-idmsg texto3 = <listado>-idcola ).
+
+      IF <listado>-e_s = 'S' AND <listado>-estado NE 'X' AND zwhs_interlocuto-envio_msg_inm = 'X'.
+* Si encontramos un mensaje más reciendo procesado, lo actualizamos a ok automáticamente
+        CLEAR l_regenerar.
+
+        IF <listado>-contenido_ficher IS INITIAL AND <listado>-contenido_zip IS INITIAL.
+          l_regenerar = 'X'.
+        ENDIF.
+
+        SELECT SINGLE * FROM zwhs_cola
+          INTO l_cola
+         WHERE idcola > <listado>-idcola
+           AND objkey = <listado>-objkey
+           AND idmsg  = <listado>-idmsg
+           AND estado = 'X'.
+        IF sy-subrc = 0.
+          UPDATE zwhs_cola
+             SET estado = 'X'
+           WHERE idcola = <listado>-idcola.
+        ELSE.
+          zwhs=>cola_2_fichero( EXPORTING idcola           = <listado>-idcola
+                                          verificar_estado = ''
+                                          regenerar = l_regenerar
+                                IMPORTING ruta             = <listado>-fichero
+                                          mensaje          = <listado>-mensaje ).
+        ENDIF.
+      ENDIF.
+
+      IF <listado>-e_s = 'E' AND <listado>-estado NE 'X'.
+        zwhs=>procesa_msg( EXPORTING idcola  = <listado>-idcola
+                                     tcode   = 'ZWHS_MONITOR'
+                                     forzar_reproceso = 'X'
+                           IMPORTING mensaje = <listado>-mensaje ).
+      ENDIF.
+
+      zwhs=>update_cola_mem( CHANGING monitor = <listado> ).
+
+      sgpi_texto( texto1 = 'Fin proceso mensaje' texto2 = <listado>-idmsg texto3 = <listado>-idcola ).
+
+    ENDLOOP.
+
+  ENDMETHOD.                    "EJECUTAR
+
+  METHOD enviar_mail.
+    DATA: o_mail   TYPE REF TO zcl_ap_envio_mail,
+          l_string TYPE string.
+
+    sgpi_texto( 'Enviando mail aviso' ).
+
+    CREATE OBJECT o_mail.
+
+    o_mail->cabecera_html( ).
+
+    o_mail->add_parrafo_html( 'Se han producido errores en reproceso mensajes de entrada' ).
+
+    o_mail->set_text( '<font size="2">' ).
+    o_mail->inicio_tabla_html( longitud = 1024
+                               c1 = 'NºCola'
+                               c2 = 'Tipo mensaje'
+                               c3 = 'Descripción error' ).
+
+    LOOP AT i_list_mail ASSIGNING <listado>.
+      o_mail->add_fila_html( c1 = <listado>-idcola
+                             c2 = <listado>-idmsg
+                             c3 = <listado>-mensaje ).
+    ENDLOOP.
+
+    o_mail->fin_tabla_html( ).
+    o_mail->set_text( '</font>' ).
+    o_mail->set_text( '</body></html>' ).
+
+    CALL METHOD o_mail->envio_mail
+      EXPORTING
+        direccion = p_mail
+        subject   = 'Se han producido errores en reproceso mensajes de entrada'
+        html      = 'X'.
+
+    o_mail->free( ).
+    CLEAR o_mail.
+
+  ENDMETHOD.                    "ENVIAR_MAIL
+
+
+  METHOD listado.
+
+    CHECK sy-batch IS INITIAL. "En fondo no imprimimos ALV
+
+    sgpi_texto( 'Generando informe' ).
+
+    o_alv->set_layout( p_vari ).
+
+    o_alv->set_top_of_page( ).
+
+    o_alv->set_seleccion( CHANGING t_tabla = i_listado ).
+
+    o_alv->show( ).
+
+
+  ENDMETHOD.                    "
+
+ENDCLASS.                    "REPORT IMPLEMENTATION
+
+*----------------------------------------------------------------------*
+* INITIALIZATION
+*----------------------------------------------------------------------*
+INITIALIZATION.
+
+  CREATE OBJECT o_prog
+    EXPORTING
+      status        = 'INICIO'
+      get_nombre_pc = 'X'.
+
+  CREATE OBJECT o_alv
+    EXPORTING
+      status = 'STANDARD'
+      lights = 'LIGHTS'.
+  p_vari = o_alv->get_default_layout( ).
+
+  o_prog->initialization( EXPORTING nombre_pc = o_prog->nombre_pc CHANGING sscrfields = sscrfields ).
+
+  CLEAR s_estado.
+  s_estado-option = 'EQ'.
+  s_estado-sign   = 'E'.
+  s_estado-low    = 'X'.
+  COLLECT s_estado.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_vari.
+
+  p_vari = o_alv->get_f4_layout( ).
+
+************************************************************************
+* AT SELECTION-SCREEN.
+************************************************************************
+AT SELECTION-SCREEN.
+
+  o_prog->at_selection(  ).
+
+  SELECT SINGLE * FROM zwhs_interlocuto
+   WHERE idcliente = p_idcli.
+  IF sy-subrc NE 0.
+    MESSAGE 'No existe el interlocutor' TYPE 'E'.
+  ENDIF.
+
+*----------------------------------------------------------------------
+* START-OF-SELECTION.
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  DATA: l_num_jobs TYPE i.
+
+  IF p_idcli = 'WHS'.
+    IF sy-slset = 'JOB_ZPD'.
+      l_num_jobs = zcl_ap_jobs=>num_job_activos( 'ZSE_WHS_REPROCESOS_ZPD' ).
+    ELSEIF sy-slset = 'JOB'.
+      l_num_jobs = zcl_ap_jobs=>num_job_activos( 'ZSE_WHS_REPROCESOS' ).
+    ELSE.
+      l_num_jobs = zcl_ap_jobs=>num_job_activos( 'ZSE_WHS_REPROCESOS' ).
+    ENDIF.
+  ELSEIF p_idcli = 'TET'.
+    IF sy-slset = 'TETRA_PTS'.
+      l_num_jobs = zcl_ap_jobs=>num_job_activos( 'ZSE_TETRA_REPROCESOS_PTS' ).
+
+    ELSEIF sy-slset = 'TETRA_NO_PTS'.
+      l_num_jobs = zcl_ap_jobs=>num_job_activos( 'ZSE_TETRA_REPROCESOS_RESTO' ).
+    ENDIF.
+  ENDIF.
+  IF ( sy-batch = 'X' AND l_num_jobs > 1 ) OR
+     ( sy-batch = '' AND l_num_jobs > 0 ).
+    MESSAGE 'Saliendo debido a que hay otro job activo' TYPE 'I'.
+    STOP.
+  ENDIF.
+
+  IF sy-batch = 'X'.
+    IF zwhs_interlocuto-rec_msg_inm IS INITIAL.
+      MESSAGE 'La recepción de msg. parada a nivel de interlocutor' TYPE 'I'.
+      LEAVE PROGRAM.
+    ENDIF.
+  ENDIF.
+
+  CLEAR s_estado.
+  s_estado-option = 'EQ'.
+  s_estado-sign   = 'E'.
+  s_estado-low    = 'X'.
+  COLLECT s_estado.
+
+  o_prog->main( ).

@@ -1,0 +1,1484 @@
+FUNCTION zsd_if_omp_trip_planning.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(INPUT_METHOD) LIKE  BDWFAP_PAR-INPUTMETHD
+*"     VALUE(MASS_PROCESSING) LIKE  BDWFAP_PAR-MASS_PROC
+*"  EXPORTING
+*"     VALUE(WORKFLOW_RESULT) LIKE  BDWF_PARAM-RESULT
+*"     VALUE(APPLICATION_VARIABLE) LIKE  BDWF_PARAM-APPL_VAR
+*"     VALUE(IN_UPDATE_TASK) LIKE  BDWFAP_PAR-UPDATETASK
+*"     VALUE(CALL_TRANSACTION_DONE) LIKE  BDWFAP_PAR-CALLTRANS
+*"  TABLES
+*"      IDOC_CONTRL STRUCTURE  EDIDC
+*"      IDOC_DATA STRUCTURE  EDIDD
+*"      IDOC_STATUS STRUCTURE  BDIDOCSTAT
+*"      RETURN_VARIABLES STRUCTURE  BDWFRETVAR
+*"      SERIALIZATION_INFO STRUCTURE  BDI_SER
+*"  EXCEPTIONS
+*"      WRONG_FUNCTION_CALLED
+*"----------------------------------------------------------------------
+  DATA: tl_trip_planning    TYPE TABLE OF zsd_s_trip_planning,
+        wl_trip_planning    TYPE zsd_s_trip_planning,
+        wl_fbtripactiondata TYPE zfbtripactiondata.
+
+  DATA: tl_itemdata         TYPE TABLE OF bapishipmentitem,
+        wl_itemdata         TYPE bapishipmentitem,
+        tl_return           TYPE TABLE OF bapiret2,
+        wl_return           TYPE bapiret2,
+        wl_headerdata       TYPE bapishipmentheader,
+        wl_headerdataaction TYPE bapishipmentheaderaction.
+
+  DATA: vl_fecha_reparto TYPE vbak-vdatu,
+        vl_delivery      TYPE bapishpdelivnumb-deliv_numb,
+        tl_sales_order   TYPE TABLE OF bapidlvreftosalesorder,
+        wl_sales_order   LIKE LINE OF tl_sales_order.
+
+  DATA: vl_transport    TYPE bapishipmentids-shipmentnum,
+        vl_shipmentguid TYPE bapishipmentids-guid.
+
+  DATA: vl_error           TYPE xflag,
+        wl_zssd_if_omp_cfg TYPE zssd_if_omp_cfg.
+
+  DATA: tl_stock_trans_items TYPE TABLE OF bapidlvreftosto,
+        wl_stock_trans_items LIKE LINE OF tl_stock_trans_items,
+        tl_deliveries        TYPE TABLE OF bapishpdelivnumb.
+
+  DATA: tl_items_sc TYPE zssd_if_omp_t_dlv_create_item,
+        wl_items_sc TYPE zssd_if_omp_s_dlv_create_item.
+
+  DATA wl_zssd_if_omp_tp_d TYPE zssd_if_omp_tp_d.
+
+  DATA: tl_zssd_if_omp_tp_r TYPE TABLE OF zssd_if_omp_tp_r,
+        wl_zssd_if_omp_tp_r LIKE LINE OF tl_zssd_if_omp_tp_r.
+
+  DATA: vl_texto_transporte TYPE string,
+        vl_texto_delivery   TYPE string.
+
+  DATA(lo_log) =  NEW zcl_seidor_guardar_log( ).
+
+  "
+  " Buscamos el registro con los datos del transporte.
+  "
+  DATA: vl_continuar TYPE xflag,
+        wl_edidd     TYPE edidd,
+        wl_tripdata  TYPE zfbtripdata.
+  READ TABLE idoc_data INTO wl_edidd WITH KEY segnam = 'ZFBTRIPDATA' .
+  IF sy-subrc <> 0.
+    CLEAR wl_edidd.
+  ENDIF.
+  wl_tripdata = wl_edidd-sdata.
+
+  vl_continuar = 'X'.
+  IF wl_tripdata-tripstatus IS INITIAL.
+    CLEAR vl_continuar.
+    APPEND INITIAL LINE TO idoc_status ASSIGNING FIELD-SYMBOL(<stat>).
+    <stat>-msgty = 'E'.
+    <stat>-msgid = 'SY'.
+    <stat>-msgno = 499.
+    <stat>-msgv1 = 'Campo status en blanco. No se puede procesar el mensaje'.
+*    <stat>-msgv2 = wa_return-message_v2.
+*    <stat>-msgv3 = wa_return-message_v3.
+*    <stat>-msgv4 = wa_return-message_v4.
+  ELSEIF wl_tripdata-tripstatus <> 'Launched' AND wl_tripdata-tripstatus <> 'Canceled'.
+    CLEAR vl_continuar.
+    APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+    <stat>-msgty = 'I'.
+    <stat>-msgid = 'SY'.
+    <stat>-msgno = 499.
+    <stat>-msgv1 = 'Campo status distinto de "Launched" o "Canceled". No se realiza ninguna acción'.
+  ENDIF.
+  IF wl_tripdata-tripid IS INITIAL.
+    CLEAR vl_continuar.
+    APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+    <stat>-msgty = 'E'.
+    <stat>-msgid = 'SY'.
+    <stat>-msgno = 499.
+    <stat>-msgv1 = 'Falta campo obligatorio TripID'.
+  ENDIF.
+  IF wl_tripdata-tripstatus = 'Canceled'.
+    "************************************************************************************
+    " Acciones para cancelar un transporte.
+    "************************************************************************************
+    CLEAR vl_error.
+
+    " Borramos las entregas.
+
+    CALL FUNCTION 'ZSD_IF_OMP_DLT_DLV'
+      EXPORTING
+        vp_tripid = wl_tripdata-tripid
+        vp_docnum = idoc_contrl-docnum
+      IMPORTING
+        tp_return = tl_return.
+    LOOP AT tl_return INTO wl_return WHERE type <> 'S' AND type <> 'I'.
+      vl_error = 'X'.
+
+      APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+      <stat>-msgty = wl_return-type.
+      <stat>-msgid = wl_return-id.
+      <stat>-msgno = wl_return-number.
+      <stat>-msgv1 = wl_return-message_v1.
+      <stat>-msgv2 = wl_return-message_v2.
+      <stat>-msgv3 = wl_return-message_v3.
+      <stat>-msgv4 = wl_return-message_v4.
+    ENDLOOP.
+
+    IF vl_error IS INITIAL.
+      " Borramos el transporte.
+
+      SELECT SINGLE *
+        FROM zssd_if_omp_tp
+        INTO @DATA(wl_transporte)
+        WHERE tripid = @wl_tripdata-tripid AND
+              borrado = ''.
+
+      CLEAR tl_return.
+
+      CLEAR: wl_headerdata, wl_headerdataaction.
+      wl_headerdata-shipment_num = wl_transporte-tknum.
+      wl_headerdataaction-shipment_num = 'D'.
+
+      CALL FUNCTION 'BAPI_SHIPMENT_CHANGE'
+        EXPORTING
+          headerdata       = wl_headerdata
+          headerdataaction = wl_headerdataaction
+        TABLES
+*         itemdata         = tl_itemdata
+*         itemdataaction   = tl_itemdataaction
+          return           = tl_return.
+
+      LOOP AT tl_return INTO wl_return WHERE type <> 'S' AND type <> 'I'.
+        vl_error = 'X'.
+
+        APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+        <stat>-msgty = wl_return-type.
+        <stat>-msgid = wl_return-id.
+        <stat>-msgno = wl_return-number.
+        <stat>-msgv1 = wl_return-message_v1.
+        <stat>-msgv2 = wl_return-message_v2.
+        <stat>-msgv3 = wl_return-message_v3.
+        <stat>-msgv4 = wl_return-message_v4.
+      ENDLOOP.
+
+      IF vl_error IS INITIAL.
+        UPDATE zssd_if_omp_tp
+        SET borrado = 'X'
+            docnum_borrado = idoc_contrl-docnum
+            usumod = sy-uname
+            aedat = sy-datum
+            aezet = sy-uzeit
+        WHERE tknum = wl_transporte-tknum AND
+              tripid = wl_transporte-tripid.
+
+        DELETE FROM zssd_if_omp_tp_r
+        WHERE tripid = wl_transporte-tripid.
+
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+
+
+        APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+        <stat>-msgty = 'I'.
+        <stat>-msgid = 'SY'.
+        <stat>-msgno = 499.
+        <stat>-msgv1 = 'Se ha borrado el transporte'.
+        <stat>-msgv2 = wl_transporte-tknum.
+
+      ENDIF.
+
+    ENDIF.
+
+  ELSEIF wl_tripdata-tripstatus = 'Launched'.
+    "************************************************************************************
+    " Acciones para crear un transporte.
+    "************************************************************************************
+    CLEAR wl_zssd_if_omp_cfg.
+    "
+    " Buscamos el texto a crear en el transporte.
+    "
+    DATA wl_zfbtripdata2 TYPE zfbtripdata2.
+    CLEAR: wl_zfbtripdata2, vl_texto_transporte, vl_texto_delivery.
+    READ TABLE idoc_data INTO wl_edidd WITH KEY segnam = 'ZFBTRIPDATA2' .
+    IF sy-subrc = 0.
+      wl_zfbtripdata2 = wl_edidd-sdata.
+    ELSE.
+      CLEAR wl_zfbtripdata2.
+    ENDIF.
+    vl_texto_transporte = wl_zfbtripdata2-loadingcomments.
+    vl_texto_delivery = wl_zfbtripdata2-dlycomments.
+    "
+    " Calculamos información de las entregas a crear.
+    "
+    LOOP AT idoc_data INTO wl_edidd WHERE segnam = 'ZFBTRIPACTIONDATA'.
+      CHECK vl_continuar IS NOT INITIAL.
+
+      wl_fbtripactiondata = wl_edidd-sdata.
+
+      CHECK wl_fbtripactiondata-action = 'Drop'.
+
+      CLEAR wl_trip_planning.
+      wl_trip_planning-tripid = wl_fbtripactiondata-tripid.
+      wl_trip_planning-transportrequirementid = wl_fbtripactiondata-transportrequirementid.
+      wl_trip_planning-quantity = wl_fbtripactiondata-quantity.
+      CALL FUNCTION 'ZSD_IF_OMP_GET_UM_FROM_OMP'
+        EXPORTING
+          vp_mseh6 = wl_fbtripactiondata-quantity_uom
+        IMPORTING
+          vp_meins = wl_trip_planning-quantity_uom.
+
+      wl_trip_planning-goodsid = wl_fbtripactiondata-goodsid.
+
+      SELECT SINGLE *
+        FROM zssd_if_omp_tr
+        INTO @DATA(wl_if_omp_tr)
+        WHERE num_req = @wl_trip_planning-transportrequirementid.
+      IF sy-subrc = 4.
+        " RMM 04.10.2024.
+        " dado de alta de forma manual en OMP.
+        " Si existe en SAP, adelante...
+        "
+        CLEAR wl_if_omp_tr.
+        wl_if_omp_tr-num_req = wl_trip_planning-transportrequirementid.
+        wl_if_omp_tr-usucre = sy-uname.
+        wl_if_omp_tr-erdat = sy-datum.
+        wl_if_omp_tr-erzet = sy-uzeit.
+
+        SPLIT wl_trip_planning-transportrequirementid AT '.' INTO wl_if_omp_tr-vbeln wl_if_omp_tr-posnr wl_if_omp_tr-etenr.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wl_if_omp_tr-vbeln
+          IMPORTING
+            output = wl_if_omp_tr-vbeln.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wl_if_omp_tr-posnr
+          IMPORTING
+            output = wl_if_omp_tr-posnr.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wl_if_omp_tr-etenr
+          IMPORTING
+            output = wl_if_omp_tr-etenr.
+
+        SELECT SINGLE *
+          INTO @DATA(ls_vbep_tmp)
+          FROM vbep
+          WHERE vbeln = @wl_if_omp_tr-vbeln AND
+                posnr = @wl_if_omp_tr-posnr AND
+                etenr = @wl_if_omp_tr-etenr.
+      ENDIF.
+      IF sy-subrc = 4.
+        CLEAR wl_if_omp_tr.
+        wl_if_omp_tr-num_req = wl_trip_planning-transportrequirementid.
+        wl_if_omp_tr-usucre = sy-uname.
+        wl_if_omp_tr-erdat = sy-datum.
+        wl_if_omp_tr-erzet = sy-uzeit.
+
+        SPLIT wl_trip_planning-transportrequirementid AT '.' INTO wl_if_omp_tr-ebeln wl_if_omp_tr-ebelp wl_if_omp_tr-etenr.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wl_if_omp_tr-ebeln
+          IMPORTING
+            output = wl_if_omp_tr-ebeln.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wl_if_omp_tr-ebelp
+          IMPORTING
+            output = wl_if_omp_tr-ebelp.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wl_if_omp_tr-etenr
+          IMPORTING
+            output = wl_if_omp_tr-etenr.
+
+        SELECT SINGLE *
+          INTO @DATA(ls_eket_tmp)
+          FROM eket
+          WHERE ebeln = @wl_if_omp_tr-ebeln AND
+                ebelp = @wl_if_omp_tr-ebelp AND
+                etenr = @wl_if_omp_tr-etenr.
+      ENDIF.
+      IF sy-subrc = 0.
+        MODIFY zssd_if_omp_tr FROM wl_if_omp_tr.
+
+        wl_trip_planning-vbeln = wl_if_omp_tr-vbeln.
+        wl_trip_planning-posnr = wl_if_omp_tr-posnr.
+        wl_trip_planning-etenr = wl_if_omp_tr-etenr.
+        wl_trip_planning-ebeln = wl_if_omp_tr-ebeln.
+        wl_trip_planning-ebelp = wl_if_omp_tr-ebelp.
+        CLEAR wl_trip_planning-tipo.
+        IF wl_trip_planning-vbeln IS NOT INITIAL.
+          wl_trip_planning-tipo = 'SO'.
+        ENDIF.
+        IF wl_trip_planning-ebeln IS NOT INITIAL.
+          wl_trip_planning-tipo = 'PO'.
+          SELECT SINGLE *
+            FROM ekpo
+            INTO @DATA(wl_ekpo_tipo)
+            WHERE ebeln = @wl_trip_planning-ebeln AND
+                  ebelp = @wl_trip_planning-ebelp AND
+                  pstyp = 3.
+          IF sy-subrc = 0.
+            wl_trip_planning-tipo = 'SC'.
+          ENDIF.
+        ENDIF.
+
+        IF wl_trip_planning-tipo = 'SO'.
+          SELECT SINGLE vstel
+            INTO wl_trip_planning-vstel
+            FROM vbap
+            WHERE vbeln = wl_if_omp_tr-vbeln AND
+                  posnr = wl_if_omp_tr-posnr.
+          "
+          " Si no nos llega UM, asumimos la del pedido.
+          "
+          IF wl_trip_planning-quantity_uom IS INITIAL.
+            SELECT SINGLE vrkme
+            INTO wl_trip_planning-quantity_uom
+            FROM vbap
+            WHERE vbeln = wl_if_omp_tr-vbeln AND
+                  posnr = wl_if_omp_tr-posnr.
+          ENDIF.
+          "
+          " Recuperamos el destinatario de la mercancía.
+          "
+          DATA wl_vbpa_dest TYPE vbpa.
+          CLEAR wl_vbpa_dest.
+          SELECT SINGLE *
+            FROM vbpa
+            INTO wl_vbpa_dest
+            WHERE vbeln = wl_if_omp_tr-vbeln AND
+                  posnr = wl_if_omp_tr-posnr AND
+                  parvw = 'WE'.
+          IF sy-subrc <> 0.
+            SELECT SINGLE *
+              FROM vbpa
+              INTO wl_vbpa_dest
+              WHERE vbeln = wl_if_omp_tr-vbeln AND
+                    posnr = '000000' AND
+                    parvw = 'WE'.
+          ENDIF.
+          IF sy-subrc <> 0.
+            CLEAR wl_vbpa_dest.
+          ENDIF.
+          wl_trip_planning-kunnr = wl_vbpa_dest-kunnr.
+
+          "
+          " Recuperamos el tipo de transporte a crear
+          "
+          IF wl_zssd_if_omp_cfg IS INITIAL.
+            SELECT SINGLE *
+              INTO @DATA(wl_vbap)
+              FROM vbap
+              INNER JOIN t320 ON ( t320~werks = vbap~werks AND t320~lgort = vbap~werks )
+              WHERE vbeln = @wl_if_omp_tr-vbeln AND
+                    posnr = @wl_if_omp_tr-posnr.
+
+
+            SELECT SINGLE *
+              INTO wl_zssd_if_omp_cfg
+              FROM zssd_if_omp_cfg
+              WHERE lgnum = wl_vbap-t320-lgnum.
+          ENDIF.
+        ENDIF.
+        IF wl_trip_planning-tipo = 'PO' OR wl_trip_planning-tipo = 'SC'.
+          IF wl_trip_planning-quantity_uom IS INITIAL.
+            SELECT SINGLE meins
+            INTO wl_trip_planning-quantity_uom
+            FROM ekpo
+            WHERE ebeln = wl_if_omp_tr-ebeln AND
+                  ebelp = wl_if_omp_tr-ebelp.
+          ENDIF.
+          IF wl_trip_planning-tipo = 'PO'.
+            "
+            " Recuperamos el destinatario de la mercancía.
+            "
+            SELECT SINGLE *
+              FROM ekpv
+              INTO @DATA(wl_ekpv)
+              WHERE ebeln = @wl_if_omp_tr-ebeln AND
+                    ebelp = @wl_if_omp_tr-ebelp.
+            IF sy-subrc <> 0.
+              CLEAR wl_ekpv.
+            ENDIF.
+            wl_trip_planning-kunnr = wl_ekpv-kunnr.
+            wl_trip_planning-vstel = wl_ekpv-vstel.
+          ELSE.
+            "
+            " Para subcontratacion no tenemos datos de expdición en el pedido.
+            "
+            SELECT SINGLE *
+              FROM ekko
+              INTO @DATA(wl_ekko)
+              WHERE ebeln = @wl_if_omp_tr-ebeln.
+            IF sy-subrc = 0.
+              SELECT SINGLE *
+                FROM ekpo
+                INTO @DATA(wl_ekpo)
+                WHERE ebeln = @wl_if_omp_tr-ebeln AND
+                      ebelp = @wl_if_omp_tr-ebelp.
+            ENDIF.
+            IF sy-subrc = 0.
+              SELECT SINGLE *
+                FROM kna1
+                INTO @DATA(wl_kna1_prov)
+                WHERE lifnr = @wl_ekko-lifnr.
+            ENDIF.
+            IF sy-subrc = 0.
+              wl_trip_planning-kunnr = wl_kna1_prov-kunnr.
+            ENDIF.
+
+            SELECT SINGLE *
+              FROM knvv
+              INTO @DATA(wl_knvv)
+              WHERE kunnr = @wl_trip_planning-kunnr AND
+                    vkorg = '2000' AND
+                    vtweg = '10' AND
+                    spart = '10'.
+            IF sy-subrc = 0.
+              SELECT SINGLE *
+                FROM marc
+                INTO @DATA(wl_marc)
+                WHERE matnr = @wl_trip_planning-goodsid AND
+                      werks = @wl_ekpo-werks.
+            ENDIF.
+            IF sy-subrc = 0.
+              SELECT SINGLE *
+                FROM tvstz
+                INTO @DATA(wl_tvstz)
+                WHERE vsbed = @wl_knvv-vsbed AND
+                      ladgr = @wl_marc-ladgr AND
+                      werks = @wl_ekpo-werks.
+            ENDIF.
+            IF sy-subrc = 0.
+              wl_trip_planning-vstel = wl_tvstz-vstel.
+            ENDIF.
+          ENDIF.
+
+          "
+          " Recuperamos el tipo de transporte a crear
+          "
+          IF wl_zssd_if_omp_cfg IS INITIAL.
+            SELECT SINGLE *
+              INTO @DATA(wl_ekpo_cfg)
+              FROM ekpo
+              INNER JOIN t320 ON ( t320~werks = ekpo~werks AND t320~lgort = ekpo~werks )
+              WHERE ebeln = @wl_if_omp_tr-ebeln AND
+                    ebelp = @wl_if_omp_tr-ebelp.
+
+
+            SELECT SINGLE *
+              INTO wl_zssd_if_omp_cfg
+              FROM zssd_if_omp_cfg
+              WHERE lgnum = wl_ekpo_cfg-t320-lgnum.
+          ENDIF.
+        ENDIF.
+      ELSE.
+        CLEAR vl_continuar.
+        " Error, no tenemos el TR Id.
+        APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+        <stat>-msgty = 'E'.
+        <stat>-msgid = 'SY'.
+        <stat>-msgno = 499.
+        <stat>-msgv1 = 'No se ha encontrado el Transport Requirement Id'.
+        <stat>-msgv2 = wl_trip_planning-transportrequirementid.
+
+      ENDIF.
+
+      APPEND wl_trip_planning TO tl_trip_planning.
+    ENDLOOP.
+    "
+    " Validamos situación de los documentos.
+    "
+    SORT tl_trip_planning BY kunnr tipo vstel.
+    LOOP AT tl_trip_planning INTO wl_trip_planning.
+      CHECK vl_continuar IS NOT INITIAL.
+      IF wl_trip_planning-tipo = 'SO'.
+        " Contra pedido de venta.
+        SELECT SINGLE *
+          FROM vbuv
+          INTO @DATA(ls_vbuv)
+          WHERE vbeln = @wl_trip_planning-vbeln.
+        IF sy-subrc = 0.
+          CLEAR vl_continuar.
+          APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+          <stat>-msgty = 'E'.
+          <stat>-msgid = 'SY'.
+          <stat>-msgno = 499.
+          <stat>-msgv1 = 'Pedido incompleto (actualice el pedido)'.
+          <stat>-msgv2 = wl_trip_planning-vbeln.
+        ENDIF.
+        SELECT SINGLE *
+          FROM vbup
+          INTO @DATA(ls_vbup)
+          WHERE vbeln = @wl_trip_planning-vbeln AND
+                posnr = @wl_trip_planning-posnr.
+        IF sy-subrc = 0 AND ls_vbup-gbsta = 'C'.
+          CLEAR vl_continuar.
+          APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+          <stat>-msgty = 'E'.
+          <stat>-msgid = 'SY'.
+          <stat>-msgno = 499.
+          <stat>-msgv1 = 'Posición documento concluida'.
+          <stat>-msgv2 = wl_trip_planning-vbeln.
+          <stat>-msgv3 = wl_trip_planning-posnr.
+        ENDIF.
+        SELECT SINGLE *
+          FROM vbuk
+          INTO @DATA(ls_vbuk)
+          WHERE vbeln = @wl_trip_planning-vbeln.
+        IF sy-subrc = 0 AND ls_vbuk-cmgst CA 'BC'.
+          CLEAR vl_continuar.
+          APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+          <stat>-msgty = 'E'.
+          <stat>-msgid = 'SY'.
+          <stat>-msgno = 499.
+          <stat>-msgv1 = 'Pedido bloqueado por crédito'.
+          <stat>-msgv2 = wl_trip_planning-vbeln.
+        ENDIF.
+      ELSE.
+        " Contra pedido de compra.
+        SELECT SINGLE *
+          FROM ekpo
+          INTO @DATA(ls_ekpo)
+          WHERE ebeln = @wl_trip_planning-ebeln AND
+                ebelp = @wl_trip_planning-ebelp.
+        IF sy-subrc = 0 AND ls_ekpo-elikz IS NOT INITIAL.
+          CLEAR vl_continuar.
+          APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+          <stat>-msgty = 'E'.
+          <stat>-msgid = 'SY'.
+          <stat>-msgno = 499.
+          <stat>-msgv1 = 'Posición documento concluida'.
+          <stat>-msgv2 = wl_trip_planning-ebeln.
+          <stat>-msgv3 = wl_trip_planning-ebelp.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    "
+    " Sin errores, continuamos con las creaciones
+    "
+    IF vl_continuar IS NOT INITIAL.
+
+      CLEAR tl_itemdata.
+
+      CLEAR vl_error.
+
+      SORT tl_trip_planning BY kunnr tipo vstel.
+      LOOP AT tl_trip_planning INTO wl_trip_planning.
+        AT NEW vstel.
+          CLEAR: tl_sales_order, tl_stock_trans_items, tl_zssd_if_omp_tp_r.
+        ENDAT.
+
+        IF wl_trip_planning-tipo = 'SO'.
+          CLEAR wl_sales_order.
+          " Añadimos los datos de la posición anterior
+          wl_sales_order-ref_doc = wl_trip_planning-vbeln.
+          wl_sales_order-ref_item = wl_trip_planning-posnr.
+          wl_sales_order-dlv_qty = wl_trip_planning-quantity.
+          wl_sales_order-sales_unit = wl_trip_planning-quantity_uom.
+          APPEND wl_sales_order TO tl_sales_order.
+          "
+          " RMM 05.06.24 Contemplar KITs
+          "
+          SELECT SINGLE *
+            FROM vbap
+            INTO @DATA(wl_vbap_kit)
+            WHERE vbeln = @wl_trip_planning-vbeln AND
+                  posnr = @wl_trip_planning-posnr.
+          IF sy-subrc = 0 AND wl_vbap_kit-uepos IS NOT INITIAL.
+            READ TABLE tl_sales_order ASSIGNING FIELD-SYMBOL(<fs_sales_order_kit>)
+            WITH KEY ref_doc = wl_trip_planning-vbeln
+                     ref_item = wl_vbap_kit-uepos.
+            IF sy-subrc <> 0.
+              CLEAR wl_sales_order.
+              " Añadimos los datos de la posición anterior
+              wl_sales_order-ref_doc = wl_trip_planning-vbeln.
+              wl_sales_order-ref_item = wl_vbap_kit-uepos.
+              wl_sales_order-dlv_qty = wl_trip_planning-quantity.
+              wl_sales_order-sales_unit = wl_trip_planning-quantity_uom.
+              APPEND wl_sales_order TO tl_sales_order.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+        IF wl_trip_planning-tipo = 'PO'.
+          CLEAR wl_stock_trans_items.
+          " Añadimos los datos de la posición anterior
+          wl_stock_trans_items-ref_doc = wl_trip_planning-ebeln.
+          wl_stock_trans_items-ref_item = wl_trip_planning-ebelp.
+          wl_stock_trans_items-dlv_qty = wl_trip_planning-quantity.
+          wl_stock_trans_items-sales_unit = wl_trip_planning-quantity_uom.
+          APPEND wl_stock_trans_items TO tl_stock_trans_items.
+        ENDIF.
+        IF wl_trip_planning-tipo = 'SC'.
+          CLEAR wl_items_sc.
+          " Añadimos los datos de la posición anterior
+          wl_items_sc-ref_doc = wl_trip_planning-ebeln.
+          wl_items_sc-ref_item = wl_trip_planning-ebelp.
+          wl_items_sc-dlv_qty = wl_trip_planning-quantity.
+          wl_items_sc-sales_unit = wl_trip_planning-quantity_uom.
+          wl_items_sc-matnr = wl_trip_planning-goodsid.
+          APPEND wl_items_sc TO tl_items_sc.
+        ENDIF.
+
+        CLEAR wl_zssd_if_omp_tp_r.
+        wl_zssd_if_omp_tp_r-num_req = wl_trip_planning-transportrequirementid.
+        APPEND wl_zssd_if_omp_tp_r TO tl_zssd_if_omp_tp_r.
+
+
+        AT END OF vstel.
+
+          DATA lt_created_items TYPE TABLE OF bapidlvitemcreated.
+
+          CLEAR: lt_created_items, lt_created_items.
+
+          CHECK vl_error IS INITIAL.
+
+          IF wl_trip_planning-tipo = 'SO'.
+            "
+            " Creamos entrega.
+            "
+            CLEAR vl_fecha_reparto.
+            vl_fecha_reparto = '99991231'.
+
+            CALL FUNCTION 'BAPI_OUTB_DELIVERY_CREATE_SLS'
+              EXPORTING
+                due_date          = vl_fecha_reparto
+              IMPORTING
+                delivery          = vl_delivery
+              TABLES
+                sales_order_items = tl_sales_order
+                deliveries        = tl_deliveries
+                created_items     = lt_created_items
+                return            = tl_return.
+
+            LOOP AT tl_return INTO wl_return WHERE type <> 'S' AND type <> 'I'.
+              vl_error = 'X'.
+
+              APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+              <stat>-msgty = wl_return-type.
+              <stat>-msgid = wl_return-id.
+              <stat>-msgno = wl_return-number.
+              <stat>-msgv1 = wl_return-message_v1.
+              <stat>-msgv2 = wl_return-message_v2.
+              <stat>-msgv3 = wl_return-message_v3.
+              <stat>-msgv4 = wl_return-message_v4.
+              EXIT.
+            ENDLOOP.
+            IF vl_error IS NOT INITIAL.
+              SORT tl_sales_order BY ref_doc.
+              LOOP AT tl_sales_order INTO DATA(ls_sales_order).
+                AT NEW ref_doc.
+*                  APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+*                  <stat>-msgty = 'E'.
+*                  <stat>-msgid = 'SY'.
+*                  <stat>-msgno = 499.
+*                  <stat>-msgv1 = 'Los errores siguientes afectan al pedido'.
+*                  <stat>-msgv2 = ls_sales_order-ref_doc.
+
+                  idoc_status-msgty = 'E'.
+                  idoc_status-msgid = 'SY'.
+                  idoc_status-msgno = 499.
+                  idoc_status-msgv1 = 'Error en pedido'.
+                  idoc_status-msgv2 = ls_sales_order-ref_doc.
+                  APPEND idoc_status.
+                ENDAT.
+              ENDLOOP.
+            ENDIF.
+
+            "
+            " Añadir entrega al nuevo transporte.
+            "
+            IF vl_error IS INITIAL.
+              LOOP AT tl_deliveries ASSIGNING FIELD-SYMBOL(<fs_delivery>).
+                CLEAR wl_itemdata.
+                wl_itemdata-delivery = <fs_delivery>-deliv_numb.
+                APPEND wl_itemdata TO tl_itemdata.
+
+                "
+                " Añadimos la nueva entrega al log.
+                "
+                CLEAR wl_zssd_if_omp_tp_d.
+                wl_zssd_if_omp_tp_d-tripid = wl_tripdata-tripid.
+                wl_zssd_if_omp_tp_d-docnum = idoc_contrl-docnum.
+                wl_zssd_if_omp_tp_d-vbeln = <fs_delivery>-deliv_numb.
+                wl_zssd_if_omp_tp_d-usucre = sy-uname.
+                wl_zssd_if_omp_tp_d-erdat = sy-datum.
+                wl_zssd_if_omp_tp_d-erzet = sy-uzeit.
+                INSERT zssd_if_omp_tp_d FROM wl_zssd_if_omp_tp_d.
+
+                "
+                " Nos guardamos los requisitos que se sirven en el transporte.
+                "
+                LOOP AT tl_zssd_if_omp_tp_r INTO wl_zssd_if_omp_tp_r.
+                  wl_zssd_if_omp_tp_r-tripid = wl_tripdata-tripid.
+                  wl_zssd_if_omp_tp_r-usucre = sy-uname.
+                  wl_zssd_if_omp_tp_r-erdat = sy-datum.
+                  wl_zssd_if_omp_tp_r-erzet = sy-uzeit.
+                  INSERT zssd_if_omp_tp_r FROM wl_zssd_if_omp_tp_r.
+                ENDLOOP.
+
+                APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+                <stat>-msgty = 'I'.
+                <stat>-msgid = 'SY'.
+                <stat>-msgno = 499.
+                <stat>-msgv1 = 'Se ha creado la entrega'.
+                <stat>-msgv2 = <fs_delivery>-deliv_numb.
+
+                COMMIT WORK.
+
+              ENDLOOP.
+            ENDIF.
+
+            IF vl_error IS INITIAL.
+              "
+              " Comprobar que se han creado entregas para todos los pedidos.
+              " Lo hago ahora, ya que así tengo las sí creadas en la tabla de trabajo.
+              LOOP AT tl_sales_order INTO wl_sales_order.
+                READ TABLE lt_created_items ASSIGNING FIELD-SYMBOL(<fs_created_item>)
+                WITH KEY ref_doc = wl_sales_order-ref_doc ref_item = wl_sales_order-ref_item.
+                IF sy-subrc <> 0.
+                  vl_error = 'X'.
+
+                  APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+                  <stat>-msgty = 'E'.
+                  <stat>-msgid = 'SY'.
+                  <stat>-msgno = 499.
+                  <stat>-msgv1 = 'No se ha creado la entrega para el pedido '.
+                  <stat>-msgv2 = wl_sales_order-ref_doc.
+                  <stat>-msgv3 = wl_sales_order-ref_item.
+                  EXIT.
+                ENDIF.
+              ENDLOOP.
+
+            ENDIF.
+          ENDIF.
+
+          IF wl_trip_planning-tipo = 'PO'.
+            "
+            " Creamos entrega.
+            "
+            DATA vl_ship_point TYPE  bapidlvcreateheader-ship_point.
+
+            vl_ship_point = wl_trip_planning-vstel.
+
+            CLEAR vl_fecha_reparto.
+            vl_fecha_reparto = '99991231'.
+
+            CLEAR: tl_deliveries, lt_created_items.
+            CALL FUNCTION 'BAPI_OUTB_DELIVERY_CREATE_STO'
+              EXPORTING
+                ship_point        = vl_ship_point
+                due_date          = vl_fecha_reparto
+*               DEBUG_FLG         =
+*               NO_DEQUEUE        = ' '
+*             IMPORTING
+*               DELIVERY          =
+*               NUM_DELIVERIES    =
+              TABLES
+                stock_trans_items = tl_stock_trans_items
+                deliveries        = tl_deliveries
+                created_items     = lt_created_items
+                return            = tl_return.
+
+            LOOP AT tl_return INTO wl_return WHERE type <> 'S' AND type <> 'I'.
+              vl_error = 'X'.
+
+              APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+              <stat>-msgty = wl_return-type.
+              <stat>-msgid = wl_return-id.
+              <stat>-msgno = wl_return-number.
+              <stat>-msgv1 = wl_return-message_v1.
+              <stat>-msgv2 = wl_return-message_v2.
+              <stat>-msgv3 = wl_return-message_v3.
+              <stat>-msgv4 = wl_return-message_v4.
+            ENDLOOP.
+
+            IF vl_error IS NOT INITIAL.
+              SORT tl_stock_trans_items BY ref_doc.
+              LOOP AT tl_stock_trans_items INTO DATA(ls_stock_trans_items).
+                AT NEW ref_doc.
+*                  APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+*                  <stat>-msgty = 'E'.
+*                  <stat>-msgid = 'SY'.
+*                  <stat>-msgno = 499.
+*                  <stat>-msgv1 = 'Los errores siguientes afectan al pedido'.
+*                  <stat>-msgv2 = ls_stock_trans_items-ref_doc.
+
+
+                  idoc_status-msgty = 'E'.
+                  idoc_status-msgid = 'SY'.
+                  idoc_status-msgno = 499.
+                  idoc_status-msgv1 = 'Error en pedido'.
+                  idoc_status-msgv2 = ls_stock_trans_items-ref_doc.
+                  APPEND idoc_status.
+                ENDAT.
+              ENDLOOP.
+            ENDIF.
+
+            "
+            " Añadir entrega al nuevo transporte.
+            "
+            IF vl_error IS INITIAL.
+              LOOP AT tl_deliveries ASSIGNING <fs_delivery>.
+                CLEAR wl_itemdata.
+                wl_itemdata-delivery = <fs_delivery>-deliv_numb.
+                APPEND wl_itemdata TO tl_itemdata.
+
+                "
+                " Añadimos la nueva entrega al log.
+                "
+                CLEAR wl_zssd_if_omp_tp_d.
+                wl_zssd_if_omp_tp_d-tripid = wl_tripdata-tripid.
+                wl_zssd_if_omp_tp_d-docnum = idoc_contrl-docnum.
+                wl_zssd_if_omp_tp_d-vbeln = <fs_delivery>-deliv_numb.
+                wl_zssd_if_omp_tp_d-usucre = sy-uname.
+                wl_zssd_if_omp_tp_d-erdat = sy-datum.
+                wl_zssd_if_omp_tp_d-erzet = sy-uzeit.
+                INSERT zssd_if_omp_tp_d FROM wl_zssd_if_omp_tp_d.
+
+                APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+                <stat>-msgty = 'I'.
+                <stat>-msgid = 'SY'.
+                <stat>-msgno = 499.
+                <stat>-msgv1 = 'Se ha creado la entrega'.
+                <stat>-msgv2 = <fs_delivery>-deliv_numb.
+
+                COMMIT WORK.
+
+              ENDLOOP.
+            ENDIF.
+            IF vl_error IS INITIAL.
+              "
+              " Comprobar que se han creado entregas para todos los pedidos.
+              " Lo hago ahora, ya que así tengo las sí creadas en la tabla de trabajo.
+              LOOP AT tl_stock_trans_items INTO wl_stock_trans_items.
+                READ TABLE lt_created_items ASSIGNING <fs_created_item>
+                WITH KEY ref_doc = wl_stock_trans_items-ref_doc ref_item = wl_stock_trans_items-ref_item.
+                IF sy-subrc <> 0.
+                  vl_error = 'X'.
+
+                  APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+                  <stat>-msgty = 'E'.
+                  <stat>-msgid = 'SY'.
+                  <stat>-msgno = 499.
+                  <stat>-msgv1 = 'No se ha creado la entrega para el pedido '.
+                  <stat>-msgv2 = wl_stock_trans_items-ref_doc.
+                  <stat>-msgv3 = wl_stock_trans_items-ref_item.
+                  EXIT.
+                ENDIF.
+              ENDLOOP.
+
+            ENDIF.
+          ENDIF.
+          IF wl_trip_planning-tipo = 'SC'.
+
+            vl_fecha_reparto = '99991231'.
+
+            LOOP AT tl_items_sc ASSIGNING FIELD-SYMBOL(<fs_item>).
+              SELECT MAX( eindt )
+                FROM eket
+                INTO vl_fecha_reparto
+                WHERE ebeln = <fs_item>-ref_doc AND
+                      ebelp = <fs_item>-ref_item.
+            ENDLOOP.
+
+            DATA: vl_deliv_numb TYPE  vbeln_vl.
+            CALL FUNCTION 'ZSD_IF_OMP_DELIVERY_CREATE_SC'
+              EXPORTING
+                vp_kunnr      = wl_trip_planning-kunnr
+                vp_vstel      = wl_trip_planning-vstel
+                vp_due_date   = vl_fecha_reparto
+                tp_items      = tl_items_sc
+              IMPORTING
+                vp_deliv_numb = vl_deliv_numb
+                tp_return     = tl_return.
+
+            LOOP AT tl_return INTO wl_return WHERE type <> 'S' AND type <> 'I'.
+              vl_error = 'X'.
+
+              APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+              <stat>-msgty = wl_return-type.
+              <stat>-msgid = wl_return-id.
+              <stat>-msgno = wl_return-number.
+              <stat>-msgv1 = wl_return-message_v1.
+              <stat>-msgv2 = wl_return-message_v2.
+              <stat>-msgv3 = wl_return-message_v3.
+              <stat>-msgv4 = wl_return-message_v4.
+            ENDLOOP.
+
+            IF vl_error IS NOT INITIAL.
+              SORT tl_items_sc BY ref_doc.
+              LOOP AT tl_items_sc INTO DATA(ls_items_sc).
+                AT NEW ref_doc.
+*                  APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+*                  <stat>-msgty = 'E'.
+*                  <stat>-msgid = 'SY'.
+*                  <stat>-msgno = 499.
+*                  <stat>-msgv1 = 'Los errores siguientes afectan al pedido'.
+*                  <stat>-msgv2 = ls_items_sc-ref_doc.
+
+                  idoc_status-msgty = 'E'.
+                  idoc_status-msgid = 'SY'.
+                  idoc_status-msgno = 499.
+                  idoc_status-msgv1 = 'Error en pedido'.
+                  idoc_status-msgv2 = ls_items_sc-ref_doc.
+                  APPEND idoc_status.
+                ENDAT.
+              ENDLOOP.
+            ENDIF.
+
+            "
+            " Añadir entrega al nuevo transporte.
+            "
+            IF vl_error IS INITIAL.
+
+              CLEAR wl_itemdata.
+              wl_itemdata-delivery = vl_deliv_numb.
+              APPEND wl_itemdata TO tl_itemdata.
+
+              "
+              " Añadimos la nueva entrega al log.
+              "
+              CLEAR wl_zssd_if_omp_tp_d.
+              wl_zssd_if_omp_tp_d-tripid = wl_tripdata-tripid.
+              wl_zssd_if_omp_tp_d-docnum = idoc_contrl-docnum.
+              wl_zssd_if_omp_tp_d-vbeln = vl_deliv_numb.
+              wl_zssd_if_omp_tp_d-usucre = sy-uname.
+              wl_zssd_if_omp_tp_d-erdat = sy-datum.
+              wl_zssd_if_omp_tp_d-erzet = sy-uzeit.
+              INSERT zssd_if_omp_tp_d FROM wl_zssd_if_omp_tp_d.
+
+              APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+              <stat>-msgty = 'I'.
+              <stat>-msgid = 'SY'.
+              <stat>-msgno = 499.
+              <stat>-msgv1 = 'Se ha creado la entrega'.
+              <stat>-msgv2 = vl_deliv_numb.
+
+              COMMIT WORK.
+
+            ENDIF.
+
+          ENDIF.
+
+        ENDAT.
+      ENDLOOP.
+
+
+      IF vl_error IS INITIAL.
+        "
+        " Necesito hacer commit para poder crear el transporte con las entregas.
+        "
+        CALL FUNCTION 'DB_COMMIT'.
+        CALL FUNCTION 'DEQUEUE_ALL'.
+        COMMIT WORK.
+
+        WAIT UP TO 1 SECONDS.
+
+        "
+        " Creamos transporte.
+        "
+        CLEAR: wl_headerdata, vl_transport, vl_shipmentguid.
+        FREE  tl_return.
+
+        wl_headerdata-shipment_type     = wl_zssd_if_omp_cfg-shtyp. "'Z005'.
+        wl_headerdata-trans_plan_pt     = wl_zssd_if_omp_cfg-tplst. "'2000'.
+*    wl_headerdata-service_agent_id  = vp_lifnr.
+        IF wl_headerdata-shipment_type IS INITIAL.
+          wl_headerdata-shipment_type = 'Z005'.
+        ENDIF.
+        IF wl_headerdata-trans_plan_pt IS INITIAL.
+          wl_headerdata-trans_plan_pt = '2000'.
+        ENDIF.
+        wl_headerdata-status_plan = 'X'.
+        wl_headerdata-external_id_2 = wl_tripdata-tripid.
+
+        "
+        " Visto en reunión del día 11.06.2023
+        " Si CarrierID = 15, significa que es por sus medios y ponemos tipo de transporte Z006.
+        " Si CarrierID = 74, significa que es un generico y debemos dejar el proveedor de servicios en blanco. y tipo Z005.
+        " En CarrierERPID nos tiene que llegar el código de SAP.
+        "
+        IF wl_tripdata-carrierid = '15'.
+          wl_headerdata-shipment_type = 'Z006'.
+        ENDIF.
+        IF wl_tripdata-carrierid <> '74'.
+          DATA vl_lifnr TYPE lifnr.
+
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING
+              input  = wl_tripdata-erpcarrierid
+            IMPORTING
+              output = vl_lifnr.
+
+          SELECT SINGLE *
+            FROM lfa1
+            INTO @DATA(wl_lfa1)
+            WHERE lifnr = @vl_lifnr.
+          IF sy-subrc = 0.
+            wl_headerdata-service_agent_id = vl_lifnr.
+          ENDIF.
+        ENDIF.
+
+        DATA: tl_headerdeadline TYPE TABLE OF bapishipmentheaderdeadline,
+              wl_headerdeadline LIKE LINE OF tl_headerdeadline.
+
+*Actually, structure HEADERDEADLINE must be filled in accordance with the following rule:
+*
+*TIME_TYPE = logical time --> to be filled with fixed values:
+*
+*TIME_TYPE = HDRSTPLDT --> Date/time of end of planning
+*
+*TIME_TYPE = HDRSTCIPDT --> PLANNED date/time of check-in
+*TIME_TYPE = HDRSTCIADT --> ACTUAL date/time of check-in
+*
+*TIME_TYPE = HDRSTLSPDT --> PLANNED date/time of loading start
+*TIME_TYPE = HDRSTLSADT --> ACTUAL date/time of loading start
+*
+*TIME_TYPE = HDRSTLEPDT --> PLANNED date/time of loading end
+*TIME_TYPE = HDRSTLEADT --> ACTUAL date/time of loading end
+*
+*TIME_TYPE = HDRSTCPDT --> PLANNED date/time of shipment completion
+*TIME_TYPE = HDRSTCADT --> ACTUAL date/time of shipment completion
+*
+*TIME_TYPE = HDRSTSSPDT --> PLANNED date/time of shipment start
+*TIME_TYPE = HDRSTSSADT --> ACTUAL date/time of shipment start
+*
+*TIME_TYPE = HDRSTSEPDT --> PLANNED date/time of shipment end
+*TIME_TYPE = HDRSTSEADT --> ACTUAL date/time of shipment end
+
+        DATA: vl_fechahora TYPE timestamp,
+              tz           TYPE timezone.
+
+        CLEAR: tl_headerdeadline, wl_headerdeadline.
+
+        CALL FUNCTION 'GET_SYSTEM_TIMEZONE'
+          IMPORTING
+            timezone = tz.
+
+        wl_headerdeadline-time_zone = 'UTC'. "tz.
+
+        wl_headerdeadline-time_type = 'HDRSTCIPDT'. " Registro
+        CALL FUNCTION 'ZSD_IF_OMP_EXTRAER_DATETIME'
+          EXPORTING
+            vp_datetime  = wl_tripdata-startloaddate
+          IMPORTING
+*           VP_FECHA     =
+*           VP_HORA      =
+            vp_fechahora = vl_fechahora
+          EXCEPTIONS
+            input_error  = 1
+            OTHERS       = 2.
+        IF sy-subrc = 0.
+          wl_headerdeadline-time_stamp_utc = vl_fechahora.
+          APPEND wl_headerdeadline TO tl_headerdeadline.
+        ENDIF.
+
+
+        wl_headerdeadline-time_type = 'HDRSTLSPDT'. " Inicio carga
+        CALL FUNCTION 'ZSD_IF_OMP_EXTRAER_DATETIME'
+          EXPORTING
+            vp_datetime  = wl_tripdata-startloaddate
+          IMPORTING
+*           VP_FECHA     =
+*           VP_HORA      =
+            vp_fechahora = vl_fechahora
+          EXCEPTIONS
+            input_error  = 1
+            OTHERS       = 2.
+        IF sy-subrc = 0.
+          wl_headerdeadline-time_stamp_utc = vl_fechahora.
+          APPEND wl_headerdeadline TO tl_headerdeadline.
+        ENDIF.
+
+        wl_headerdeadline-time_type = 'HDRSTLEPDT'. " Fin carga
+        CALL FUNCTION 'ZSD_IF_OMP_EXTRAER_DATETIME'
+          EXPORTING
+            vp_datetime  = wl_tripdata-endloaddate
+          IMPORTING
+*           VP_FECHA     =
+*           VP_HORA      =
+            vp_fechahora = vl_fechahora
+          EXCEPTIONS
+            input_error  = 1
+            OTHERS       = 2.
+        IF sy-subrc = 0.
+          wl_headerdeadline-time_stamp_utc = vl_fechahora.
+          APPEND wl_headerdeadline TO tl_headerdeadline.
+        ENDIF.
+
+        wl_headerdeadline-time_type = 'HDRSTCPDT'. "Desp. Exped.
+        CALL FUNCTION 'ZSD_IF_OMP_EXTRAER_DATETIME'
+          EXPORTING
+            vp_datetime  = wl_tripdata-departuredate
+          IMPORTING
+*           VP_FECHA     =
+*           VP_HORA      =
+            vp_fechahora = vl_fechahora
+          EXCEPTIONS
+            input_error  = 1
+            OTHERS       = 2.
+        IF sy-subrc = 0.
+          wl_headerdeadline-time_stamp_utc = vl_fechahora.
+          APPEND wl_headerdeadline TO tl_headerdeadline.
+        ENDIF.
+
+        wl_headerdeadline-time_type = 'HDRSTSSPDT'. "Inicio transporte
+        CALL FUNCTION 'ZSD_IF_OMP_EXTRAER_DATETIME'
+          EXPORTING
+            vp_datetime  = wl_tripdata-departuredate
+          IMPORTING
+*           VP_FECHA     =
+*           VP_HORA      =
+            vp_fechahora = vl_fechahora
+          EXCEPTIONS
+            input_error  = 1
+            OTHERS       = 2.
+        IF sy-subrc = 0.
+          wl_headerdeadline-time_stamp_utc = vl_fechahora.
+          APPEND wl_headerdeadline TO tl_headerdeadline.
+        ENDIF.
+
+        wl_headerdeadline-time_type = 'HDRSTSEPDT'. "Fin transporte
+        CALL FUNCTION 'ZSD_IF_OMP_EXTRAER_DATETIME'
+          EXPORTING
+            vp_datetime  = wl_tripdata-enddate
+          IMPORTING
+*           VP_FECHA     =
+*           VP_HORA      =
+            vp_fechahora = vl_fechahora
+          EXCEPTIONS
+            input_error  = 1
+            OTHERS       = 2.
+        IF sy-subrc = 0.
+          wl_headerdeadline-time_stamp_utc = vl_fechahora.
+          APPEND wl_headerdeadline TO tl_headerdeadline.
+        ENDIF.
+
+        CALL FUNCTION 'BAPI_SHIPMENT_CREATE'
+          EXPORTING
+            headerdata     = wl_headerdata
+          IMPORTING
+            transport      = vl_transport
+            shipmentguid   = vl_shipmentguid
+          TABLES
+            headerdeadline = tl_headerdeadline
+            itemdata       = tl_itemdata
+            return         = tl_return.
+
+        LOOP AT tl_return INTO wl_return WHERE type CA 'EA'.
+          vl_error = 'X'.
+
+          APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+          <stat>-msgty = wl_return-type.
+          <stat>-msgid = wl_return-id.
+          <stat>-msgno = wl_return-number.
+          <stat>-msgv1 = wl_return-message_v1.
+          <stat>-msgv2 = wl_return-message_v2.
+          <stat>-msgv3 = wl_return-message_v3.
+          <stat>-msgv4 = wl_return-message_v4.
+
+        ENDLOOP.
+      ENDIF.
+
+      IF vl_error IS INITIAL.
+        DATA wl_if_omp_tp TYPE zssd_if_omp_tp.
+        CLEAR wl_if_omp_tp.
+        wl_if_omp_tp-tknum = vl_transport.
+        wl_if_omp_tp-tripid = wl_tripdata-tripid.
+        wl_if_omp_tp-docnum = idoc_contrl-docnum.
+        wl_if_omp_tp-usucre = sy-uname.
+        wl_if_omp_tp-erdat = sy-datum.
+        wl_if_omp_tp-erzet = sy-uzeit.
+        INSERT zssd_if_omp_tp FROM wl_if_omp_tp.
+
+        APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+        <stat>-msgty = 'I'.
+        <stat>-msgid = 'SY'.
+        <stat>-msgno = 499.
+        <stat>-msgv1 = 'Se ha creado el transporte '.
+        <stat>-msgv2 = vl_transport.
+
+        "
+        " Llamo a la creación del mensaje de confirmación.
+        " En la user-exit cuando se llama a la creación no tengo la tabla Z donde compruebo
+        " si se ha mandado a OMP o no.
+        "
+        CALL FUNCTION 'DB_COMMIT'.
+        CALL FUNCTION 'DEQUEUE_ALL'.
+        COMMIT WORK.
+***        CALL FUNCTION 'ZSD_IF_OMP_TRIP_EVENT'
+***          IN UPDATE TASK
+***          EXPORTING
+***            vp_tknum = vl_transport.
+
+        "
+        " Actualizamos textos en el transporte creado.
+        "
+        IF vl_texto_transporte IS NOT INITIAL.
+          DATA: wl_header TYPE  thead,
+                tl_tlines TYPE TABLE OF tline.
+
+          wl_header-tdobject = 'VTTK'.
+          wl_header-tdname = vl_transport.
+          wl_header-tdid = 'ZCCA'.
+          wl_header-tdspras = 'S'. "Siempre en Español. "sy-langu.
+
+          DATA tl_texto TYPE TABLE OF string.
+          CLEAR: tl_tlines, tl_texto.
+          CALL FUNCTION 'CONVERT_STRING_TO_TABLE'
+            EXPORTING
+              i_string         = vl_texto_transporte
+              i_tabline_length = 132
+            TABLES
+              et_table         = tl_texto.
+          LOOP AT tl_texto ASSIGNING FIELD-SYMBOL(<fs_texto>).
+            APPEND INITIAL LINE TO tl_tlines ASSIGNING FIELD-SYMBOL(<fs_lines>).
+            <fs_lines>-tdformat = '*'.
+            <fs_lines>-tdline   = <fs_texto>.
+          ENDLOOP.
+
+          CALL FUNCTION 'SAVE_TEXT'
+            EXPORTING
+*             CLIENT          = SY-MANDT
+              header          = wl_header
+*             INSERT          = ' '
+              savemode_direct = 'X'
+*             OWNER_SPECIFIED = ' '
+*             LOCAL_CAT       = ' '
+*             KEEP_LAST_CHANGED       = ' '
+*         IMPORTING
+*             FUNCTION        =
+*             NEWHEADER       =
+            TABLES
+              lines           = tl_tlines
+            EXCEPTIONS
+              id              = 1
+              language        = 2
+              name            = 3
+              object          = 4
+              OTHERS          = 5.
+          IF sy-subrc <> 0.
+* Implement suitable error handling here
+          ENDIF.
+
+          CALL FUNCTION 'DB_COMMIT'.
+          CALL FUNCTION 'DEQUEUE_ALL'.
+          COMMIT WORK.
+        ENDIF.
+        IF vl_texto_delivery IS NOT INITIAL.
+          CLEAR: wl_header,
+                tl_tlines.
+
+          wl_header-tdobject = 'VTTK'.
+          wl_header-tdname = vl_transport.
+          wl_header-tdid = '0001'.
+          wl_header-tdspras = 'S'. "Siempre en Español. "sy-langu.
+
+          CLEAR: tl_tlines, tl_texto.
+          CALL FUNCTION 'CONVERT_STRING_TO_TABLE'
+            EXPORTING
+              i_string         = vl_texto_delivery
+              i_tabline_length = 132
+            TABLES
+              et_table         = tl_texto.
+          LOOP AT tl_texto ASSIGNING <fs_texto>.
+            APPEND INITIAL LINE TO tl_tlines ASSIGNING <fs_lines>.
+            <fs_lines>-tdformat = '*'.
+            <fs_lines>-tdline   = <fs_texto>.
+          ENDLOOP.
+
+          CALL FUNCTION 'SAVE_TEXT'
+            EXPORTING
+*             CLIENT          = SY-MANDT
+              header          = wl_header
+*             INSERT          = ' '
+              savemode_direct = 'X'
+*             OWNER_SPECIFIED = ' '
+*             LOCAL_CAT       = ' '
+*             KEEP_LAST_CHANGED       = ' '
+*         IMPORTING
+*             FUNCTION        =
+*             NEWHEADER       =
+            TABLES
+              lines           = tl_tlines
+            EXCEPTIONS
+              id              = 1
+              language        = 2
+              name            = 3
+              object          = 4
+              OTHERS          = 5.
+          IF sy-subrc <> 0.
+* Implement suitable error handling here
+          ENDIF.
+
+          CALL FUNCTION 'DB_COMMIT'.
+          CALL FUNCTION 'DEQUEUE_ALL'.
+          COMMIT WORK.
+        ENDIF.
+      ELSE.
+        "
+        " Borramos las entregas creadas.
+        "
+        CLEAR tl_return.
+        CALL FUNCTION 'ZSD_IF_OMP_DLT_DLV'
+          EXPORTING
+            vp_tripid = wl_tripdata-tripid
+            vp_docnum = idoc_contrl-docnum
+          IMPORTING
+            tp_return = tl_return.
+        LOOP AT tl_return INTO wl_return WHERE type CA 'EA'.
+
+          APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+          <stat>-msgty = wl_return-type.
+          <stat>-msgid = wl_return-id.
+          <stat>-msgno = wl_return-number.
+          <stat>-msgv1 = wl_return-message_v1.
+          <stat>-msgv2 = wl_return-message_v2.
+          <stat>-msgv3 = wl_return-message_v3.
+          <stat>-msgv4 = wl_return-message_v4.
+
+        ENDLOOP.
+
+      ENDIF.
+
+    ENDIF.
+
+  ENDIF.
+
+
+*  DATA: i_type       TYPE bapi_mtype,
+*        i_id         TYPE symsgid,
+*        i_number     TYPE symsgno,
+*        i_message_v1 TYPE symsgv,
+*        i_message_v2 TYPE symsgv,
+*        i_message_v3 TYPE symsgv,
+*        i_message_v4 TYPE symsgv.
+*
+*  LOOP AT idoc_status INTO DATA(wa_status).
+*    i_type = wa_status-msgty.
+*    i_id = wa_status-msgid.
+*    i_number = wa_status-msgno.
+*    i_message_v1 = wa_status-msgv1.
+*    i_message_v2 = wa_status-msgv2.
+*    i_message_v3 = wa_status-msgv3.
+*    i_message_v4 = wa_status-msgv4.
+*    lo_log->guardar_mensaje(
+*    EXPORTING
+*      i_type       = i_type
+*      i_id         = i_id
+*      i_number     = i_number
+*      i_message_v1 = i_message_v1
+*      i_message_v2 = i_message_v2
+*      i_message_v3 = i_message_v3
+*      i_message_v4 = i_message_v4
+*      ).
+*  ENDLOOP.
+*  IF sy-subrc = 0.
+*    lo_log->guardar_log(
+*    EXPORTING
+*      objeto    = 'ZEDI_OMP'
+*      subobjeto = 'ZTRIPPLANNING'
+*    IMPORTING
+*    lognumber = DATA(lv_lognum)    " Número de LOG
+*          ).
+*  ENDIF.
+*  DATA it_logtab TYPE bapiret2_tab.
+*  lo_log->get_bapiret_tab(
+*  IMPORTING
+*  gt_bapiret = it_logtab
+*  ).
+*  LOOP AT it_logtab TRANSPORTING NO FIELDS WHERE type EQ 'E' OR type EQ 'A' OR type EQ 'X'.
+*    DATA(lv_err_idoc) = 'X'.
+*    EXIT.
+*  ENDLOOP.
+  LOOP AT idoc_status TRANSPORTING NO FIELDS WHERE msgty EQ 'E' OR msgty EQ 'A' OR msgty EQ 'X' OR msgty EQ 'W'.
+    DATA(lv_err_idoc) = 'X'.
+    EXIT.
+  ENDLOOP.
+*
+*
+*  workflow_result = '99999'.
+*
+*  IF lv_err_idoc = 'X'.
+*    REFRESH idoc_status.
+*    CLEAR idoc_status.
+*    idoc_status-msgty    = 'E'.
+*    idoc_status-status   = '63'.
+*    idoc_status-msgid    = '00'.
+*    idoc_status-msgno    = '398'.
+*    idoc_status-msgv1    = 'Revisar LOG de Aplicación'.
+*    idoc_status-msgv2    = ''.
+*    idoc_status-msgv3    = ''.
+*    idoc_status-msgv4    = ''.
+*  ELSE.
+*    DATA(vl_last_msg) = lines( idoc_status ).
+*    READ TABLE idoc_status INTO idoc_status INDEX vl_last_msg. " El último mensaje debe tener la orden creada.
+*    IF sy-subrc <> 0.
+*      REFRESH idoc_status.
+*      CLEAR idoc_status.
+*      idoc_status-msgty    = 'S'.
+*      idoc_status-status   = '53'.
+*      idoc_status-msgid    = '00'.
+*      idoc_status-msgno    = '398'.
+*      idoc_status-msgv1    = 'Revisar LOG de Aplicación'.
+*      idoc_status-msgv2    = ''.
+*      idoc_status-msgv3    = ''.
+*      idoc_status-msgv4    = ''.
+*    ENDIF.
+*  ENDIF.
+  DATA(vl_last_msg) = lines( idoc_status ).
+  READ TABLE idoc_status INTO idoc_status INDEX vl_last_msg.
+**  REFRESH idoc_status.
+  idoc_status-repid    = sy-repid.
+  IF lv_err_idoc = 'X'.
+    idoc_status-status   = '63'.
+  ELSE.
+    idoc_status-status   = '53'.
+  ENDIF.
+*  idoc_status-appl_log = lv_lognum.
+
+  READ TABLE idoc_contrl INTO idoc_contrl INDEX 1.
+  LOOP AT idoc_status ASSIGNING FIELD-SYMBOL(<fs_idoc_status>).
+
+    <fs_idoc_status>-docnum = idoc_contrl-docnum.
+    <fs_idoc_status>-repid    = sy-repid.
+    IF lv_err_idoc = 'X'.
+      <fs_idoc_status>-status   = '63'.
+    ELSE.
+      <fs_idoc_status>-status   = '53'.
+    ENDIF.
+
+    IF vl_last_msg > 1.
+      IF <fs_idoc_status>-msgid = 'BAPI' AND <fs_idoc_status>-msgno = '001'.
+        DELETE idoc_status.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  CLEAR return_variables.
+  return_variables-wf_param = 'PROCESS_IDOCs'.
+  LOOP AT idoc_contrl.
+*    idoc_status-docnum = idoc_contrl-docnum.
+*    APPEND idoc_status.
+    return_variables-doc_number = idoc_contrl-docnum.
+    APPEND return_variables.
+  ENDLOOP.
+
+  SORT return_variables.
+  DELETE ADJACENT DUPLICATES FROM return_variables.
+
+  CALL FUNCTION 'DB_COMMIT'.
+  CALL FUNCTION 'DEQUEUE_ALL'.
+  COMMIT WORK.
+
+ENDFUNCTION.

@@ -1,0 +1,790 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0018_FORMS
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  F_RECL_LOTE_FONDO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_recl_lote_fondo .
+
+  " 1) Selección de datos:
+  PERFORM f_selec_datos.
+
+  " 2) Procesar datos:
+  PERFORM f_proc_datos.
+
+  " 3) Mostrar datos: Log (proceso en fondo)
+  PERFORM f_alv_fondo.
+
+ENDFORM.                    " F_RECL_LOTE_FONDO
+*&---------------------------------------------------------------------*
+*&      Form  F_RECL_LOTE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_recl_lote .
+
+  " 1) Selección de datos:
+  PERFORM f_selec_datos.
+
+  " 2) Procesar datos:
+  PERFORM f_proc_datos.
+
+  " 3) Mostrar datos: Listado ALV
+  CALL SCREEN 0100.
+
+ENDFORM.                    " F_RECL_LOTE
+*&---------------------------------------------------------------------*
+*&      Form  F_SELEC_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_selec_datos .
+
+  CLEAR: gt_datos[].
+
+  SELECT a~matnr a~mtart b~werks b~lgort b~charg
+    INTO TABLE gt_datos
+    FROM mara AS a
+    INNER JOIN mchb AS b ON b~matnr = a~matnr
+    WHERE a~matnr IN s_matnr
+    AND a~mtart IN s_mtart
+    AND b~werks IN s_werks
+    AND b~clabs <> 0
+    AND b~cinsm = 0
+    AND b~cspem = 0
+    AND b~lgort IN s_lgort
+    AND b~charg IN s_charg.
+
+ENDFORM.                    " F_SELEC_DATOS
+*&---------------------------------------------------------------------*
+*&      Form  F_PROC_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_proc_datos .
+
+  DATA: ls_datos TYPE zspp0018_alv,
+        lv_index LIKE sy-tabix,
+        lv_error TYPE xflag.
+
+  CLEAR: ls_datos, lv_index.
+  " Procesamiento de los datos:
+  LOOP AT gt_datos INTO ls_datos.
+    lv_index = sy-tabix.
+    " Leer datos de características de bobina:
+    CLEAR lv_error.
+    PERFORM f_dat_clasif_bobina CHANGING ls_datos
+                                         lv_error.
+    IF lv_error = 'X'.
+*      CLEAR: ls_datos-flag_de, ls_datos-flag_fsc.
+      MODIFY gt_datos FROM ls_datos INDEX lv_index.
+      CONTINUE.
+    ELSE.
+      IF ls_datos-flag_fsc = 'X' OR ls_datos-flag_de = 'X'
+        OR ls_datos-z_contramaestre = '?'. " Si el contramaestre no está informado, obtenemos datos rollo y heredamos contram.
+        " Leer datos de características de rollo origen:
+        PERFORM f_dat_clasif_rollo CHANGING ls_datos
+                                            lv_error.
+        IF lv_error = 'X'.
+*          CLEAR: ls_datos-flag_de, ls_datos-flag_fsc.
+          MODIFY gt_datos FROM ls_datos INDEX lv_index.
+          CONTINUE.
+* GST - 20/01/2016 ->
+        ELSEIF lv_error = 'D'.
+          PERFORM f_act_caract_bobina  USING lv_error
+                                       CHANGING ls_datos.
+          MODIFY gt_datos FROM ls_datos INDEX lv_index.
+* GST - 20/01/2016 <-
+        ELSE.
+          " Actualización datos:
+          PERFORM f_act_caract_bobina USING lv_error
+                                      CHANGING ls_datos.
+
+          MODIFY gt_datos FROM ls_datos INDEX lv_index.
+        ENDIF.
+
+      ELSE.
+        PERFORM f_act_caract_bobina  USING lv_error  " CMS 30/05/2019 PMC Calidad
+                                  CHANGING ls_datos. " Aunque FSC y DE estén OK, actualizamos la Nota de Inspección, si se encuentra
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " F_PROC_DATOS
+*&---------------------------------------------------------------------*
+*&      Form  F_DAT_CLASIF_BOBINA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_DATOS  text
+*----------------------------------------------------------------------*
+FORM f_dat_clasif_bobina  CHANGING ps_datos TYPE zspp0018_alv
+                                   p_error.
+
+  DATA: lt_class      TYPE /isdfps/lm_accident_sclass_t,
+        lt_objectdata TYPE rihclobjdat_tab.
+
+  DATA: lv_object     TYPE objnum,
+        ls_objectdata TYPE clobjdat.
+
+  CLEAR: lv_object, lt_class, lt_objectdata, ls_objectdata.
+  REFRESH: lt_class, lt_objectdata.
+
+  CONCATENATE ps_datos-matnr ps_datos-charg INTO lv_object.
+
+  CALL FUNCTION 'CLAF_CLASSIFICATION_OF_OBJECTS'
+    EXPORTING
+      class              = 'Z_BOBINA'
+      classtype          = '023'
+      object             = lv_object
+      objecttable        = 'MCH1'
+    TABLES
+      t_class            = lt_class
+      t_objectdata       = lt_objectdata
+    EXCEPTIONS
+      no_classification  = 1
+      no_classtypes      = 2
+      invalid_class_type = 3
+      OTHERS             = 4.
+*  IF sy-subrc <> 0.
+** Implement suitable error handling here
+*  ENDIF.
+
+  IF lt_objectdata[] IS NOT INITIAL.
+
+    " 1. Decisión empleo bobina:
+    CLEAR ls_objectdata.
+    READ TABLE lt_objectdata INTO ls_objectdata WITH KEY atnam = 'LOBM_UDCODE'.
+    IF ls_objectdata IS NOT INITIAL AND ( ls_objectdata-ausp1 IS INITIAL OR ls_objectdata-ausp1 EQ '?' ) . " Hay que actualizar
+      ps_datos-flag_de = 'X'.
+    ENDIF.
+
+    " 2. Herencia del % FSC: de la bobina
+    CLEAR ls_objectdata.
+    READ TABLE lt_objectdata INTO ls_objectdata WITH KEY atnam = 'Z_FSC_PORCENTAJE'.
+    IF ls_objectdata IS NOT INITIAL AND ( ls_objectdata-ausp1 IS INITIAL OR ls_objectdata-ausp1 EQ '?' ). " Hay que actualizar
+      ps_datos-flag_fsc = 'X'.
+    ENDIF.
+
+    " 3. Si DE=A y NI <> ' ' limpiaremos la caracteristica: Nota de Inspección
+* Captura de Nueva casuistica, DE=A y Nota Inspección informada, limpiaremos la nota de inspección.    CLEAR ls_objectdata.
+    TRY.
+        IF ( lt_objectdata[ atnam = 'Z_NOTA_INSP' ]-ausp1 IS NOT INITIAL OR
+             lt_objectdata[ atnam = 'Z_NOTA_INSP' ]-ausp1 = '?'              ) AND
+           lt_objectdata[ atnam = 'LOBM_UDCODE' ]-ausp1 = 'DE       R'.
+          ps_datos-flag_nota_insp = 'X'.
+          ps_datos-ni             = lt_objectdata[ atnam = 'Z_NOTA_INSP' ]-ausp1. "Guardamos la NI para compararla con la mas actual encontrada.
+        ENDIF.
+      CATCH cx_root .
+        CLEAR : ps_datos-flag_nota_insp , ps_datos-ni.
+    ENDTRY.
+
+
+*    4. FLAG_DEA ->Si DE=A y NI <> ' ', limpiaremos la NI
+    TRY.
+        IF lt_objectdata[ atnam = 'LOBM_UDCODE' ]-ausp1 = 'DE       A' AND
+           ( lt_objectdata[ atnam = 'Z_NOTA_INSP' ]-ausp1 IS NOT INITIAL OR
+             lt_objectdata[ atnam = 'Z_NOTA_INSP' ]-ausp1 = '?'             ).
+          ps_datos-flag_dea = 'X'.
+        ENDIF.
+
+      CATCH cx_root .
+        ps_datos-flag_dea = ' '.
+
+    ENDTRY.
+
+* Validar si está informado el contramaestre.
+    TRY.
+        IF lt_objectdata[ atnam = 'Z_CONTRAMAESTRE' ]-ausp1 = '?'.
+          ps_datos-z_contramaestre = '?'.
+        ENDIF.
+      CATCH cx_root .
+    ENDTRY.
+
+    IF ps_datos-flag_de = 'X' OR ps_datos-flag_fsc = 'X'.
+      " Recuperamos los valores de material/lote origen:
+      CLEAR ls_objectdata.
+      READ TABLE lt_objectdata INTO ls_objectdata WITH KEY atnam = 'Z_ROLLO_ORIGEN_V2'.
+      IF ls_objectdata-ausp1 IS NOT INITIAL AND ls_objectdata-ausp1 NE '?'. " Hay que actualizar
+        ps_datos-matnr_origen = ls_objectdata-ausp1.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = ps_datos-matnr_origen
+          IMPORTING
+            output = ps_datos-matnr_origen.
+
+      ELSE.
+        p_error = 'X'.
+        ps_datos-icono = '@0A@'.  " Error
+        ps_datos-tipo = 'E'.
+        ps_datos-mensaje = 'Falta material rollo origen'.
+      ENDIF.
+
+      IF p_error <> 'X'.
+        CLEAR ls_objectdata.
+        READ TABLE lt_objectdata INTO ls_objectdata WITH KEY atnam = 'Z_LOTE_ORIGEN'.
+        IF ls_objectdata-ausp1 IS NOT INITIAL AND ls_objectdata-ausp1 NE '?'. " Hay que actualizar
+          ps_datos-charg_origen = ls_objectdata-ausp1.
+        ELSE.
+          p_error = 'X'.
+          ps_datos-icono = '@0A@'.  " Error
+          ps_datos-tipo = 'E'.
+          ps_datos-mensaje = 'Falta lote rollo origen'.
+        ENDIF.
+      ENDIF.
+
+    ENDIF.
+
+  ENDIF.
+
+
+ENDFORM.                    " F_DAT_CLASIF_BOBINA
+*&---------------------------------------------------------------------*
+*&      Form  F_DAT_CLASIF_ROLLO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_DATOS  text
+*----------------------------------------------------------------------*
+FORM f_dat_clasif_rollo  CHANGING ps_datos TYPE zspp0018_alv
+                                  p_error.
+
+  DATA: lt_class      TYPE /isdfps/lm_accident_sclass_t,
+        lt_objectdata TYPE rihclobjdat_tab.
+
+  DATA: lv_object     TYPE objnum,
+        ls_objectdata TYPE clobjdat.
+
+  CLEAR: lv_object, lt_class, lt_objectdata, ls_objectdata.
+  REFRESH: lt_class, lt_objectdata.
+
+  CONCATENATE ps_datos-matnr_origen ps_datos-charg_origen INTO lv_object.
+
+  CALL FUNCTION 'CLAF_CLASSIFICATION_OF_OBJECTS'
+    EXPORTING
+      class              = 'Z_ROLLO'
+*     CLASSTEXT          = 'X'
+      classtype          = '023'
+*     CLINT              = 0
+*     FEATURES           = 'X'
+*     LANGUAGE           = SY-LANGU
+      object             = lv_object
+      objecttable        = 'MCH1'
+*     KEY_DATE           = SY-DATUM
+*     INITIAL_CHARACT    = 'X'
+*     NO_VALUE_DESCRIPT  =
+*     CHANGE_SERVICE_CLF = 'X'
+*     INHERITED_CHAR     = ' '
+*     CHANGE_NUMBER      = ' '
+    TABLES
+      t_class            = lt_class
+      t_objectdata       = lt_objectdata
+*     I_SEL_CHARACTERISTIC       =
+*     T_NO_AUTH_CHARACT  =
+    EXCEPTIONS
+      no_classification  = 1
+      no_classtypes      = 2
+      invalid_class_type = 3
+      OTHERS             = 4.
+*  IF sy-subrc <> 0.
+** Implement suitable error handling here
+*  ENDIF.
+
+*  IF lt_objectdata[] IS NOT INITIAL.
+  CHECK lt_objectdata[] IS NOT INITIAL.
+
+  IF ps_datos-flag_de = 'X'.
+
+    " Leemos valor de decisión de empleo del rollo y asignamos al reg. de bobina:
+    CLEAR ls_objectdata.
+    READ TABLE lt_objectdata INTO ls_objectdata WITH KEY atnam = 'LOBM_UDCODE'.
+    IF ls_objectdata-ausp1 IS NOT INITIAL AND ls_objectdata-ausp1 NE '?'. " Hay que actualizar
+      ps_datos-de_bobina = ls_objectdata-ausp1.
+    ELSE.
+      p_error = 'D'.
+      ps_datos-icono = '@09@'.  " Warning
+      ps_datos-tipo = 'W'.
+      ps_datos-mensaje = 'Falta DE en rollo origen'.
+    ENDIF.
+
+  ENDIF.
+
+  IF ps_datos-flag_fsc = 'X'.
+    " Leemos valor de %FSC:
+    CLEAR ls_objectdata.
+    READ TABLE lt_objectdata INTO ls_objectdata WITH KEY atnam = 'Z_FSC_PORCENTAJE'.
+    IF ls_objectdata-ausp1 IS NOT INITIAL AND ls_objectdata-ausp1 NE '?'. " Hay que actualizar
+      ps_datos-fsc_bobina = ls_objectdata-ausp1.
+*      ELSE.
+*        p_error = 'X'.
+*        ps_datos-icono = '@0A@'.  " Error
+*        ps_datos-tipo = 'E'.
+*        ps_datos-mensaje = 'Falta %FSC en rollo origen'.
+    ENDIF.
+  ENDIF.
+
+  IF ps_datos-z_contramaestre = '?'.
+    TRY.
+        ps_datos-z_contramaestre = lt_objectdata[ atnam = 'Z_CONTRAMAESTRE' ]-ausp1.
+      CATCH cx_root .
+    ENDTRY.
+
+  ENDIF.
+
+ENDFORM.                    " F_DAT_CLASIF_ROLLO
+*&---------------------------------------------------------------------*
+*&      Form  F_ACT_CARACT_BOBINA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_DATOS  text
+*----------------------------------------------------------------------*
+FORM f_act_caract_bobina  USING p_error
+                          CHANGING ps_datos TYPE zspp0018_alv.
+
+  DATA: lv_object            TYPE objnum,
+        lv_index             LIKE sy-tabix,
+        ls_alloc_values_num  TYPE bapi1003_alloc_values_num,
+        ls_alloc_values_char TYPE bapi1003_alloc_values_char,
+        ls_return            TYPE bapiret2.
+
+  DATA: lt_alloc_values_num  TYPE tt_bapi1003_alloc_values_num,
+        lt_alloc_values_char TYPE tt_bapi1003_alloc_values_char,
+        lt_alloc_values_curr TYPE tt_bapi1003_alloc_values_curr,
+        lt_return            TYPE bapiret2_tab.
+
+  CLEAR: lv_object, lt_alloc_values_num, lt_alloc_values_char, lt_alloc_values_curr, lt_return.
+  CLEAR: ls_alloc_values_num, ls_alloc_values_char, ls_return.
+  REFRESH: lt_alloc_values_num, lt_alloc_values_char, lt_alloc_values_curr, lt_return.
+
+  CONCATENATE ps_datos-matnr ps_datos-charg INTO lv_object.
+
+* GST - 04/03/2015 ->
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey       = lv_object
+      objecttable     = 'MCH1'
+      classnum        = 'Z_BOBINA'
+      classtype       = '023'
+*     KEYDATE         = SY-DATUM
+*     UNVALUATED_CHARS       = ' '
+*     LANGUAGE        = SY-LANGU
+* IMPORTING
+*     STATUS          =
+*     STANDARDCLASS   =
+    TABLES
+      allocvaluesnum  = lt_alloc_values_num
+      allocvalueschar = lt_alloc_values_char
+      allocvaluescurr = lt_alloc_values_curr
+      return          = lt_return.
+
+  CLEAR ls_return.
+  READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+  IF ls_return IS NOT INITIAL. " Error leer característica
+
+    ps_datos-icono = '@0A@'. " Icono rojo
+    ps_datos-tipo = ls_return-type.
+    ps_datos-mensaje = ls_return-message.
+    CLEAR: ps_datos-flag_de, ps_datos-flag_fsc.
+
+  ELSE.
+    REFRESH: lt_return.
+    CLEAR: lt_return, ls_return.
+
+* GST - 04/03/2015 <-
+
+    " Decisión de empleo:
+* GST - 20/01/2016 ->
+*    IF ps_datos-flag_de = 'X'.
+
+* Obtenemos el cliente, para saber si cumple la condición de CABO.
+    SELECT SINGLE ak~zzkunnr1
+      FROM aufm AS af
+      INNER JOIN mara AS ma   ON ma~matnr    = af~matnr
+      INNER JOIN aufk AS ak   ON ak~aufnr    = af~aufnr
+      INTO @DATA(l_kunnr)
+      WHERE af~werks    = @ps_datos-werks AND
+            af~matnr    = @ps_datos-matnr_origen AND
+            af~charg    = @ps_datos-charg.
+
+* 1. Si no tiene DE, la hemos obtenido del rollo y NO es un cabo, actualizamos la DE para la bobina tratada.
+    IF ps_datos-flag_de = 'X' AND ps_datos-de_bobina IS NOT INITIAL AND
+       zcl_utils_hpap_pp=>es_cabo( i_matnr = ps_datos-matnr
+                                   i_kunnr = l_kunnr ) = ' '.
+* GST - 20/01/2016 <-
+* Asignamos la DE del rollo
+      CLEAR: ls_alloc_values_char.
+      ls_alloc_values_char-charact = 'LOBM_UDCODE'.
+      ls_alloc_values_char-value_char = ps_datos-de_bobina.
+      ls_alloc_values_char-value_neutral = ps_datos-de_bobina.
+      APPEND ls_alloc_values_char TO lt_alloc_values_char.
+
+*Insertamos la Nota de Inspección del Lote de Inspección del rollo
+      SELECT qa~enstehdat , qa~entstezeit , qr~pruefbemkt
+        FROM qals AS qa
+        INNER JOIN qamr AS qr   ON qa~prueflos = qr~prueflos
+        INTO TABLE @DATA(lt_nota_insp_rollo)
+        WHERE qa~werk     = @ps_datos-werks AND
+              qa~matnr    = @ps_datos-matnr_origen AND
+              qa~charg    = @ps_datos-charg_origen AND
+              qr~merknr   = 10. " Posición dentro de la lista de valores de caracteristica: "10 - Gramajeps
+
+      IF sy-subrc = 0.
+        TRY.
+            SORT lt_nota_insp_rollo BY enstehdat entstezeit DESCENDING.
+
+* Si se han encontrado datos de la nota de inspección, grabamos característica, sino NO.
+            IF lt_nota_insp_rollo[ 1 ]-pruefbemkt IS NOT INITIAL.
+
+              CLEAR: ls_alloc_values_char.
+              ls_alloc_values_char-charact       = 'Z_NOTA_INSP'.
+              ls_alloc_values_char-value_char    = lt_nota_insp_rollo[ 1 ]-pruefbemkt.
+              ls_alloc_values_char-value_neutral = lt_nota_insp_rollo[ 1 ]-pruefbemkt.
+              APPEND ls_alloc_values_char TO lt_alloc_values_char.
+
+              ps_datos-nota_insp = lt_nota_insp_rollo[ 1 ]-pruefbemkt.
+
+            ENDIF.
+          CATCH cx_root .
+        ENDTRY.
+
+      ENDIF.
+    ENDIF.
+
+* 2. Herencia de % FSC del rollo.
+    IF ps_datos-flag_fsc = 'X' AND ps_datos-fsc_bobina IS NOT INITIAL.
+      CLEAR: ls_alloc_values_num.
+      ls_alloc_values_num-charact = 'Z_FSC_PORCENTAJE'.
+      ls_alloc_values_num-value_from = ps_datos-fsc_bobina.
+      APPEND ls_alloc_values_num TO lt_alloc_values_num.
+    ENDIF.
+
+* 3. Si DE=R buscamos la última NI. Si esta NI es diferente a la que había, la actualizamos.
+    IF ps_datos-flag_nota_insp = 'X'.
+
+* Buscamos el lote de inspección de la bobina mas actual.
+      SELECT qa~enstehdat , qa~entstezeit , qr~pruefbemkt
+        FROM qals AS qa
+        INNER JOIN qamr AS qr   ON qa~prueflos = qr~prueflos
+        INTO TABLE @DATA(lt_nota_insp)
+        WHERE qa~werk     = @ps_datos-werks AND
+              qa~matnr    = @ps_datos-matnr AND
+              qa~charg    = @ps_datos-charg AND
+              qr~merknr   = 10. " Posición dentro de la lista de valores de caracteristica: "10 - Gramajeps
+      IF sy-subrc = 0.
+        TRY.
+            SORT lt_nota_insp BY enstehdat entstezeit DESCENDING.
+
+            IF lt_nota_insp[ 1 ]-pruefbemkt <> ps_datos-ni AND
+               lt_nota_insp[ 1 ]-pruefbemkt IS NOT INITIAL.
+
+
+              CLEAR: ls_alloc_values_char.
+              ls_alloc_values_char-charact       = 'Z_NOTA_INSP'.
+              ls_alloc_values_char-value_char    = lt_nota_insp[ 1 ]-pruefbemkt.
+              ls_alloc_values_char-value_neutral = lt_nota_insp[ 1 ]-pruefbemkt.
+              APPEND ls_alloc_values_char TO lt_alloc_values_char.
+            ENDIF.
+          CATCH cx_root .
+        ENDTRY.
+
+      ENDIF.
+
+    ENDIF.
+
+*  4. flag_dea , como la bobina es DE=A, borramos la NI
+    IF ps_datos-flag_dea = 'X'.
+
+      DELETE lt_alloc_values_char WHERE charact = 'Z_NOTA_INSP'.
+
+    ENDIF.
+
+* 62586 - CMS - 09-09-2020 Heredar la caract. Contramaestre del rollo.
+* 5. Actualización de la característica de contramaestre
+    IF ps_datos-z_contramaestre IS NOT INITIAL AND
+       ps_datos-z_contramaestre <> '?'.
+      ls_alloc_values_char-charact       = 'Z_CONTRAMAESTRE'.
+      ls_alloc_values_char-value_char    = ps_datos-z_contramaestre.
+      ls_alloc_values_char-value_neutral = ps_datos-z_contramaestre.
+      APPEND ls_alloc_values_char TO lt_alloc_values_char.
+
+    ENDIF.
+
+    CALL FUNCTION 'BAPI_OBJCL_CHANGE'
+      EXPORTING
+        objectkey          = lv_object
+        objecttable        = 'MCH1'
+        classnum           = 'Z_BOBINA'
+        classtype          = '023'
+      TABLES
+        allocvaluesnumnew  = lt_alloc_values_num
+        allocvaluescharnew = lt_alloc_values_char
+        allocvaluescurrnew = lt_alloc_values_curr
+        return             = lt_return.
+
+    CLEAR ls_return.
+    READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+    IF ls_return IS NOT INITIAL. " Error act. característica
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+*       IMPORTING
+*         RETURN        =
+        .
+
+      ps_datos-icono = '@0A@'. " Icono rojo
+      ps_datos-tipo = ls_return-type.
+      ps_datos-mensaje = ls_return-message.
+      CLEAR: ps_datos-flag_de, ps_datos-flag_fsc.
+
+    ELSE.
+
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+
+      IF ps_datos-flag_de = 'X' AND ps_datos-de_bobina IS NOT INITIAL. "Enviamos solo en caso de que haya cambio de DE
+
+        "EAB T76941 28.06.2023 Integración E80: se llama a la función de envio de datos de bobina a E80
+        CALL FUNCTION 'Z_E80_ENVIO_STOCK_BOBINA'
+          EXPORTING
+            i_werks          = ps_datos-werks
+*           I_CHARG          =
+            i_objek          = lv_object
+            i_par_origen     = '1'
+          EXCEPTIONS
+            lote_inexistente = 1
+            OTHERS           = 2.
+        IF sy-subrc <> 0.
+* Implement suitable error handling here
+        ENDIF.
+
+      ENDIF.
+
+* GST - 20/01/2016 ->
+      IF p_error <> 'D'.
+        ps_datos-icono = '@08@'. " Icono verde
+        ps_datos-tipo = 'S'.
+        ps_datos-mensaje = 'Clasificación actualizada'.
+      ELSE.
+        ps_datos-icono = '@09@'. " Icono verde
+        ps_datos-tipo = 'W'.
+        IF ps_datos-mensaje = space.
+          ps_datos-mensaje = 'Error en actualización de bobina'.
+
+        ENDIF.
+
+      ENDIF.
+* GST - 20/01/2016 <-
+
+    ENDIF.
+
+* GST - 04/03/2015 ->
+  ENDIF.
+* GST - 04/03/2015 <-
+
+ENDFORM.                    " F_ACT_CARACT_BOBINA
+*&---------------------------------------------------------------------*
+*&      Form  F_ALV_FONDO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_alv_fondo .
+
+  DATA: t_variant TYPE disvariant.
+
+
+* Variante ALV
+  CLEAR t_variant.
+  t_variant-report = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_DEFAULT_GET'
+    EXPORTING
+      i_save     = 'U'
+    CHANGING
+      cs_variant = t_variant
+    EXCEPTIONS
+      not_found  = 2.
+*
+* Genero las Columnas
+  PERFORM col_alv.
+
+
+* Llamo a la Función que visualiza el ALV
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+*     i_structure_name = i_structure_name
+      it_fieldcat = gt_fieldcat_ant
+      i_save      = 'U'
+      is_variant  = t_variant
+    TABLES
+      t_outtab    = gt_datos.
+
+ENDFORM.                    " F_ALV_FONDO
+*&---------------------------------------------------------------------*
+*&      Form  COL_ALV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM col_alv .
+
+  DATA: ls_fcat TYPE slis_fieldcat_alv.
+  DATA: lv_tabix TYPE sytabix.
+
+
+  REFRESH: gt_fieldcat_ant.
+
+* Pasar tabla interna al formato del fieldcat
+*  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+*    EXPORTING
+*      i_program_name         = sy-repid
+*      i_internal_tabname     = 'GT_DATOS'
+*      i_inclname             = sy-repid
+*      i_bypassing_buffer     = 'X'
+*    CHANGING
+*      ct_fieldcat            = gt_fieldcat_ant
+*    EXCEPTIONS
+*      inconsistent_interface = 1
+*      program_error          = 2
+*      OTHERS                 = 3.
+*
+
+  DATA: l_catalog TYPE lvc_t_fcat.
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+*     I_BUFFER_ACTIVE        =
+*     I_STRUCTURE_NAME       = 'GT_DATOS'
+      i_structure_name       = 'ZSPP0018_ALV'
+*     I_CLIENT_NEVER_DISPLAY = 'X'
+*     I_BYPASSING_BUFFER     = 'X'
+*     I_INTERNAL_TABNAME     = 'GT_DATOS'
+    CHANGING
+*     ct_fieldcat            = gt_fieldcat_ant
+      ct_fieldcat            = l_catalog
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+*  gt_fieldcat_ant = CORRESPONDING #( L_catalog ).
+
+  CALL FUNCTION 'LVC_TRANSFER_TO_SLIS'
+    EXPORTING
+      it_fieldcat_lvc = l_catalog
+*     IT_SORT_LVC     =
+*     IT_FILTER_LVC   =
+*     IS_LAYOUT_LVC   =
+    IMPORTING
+      et_fieldcat_alv = gt_fieldcat_ant
+*     ET_SORT_ALV     =
+*     ET_FILTER_ALV   =
+*     ES_LAYOUT_ALV   =
+* TABLES
+*     IT_DATA         =
+* EXCEPTIONS
+*     IT_DATA_MISSING = 1
+*     IT_FIELDCAT_LVC_MISSING       = 2
+*     OTHERS          = 3
+    .
+  IF sy-subrc <> 0.
+* Implement suitable error handling here
+  ENDIF.
+
+** Pasar el anterior fieldcat al formato del nuevo
+**  CALL FUNCTION 'LVC_TRANSFER_FROM_SLIS'
+**    EXPORTING
+**      it_fieldcat_alv = gt_fieldcat_ant
+**    IMPORTING
+**      et_fieldcat_lvc = gt_fieldcat
+**    TABLES
+**      it_data         = gt_datos
+**    EXCEPTIONS
+**      it_data_missing = 1
+**      OTHERS          = 2.
+
+** Recorremos el catálogo de campos modificandolo
+
+  LOOP AT gt_fieldcat_ant INTO ls_fcat.
+    lv_tabix = sy-tabix.
+    CASE ls_fcat-fieldname.
+
+      WHEN 'ICON'.
+*        ls_fcat-seltext   = text-t01.
+        ls_fcat-seltext_l = text-t01.
+        ls_fcat-seltext_m = text-t01.
+        ls_fcat-seltext_s = text-t01.
+        ls_fcat-reptext_ddic   = text-t01.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'TYPE_RET'.
+*        ls_fcat-seltext   = text-t02.
+        ls_fcat-seltext_l = text-t02.
+        ls_fcat-seltext_m = text-t02.
+        ls_fcat-seltext_s = text-t02.
+        ls_fcat-reptext_ddic   = text-t02.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'MSG_RET'.
+*        ls_fcat-seltext   = text-t03.
+        ls_fcat-seltext_l = text-t03.
+        ls_fcat-seltext_m = text-t03.
+        ls_fcat-seltext_s = text-t03.
+        ls_fcat-reptext_ddic   = text-t03.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+    ENDCASE.
+  ENDLOOP.
+
+
+
+ENDFORM.                    " COL_ALV
+*&---------------------------------------------------------------------*
+*&      Form  INICIALIZACION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM inicializacion .
+
+  DATA: ls_werks LIKE LINE OF s_werks,
+        lv_werks TYPE werks_d.
+
+  IF sy-batch <> 'X'.
+
+    CLEAR: ls_werks, lv_werks.
+
+    SELECT SINGLE parva FROM usr05
+      INTO lv_werks
+      WHERE bname = sy-uname AND
+      parid = 'WRK'.
+
+    IF lv_werks IS NOT INITIAL.
+      ls_werks-sign = 'I'.
+      ls_werks-option = 'EQ'.
+      ls_werks-low = lv_werks.
+      APPEND ls_werks TO s_werks.
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.                    " INICIALIZACION

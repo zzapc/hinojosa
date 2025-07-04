@@ -1,0 +1,298 @@
+FUNCTION zswm_close_delivry_out_ui5 .
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(TCODE) TYPE  TCODE OPTIONAL
+*"     VALUE(UNAME) TYPE  SY-UNAME DEFAULT SY-UNAME
+*"     VALUE(OPERARIO) TYPE  ZLNUM_OPER OPTIONAL
+*"     VALUE(TKNUM) TYPE  TKNUM OPTIONAL
+*"     VALUE(VBELN) TYPE  VBELN OPTIONAL
+*"     VALUE(CIERRA) TYPE  FLAG OPTIONAL
+*"     VALUE(DAR_SALIDA) TYPE  FLAG OPTIONAL
+*"  EXPORTING
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+  PERFORM break USING 'ZSWM_CLOSE_DELIVRY_OUT_UI5'.
+
+  DATA: data_u            TYPE zswm_data_ui5_eeeoo_str,
+        r_param           TYPE zswm_data_ui5_param_str,
+        r_funcionalidades TYPE zswm_data_ui5_func_str,
+        tt_tranp_out      TYPE zswm_get_transportes_ui5_strtt,
+        tt_head           TYPE zswm_get_entregas_head_ui5_stt,
+        tt_entre          TYPE zswm_get_entregas_ui5_str_tt,
+        lt_vttk           TYPE vttk_tab.
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = tknum
+    IMPORTING
+      output = tknum.
+
+  CALL FUNCTION 'ZSWM_GET_DATA_USER_UI5'
+    EXPORTING
+      uname      = uname
+      statu      = 'X'
+      no_gen_log = abap_true
+    IMPORTING
+      data_user  = data_u
+*     ERROR      =
+*     TT_LOG     =
+    .
+
+* JSH: Permitir aunque no cumpla tolerancias.
+* Obtenemos una posicion de la entrega para obtener el centro
+  DATA lv_permitir_exceso TYPE flag.
+
+  IF vbeln IS NOT INITIAL.
+    SELECT SINGLE likp~vbeln, likp~vstel, lips~posnr, lips~werks
+      INTO @DATA(ls_lips)
+      FROM likp
+      INNER JOIN lips ON likp~vbeln = lips~vbeln
+      WHERE likp~vbeln = @vbeln.
+    IF sy-subrc = 0.
+      SELECT SINGLE *
+        INTO @DATA(ls_toler)
+        FROM zsd_excl_tolerac
+        WHERE werks = @ls_lips-werks
+          AND ( vstel = @ls_lips-vstel OR vstel = '' ).
+      IF sy-subrc = 0.
+        lv_permitir_exceso = 'X'. "Permitimos el exceso de tolerancia
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  IF tknum IS NOT INITIAL AND vbeln IS INITIAL.
+    SELECT likp~vbeln, likp~vstel, lips~posnr, lips~werks
+      INTO TABLE @DATA(lt_lips)
+      FROM vttp AS a
+      INNER JOIN likp ON a~vbeln = likp~vbeln
+      INNER JOIN lips ON likp~vbeln = lips~vbeln
+      WHERE a~tknum = @tknum.
+    IF sy-subrc = 0.
+      SELECT  *
+        INTO TABLE @DATA(lt_toler)
+        FROM zsd_excl_tolerac
+        FOR ALL ENTRIES IN @lt_lips
+        WHERE werks = @lt_lips-werks
+          AND ( vstel = @lt_lips-vstel OR vstel = '' ).
+      IF sy-subrc = 0.
+        lv_permitir_exceso = 'X'. "Permitimos el exceso de tolerancia
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  CALL FUNCTION 'ZSWM_GET_PARAM_UI5'
+    EXPORTING
+      data_user         = data_u
+      tcode             = tcode
+      no_gen_log        = abap_true
+    IMPORTING
+      r_param           = r_param
+      r_funcionalidades = r_funcionalidades
+*     ERROR             =
+*     TT_LOG            =
+    .
+  SELECT * INTO TABLE lt_vttk FROM vttk WHERE tknum EQ tknum.
+  DATA: vbeln_ini TYPE vbeln, posnr_ini TYPE posnr.
+  PERFORM get_transportes_out USING lt_vttk
+                                    data_u
+                                    r_param
+                                    tcode
+                                    vbeln_ini
+                                    posnr_ini
+                              CHANGING tt_tranp_out
+                                       tt_head
+                                       tt_entre.
+  IF vbeln IS NOT INITIAL.
+    DELETE tt_head  WHERE vbeln NE vbeln.
+    DELETE tt_entre WHERE vbeln NE vbeln.
+  ENDIF.
+* add jtm 18.08.2022
+  DATA tt_head_ya_cerrados_prev TYPE zswm_get_entregas_head_ui5_stt.
+  CLEAR tt_head_ya_cerrados_prev[].
+  DESCRIBE TABLE tt_head LINES DATA(n_entregas).
+  DATA n_entregas_leidas TYPE i.
+  n_entregas_leidas = 0.
+
+
+* fin de add jtm 18.08.2022
+  LOOP AT tt_head INTO DATA(rt_head)." INDEX 1.
+    ADD 1 TO n_entregas_leidas. " add jtm 18.08.2022
+
+
+*    00	No iniciado
+*    10	Iniciado
+*    20	Picking parcial realizado
+*    25	Picking aceptable
+*    30	Picking realizado
+*    35	Picking saturado
+*    40	Cerrado
+*    50	Contabilizada/Finalizado
+    CASE dar_salida.
+      WHEN abap_true.
+        IF rt_head-status < '40'.
+*Entrega & no ha sido cerrada.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '085' rt_head-vbeln space space space CHANGING tt_log[].
+          MOVE abap_true TO error.
+        ELSE.
+          DATA tt_pick TYPE TABLE OF zswm_ui5_pick.
+
+          PERFORM valida TABLES tt_pick[]
+                         USING rt_head-vbeln data_u
+                         CHANGING error
+                                  tt_log
+                                  tt_entre.
+
+
+        ENDIF.
+      WHEN OTHERS.
+        IF rt_head-status >= '40'.
+*         add jtm 18.08.2022
+          IF n_entregas <= 1.
+*         fin de add jtm 18.08.2022
+*          if vbeln is not INITIAL. " este chequeo solo lo hago si quiero cerrar entrega, no si quiero cerrar transporte
+            MOVE abap_true TO error.
+*           Entrega & ya cerrada previamente.
+            PERFORM mensaje USING 'E' 'ZSWM_UI5' '081' rt_head-vbeln space space space CHANGING tt_log[].
+*          endif.
+*         add jtm 18.08.2022
+          ELSE.
+            APPEND rt_head TO tt_head_ya_cerrados_prev.
+          ENDIF.
+*         fin de add jtm 18.08.2022
+        ELSEIF rt_head-status >= '31'.
+          MOVE abap_true TO error.
+*        Entrega & con cantidad de picking mayor que solicitada. Posición &
+          LOOP AT tt_entre INTO DATA(rt_entre) WHERE status >= '31' AND status < '40'
+                                                 AND vbeln  EQ rt_head-vbeln.
+            EXIT.
+          ENDLOOP.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '082' rt_head-vbeln rt_entre-posnr space space CHANGING tt_log[].
+        ELSE.
+*          DATA tt_pick TYPE TABLE OF zswm_ui5_pick.
+
+          PERFORM valida TABLES tt_pick[]
+                         USING rt_head-vbeln data_u
+                         CHANGING error
+                                  tt_log
+                                  tt_entre.
+
+        ENDIF.
+    ENDCASE.
+    CHECK error EQ abap_true.
+    EXIT.
+  ENDLOOP.
+  CHECK error  NE abap_true.
+  CASE abap_true.
+    WHEN cierra.
+      IF vbeln IS INITIAL.
+        IF tt_head_ya_cerrados_prev[] IS INITIAL. " add jtm 18.08.2022 Casuistica extraña donde hay entregas cerradas y otras nao
+          CALL FUNCTION 'ZSWM_CLOSE_DELIVERY'
+            EXPORTING
+              tknum           = tknum
+*             VBELN           =
+              permitir_exceso = lv_permitir_exceso
+            IMPORTING
+              error           = error
+              tt_log          = tt_log.
+*       add jtm 18.08.2022
+        ELSE.
+          DATA n_cerrar_entregas TYPE i.
+          n_cerrar_entregas = 0.
+          LOOP AT tt_head INTO rt_head.
+            READ TABLE tt_head_ya_cerrados_prev WITH KEY vbeln = rt_head-vbeln TRANSPORTING NO FIELDS.
+            CHECK sy-subrc NE 0.
+            DATA: error_aux  TYPE flag,
+                  tt_log_aux TYPE bapiret2_t.
+            ADD 1 TO n_cerrar_entregas.
+            CALL FUNCTION 'ZSWM_CLOSE_DELIVERY'
+              EXPORTING
+                tknum           = tknum
+                vbeln           = vbeln
+                permitir_exceso = lv_permitir_exceso
+              IMPORTING
+                error           = error_aux
+                tt_log          = tt_log_aux.
+            CHECK error_aux EQ abap_true.
+            MOVE abap_true TO error.
+            APPEND LINES OF tt_log_aux TO tt_log.
+          ENDLOOP.
+          IF n_cerrar_entregas <= 0 AND error NE abap_true.
+            MOVE abap_true TO error.
+*           Transporte & ya cerrado
+            PERFORM mensaje USING 'E' 'ZSWM_UI5' '160' tknum space space space CHANGING tt_log[].
+          ENDIF.
+        ENDIF.
+*       fin de add jtm 18.08.2022
+      ELSE.
+*       add jtm 18.05.2022 usuarios con funcionalidad añadida
+        DATA rr_uname_fa TYPE tab_range_uname.
+        CALL FUNCTION 'ZSWM_SET_GET_VALUES'
+          EXPORTING
+            shortname   = 'ZSWM_UNAME_FA'
+          IMPORTING
+            rr_uname_fa = rr_uname_fa.
+        IF uname NOT IN rr_uname_fa.
+          MOVE abap_true TO error.
+*         Funcionalidad de & no habilitada para usuario &
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '159' 'Cerrar entrega' uname space space CHANGING tt_log[].
+        ELSE.
+*       fin de add jtm 18.05.2022
+          CALL FUNCTION 'ZSWM_CLOSE_DELIVERY'
+            EXPORTING
+              tknum           = tknum
+              vbeln           = vbeln
+              permitir_exceso = lv_permitir_exceso
+            IMPORTING
+              error           = error
+              tt_log          = tt_log.
+        ENDIF. " add jtm 18.05.2022
+      ENDIF.
+      IF error IS INITIAL.
+        CALL FUNCTION 'ZSWM_UPDATE_SHIPMENT_STATUS'
+          EXPORTING
+            i_tknum = tknum
+            i_paso  = 4 "4. Status de Fin de carga
+*           I_LGNUM =
+          IMPORTING
+            error   = error
+            tt_log  = tt_log.
+      ENDIF.
+    WHEN dar_salida.
+*      PERFORM close_shipment USING tknum 5 CHANGING tt_log_global error. "5. Despacho de Expedición
+      CALL FUNCTION 'ZSWM_UPDATE_SHIPMENT_STATUS'
+        EXPORTING
+          i_tknum = tknum
+          i_paso  = 5 "5. Despacho de Expedición
+*         I_LGNUM =
+        IMPORTING
+          error   = error
+          tt_log  = tt_log.
+      IF error EQ abap_true AND tt_log_global[] IS NOT INITIAL.
+        APPEND LINES OF tt_log_global TO tt_log.
+      ENDIF.
+
+      "JCB 04.09.24. SAITÍ - PERIS EM en 1 paso
+      IF error = space.
+        IF vbeln IS INITIAL.
+          DATA(lo_transporte) = NEW zhcl_transportes_core( tknum ).
+          DATA(lt_return) = lo_transporte->em_un_paso( ).
+        ELSE.
+          DATA(lo_entrega) = NEW zhcl_entregas_core( vbeln ).
+          lt_return = lo_entrega->em_un_paso( ).
+        ENDIF.
+
+        LOOP AT lt_return ASSIGNING FIELD-SYMBOL(<fs_return>) WHERE type CA 'EA'.
+          error = abap_true.
+          APPEND <fs_return> TO tt_log.
+        ENDLOOP.
+      ENDIF.
+
+
+  ENDCASE.
+* add jtm 07.11.2022
+  IF error EQ abap_true.
+    DELETE tt_log WHERE type NE 'E'.
+  ENDIF.
+* fin de add jtm 07.11.2022
+ENDFUNCTION.

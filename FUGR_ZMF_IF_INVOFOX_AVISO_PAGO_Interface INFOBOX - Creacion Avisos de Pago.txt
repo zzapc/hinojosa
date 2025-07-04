@@ -1,0 +1,230 @@
+FUNCTION zmf_if_invofox_aviso_pago .
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_DATOS) TYPE  ZMT_INVOFOX_REQUEST
+*"  EXPORTING
+*"     VALUE(OUTPUT) TYPE  ZMT_INFOVOX_PROXY_RESPONSE
+*"----------------------------------------------------------------------
+* 1. INVOFOX ENVIA LA INFORMACIÓN DEL CHEQUE Ó DEL PAGARÉ
+* 2. INTEGRACIÓN MAPEA LA INFO EN EL PROXY
+* 3. LA FUNCIÓN ZMF_IF_INFOBOX_AVISO_PAGO CREA EL AVISO
+*"----------------------------------------------------------------------
+  DATA: lv_datos  TYPE zmt_invofox_request,
+        lv_output TYPE zdt_invofox_response.
+
+  DATA: ls_avik       LIKE avik,
+        ls_rfradc_in  LIKE rfradc,
+        ls_rfradc_out LIKE rfradc.
+
+  DATA: lt_avip TYPE STANDARD TABLE OF avip,
+        wa_avip TYPE avip.
+
+  DATA: lv_aviso TYPE avsid,
+        lv_xblnr TYPE xblnr.
+
+  DATA: lv_string TYPE  char30,
+        lv_float  TYPE  f,
+        lv_dec    TYPE  p DECIMALS 4.
+
+  DATA: lv_ind TYPE avspo.
+
+*... INPUT
+  lv_datos = i_datos.
+
+
+*...initialize handling of payment advices.............................*
+  CALL FUNCTION 'REMADV_INIT'.
+
+
+*...build payment advice header........................................*
+
+  READ TABLE lv_datos-mt_invofox_request-invoices INTO DATA(wa_invoices) WITH KEY number = ''.
+  IF sy-subrc = 0.
+    lv_aviso = '04 SIN REFERNCIA'.
+    lv_xblnr = 'SIN REFERNCIA'.
+  ELSE.
+    READ TABLE lv_datos-mt_invofox_request-invoices INTO wa_invoices INDEX 1.
+    CONCATENATE '04' wa_invoices-number INTO lv_aviso SEPARATED BY space.
+    lv_xblnr = wa_invoices-number.
+  ENDIF.
+
+  CONCATENATE 'ES' lv_datos-mt_invofox_request-beneficiary INTO DATA(lv_nif).
+  SELECT SINGLE bukrs FROM t001
+   INTO ls_avik-bukrs
+   WHERE stceg = lv_nif.
+  IF lv_nif IS INITIAL.
+    lv_output-error = 'Beneficiary initial'.
+    output-mt_infovox_proxy_response = lv_output.
+    EXIT.
+  ELSEIF ls_avik-bukrs IS INITIAL.
+    lv_output-error = 'Beneficiary not valid'.
+    output-mt_infovox_proxy_response = lv_output.
+    EXIT.
+  ENDIF.
+
+  ls_avik-koart = 'D'.
+  SELECT SINGLE kunnr FROM kna1
+    INTO ls_avik-konto
+    WHERE stcd1 = lv_datos-mt_invofox_request-issuer.
+  IF lv_datos-mt_invofox_request-issuer IS INITIAL.
+    lv_output-error = 'Issuer initial'.
+    output-mt_infovox_proxy_response = lv_output.
+    EXIT.
+  ELSEIF ls_avik-konto IS INITIAL.
+    lv_output-error = 'Issuer not valid'.
+    output-mt_infovox_proxy_response = lv_output.
+    EXIT.
+  ENDIF.
+
+  ls_avik-avsid = lv_aviso.
+  ls_avik-waers = lv_datos-mt_invofox_request-divisa.
+  CONCATENATE lv_datos-mt_invofox_request-expiration_date+4(4)
+              lv_datos-mt_invofox_request-expiration_date+2(2)
+              lv_datos-mt_invofox_request-expiration_date(2) INTO ls_avik-zaldt.
+
+  lv_string = lv_datos-mt_invofox_request-amount.
+
+  CALL FUNCTION 'C14DG_CHAR_NUMBER_CONVERSION'
+    EXPORTING
+      i_string                   = lv_string
+    IMPORTING
+      e_float                    = lv_float
+      e_dec                      = lv_dec
+*     E_DECIMALS                 =
+    EXCEPTIONS
+      wrong_characters           = 1
+      first_character_wrong      = 2
+      arithmetic_sign            = 3
+      multiple_decimal_separator = 4
+      thousandsep_in_decimal     = 5
+      thousand_separator         = 6
+      number_too_big             = 7
+      OTHERS                     = 8.
+  IF sy-subrc = 0.
+    ls_avik-rwbtr = lv_float.
+*    ls_avik-rwbtr = lv_dec.
+  ENDIF.
+
+  ls_avik-zbnkl = lv_datos-mt_invofox_request-bank_account(12). "Código bancario del banco
+  ls_avik-zbnkn = lv_datos-mt_invofox_request-bank_account+12(12). ""Número de cuenta bancaria
+  ls_avik-avsrt = '04'.
+  ls_avik-sregl = 'Z01'.
+
+  CONCATENATE lv_datos-mt_invofox_request-identification_code
+              lv_datos-mt_invofox_request-document_number INTO ls_avik-avtxt SEPARATED BY '-'.
+
+  ls_rfradc_in-bukrs = ls_avik-bukrs.
+  ls_rfradc_in-koart = 'D'.
+  ls_rfradc_in-konto = ls_avik-konto.
+  ls_rfradc_in-avsid = lv_aviso.
+  ls_rfradc_in-titl1 = 'Creado interface INFOBOX'.
+  ls_rfradc_in-text1 = 'Creado interface INFOBOX'.
+  ls_rfradc_in-xdark = 'X'. "Indicador: ¿Tratar aviso en forma invisible?
+  ls_rfradc_in-xintn = 'X'. "Indicador: ¿Asignar Nº de aviso sin consultar?
+
+
+*...build payment advice positions.....................................*
+  lv_ind = 0.
+  LOOP AT lv_datos-mt_invofox_request-invoices INTO wa_invoices.
+    lv_ind = lv_ind + 1.
+    wa_avip-bukrs = ls_avik-bukrs.
+    wa_avip-koart = 'D'.
+    wa_avip-konto = ls_avik-konto.
+    wa_avip-avsid = lv_aviso.
+    wa_avip-avspo = lv_ind.
+    wa_avip-abwko = ls_avik-konto.
+    wa_avip-abwbu = ls_avik-bukrs.
+    wa_avip-sfeld = 'XBLNR'.
+
+    IF wa_invoices-number IS NOT INITIAL.
+      wa_avip-swert = wa_invoices-number.
+    ELSE.
+      wa_avip-swert = 'SIN REFERENCIA'.
+    ENDIF.
+
+    wa_avip-xblnr = wa_avip-swert.
+
+    lv_string = wa_invoices-importe.
+
+    CALL FUNCTION 'C14DG_CHAR_NUMBER_CONVERSION'
+      EXPORTING
+        i_string                   = lv_string
+      IMPORTING
+        e_float                    = lv_float
+        E_DEC                      = lv_dec
+*       E_DECIMALS                 =
+      EXCEPTIONS
+        wrong_characters           = 1
+        first_character_wrong      = 2
+        arithmetic_sign            = 3
+        multiple_decimal_separator = 4
+        thousandsep_in_decimal     = 5
+        thousand_separator         = 6
+        number_too_big             = 7
+        OTHERS                     = 8.
+    IF sy-subrc = 0.
+      wa_avip-scurr = lv_float.
+*      wa_avip-scurr = lv_dec.
+    ENDIF.
+
+    wa_avip-nebtr = wa_avip-scurr. "Importe neto del pago con signo +/-_
+    wa_avip-abwka = 'D'.
+    wa_avip-waers = lv_datos-mt_invofox_request-divisa.
+    wa_avip-afeld = 'XBLNR'.
+    APPEND wa_avip TO lt_avip.
+  ENDLOOP.
+
+
+
+  CALL FUNCTION 'REMADV_INSERT'
+    EXPORTING
+      i_avik              = ls_avik
+      i_rfradc            = ls_rfradc_in
+    IMPORTING
+      e_rfradc            = ls_rfradc_out
+    TABLES
+      t_avip              = lt_avip
+    EXCEPTIONS
+      error               = 1
+      no_number_entered   = 2
+      no_authority        = 3
+      already_existing    = 4
+      company_not_defined = 5
+      country_not_defined = 6
+      OTHERS              = 7.
+
+  CASE sy-subrc.
+    WHEN '1'.
+      MESSAGE e617(webfi_master) INTO lv_output-error.
+      output-mt_infovox_proxy_response = lv_output.
+      EXIT.
+
+    WHEN '2'.
+      MESSAGE e618(webfi_master) INTO lv_output-error.
+      output-mt_infovox_proxy_response = lv_output.
+      EXIT.
+
+    WHEN '3'.
+      MESSAGE e614(webfi_master) WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 INTO lv_output-error.
+      output-mt_infovox_proxy_response = lv_output.
+      EXIT.
+
+    WHEN '4' OR '5' OR '6' OR '7'.
+      MESSAGE e619(webfi_master) WITH sy-subrc INTO lv_output-error.
+      output-mt_infovox_proxy_response = lv_output.
+      EXIT.
+  ENDCASE.
+
+
+*...store payment advice in database...................................*
+  CALL FUNCTION 'REMADV_SAVE_DB_ALL'
+    EXPORTING
+      i_dialog_update = 'X'
+      i_commit        = 'X'.
+
+
+
+
+
+ENDFUNCTION.

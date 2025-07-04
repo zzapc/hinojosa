@@ -1,0 +1,5507 @@
+REPORT rfbila00 MESSAGE-ID fr
+                LINE-SIZE   132
+                NO STANDARD PAGE HEADING.
+
+*----------------------------------------------------------------------*
+* Corrections/ repair
+* wes140906 140906 note 980527: Pass trig-kz to konz_extract(RGCBILA0)
+*                  for enhancement of wes190202
+* ECC500
+* xrp290904 290904 note 758747: Add functionality for SEM-BCS
+* 4.70
+* xrp260704 260704 note 758742: Activate Sel Screen 2000 for FI-LC
+* xrp040803 040803 note 647723: Unicode enabling for extract to cons
+* wms086855 110603 Note 630825: performance enhancement/ subsequent
+*                  error after note 623476 in case of restriction to
+*                  business areas
+* wes190202 190202 Extract: Handle values with LC = 0 and GC <> 0
+* wms068863 211101 Unicode decoupling
+* 4.0C
+* xrp250698 Add functionality to determine path and location of
+*           extract file for EC-CS
+* 4.0B
+* xfm064986 110298  Bilanztyp = Eröffnungsbilanz, wegen EURO nun
+*                   möglich
+* 3.1I
+* VSK047132 051197  Datenextrakt für die Konsolidierung nun auch
+*                   möglich für Bilanz/GuV-Strukturen auf der Basis
+*                   von Konzernkontonummern (Annahme: in GLT3 steht
+*                   immer das operative Konto).
+
+CLASS: cl_abap_char_utilities DEFINITION LOAD.
+
+TYPE-POOLS: slis.                                                  "ALV
+
+TABLES:   t001,  ska1,  bhdgd,
+          t011,  skat,
+          t011t, skb1,
+          t009,  skc1a,
+          t004,
+          t009b,
+          t009y.
+
+TABLES:   rfsdo.
+TABLES:   tgsb.
+TABLES:   fimsg.
+TABLES:   faglfreesel.
+
+uc_data.
+
+FIELD-SYMBOLS: <f1>.
+
+*---------------------------------------------------------------------*
+*     D A T E N - D E F I N I T I O N E N                             *
+*---------------------------------------------------------------------*
+
+*     'H' =   Hilfsfelder, die jederzeit fuer Berechnungen
+*     verwendet werden koennen.
+*     ----------------------------------------------------
+DATA: BEGIN OF h,
+        um01s     LIKE skc1a-um01s,
+        um01h     LIKE skc1a-um01h,
+*...... reference field for internal calculation fields
+        amount(9) TYPE p DECIMALS 2,
+        saldo     LIKE h-amount,
+        usald     LIKE h-amount,
+        relab(16) TYPE p DECIMALS 1,
+        umonat(2) TYPE p,
+        omonat(2) TYPE p,
+        sign(1)   TYPE p,
+        prkey     LIKE rf011p-prkey,
+        ergsl     LIKE t011-ergak,
+        text(15),
+        subrc     LIKE sy-subrc,
+        waers     LIKE t001-waers,
+        fname(7)  TYPE c VALUE 'H-USALD',
+      END   OF h.
+
+*..... data declarations for output via ALV
+CONSTANTS: con_grid(4)  TYPE c        VALUE 'GRID',              " ALV
+           con_tree(4)  TYPE c        VALUE 'TREE',              " ALV
+           con_repid    LIKE sy-repid VALUE 'RFBILA00'.          " ALV
+CONSTANTS:
+           con_fagl_bhdgd_rldnr(16) TYPE c
+                                      VALUE 'FAGL_BHDGD_RLDNR'.
+TYPES: tt_bspl          LIKE rfbila_alv_data OCCURS 0.           " ALV
+DATA:  gt_bspl          TYPE tt_bspl WITH HEADER LINE.           " ALV
+DATA:  gt_bspltop       TYPE slis_t_listheader..                 " ALV
+DATA:  gs_bspl_settings LIKE rfbila_alv_settings.                " ALV
+DATA:  gs_grid_settings TYPE lvc_s_glay.                         " ALV
+DATA:  g_grid_title     TYPE lvc_title.                          " ALV
+DATA:  g_rldnr          LIKE skc1a-rldnr.
+DATA:  g_ryear          LIKE rfbila_alv_data-ryear.
+DATA:  g_poper          LIKE rfbila_alv_data-poper.
+DATA   gt_curr_info     TYPE STANDARD TABLE OF fagl_fc_documents.
+
+*     Übergabestruktur an SAP-EIS
+*     ---------------------------
+DATA: BEGIN OF eis_rec,
+        versn LIKE t011-versn,         " Bilanzversion
+        pvers LIKE rfpdo-bilapver,     " Planversion
+        basis LIKE rf011p-ergsl,       " Basisgröße
+        konto LIKE ska1-saknr,         " Kontonummer
+        bukrs LIKE skb1-bukrs,         " Buchungskreis
+        gsber LIKE skc1a-gsber,        " Gesch.bereich
+        bjahr LIKE bkpf-gjahr,         " Berichtsjahr
+        bmvon LIKE bkpf-monat,         " Berichtsmonat VON
+        bmbis LIKE bkpf-monat,         " Berichtsmonat BIS
+        waers LIKE t001-waers,         " Währung
+        betrg LIKE h-amount,           " Betrag
+      END   OF eis_rec.
+DATA: eis_subrc LIKE sy-subrc,
+      grpid     LIKE t242x-grpid.
+
+DATA: read_tabix       LIKE sy-tabix,
+      altkt_not_found  TYPE c,
+      alttx_not_found  TYPE c.
+DATA: save_sakan       LIKE ska1-sakan.
+DATA: list_createt     TYPE c VALUE ' '.
+DATA: BEGIN OF high_value,
+        space TYPE c,
+        high  TYPE c,
+      END   OF high_value.
+high_value-high = cl_abap_char_utilities=>maxchar.
+DATA: BEGIN OF x_ff_gsber,
+        ff(4) TYPE c,
+      END   OF x_ff_gsber.
+TRANSLATE x_ff_gsber USING high_value.
+
+*     CTYP_WAERS enthällt den Währungsschlüssel gem. dem gewählten
+*     Währungstyp auf den Selektionsbild.
+*     ------------------------------------------------------------
+DATA: ctyp_waers LIKE t001-waers.
+
+*     Zwischenspeicher fuer Suchargument fuer Tabelle 011Q.
+*     -----------------------------------------------------
+DATA: BEGIN OF old,
+        suarg1 LIKE rf011q-ergsl,
+      END   OF old.
+
+*     Ergebnisschluessel der Aktiva repraesentiert
+*     --------------------------------------------
+DATA: BEGIN OF aktva,
+        prkey LIKE rf011p-prkey,
+      END   OF aktva.
+
+*     Ergebnisschluessel der Passiva repraesentiert
+*     ---------------------------------------------
+DATA: BEGIN OF pssva,
+        prkey LIKE rf011p-prkey,
+      END   OF pssva.
+
+*     Ergebnisschluessel der den Bilanzanhang repraesentiert
+*     ------------------------------------------------------
+DATA: BEGIN OF anhng,
+        prkey LIKE rf011p-prkey,
+      END   OF anhng.
+
+*     Ergebnisschluessel fuer die nicht zugeordneten Konten
+*     -----------------------------------------------------
+DATA: BEGIN OF nzuon,
+        prkey LIKE rf011p-prkey,
+      END   OF nzuon.
+
+*     Position des Ergebnisses in der Bilanz (positiv)
+*     ------------------------------------------------
+DATA: BEGIN OF e1pos,
+        prkey LIKE rf011p-prkey,
+      END   OF e1pos.
+
+*     Position des Ergebnisses in der Bilanz (negativ)
+*     ------------------------------------------------
+DATA: BEGIN OF e1neg,
+        prkey LIKE rf011p-prkey,
+      END   OF e1neg.
+
+*     Position des Ergebnisses in der G u V  (positiv)
+*     ------------------------------------------------
+DATA: BEGIN OF e2pos,
+        prkey LIKE rf011p-prkey,
+      END   OF e2pos.
+
+*     Position des Ergebnisses in der G u V  (negativ)
+*     ------------------------------------------------
+DATA: BEGIN OF e2neg,
+        prkey LIKE rf011p-prkey,
+      END   OF e2neg.
+
+*     length according to the level in fsv
+DATA: aktva_len   TYPE i VALUE 2,
+      pssva_len   TYPE i VALUE 2,
+      nzuon_len   TYPE i VALUE 2,
+      anhng_len   TYPE i VALUE 2.
+
+*     Programmschluessel gemaess ausgewaehlter Version
+*     ------------------------------------------------
+DATA: BEGIN OF prkey,
+        soll  LIKE rf011p-prkey,
+        haben LIKE rf011p-prkey,
+        verd  LIKE rf011z-xverd,
+      END   OF prkey.
+
+*     Ergebnisschluessel gemaess ausgewaehlter Version
+*     ------------------------------------------------
+DATA: BEGIN OF ergsl,
+        soll  LIKE rf011z-ergso,
+        haben LIKE rf011z-erghb,
+      END   OF ergsl.
+
+*     In der Feldleiste PER werden die Berichts- und
+*     Vergleichsperioden gesammelt.
+*     ----------------------------------------------
+DATA: BEGIN OF per,
+        bjjv LIKE bkpf-gjahr,          " Ber.Jahr von
+        bmmv LIKE bkpf-monat,          " Ber.Monat von
+        bjjb LIKE bkpf-gjahr,          " Ber.Jahr bis
+        bmmb LIKE bkpf-monat,          " Ber.Monat bis
+        vjjv LIKE bkpf-gjahr,          " Ver.Jahr von
+        vmmv LIKE bkpf-monat,          " Ver.Monat von
+        vjjb LIKE bkpf-gjahr,          " Ver.Jahr bis
+        vmmb LIKE bkpf-monat,          " Ver.Monat bis
+      END   OF per.
+
+*     Daten der Berichtsperiode
+*     -------------------------
+DATA: BEGIN OF bper,
+        embil(2) TYPE p,               " Erster  Monat Bilanz
+        lmbil(2) TYPE p,               " Letzter Monat Bilanz
+        emguv(2) TYPE p,               " Erster  Monat GuV
+        lmguv(2) TYPE p,               " Letzter Monat GuV
+        anzmo(2) TYPE p,               " Anzahl  Monate
+      END   OF bper.
+
+*     Daten der Vergleichsperiode
+*     ---------------------------
+DATA: BEGIN OF vper,
+        embil(2) TYPE p,               " Erster  Monat Bilanz
+        lmbil(2) TYPE p,               " Letzter Monat Bilanz
+        emguv(2) TYPE p,               " Erster  Monat GuV
+        lmguv(2) TYPE p,               " Letzter Monat GuV
+        anzmo(2) TYPE p,               " Anzahl  Monate
+      END   OF vper.
+
+*     ZUON_SAKNR
+*     wird abhaengig von der Bilanzversion entweder mit mit der
+*     normalen Kontonummer (SKA1-SAKNR) oder mit der Konzernkonto-
+*     nummer (SKA1-BILKT) versorgt.
+*     Mit ihr wird dann die Zuordnung eines Kontos zu einer Bilanz-
+*     position getroffen.
+DATA: zuon_saknr  LIKE ska1-saknr.
+
+*     ZUON_KTOPL
+*     wird abhaengig von der Bilanzversion entweder mit mit dem
+*     normalen Kontenplan  (T001-KTOPL) oder mit der Konzernkonten-
+*     plan (T004-KKTPL) versorgt.
+*     Mit ihm wird dann die Zuordnung eines Kontos zu einer Bilanz-
+*     position getroffen.
+DATA: zuon_ktopl  LIKE t001-ktopl.
+
+*     TRIG-KZ
+*     Bei zu verdichtenden Ergebnisschluesseln  entscheidet nicht
+*     Saldo eines Kontos sondern der Gesamtsaldo der Gruppe ob die
+*     Konten auf der Aktiv- oder Passivseite gezeigt werden.
+*     Deshalb wird dieses Kennzeichen bei AT TRIGGER gesetzt um ggf
+*     Saetze bei AT KONTEN zu unterdruecken.
+*     -------------------------------------------------------------
+DATA: trig-kz(1) TYPE c.
+
+*     X011P Interne Tabelle der Bilanzpositionen
+*     ------------------------------------------
+DATA: BEGIN OF x011p OCCURS 250.
+        INCLUDE STRUCTURE rf011p.
+DATA: END   OF x011p.
+
+*     X011Q Interne Tabelle der Bilanzpositionstexte
+*     ----------------------------------------------
+DATA: BEGIN OF x011q OCCURS 900.
+        INCLUDE STRUCTURE rf011q.
+DATA: END   OF x011q.
+
+*     X011Z Interne Tabelle der Bilanzzuordnung
+*     -----------------------------------------
+DATA: BEGIN OF x011z OCCURS 1100.
+        INCLUDE STRUCTURE rf011z.
+DATA: END   OF x011z.
+
+*     SAVE_X011Z Merker für Eintrag aus X011Z
+*     ---------------------------------------
+DATA: BEGIN OF save_x011z.
+        INCLUDE STRUCTURE rf011z.
+DATA: END   OF save_x011z.
+
+*     X011V Interne Tabelle der Verdichtungsgruppen
+*     ---------------------------------------------
+DATA: BEGIN OF x011v OCCURS 50.
+        INCLUDE STRUCTURE rf011v.
+DATA: END   OF x011v.
+
+*     X011ZKEY Schluessel zum Zugriff auf Tabelle X011Z
+*     -------------------------------------------------
+DATA: BEGIN OF x011zkey,
+        ktopl LIKE rf011z-ktopl,
+        bilkt LIKE rf011z-bilkt,
+      END   OF x011zkey.
+
+*     X011VKEY Schluessel zum Zugriff auf Tabelle X011V
+*     -------------------------------------------------
+DATA: BEGIN OF x011vkey,
+        ergs1 LIKE rf011v-ergs1,
+        ergs2 LIKE rf011v-ergs2,
+      END   OF x011vkey.
+
+*     GTAB enthaelt die Berichts- und Vergleichssalden
+*     pro Geschaeftsbereich.
+*     ------------------------------------------------
+DATA: BEGIN OF gtab OCCURS 60,
+        ktopl    LIKE ska1-ktopl,
+        saknr    LIKE ska1-saknr,
+        bukrs    LIKE skc1a-bukrs,
+        gsber    LIKE skc1a-gsber,
+        sakan    LIKE ska1-sakan,
+        prkys    LIKE rf011p-prkey,
+        prkyh    LIKE rf011p-prkey,
+        verd     LIKE rf011z-xverd,
+        bsign(3) TYPE p,
+        bsald    LIKE h-amount,
+        vsign(3) TYPE p,
+        vsald    LIKE h-amount,
+      END   OF gtab.
+
+*     Verdichtungstabelle
+*     -------------------
+DATA: BEGIN OF vtab OCCURS 200,
+        bukrs    LIKE skb1-bukrs,
+        gsber    LIKE skc1a-gsber,
+        prkys    LIKE rf011p-prkey,
+        prkyh    LIKE rf011p-prkey,
+        verds    LIKE rf011z-xverd,
+        waers    LIKE t001-waers,
+        bsign(3) TYPE p,
+        bsald    LIKE h-amount,
+        vsign(3) TYPE p,
+        vsald    LIKE h-amount,
+      END   OF vtab.
+
+*     Verdichtungstabelle (Schlüssel)
+*     -------------------------------
+DATA: BEGIN OF vtabkey,
+        bukrs    LIKE skb1-bukrs,
+        gsber    LIKE skc1a-gsber,
+        prkys    LIKE rf011p-prkey,
+        prkyh    LIKE rf011p-prkey,
+        verds    LIKE rf011z-xverd,
+        waers    LIKE t001-waers,
+      END   OF vtabkey.
+
+*     Sortfelder
+*     ----------
+DATA: BEGIN OF sort,
+        buk1     LIKE skb1-bukrs,
+        gsb1     LIKE skc1a-gsber,
+        list(2)  TYPE c,
+        pky1(2)  TYPE c,
+        pky2(2)  TYPE c,
+        pky3(2)  TYPE c,
+        pky4(2)  TYPE c,
+        pky5(2)  TYPE c,
+        pky6(2)  TYPE c,
+        pky7(2)  TYPE c,
+        pky8(2)  TYPE c,
+        pky9(2)  TYPE c,
+        pky0(2)  TYPE c,
+        verd     LIKE rf011z-xverd,
+        ktnr     LIKE skb1-saknr,
+        buk2     LIKE skb1-bukrs,
+        gsb2     LIKE skc1a-gsber,
+      END   OF sort.
+
+*     restliche EXTRACT-Felder
+*     ------------------------
+DATA: BEGIN OF date,
+        prkey    LIKE rf011p-prkey,
+        ergsl    LIKE rf011z-ergso,
+        saknr    LIKE ska1-saknr,                           "VSK047132
+        sakan    LIKE ska1-sakan,
+        skbez    LIKE skat-txt50,
+        bklau(1) TYPE c,
+        bsald    LIKE h-amount,
+        bklzu(1) TYPE c,
+        vklau(1) TYPE c,
+        vsald    LIKE h-amount,
+        vklzu(1) TYPE c,
+        waers    LIKE t001-waers,
+      END   OF date.
+
+*     SORTBKRS = enthaelt den Sortierbegriff fuer Buchungskreis
+*     Das Feld wird in Abhaengigkeit des Parameters BILABKON gefuellt
+*     -----------------------------------------------------------------
+DATA: sortbkrs LIKE skb1-bukrs.
+
+*     SORTGBER = enthaelt den Sortierbegriff fuer Geschaeftsbereich
+*     Das Feld wird in Abhaengigkeit des Parameters BILAGKON gefuellt
+*     -----------------------------------------------------------------
+DATA: sortgber LIKE skc1a-gsber.
+
+FIELD-GROUPS:
+             header,
+             konten,
+             trigger.
+INSERT
+  sort-buk1                            " Buchungskreis
+  sort-gsb1                            " Geschaeftsbereich
+  sort-list                            " Listenteil
+  sort-pky1                                                 " Stufe 1
+  sort-pky2                                                 " Stufe 2
+  sort-pky3                                                 " Stufe 3
+  sort-pky4                                                 " Stufe 4
+  sort-pky5                                                 " Stufe 5
+  sort-pky6                                                 " Stufe 6
+  sort-pky7                                                 " Stufe 7
+  sort-pky8                                                 " Stufe 8
+  sort-pky9                                                 " Stufe 9
+  sort-pky0                                                 " Stufe 10
+  sort-verd                            " Verdichtungsschluessel
+  sort-ktnr                            " Sachkonto
+  sort-buk2                            " Buchungskreis     (KONS)
+  sort-gsb2                            " Geschaeftsbereich (KONS)
+INTO header.
+
+INSERT
+  date-prkey                           " Programmschluessel
+  date-ergsl                           " Ergebnisschluessel
+  date-saknr                           " Kontonr           "VSK047132
+  date-sakan                           " Kontonummer in relev. Länge
+  date-skbez                           " Kontobezeichnung
+  date-bklau                           " Klammer auf    (B)
+  date-bsald                           " Saldo Berichtszeitraum
+  date-bklzu                           " Klammer zu     (B)
+  date-vklau                           " Klammer auf    (V)
+  date-vsald                           " Saldo Vergleichszeitraum
+  date-vklzu                           " Klammer zu     (V)
+  date-waers                           " Buchungskreis-Waehrung
+  ergsl-soll                           " for consolidation only
+  ergsl-haben                          " for consolidation only
+INTO konten.
+
+INSERT
+  date-prkey                           " Programmschluessel
+  date-skbez                           " Kontobezeichnung
+  date-bklau                           " Klammer auf    (B)
+  date-bsald                           " Saldo Berichtszeitraum
+  date-bklzu                           " Klammer zu     (B)
+  date-vklau                           " Klammer auf    (V)
+  date-vsald                           " Saldo Vergleichszeitraum
+  date-vklzu                           " Klammer zu     (V)
+  date-waers                           " Buchungskreis-Waehrung
+INTO trigger.
+
+*     Schleifenzaehler
+*     ----------------
+DATA: loopctr(3) TYPE p.
+
+*     RESERVE = enthaelt die Anzahl der zu reservierenden
+*     Zeilen am Seitenende
+*     ---------------------------------------------------
+DATA: reserve(3) TYPE p.
+
+*     I011Q dient zur Zwischenspeicherung von Texten aus Tabelle X011Q.
+*     Zur Gruppenanfangszeit werden alle fuer die jeweilige(n)
+*     Gruppenstufe(n) benoetigten Texte in dieser Tabelle gesammelt
+*     und vor Ausgabe der 1. Kontenzeile gedruckt. Damit soll
+*     erreicht werden, dass die Gruppenanfangstexte nicht am
+*     Seitenende auseinandergerissen, sondern ggf. auf eine neue
+*     Seite gedruckt werden.
+*     Zur Gruppenendezeit gilt das gleiche allerdings nur fuer die
+*     jeweils zu Ende gehende Gruppenstufe. Summen fuer Berichts-
+*     und Vergleichszeitraum werden dann ebenfalls in I011Q gesammelt.
+*     ----------------------------------------------------------------
+DATA: BEGIN OF i011q OCCURS 20,
+        skip(2)  TYPE p,               " Anzahl ZeilenVorschub.
+        text(45) TYPE c,               " Text aus T011Q
+        bsum     LIKE h-amount,        " Summe Berichtszeitraum
+        vsum     LIKE h-amount,        " Summe Vergleichszeitraum
+        star(5)  TYPE c,               " Summensterne
+      END   OF i011q.
+
+*     I011P enthaelt die Programmschluessel sortiert nach Ergebnis-
+*     rechnungsschluessel.
+*     Aus ihr werden am Programmanfang Programmschluessel fuer
+*       - das Bilanzergebnis in der Bilanz (positiv)
+*       - das Bilanzergebnis in der Bilanz (negativ)
+*       - das Bilanzergebnis in der GuV    (positiv)
+*       - das Bilanzergebnis in der GuV    (negativ)
+*       - die Konten, die Aktiva repraesentieren
+*       - die Konten, die Passiva repraesentieren
+*       - die Konten, die nicht zugeordnet sind
+*     besorgt.
+*     Waehrend der Selektion werden den Konten die Programmschluessel
+*     zur Sortierung zugeordnet.
+*     --------------------------------------------------------------
+DATA: BEGIN OF i011p OCCURS 250,
+        ergsl    LIKE rf011p-ergsl,    " Bilanzsteuerungsschluessel
+        prkey    LIKE rf011p-prkey,    " Programmschluessel
+        summe    LIKE rf011p-summe,    " Summenkennzeichen
+        stufe    LIKE rf011p-stufe,    " Hierarchiestufe
+      END   OF i011p.
+
+*     Variable Ueberschrift
+*     ---------------------
+DATA: varueb(132).
+
+*     Summenfelder fuer Staffelsummen
+*     -------------------------------
+DATA: BEGIN OF ss,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF ss.
+
+*     Summenfelder fuer Programmschluessel Stufe 1
+*     --------------------------------------------
+DATA: BEGIN OF s1,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF s1.
+
+*     Summenfelder fuer Programmschluessel Stufe 2
+*     --------------------------------------------
+DATA: BEGIN OF s2,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF s2.
+
+*     Summenfelder fuer Programmschluessel Stufe 3
+*     --------------------------------------------
+DATA: BEGIN OF s3,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF s3.
+
+*     Summenfelder fuer Programmschluessel Stufe 4
+*     --------------------------------------------
+DATA: BEGIN OF s4,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF s4.
+
+*     Summenfelder fuer Programmschluessel Stufe 5
+*     --------------------------------------------
+DATA: BEGIN OF s5,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF s5.
+
+*     Summenfelder fuer Programmschluessel Stufe 6
+*     --------------------------------------------
+DATA: BEGIN OF s6,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF s6.
+
+*     Summenfelder fuer Programmschluessel Stufe 7
+*     --------------------------------------------
+DATA: BEGIN OF s7,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF s7.
+
+*     Summenfelder fuer Programmschluessel Stufe 8
+*     --------------------------------------------
+DATA: BEGIN OF s8,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF s8.
+
+*     Summenfelder fuer Programmschluessel Stufe 9
+*     --------------------------------------------
+DATA: BEGIN OF s9,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF s9.
+
+*     Summenfelder fuer Programmschluessel Stufe 10
+*     ---------------------------------------------
+DATA: BEGIN OF s0,
+        bsum LIKE h-amount,
+        vsum LIKE h-amount,
+      END   OF s0.
+
+INCLUDE bilai00_1.                                         "SCRIPT
+
+DATA: gd_fname          LIKE fc03tab-pl00_lfile,            "xrp250698
+      gd_pres           LIKE fcintab-flg_pres,              "xrp250698
+      gd_leave_program.                                     "xrp250698
+* Flag: Select classic G/L balances according to user parameter
+* CLASSIC_BAL_FIREP
+DATA ld_clas_bal_fs10n   TYPE boole_d.                      "n2133360
+
+*EJECT
+
+begin_of_screen 1.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT  1(30) text-030 FOR FIELD bilavers.
+SELECTION-SCREEN POSITION       35.
+PARAMETERS:     bilavers LIKE t011t-versn    MEMORY ID bil
+                                             OBLIGATORY.
+SELECTION-SCREEN COMMENT 40(8) text-031 FOR FIELD bilaspra.
+SELECTION-SCREEN POSITION       49.
+PARAMETERS:     bilaspra LIKE t011-dspra     DEFAULT sy-langu
+                                             OBLIGATORY.
+SELECTION-SCREEN END   OF LINE.
+PARAMETERS:     bilbjahr LIKE bkpf-gjahr OBLIGATORY.
+SELECT-OPTIONS: b-monate FOR  rfsdo-bilabmon NO-EXTENSION
+                                             OBLIGATORY.
+PARAMETERS:     bilvjahr LIKE bkpf-gjahr OBLIGATORY.
+SELECT-OPTIONS: v-monate FOR  rfsdo-bilavmon NO-EXTENSION
+                                             OBLIGATORY.
+*PARAMETERS:     planvers LIKE rfpdo-bilapver DEFAULT space.
+PARAMETERS:     planvers LIKE skc1a-rvers DEFAULT space.
+SELECTION-SCREEN SKIP 1.      "JJR                                 "ALV
+** list layout frame:
+SELECTION-SCREEN BEGIN OF BLOCK list WITH FRAME TITLE text-204.    "ALV
+*SELECTION-SCREEN BEGIN OF LINE.
+*PARAMETERS: bilalist LIKE rfbila_alv_settings-classic
+*                                       RADIOBUTTON GROUP alv.
+*SELECTION-SCREEN COMMENT 3(20) text-205 FOR FIELD bilalist.
+*SELECTION-SCREEN END   OF LINE.
+*
+*SELECTION-SCREEN BEGIN OF LINE.
+*PARAMETERS: bilagrid LIKE rfbila_alv_settings-grid
+*                                       RADIOBUTTON GROUP alv.
+*SELECTION-SCREEN COMMENT  3(20) text-206 FOR FIELD bilagrid.
+*SELECTION-SCREEN COMMENT 25(10) text-209 FOR FIELD bilagvar.
+*SELECTION-SCREEN POSITION  40.
+*PARAMETERS: bilagvar TYPE slis_vari
+*                         MEMORY ID gl_bspl_alv_grid_var.
+*SELECTION-SCREEN END   OF LINE.
+*
+*SELECTION-SCREEN BEGIN OF LINE.
+*PARAMETERS: bilatree LIKE rfbila_alv_settings-tree
+*                                       RADIOBUTTON GROUP alv.
+*SELECTION-SCREEN COMMENT  3(20) text-207 FOR FIELD bilatree.
+*SELECTION-SCREEN COMMENT 25(10) text-209 FOR FIELD bilatvar.
+*SELECTION-SCREEN POSITION  40.
+*PARAMETERS: bilatvar TYPE slis_vari
+*                         MEMORY ID gl_bspl_alv_tree_var.
+*SELECTION-SCREEN END   OF LINE.
+*
+*SELECTION-SCREEN BEGIN OF LINE.
+*SELECTION-SCREEN POSITION   4.
+*PARAMETERS: bilastsl LIKE rfbila_alv_settings-strucblnce
+*                                        AS CHECKBOX.
+*SELECTION-SCREEN COMMENT 6(40) text-208 FOR FIELD bilastsl.
+*SELECTION-SCREEN END   OF LINE.
+*
+*SELECTION-SCREEN END OF BLOCK list.                                "ALV "JJR
+*... end of selection screen layout.
+*ENHANCEMENT-POINT SELE01 SPOTS FI_BILA_PRINT STATIC .
+PARAMETERS: bilalist LIKE rfbila_alv_settings-classic NO-DISPLAY.
+PARAMETERS: bilagrid LIKE rfbila_alv_settings-grid DEFAULT 'X' NO-DISPLAY.
+PARAMETERS: bilagvar TYPE slis_vari NO-DISPLAY.
+PARAMETERS: bilatree LIKE rfbila_alv_settings-tree NO-DISPLAY.
+PARAMETERS: bilatvar TYPE slis_vari  NO-DISPLAY.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN POSITION   4.
+PARAMETERS: bilastsl LIKE rfbila_alv_settings-strucblnce
+                                        AS CHECKBOX.
+SELECTION-SCREEN COMMENT 6(40) TEXT-208 FOR FIELD bilastsl.
+SELECTION-SCREEN END   OF LINE.
+
+SELECTION-SCREEN END OF BLOCK list.                                "ALV
+end_of_screen 1.
+begin_of_screen 2.
+PARAMETERS:
+                bilabkon LIKE rfpdo-bilabkon OBLIGATORY
+                                             DEFAULT '1',
+                bilagkon LIKE rfpdo-bilagkon OBLIGATORY
+                                             DEFAULT '2',
+                bilasumm LIKE rfpdo-bilasumm DEFAULT space,
+                p_summ(1) NO-DISPLAY,                       "n1489749
+                bilavart LIKE rfpdo-bilavtyp DEFAULT '1',
+                bilaskal LIKE rfpdo-bilaskal DEFAULT '0/0',
+                allglsep LIKE rfpdo-allglsep  DEFAULT space,
+                mikfiche LIKE rfpdo-bilamikf  DEFAULT space,
+                allgline LIKE rfpdo-allgline DEFAULT space.
+PARAMETERS:       bilapage LIKE rfpdo3-bilapagno DEFAULT 1.
+INCLUDE bilai00_2.                                       "SCRIPT
+end_of_screen 2.
+
+SELECTION-SCREEN BEGIN OF SCREEN 0030 AS SUBSCREEN.
+PARAMETERS:
+                  bilabtyp LIKE rfpdo-bilabtyp DEFAULT '1',
+                  allgaltk LIKE rfpdo1-allgaltk DEFAULT space,
+                  hochrech LIKE rfpdo-bilahoch DEFAULT space,
+                  bilanull LIKE rfpdo-bilanull DEFAULT space,
+                  loe-vorm LIKE rfpdo-bilalovm DEFAULT space,
+                  repwaers LIKE rfpdo-bilawaer DEFAULT space,
+                  stichtag LIKE rfpdo-bilastid DEFAULT sy-datum,
+                  kurs_typ LIKE tcurr-kurst    DEFAULT 'M   ',
+                  kalzeitr LIKE rfpdo-bilakalz DEFAULT space.
+SELECT-OPTIONS:
+                  kalzeitb FOR  rfsdo-bilakalb NO-EXTENSION,
+                  kalzeitv FOR  rfsdo-bilakalv NO-EXTENSION.
+PARAMETERS:
+                  fi_lc_ex LIKE rfpdo-bilafilc  DEFAULT space,
+                  bila_eis LIKE rfpdo-bila_eis  DEFAULT space.
+PARAMETER:        bilainfl LIKE j_1asinff-compperiod DEFAULT space.
+SELECTION-SCREEN BEGIN OF LINE.                             "n1845459
+PARAMETERS        p_xglyec AS CHECKBOX. "Include GLYEC bal. "n1845459
+SELECTION-SCREEN COMMENT 03(70) text-220 FOR FIELD p_xglyec."n1845459
+SELECTION-SCREEN END OF LINE.                               "n1845459
+SELECTION-SCREEN END   OF SCREEN 0030.
+
+* Definition of TabStrips
+*BEGIN_OF_TABBED_BLOCK: 1 14.
+SELECTION-SCREEN BEGIN OF TABBED BLOCK tabbl1
+                                 FOR 15 LINES.              "n1845459
+tabstrip: 1 (25).
+SELECTION-SCREEN TAB (25) tab30
+                      USER-COMMAND ucom30
+                      DEFAULT SCREEN 0030.
+tabstrip: 2 (25).
+SELECTION-SCREEN END   OF BLOCK tabbl1.
+
+INCLUDE rkasmawf.
+
+SELECTION-SCREEN BEGIN OF SCREEN 2000 AS WINDOW TITLE text-s01.
+                                                            "xrp250698
+SELECTION-SCREEN COMMENT /1(80) text-s02.                   "xrp250698
+*  SELECTION-SCREEN COMMENT /1(80) TEXT-S03.  "xrp250698   "xrp260704
+SELECTION-SCREEN SKIP.                                      "xrp250698
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-f01.
+                                                            "xrp250698
+SELECTION-SCREEN BEGIN OF LINE.                             "xrp250698
+SELECTION-SCREEN POSITION 01.                               "xrp250698
+PARAMETERS  pa_pres RADIOBUTTON GROUP r01.                  "xrp250698
+SELECTION-SCREEN COMMENT 03(30) text-s04                    "xrp250698
+            FOR FIELD pa_pres.                              "xrp250698
+SELECTION-SCREEN END OF LINE.                               "xrp250698
+SELECTION-SCREEN BEGIN OF LINE.                             "xrp250698
+SELECTION-SCREEN POSITION 01.                               "xrp250698
+PARAMETERS  pa_appl RADIOBUTTON GROUP r01.                  "xrp250698
+SELECTION-SCREEN COMMENT 03(30) text-s05                    "xrp250698
+            FOR FIELD pa_appl.                              "xrp250698
+SELECTION-SCREEN END OF LINE.                               "xrp250698
+SELECTION-SCREEN BEGIN OF LINE.                             "xrp250698
+SELECTION-SCREEN COMMENT 01(30) text-s06                    "xrp250698
+            FOR FIELD pa_fname.                             "xrp250698
+PARAMETERS  pa_fname LIKE fc03tab-pl00_lfile OBLIGATORY.    "xrp250698
+SELECTION-SCREEN END OF LINE.                               "xrp250698
+SELECTION-SCREEN END OF BLOCK b01.                          "xrp250698
+PARAMETERS: pa_rbcs TYPE fc_flg AS CHECKBOX                 "xrp290904
+                    USER-COMMAND dummy.                     "n1630595
+PARAMETERS: pa_aggr TYPE fc_flg AS CHECKBOX.                "n1630595
+                                                            "xrp250698
+SELECTION-SCREEN END OF SCREEN 2000.                        "xrp250698
+
+PARAMETERS pa_choff NO-DISPLAY.                             "xrp240209
+PARAMETERS p_cntry  TYPE land NO-DISPLAY.                   "n2145597
+DATA gd_log_handle            TYPE balloghndl.              "n1944061
+*BILA&I00 replaced by BILAI00_1 and BILAI00_2
+*INCLUDE BILA&I00.                      "SCRIPT
+
+*EJECT
+*--------------------------------------------------------------------*
+*        INITIALIZATION                                              *
+*--------------------------------------------------------------------*
+INITIALIZATION.
+  get_tabstrip_title: 1,2.
+  tab30 = text-051.
+* Vorschlagswerte Berichts- und Vergleichsjahr
+* --------------------------------------------
+  GET PARAMETER ID 'BUK' FIELD sortbkrs.
+  CALL FUNCTION 'GET_CURRENT_YEAR'
+    EXPORTING
+      bukrs = sortbkrs
+    IMPORTING
+      curry = bilbjahr
+      prevy = bilvjahr.
+
+  IF bilbjahr IS INITIAL.
+    bilbjahr = sy-datum(4).
+    bilvjahr = bilbjahr - 1.
+  ENDIF.
+
+* Vorschlagswerte Berichtsperioden
+* --------------------------------
+  CALL FUNCTION 'BUILD_DEFAULT_PERIOD'
+    EXPORTING
+      i_use_msgty = 'E'
+    TABLES
+      xmonat      = b-monate.
+
+* Vorschlagswerte Vergleichsperioden
+* ----------------------------------
+  CALL FUNCTION 'BUILD_DEFAULT_PERIOD'
+    EXPORTING
+      i_use_msgty = 'E'
+    TABLES
+      xmonat      = v-monate.
+* Export flag to make log. database SDF select classic G/L
+  GET PARAMETER ID 'CLASSIC_BAL_FIREP'                      "n2133360
+    FIELD ld_clas_bal_fs10n.                                "n2133360
+  EXPORT ld_clas_bal_fs10n                                  "n2133360
+    TO MEMORY ID 'CLASSIC_BALANCE_SDF'.                     "n2133360
+
+* Pruefen Berichtsperioden
+* ------------------------
+AT SELECTION-SCREEN ON b-monate.
+  CALL FUNCTION 'BUILD_DEFAULT_PERIOD'
+    EXPORTING
+      i_use_msgty = 'E'
+    TABLES
+      xmonat      = b-monate.
+
+* Pruefen Vergleichsperioden
+* --------------------------
+AT SELECTION-SCREEN ON v-monate.
+  CALL FUNCTION 'BUILD_DEFAULT_PERIOD'
+    EXPORTING
+      i_use_msgty = 'E'
+    TABLES
+      xmonat      = v-monate.
+
+* JJR
+*AT SELECTION-SCREEN ON RADIOBUTTON GROUP alv.
+*  PERFORM sel_screen_alv.
+*JJR
+
+AT SELECTION-SCREEN ON bilavers.
+* check fin.statement version
+  SELECT SINGLE * FROM  t011 WHERE versn = bilavers.
+  IF sy-subrc NE 0.
+    MESSAGE e714(fe) WITH bilavers.
+  ENDIF..
+  AUTHORITY-CHECK OBJECT 'F_T011'
+    ID 'VERSN' FIELD bilavers
+    ID 'ACTVT' FIELD '03'.
+  IF sy-subrc <> 0.
+    MESSAGE e031(fe).
+  ENDIF.
+
+AT SELECTION-SCREEN ON bilasumm.                            "n1787406
+  IF bilasumm CN ' 0123456789'.                             "n1787406
+    MESSAGE e052(00).                                       "n1787406
+  ENDIF.                                                    "n1787406
+
+AT SELECTION-SCREEN OUTPUT.                                      "ALV
+  IF bilalist IS INITIAL                                         "ALV
+ AND bilagrid IS INITIAL                                         "ALV
+ AND bilatree IS INITIAL.                                        "ALV
+*    IF syst-slset IS INITIAL.                              "n1060564
+*      bilagrid = 'X'.                                      "n1060564
+*    ELSE.                                                  "n1060564
+    bilalist = 'X'.                                            "ALV
+*    ENDIF.                                                 "n1060564
+  ENDIF.
+  IF sy-dynnr = '2000'.                           "begin "n1630595
+    LOOP AT SCREEN.
+      IF screen-name CS 'AGGR'.
+        IF pa_rbcs IS INITIAL.
+          screen-input = 0.
+        ELSE.
+          screen-input = 1.
+        ENDIF.
+        MODIFY SCREEN.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.                                          "end "n1630595
+
+* jjr
+*AT SELECTION-SCREEN ON VALUE-REQUEST FOR bilagvar.                "ALV
+*  PERFORM bspl_alv_variant_f4 USING    con_repid                  "ALV
+*                                       con_grid                   "ALV
+*                              CHANGING bilagvar.                  "ALV
+*
+*AT SELECTION-SCREEN ON VALUE-REQUEST FOR bilatvar.                "ALV
+*  PERFORM bspl_alv_variant_f4 USING    con_repid                  "ALV
+*                                       con_tree                   "ALV
+*                              CHANGING bilatvar.                  "ALV
+* jjr
+AT SELECTION-SCREEN.
+  IF bila_eis EQ 'X' AND fi_lc_ex <> space.
+    MESSAGE e394.
+  ENDIF.
+  IF bila_eis EQ 'X'.
+    bilabkon = '1'.
+    bilagkon = '2'.
+    bilasumm = ' '.
+*   BILABTYP = '3'.
+  ENDIF.
+
+  IF p_xglyec IS NOT INITIAL.                               "n1845459
+    sd_plan = 2.  "Include GLYEC balances RRCTY=5           "n1845459
+  ELSE.                                                     "n1845459
+    CLEAR sd_plan.                                          "n1845459
+  ENDIF.                                                    "n1845459
+
+  IF fi_lc_ex = '1' OR fi_lc_ex = '2'.
+    IF sd_curtp <> space AND sd_curtp <> '10'.
+      MESSAGE e395.
+    ENDIF.
+  ENDIF.
+  IF fi_lc_ex = '1' OR fi_lc_ex = '2'.
+    IF bilabtyp <> '1' AND bilabtyp <> '4'.                 "xfm064986
+      MESSAGE e396.
+    ENDIF.
+  ENDIF.
+  IF fi_lc_ex = '1'.
+*   Extrakt an FI_LC
+*   Geschaeftsbereichskonsolidierung muß gesetzt werden.
+*   >> ein Satz pro Buchungskreis <<
+*   ---------------------------------------------------
+    bilabkon  = '1'.
+    bilagkon  = '3'.
+    bilasumm  = ' '.
+  ENDIF.
+
+  IF fi_lc_ex = '2'.
+*   Extrakt an FI_LC
+*   Geschaeftsbereiche einzeln muß gesetzt werden.
+*   >> ein Satz pro globalem Geschäftsbereich <<
+*   ----------------------------------------------
+    bilabkon  = '1'.
+    bilagkon  = '1'.
+    bilasumm  = ' '.
+  ENDIF.
+
+  PERFORM check_output_options.                             "n1060564
+  PERFORM check_org_data.                         "n1740109 "n1944061
+
+  IF sy-dynnr = '2000'.                           "begin "n1630595
+    IF pa_rbcs IS INITIAL.
+      CLEAR pa_aggr.
+    ENDIF.
+  ENDIF.                                          "end "n1630595
+
+  INCLUDE bila&i01.                    "SCRIPT
+
+*EJECT
+START-OF-SELECTION.
+  IF NOT (  fi_lc_ex IS INITIAL                                 "ALV
+        AND bila_eis IS INITIAL ).                              "ALV
+    CLEAR: bilatree,                                            "ALV
+           bilagrid.                                            "ALV
+  ENDIF.                                                        "ALV
+
+  PERFORM transform_bilasumm.                               "n1787406
+*  p_summ = bilasumm.                            "n1486648  "n1787406
+* determine fisc. year, period for ALV output
+  IF bilbjahr = bilvjahr.
+    g_ryear = bilbjahr.
+  ENDIF.
+  IF b-monate-low  = v-monate-low
+ AND b-monate-high = v-monate-high.
+    g_poper = b-monate-high.
+  ENDIF.
+
+* registration for shedule manager
+  PERFORM schedman_start_stop USING 'START'.
+
+* Extract to consolidation required                        "xrp250698
+  IF fi_lc_ex <> space.                                     "xrp250698
+*   get logical filename for extract file through popup    "xrp250698
+*   if EC-CS or FI-LC is active                "xrp250698  "xrp260704
+    PERFORM fname_for_eccs_get CHANGING gd_fname            "xrp250698
+                                        gd_pres             "xrp250698
+                                        gd_leave_program.   "xrp250698
+*   GD_LEAVE_PROGRAM = 'X' => User cancelled file name entry "xrp250698
+    IF gd_leave_program = 'X'.                              "xrp250698
+      EXIT.                                                 "xrp250698
+    ENDIF.                                                  "xrp250698
+  ENDIF.                                                    "xrp250698
+
+  IF sy-langu <> bilaspra.
+    SET LANGUAGE bilaspra.
+    PERFORM set_language(rsbtchh0) USING bilaspra IF FOUND.
+  ENDIF.
+
+  CLEAR t004.
+* Geschaeftsjahre in die DB-Abgrenzung SD_GJAHR
+* uebernehmen um DB-Zugriffe zu sparen.
+* ---------------------------------------------
+  IF kalzeitr = space.
+    sd_gjahr-sign   = 'I'.
+    sd_gjahr-option = 'EQ'.
+    sd_gjahr-low    = bilbjahr.
+    APPEND sd_gjahr.
+    IF planvers = space.
+      sd_gjahr-sign   = 'I'.
+      sd_gjahr-option = 'EQ'.
+      sd_gjahr-low    = bilvjahr.
+      APPEND sd_gjahr.
+    ENDIF.
+  ELSE.
+*   Datum in Kopreintrag bereitstellen
+*   ----------------------------------
+    READ TABLE kalzeitb INDEX 1.
+    READ TABLE kalzeitv INDEX 1.
+  ENDIF.
+
+* Planversion in die DB-Abgrenzung SD_VERS
+* uebernehmen.
+* ----------------------------------------
+  IF planvers <> space.
+    sd_vers-sign   = 'I'.
+    sd_vers-option = 'EQ'.
+    sd_vers-low    = planvers.
+    APPEND sd_vers.
+  ENDIF.
+
+* Standardseitenkopf fuellen.
+* ---------------------------
+  PERFORM fill_bhdgd.
+
+  SELECT SINGLE * FROM  t011
+                  WHERE versn = bilavers.
+  IF sy-subrc NE 0.
+    MESSAGE e714(fe) WITH bilavers.
+  ELSE.
+*   Import der Daten von RFDT
+*   -------------------------
+    CALL FUNCTION 'FI_IMPORT_BALANCE_SHEET_POS'
+      EXPORTING
+        version           = t011-versn
+      TABLES
+        x011p             = x011p
+        x011v             = x011v
+        i011z             = x011z
+      EXCEPTIONS
+        new_balance_sheet = 04.
+    IF sy-subrc = 0.
+      CALL FUNCTION 'FI_IMPORT_BALANCE_SHEET_TEXT'
+        EXPORTING
+          sprache        = bilaspra
+          version        = t011-versn
+        TABLES
+          x011q          = x011q
+        EXCEPTIONS
+          text_not_found = 04.
+      IF sy-subrc <> 0.
+        CALL FUNCTION 'FI_IMPORT_BALANCE_SHEET_TEXT'
+          EXPORTING
+            sprache        = t011-dspra
+            version        = t011-versn
+          TABLES
+            x011q          = x011q
+          EXCEPTIONS
+            text_not_found = 04.
+      ENDIF.
+    ELSE.
+      MESSAGE w714(fe) WITH bilavers.
+    ENDIF.
+  ENDIF.
+
+* Programmschluessel fuer die Position des Bilanzergebnisses in der
+* Bilanz und GuV ermitteln.
+* -----------------------------------------------------------------
+  PERFORM suchen_ergebnis_position USING bilavers.
+
+  IF NOT sy-batch IS INITIAL AND scr_print_to_form = yes.
+    PERFORM scr_check_printer_filled.
+  ENDIF.
+
+* Uebernahme der eventuell abgeaenderten Parameter
+* in die Feldleiste PER.
+* ------------------------------------------------
+  CLEAR per.
+  MOVE: bilbjahr         TO per-bjjv," Ber.Jahr  von
+        b-monate-low     TO per-bmmv," Ber.Monat von
+        bilbjahr         TO per-bjjb," Ber.Jahr  bis
+        b-monate-high    TO per-bmmb," Ber.Monat bis
+        bilvjahr         TO per-vjjv," Ver.Jahr  von
+        v-monate-low     TO per-vmmv," Ver.Monat von
+        bilvjahr         TO per-vjjb," Ver.Jahr  bis
+        v-monate-high    TO per-vmmb." Ver.Monat bis
+  IF bilabtyp = '4'.
+*.. Eröffnungsbilanz
+    CLEAR: per-bmmv,                 " Ber.Monat von
+           per-bmmb,                 " Ber.Monat bis
+           per-vmmv,                 " Ver.Monat von
+           per-vmmb.                 " Ver.Monat bis
+  ENDIF.
+
+  IF planvers <> space.
+*   Planversion, Vergleichsperiode gleich Berichtsperiode
+*   -----------------------------------------------------
+    per-vmmv = per-bmmv.
+    per-vmmb = per-bmmb.
+  ENDIF.
+
+  CALL FUNCTION 'MESSAGES_INITIALIZE'.                      "n1345104
+
+*EJECT
+GET ska1.
+  CHECK SELECT-OPTIONS.
+
+  REFRESH: gtab.
+  CLEAR:   ctyp_waers.
+  CLEAR:   prkey.
+
+  IF t011-xergs = 'X'.
+*   Konzernkontonummern verwenden
+*   -----------------------------
+    IF t004-ktopl NE ska1-ktopl.
+      SELECT SINGLE * FROM t004 WHERE
+                                ktopl = ska1-ktopl.
+    ENDIF.
+    zuon_saknr = ska1-bilkt.
+    zuon_ktopl = t004-kktpl.
+
+*   Sachkonto auf relevante Länge stutzen
+*   ------------------------------------
+    ska1-sakan = ska1-bilkt.
+    IF t004-sakln > 0.
+      DESCRIBE FIELD ska1-bilkt LENGTH sy-fdpos IN CHARACTER MODE.
+      sy-fdpos = sy-fdpos - t004-sakln.
+      IF ska1-sakan CO '0123456789'.
+        WHILE sy-index LE sy-fdpos AND ska1-sakan(1) = '0'.
+          SHIFT ska1-sakan.
+        ENDWHILE.
+      ENDIF.
+    ENDIF.
+  ELSE.
+*   normaler Kontenplan
+*   -------------------
+    zuon_saknr = ska1-saknr.
+    zuon_ktopl = ska1-ktopl.
+  ENDIF.
+
+  IF t011-xergs = 'X'
+  OR sy-langu  <> bilaspra.
+*   Bezeichnung Konzernkontonummer
+*   ------------------------------
+    CALL FUNCTION 'READ_HAUPTBUCH_TEXT'
+      EXPORTING
+        kontenplan     = zuon_ktopl
+        sachkonto      = zuon_saknr
+        sprache        = bilaspra
+      IMPORTING
+        text_wa        = skat
+      EXCEPTIONS
+        text_not_found = 04.
+  ENDIF.
+
+GET skb1.
+  CHECK SELECT-OPTIONS.
+
+  CLEAR:  gtab, h.
+  IF bilabkon <= '2'.
+    CLEAR:  ctyp_waers.
+    REFRESH gtab.
+  ENDIF.
+
+* Zu den selektierten SKB1 Saetzen die zugehoerigen Ergebnis- und
+* Programmschluessel aus den Tabellen X011Z und I011P besorgen.
+* ---------------------------------------------------------------
+
+* Kontenplan aus Tabelle T001
+* ---------------------------
+  IF skb1-bukrs NE t001-bukrs.
+    SELECT SINGLE * FROM t001
+                    WHERE bukrs = skb1-bukrs.
+  ENDIF.
+
+  IF allgaltk = 'X'.
+*   Alternative Kontonummer gewünscht
+*   ---------------------------------
+    save_sakan = ska1-sakan.
+    CALL FUNCTION 'READ_SACHKONTO_ALTKT'
+      EXPORTING
+        altkt_i         = skb1-altkt
+        bukrs           = skb1-bukrs
+        saknr           = ska1-saknr
+        spras           = bilaspra
+        xskan           = 'X'
+        xtext           = 'X'
+      IMPORTING
+        altkt           = skb1-altkt
+        altkt_sakan     = ska1-sakan
+        ltext           = skat-txt50
+        altkt_not_found = altkt_not_found
+        text_not_found  = alttx_not_found.
+
+    IF altkt_not_found <> 'X'
+   AND alttx_not_found <> 'X'.
+*     Alles Ok.
+*     ---------
+      zuon_saknr = skb1-altkt.
+      zuon_ktopl = t001-ktop2.
+    ELSE.
+      IF altkt_not_found = 'X'.
+*       Alternative Kontonummer nicht gepflegt
+*       --------------------------------------
+        CLEAR fimsg.
+        fimsg-msort = '0006'.
+        fimsg-msgid = 'FR'.
+        fimsg-msgty = 'E'.
+        fimsg-msgno = '319'.
+        fimsg-msgv1 = ska1-saknr.
+        fimsg-msgv2 = skb1-bukrs.
+        CALL FUNCTION 'FI_MESSAGE_COLLECT'
+          EXPORTING
+            i_fimsg = fimsg.
+        ska1-sakan = save_sakan.
+      ENDIF.
+
+      IF alttx_not_found = 'X'.
+*       Text zur alternativen Kontonummer nicht gepflegt
+*       ------------------------------------------------
+        CLEAR fimsg.
+        fimsg-msort = '0007'.
+        fimsg-msgid = 'FR'.
+        fimsg-msgty = 'E'.
+        fimsg-msgno = '316'.
+        fimsg-msgv1 = skb1-altkt.
+        fimsg-msgv2 = t001-ktop2.
+        CALL FUNCTION 'FI_MESSAGE_COLLECT'
+          EXPORTING
+            i_fimsg = fimsg.
+        zuon_saknr = skb1-altkt.
+        zuon_ktopl = t001-ktop2.
+      ENDIF.
+    ENDIF.
+    IF t001-ktopl = t001-ktop2.                   "begin "n1885798
+      PERFORM get_account_text
+        USING
+          bilaspra
+          t001-ktop2
+          skb1-altkt
+        CHANGING
+          skat-txt50.
+    ENDIF.                                        "end "n1885798
+  ENDIF.
+
+* Ergebnisschluessel Soll und Haben aus Tabelle X011Z
+* ---------------------------------------------------
+  CLEAR prkey.
+  x011zkey-ktopl = zuon_ktopl.
+  x011zkey-bilkt = zuon_saknr.
+  READ TABLE x011z WITH KEY x011zkey BINARY SEARCH.
+
+  CASE sy-subrc.
+    WHEN 0.
+*   OK, nichts machen
+*   -----------------
+    WHEN 4.
+*   nicht eindeutig, den nächst größeren nehmen
+*   -------------------------------------------
+      READ TABLE x011z INDEX sy-tabix.
+    WHEN 8.
+*   erzwinge Nicht-Zuordenbarkeit
+*   -----------------------------
+      CLEAR x011z.
+  ENDCASE.
+
+  IF zuon_saknr LE x011z-bilkt AND
+     zuon_saknr GE x011z-vonkt AND
+     zuon_ktopl EQ x011z-ktopl.
+*   Konto liegt im gefundenen Intervall
+*   -----------------------------------
+    IF x011z-ergso = space
+    OR x011z-erghb = space.
+*     Soll- oder Haben-Zuordnung fehlen
+*     ---------------------------------
+      save_x011z = x011z.
+      read_tabix = sy-tabix.
+      DO.
+        read_tabix = read_tabix + 1.
+        READ TABLE x011z INDEX read_tabix.
+        IF sy-subrc = 0.
+          IF zuon_saknr LE x011z-bilkt AND
+             zuon_saknr GE x011z-vonkt AND
+             zuon_ktopl EQ x011z-ktopl.
+*           Konto liegt im gefundenen Intervall
+*           -----------------------------------
+            IF save_x011z-ergso =  space AND
+                    x011z-ergso <> space.
+*             Soll-Zuordnung ergänzen
+*             -----------------------
+              save_x011z-ergso = x011z-ergso.
+            ENDIF.
+            IF save_x011z-erghb =  space AND
+                    x011z-erghb <> space.
+*             Haben-Zuordnung ergänzen
+*             ------------------------
+              save_x011z-erghb = x011z-erghb.
+            ENDIF.
+            IF save_x011z-ergso <> space AND
+               save_x011z-erghb <> space.
+*             alle Zuordnungen gefunden
+*             -------------------------
+              EXIT.                    ">>>>>>>>>>>>>>>>>
+            ENDIF.
+          ELSE.
+*           keine passenden Einträge mehr vorhanden
+*           ---------------------------------------
+*           EXIT.                      ">>>>>>>>>>>>>>>>>       "H68224
+          ENDIF.
+        ELSE.
+*         keine Einträge mehr vorhanden
+*         -----------------------------
+          EXIT.                        ">>>>>>>>>>>>>>>>>
+        ENDIF.
+      ENDDO.
+*     Restore X011z-Eintrag
+*     ----------------------
+      x011z = save_x011z.
+    ENDIF.
+    sy-subrc = 0.
+  ELSE.
+    sy-subrc = 4.
+  ENDIF.
+
+  IF sy-subrc = 0.
+*   Pruefen, ob Verdichtungsgruppe vorliegt
+*   ---------------------------------------
+    x011vkey-ergs1 = x011z-ergso.
+    x011vkey-ergs2 = x011z-erghb.
+    READ TABLE x011v WITH KEY x011vkey BINARY SEARCH.
+    IF sy-subrc = 0.
+      prkey-verd = 'X'.
+    ENDIF.
+
+*   Programmschluessel Soll  aus Tabelle I011P
+*   Ergebnisschluessel Soll  aus Tabelle X011Z
+*   ------------------------------------------
+    READ TABLE i011p WITH KEY x011z-ergso BINARY SEARCH.
+    IF sy-subrc = 0.
+      prkey-soll  = i011p-prkey.
+      ergsl-soll  = x011z-ergso.
+    ELSE.
+      prkey-soll  = nzuon-prkey.
+      ergsl-soll  = t011-zuord.
+    ENDIF.
+
+*   Programmschluessel Haben aus Tabelle I011P
+*   Ergebnisschluessel Haben aus Tabelle X011Z
+*   ------------------------------------------
+    READ TABLE i011p WITH KEY x011z-erghb BINARY SEARCH.
+    IF sy-subrc = 0.
+      prkey-haben = i011p-prkey.
+      ergsl-haben = x011z-erghb.
+    ELSE.
+      prkey-haben = nzuon-prkey.
+      ergsl-haben = t011-zuord.
+    ENDIF.
+  ELSE.
+*   Konto ist nicht zugeordnet
+*   --------------------------
+    prkey-soll  = nzuon-prkey.
+    prkey-haben = nzuon-prkey.
+    ergsl-soll  = t011-zuord.
+    ergsl-haben = t011-zuord.
+  ENDIF.
+
+  IF bilabkon = '1'.
+*   Buchungskreise einzeln
+*   ----------------------
+    sortbkrs = skb1-bukrs.
+  ELSE.
+*   Buchungskreiskonsolidierung
+*   ---------------------------
+    sortbkrs = '0000'.
+*   BILAGKON = '3'.           " Meldung 1039323 1996
+  ENDIF.
+
+  IF kalzeitr = 'X'.
+*   Berichts- und Vergleichsperioden aus  Datum bereitstellen
+*   ---------------------------------------------------------
+    PERFORM get_per_via_date.
+
+    IF planvers <> space.
+*     Planversion, Vergleichsperiode gleich Berichtsperiode
+*     -----------------------------------------------------
+      per-vmmv = per-bmmv.
+      per-vmmb = per-bmmb.
+    ENDIF.
+  ENDIF.
+
+* Berichts- und Vergleichsperioden gemaess Bilanztyp anpassen
+* -----------------------------------------------------------
+  CASE bilabtyp.
+    WHEN '1'.
+*   aufgelaufene Bilanz
+*   -------------------
+*     Berichtsperiode
+*     ---------------
+      per-bmmv   = 1.
+      bper-embil = per-bmmv.           " Erster  Monat Bilanz
+      bper-lmbil = per-bmmb.           " Letzter Monat Bilanz
+      bper-emguv = per-bmmv.           " Erster  Monat GuV
+      bper-lmguv = per-bmmb.           " Letzter Monat GuV
+*     Vergleichsperiode
+*     -----------------
+      per-vmmv   = 1.
+      vper-embil = per-vmmv.           " Erster  Monat Bilanz
+      vper-lmbil = per-vmmb.           " Letzter Monat Bilanz
+      vper-emguv = per-vmmv.           " Erster  Monat GuV
+      vper-lmguv = per-vmmb.           " Letzter Monat GuV
+
+    WHEN '2'.
+*   Bewegungsbilanz
+*   ---------------
+*     Berichtsperiode
+*     ---------------
+      bper-embil = per-bmmv.           " Erster  Monat Bilanz
+      bper-lmbil = per-bmmb.           " Letzter Monat Bilanz
+      bper-emguv = per-bmmv.           " Erster  Monat GuV
+      bper-lmguv = per-bmmb.           " Letzter Monat GuV
+*     Vergleichsperiode
+*     -----------------
+      vper-embil = per-vmmv.           " Erster  Monat Bilanz
+      vper-lmbil = per-vmmb.           " Letzter Monat Bilanz
+      vper-emguv = per-vmmv.           " Erster  Monat GuV
+      vper-lmguv = per-vmmb.           " Letzter Monat GuV
+
+    WHEN '3'.
+*   aufgelaufene Bilanz ( bei Bilanzkonten )
+*   Bewegungsbilanz     ( bei GuV - Konten )
+*   ----------------------------------------
+*     Berichtsperiode
+*     ---------------
+      bper-embil = 1.                  " Erster  Monat Bilanz
+      bper-lmbil = per-bmmb.           " Letzter Monat Bilanz
+      bper-emguv = per-bmmv.           " Erster  Monat GuV
+      bper-lmguv = per-bmmb.           " Letzter Monat GuV
+*     Vergleichsperiode
+*     -----------------
+      vper-embil = 1.                  " Erster  Monat Bilanz
+      vper-lmbil = per-vmmb.           " Letzter Monat Bilanz
+      vper-emguv = per-vmmv.           " Erster  Monat GuV
+      vper-lmguv = per-vmmb.           " Letzter Monat GuV
+
+    WHEN '4'.
+*   Eroeffnungsbilanz
+*   -----------------
+*     Berichtsperiode
+*     ---------------
+      bper-embil = 0.                  " Erster  Monat Bilanz
+      bper-lmbil = 0.                  " Letzter Monat Bilanz
+      bper-emguv = 0.                  " Erster  Monat GuV
+      bper-lmguv = 0.                  " Letzter Monat GuV
+*     Vergleichsperiode
+*     -----------------
+      vper-embil = 0.                  " Erster  Monat Bilanz
+      vper-lmbil = 0.                  " Letzter Monat Bilanz
+      vper-emguv = 0.                  " Erster  Monat GuV
+      vper-lmguv = 0.                  " Letzter Monat GuV
+
+  ENDCASE.
+
+* Anzahl der Monate fuer Hochrechnung der GuV-Werte berechnen
+* -----------------------------------------------------------
+* Berichtsjahr
+  IF per-bjjv = per-bjjb.
+*   Abgrenzung in einem G-Jahr
+    bper-anzmo = bper-lmguv - bper-emguv + 1.
+  ELSE.
+*   Abgrenzung in mehreren G-Jahren
+    bper-anzmo =     12     - bper-emguv + 1.
+    bper-anzmo = bper-anzmo + bper-lmguv.
+  ENDIF.
+
+* Vergleichsjahr
+  IF per-vjjv = per-vjjb.
+*   Abgrenzung in einem G-Jahr
+    vper-anzmo = vper-lmguv - vper-emguv + 1.
+  ELSE.
+*   Abgrenzung in mehreren G-Jahren
+    vper-anzmo =     12     - vper-emguv + 1.
+    vper-anzmo = vper-anzmo + vper-lmguv.
+  ENDIF.
+
+*EJECT
+GET skc1a.
+*ENHANCEMENT-POINT GET_SKC1A SPOTS FI_BILA_PRINT .
+  IF NOT ( repwaers IS INITIAL ).
+    ctyp_waers  = repwaers.
+  ELSE.
+    ctyp_waers  = skc1a-hwaer.
+  ENDIF.
+  IF fi_lc_ex = '2'.
+*   Extrakt an FI_LC, Geschäftsbereich austauschen
+*   ----------------------------------------------
+    SELECT SINGLE * FROM tgsb WHERE gsber = skc1a-gsber.
+*   IF SY-SUBRC = 0 AND TGSB-GSBER_KONS <> SPACE.           "vhs134295
+    IF sy-subrc = 0.                                        "vhs134295
+      skc1a-gsber = tgsb-gsber_kons.
+    ELSE.
+      IF NOT skc1a-gsber IS INITIAL.                        "vhs134295
+*       Fehler, Gsber auf HexFF setzen
+*       ------------------------------
+        skc1a-gsber = x_ff_gsber.
+      ENDIF.                                                "vhs134295
+    ENDIF.
+  ENDIF.
+  DO 2 TIMES.
+    CASE sy-index.
+      WHEN 1.
+* Berichtsjahr
+* ------------
+        IF p_xglyec IS NOT INITIAL.                         "n1845459
+          CHECK skc1a-rrcty =  '0'     " Nur Ist-Daten      "n1845459
+             OR skc1a-rrcty =  '5'.    " GLYEC balances     "n1845459
+        ELSE.                                               "n1845459
+          CHECK skc1a-rrcty =  '0'.    " Nur Ist-Daten      "n1845459
+        ENDIF.                                              "n1845459
+        CHECK skc1a-gjahr GE per-bjjv. " Berichtsjahr von
+        CHECK skc1a-gjahr LE per-bjjb. " Berichtsjahr bis
+* -----------------------------------------------------------------
+* Ermittlung des Saldos pro Geschaeftsbereich fuer das Berichts-
+* jahr und abspeichern desselben in der Tabelle GTAB.
+* Gehoert ein Konto zu einer Verdichtungsgruppe, so wird der Saldo
+* zusaetzlich in der Verdichtungstabelle VTAB gesammelt.
+* Zur Berechnung des Bilanzergebnisses wird der Saldo nochmals
+* unter dem besonderen Programmschluessel fuer Ergebnis-Bilanz oder
+* -GuV in Tabelle VTAB gesammelt.
+* -----------------------------------------------------------------
+        CLEAR h.
+        IF kalzeitr = 'X'.
+*   Wenn Kalenderzeitraum gewaehlt wird erfolgt Umrechnung
+*   zur Obergrenze des Zeitraums.
+*   ------------------------------------------------------
+          MOVE kalzeitb-high TO stichtag.
+        ENDIF.
+
+        PERFORM saldo_gsber USING 'B' skc1a-gjahr h-sign.
+        IF bilagrid = 'X'
+        OR bilatree = 'X'.
+*.. fill table for ALV Grid- and ALV Tree-Control
+          g_rldnr = skc1a-rldnr.
+          IF bilanull = 'X'
+          OR h-saldo <>  0.
+            IF h-saldo  <> 0                                "n1267794
+            OR loe-vorm = 'X'                               "n1267794
+            OR (     ska1-xloev = space                     "n1267794
+                 AND skb1-xloeb = space ).                  "n1267794
+              PERFORM gt_bspl_fill USING 'B'.
+            ENDIF.                                          "n1267794
+          ENDIF.
+          CONTINUE.
+        ENDIF.
+
+* Konto signifikant ?????????
+* ---------------------------
+        CHECK h-sign NE 0.
+
+        IF bilagkon = '3'.
+*   Geschaeftsbereichs Verdichtung
+          sortgber = '****'.
+        ELSE.
+*   Geschaeftsbereiche einzeln/konsol.
+          sortgber = skc1a-gsber.
+        ENDIF.
+
+* Aufnahme des Saldos in GTAB
+* ---------------------------
+        CLEAR gtab.
+        READ TABLE gtab WITH KEY
+                        bukrs = skb1-bukrs
+                        gsber = sortgber.
+        IF sy-subrc = 0.
+          MOVE skb1-bukrs TO gtab-bukrs.
+          MOVE sortgber TO gtab-gsber.
+          MOVE zuon_ktopl  TO gtab-ktopl.
+          MOVE zuon_saknr  TO gtab-saknr.
+          MOVE ska1-sakan  TO gtab-sakan.
+          MOVE prkey-soll  TO gtab-prkys.
+          MOVE prkey-haben TO gtab-prkyh.
+          MOVE prkey-verd  TO gtab-verd.
+          ADD  h-saldo     TO gtab-bsald.
+          MOVE h-sign   TO gtab-bsign.
+          MODIFY gtab INDEX sy-tabix.
+        ELSE.
+          MOVE skb1-bukrs TO gtab-bukrs.
+          MOVE sortgber   TO gtab-gsber.
+          MOVE zuon_ktopl  TO gtab-ktopl.
+          MOVE zuon_saknr  TO gtab-saknr.
+          MOVE ska1-sakan  TO gtab-sakan.
+          MOVE prkey-soll  TO gtab-prkys.
+          MOVE prkey-haben TO gtab-prkyh.
+          MOVE prkey-verd  TO gtab-verd.
+          ADD  h-saldo     TO gtab-bsald.
+          MOVE h-sign   TO gtab-bsign.
+          APPEND gtab.
+        ENDIF.
+
+* Aufnahme in Verdichtungstabelle falls erforderlich
+* --------------------------------------------------
+        IF prkey-verd = 'X'.
+          CLEAR vtab.
+          MOVE: sortbkrs      TO vtabkey-bukrs,
+                prkey-soll    TO vtabkey-prkys,
+                prkey-haben   TO vtabkey-prkyh,
+                prkey-verd    TO vtabkey-verds,
+                ctyp_waers    TO vtabkey-waers.
+          IF bilagkon = '1'.
+*     Geschaeftsbereiche  e i n z e l n  ???
+            MOVE  skc1a-gsber TO vtabkey-gsber.
+          ELSE.
+            MOVE  '****'      TO vtabkey-gsber.
+          ENDIF.
+
+          READ TABLE vtab WITH KEY vtabkey.
+          IF sy-subrc = 0.
+            MOVE  h-sign      TO vtab-bsign.
+            ADD   h-saldo     TO vtab-bsald.
+            MODIFY vtab INDEX sy-tabix.
+          ELSE.
+            MOVE-CORRESPONDING vtabkey TO vtab.
+            MOVE  h-sign      TO vtab-bsign.
+            ADD   h-saldo     TO vtab-bsald.
+            COLLECT vtab.
+          ENDIF.
+        ENDIF.
+
+*EJECT
+      WHEN 2.
+* Vergleichsjahr
+* --------------
+        IF planvers = space.
+          IF p_xglyec IS NOT INITIAL.                       "n1845459
+            CHECK skc1a-rrcty =  '0'     " Nur Ist-Daten    "n1845459
+               OR skc1a-rrcty =  '5'.    " GLYEC balances   "n1845459
+          ELSE.                                             "n1845459
+            CHECK skc1a-rrcty =  '0'.    " Nur Ist-Daten    "n1845459
+          ENDIF.                                            "n1845459
+          CHECK skc1a-gjahr GE per-vjjv.       " Vergl.jahr von
+          CHECK skc1a-gjahr LE per-vjjb.       " Vergl.jahr bis
+        ELSE.
+          CHECK skc1a-rrcty =  '1'.    " Nur Plan-Daten
+          CHECK skc1a-gjahr GE per-bjjv.       " Ber.jahr von
+          CHECK skc1a-gjahr LE per-bjjb.       " Ber.jahr bis
+          CHECK skc1a-rvers =  planvers.       " richtige Planversion
+        ENDIF.
+* -------------------------------------------------------------------
+* Ermittlung des Saldos pro Geschaeftsbereich fuer das Vergleichs-
+* jahr und abspeichern desselben in der Tabelle GTAB.
+* Gehoert ein Konto zu einer Verdichtungsgruppe, so wird der Saldo
+* zusaetzlich in der Verdichtungstabelle VTAB gesammelt.
+* Zur Berechnung des Bilanzergebnisses wird der Saldo nochmals
+* unter dem besonderen Programmschluessel fuer Ergebnis-Bilanz oder
+* -GuV in Tabelle VTAB gesammelt.
+* -------------------------------------------------------------------
+        CLEAR h.
+        IF kalzeitr = 'X'.
+*   Wenn Kalenderzeitraum gewaehlt wird erfolgt Umrechnung
+*   zur Obergrenze des Zeitraums.
+*   ------------------------------------------------------
+          MOVE kalzeitb-high TO stichtag.
+        ENDIF.
+
+* Inflation adjustment
+        IF bilainfl = 'X'.
+          CALL FUNCTION 'ID_INFLATION_BAL_SHEET'
+            EXPORTING
+              i_skb1                  = skb1
+              i_bilbjahr              = bilbjahr
+              i_bilvjahr              = bilvjahr
+            CHANGING
+              c_skc1a                 = skc1a
+            EXCEPTIONS
+              adjustment_not_possible = 1
+              OTHERS                  = 2.
+
+          IF sy-subrc <> 0.
+            CLEAR fimsg.
+            fimsg-msort = '0010'.
+            fimsg-msgid = 'FR'.
+            fimsg-msgty = 'E'.
+            fimsg-msgno = '530'.
+            fimsg-msgv1 = ska1-saknr.
+            fimsg-msgv2 = skb1-bukrs.
+            CALL FUNCTION 'FI_MESSAGE_COLLECT'
+              EXPORTING
+                i_fimsg = fimsg.
+          ENDIF.
+        ENDIF.
+
+        PERFORM saldo_gsber USING 'V' skc1a-gjahr h-sign.
+        IF bilagrid = 'X'
+        OR bilatree = 'X'.
+*.. fill table for ALV Grid- and ALV Tree-Control
+          g_rldnr = skc1a-rldnr.
+          IF bilanull = 'X'
+          OR h-saldo <>  0.
+            IF h-saldo  <> 0                                "n1267794
+            OR loe-vorm = 'X'                               "n1267794
+            OR (     ska1-xloev = space                     "n1267794
+                 AND skb1-xloeb = space ).                  "n1267794
+              PERFORM gt_bspl_fill USING 'V'.
+            ENDIF.                                          "n1267794
+          ENDIF.
+          CONTINUE.
+        ENDIF.
+
+* Konto signifikant ?????????
+* ---------------------------
+        CHECK h-sign NE 0.
+
+        IF bilagkon = '3'.
+*   Geschaeftsbereichs Verdichtung
+          sortgber = '****'.
+        ELSE.
+*   Geschaeftsbereiche einzeln/konsol.
+          sortgber = skc1a-gsber.
+        ENDIF.
+
+* Aufnahme des Saldos in GTAB
+* ---------------------------
+        CLEAR gtab.
+        READ TABLE gtab WITH KEY
+                        bukrs = skb1-bukrs
+                        gsber = sortgber.
+        IF sy-subrc = 0.
+          MOVE skb1-bukrs TO gtab-bukrs.
+          MOVE sortgber TO gtab-gsber.
+          MOVE zuon_ktopl  TO gtab-ktopl.
+          MOVE zuon_saknr  TO gtab-saknr.
+          MOVE ska1-sakan  TO gtab-sakan.
+          MOVE prkey-soll  TO gtab-prkys.
+          MOVE prkey-haben TO gtab-prkyh.
+          MOVE prkey-verd  TO gtab-verd.
+          ADD  h-saldo     TO gtab-vsald.
+          MOVE h-sign   TO gtab-vsign.
+          MODIFY gtab INDEX sy-tabix.
+        ELSE.
+          MOVE skb1-bukrs TO gtab-bukrs.
+          MOVE sortgber   TO gtab-gsber.
+          MOVE zuon_ktopl  TO gtab-ktopl.
+          MOVE zuon_saknr  TO gtab-saknr.
+          MOVE ska1-sakan  TO gtab-sakan.
+          MOVE prkey-soll  TO gtab-prkys.
+          MOVE prkey-haben TO gtab-prkyh.
+          MOVE prkey-verd  TO gtab-verd.
+          ADD  h-saldo     TO gtab-vsald.
+          MOVE h-sign   TO gtab-vsign.
+          APPEND gtab.
+        ENDIF.
+
+* Aufnahme in Verdichtungstabelle falls erforderlich
+* --------------------------------------------------
+        IF prkey-verd = 'X'.
+          CLEAR vtab.
+          MOVE: sortbkrs      TO vtabkey-bukrs,
+                prkey-soll    TO vtabkey-prkys,
+                prkey-haben   TO vtabkey-prkyh,
+                prkey-verd    TO vtabkey-verds,
+                ctyp_waers    TO vtabkey-waers.
+          IF bilagkon = '1'.
+*     Geschaeftsbereiche  e i n z e l n  ???
+            MOVE  skc1a-gsber TO vtabkey-gsber.
+          ELSE.
+            MOVE  '****'      TO vtabkey-gsber.
+          ENDIF.
+
+          READ TABLE vtab WITH KEY vtabkey.
+          IF sy-subrc = 0.
+            MOVE  h-sign      TO vtab-vsign.
+            ADD   h-saldo     TO vtab-vsald.
+            MODIFY vtab INDEX sy-tabix.
+          ELSE.
+            MOVE-CORRESPONDING vtabkey TO vtab.
+            MOVE  h-sign      TO vtab-vsign.
+            ADD   h-saldo     TO vtab-vsald.
+            COLLECT vtab.
+          ENDIF.
+        ENDIF.
+    ENDCASE.
+  ENDDO.
+
+*EJECT
+GET skb1 LATE.
+* begin "n1399773
+* Classical list: Process only if company code summarization <= 2
+  IF  bilagrid = space
+  AND bilatree = space.
+    CHECK: bilabkon <= '2'.
+* Grid or Tree control output
+  ELSE.
+* Processing this event is only relevant if the balance of the current
+* account was zero and accounts with zero balance are supposed to be
+* shown.
+    CHECK bilanull = 'X'.
+    DESCRIBE TABLE gt_bspl LINES sy-tfill.
+    READ TABLE gt_bspl     INDEX sy-tfill.
+    IF  gt_bspl-rbukrs = skb1-bukrs
+    AND gt_bspl-racct  = skb1-saknr.
+*   The last entry in the table was created for the current company
+*   code and account
+*   >> No processing necessary
+      RETURN.
+    ENDIF.
+  ENDIF.
+* end "n1399773
+
+  DO 2 TIMES.
+    CASE sy-index.
+      WHEN 1.
+* -----------------------------------------------------------------
+* Die in der Tabelle GTAB gesammelten Geschaeftsbereichs-Salden
+* werden um Kontonummer, Bezeichnung etc. ergaenzt und auf der
+* Zwischendatenbestand geschrieben. (mit EXTRACT).
+* -----------------------------------------------------------------
+        SORT gtab.
+        LOOP AT gtab.
+          CLEAR sort.
+          CLEAR date.
+          IF bilagkon <> '1'.
+            AT FIRST.
+              SUM.
+              PERFORM berechne_ergebnis.
+            ENDAT.
+          ELSE.
+            PERFORM berechne_ergebnis.
+          ENDIF.
+
+          IF bilanull NE 'X'.
+            IF fi_lc_ex IS INITIAL.
+*       nur Konten mit Saldo <> Null
+              CHECK gtab-bsald NE 0
+                 OR gtab-vsald NE 0.
+            ENDIF.
+          ELSE.
+*     auch Konten mit Saldo Null
+            IF gtab-bsald EQ 0 AND gtab-vsald EQ 0.
+*       Defaultmäßig Konten ohne Löschvormerkung
+              IF loe-vorm NE 'X'.
+                CHECK ska1-xloev = space.
+                CHECK skb1-xloeb = space.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+
+*   Merken, ob Konto im Berichts- oder Vergl.zeitraum signifikant war
+*   -----------------------------------------------------------------
+          IF gtab-bsign NE 0.
+            h-sign = gtab-bsign.
+          ENDIF.
+          IF gtab-vsign NE 0.
+            h-sign = gtab-vsign.
+          ENDIF.
+
+*   Pruefen, ob Konto zu einer Verdichtungsgruppe gehoehrt
+*   ------------------------------------------------------
+          CASE prkey-verd.
+            WHEN ' '.                  " <=== dann nicht
+
+*     --------------------------------------------
+*     Bilanzschluessel Soll- und Haben sind gleich
+*     --------------------------------------------
+              IF prkey-soll = prkey-haben.
+                PERFORM extract_soll_position.
+                EXTRACT konten.
+              ELSE.
+
+*     --------------------------------------------------------
+*     Bilanzschluessel Soll- und Haben sind  n i c h t  gleich
+*     --------------------------------------------------------
+*       Berichts- und Vergleichssaldo sind positiv
+*       ------------------------------------------
+                IF gtab-bsald GE 0 AND gtab-vsald GE 0.
+                  PERFORM extract_soll_position.
+                  EXTRACT konten.
+                ENDIF.
+
+*       Berichts- und Vergleichssaldo sind negativ
+*       ------------------------------------------
+                IF gtab-bsald LE 0 AND gtab-vsald LE 0.
+                  PERFORM extract_haben_position.
+                  EXTRACT konten.
+                ENDIF.
+
+*       Berichtssaldo ist negativ und Vergleichssaldo ist positiv
+*       ---------------------------------------------------------
+                IF gtab-bsald < 0 AND gtab-vsald > 0.
+                  PERFORM extract_soll_position.
+                  MOVE: '('        TO date-bklau,
+                        ')'        TO date-bklzu.
+                  EXTRACT konten.
+                  CLEAR sort.
+                  CLEAR date.
+
+                  PERFORM extract_haben_position.
+                  MOVE: '('        TO date-vklau,
+                        ')'        TO date-vklzu.
+                  EXTRACT konten.
+                ENDIF.
+
+*       Berichtssaldo ist positiv und Vergleichssaldo ist negativ
+*       ---------------------------------------------------------
+                IF gtab-bsald > 0 AND gtab-vsald < 0.
+                  PERFORM extract_soll_position.
+                  MOVE: '('        TO date-vklau,
+                        ')'        TO date-vklzu.
+                  EXTRACT konten.
+                  CLEAR sort.
+                  CLEAR date.
+
+                  PERFORM extract_haben_position.
+                  MOVE: '('        TO date-bklau,
+                        ')'        TO date-bklzu.
+                  EXTRACT konten.
+                ENDIF.
+              ENDIF.
+            WHEN OTHERS.
+
+*     --------------------------------------------
+*     Bilanzschluessel Soll- und Haben sind gleich
+*     --------------------------------------------
+              IF prkey-soll = prkey-haben.
+                PERFORM extract_soll_position.
+                EXTRACT konten.
+              ELSE.
+*     --------------------------------------------------------
+*     Bilanzschluessel Soll- und Haben sind  n i c h t  gleich
+*     --------------------------------------------------------
+                PERFORM extract_soll_position.
+                EXTRACT konten.
+                CLEAR sort.
+                CLEAR date.
+                PERFORM extract_haben_position.
+                EXTRACT konten.
+              ENDIF.
+          ENDCASE.
+        ENDLOOP.
+
+*EJECT
+      WHEN 2.
+* -------------------------------------------------------------------
+* Hier gehts nur weiter, wenn Konten mit Saldo = 0 gewuenscht werden,
+* fuer die aber keine GLDB-Saetze vorhanden sind.
+* -------------------------------------------------------------------
+
+* Saldo = 0 erwuenscht ??
+        CHECK bilanull = 'X'.
+
+* Defaultmäßig Konten ohne Löschvormerkung
+        IF loe-vorm NE 'X'.
+          CHECK ska1-xloev = space.
+          CHECK skb1-xloeb = space.
+        ENDIF.
+
+* Konto darf nicht signifikant sein, keine GLDB-Saetze haben.
+        CHECK h-sign =  0.
+
+* Felder fuer die Extract-Routine vorbereiten
+        CLEAR: gtab,
+               sort,
+               ctyp_waers,                                  "n1399773
+               date.
+
+* Gesber kennzeichnen, dass keine GLDB-Saetze vorhanden sind
+        MOVE '****' TO gtab-gsber.
+        IF ctyp_waers IS INITIAL.
+          PERFORM currency_information_get
+                                CHANGING ctyp_waers.
+        ENDIF.
+
+        IF NOT ( repwaers IS INITIAL ).
+          ctyp_waers  = repwaers.
+        ENDIF.
+
+        IF bilagrid = 'X'
+        OR bilatree = 'X'.
+*.. prepare fields for dummy records
+          CLEAR: h-saldo.
+*         skc1a-gsber = '****'.                             "n1399773
+          skc1a-gsber = space.                              "n1399773
+          skc1a-curtp = sd_curtp.
+          skc1a-rldnr = g_rldnr.
+          IF sd_curtp IS INITIAL.
+            skc1a-curtp = '10'.
+          ENDIF.
+*.. fill table for ALV Grid- and ALV Tree-Control
+          PERFORM gt_bspl_fill USING 'B'.
+          CONTINUE.
+        ENDIF.
+
+* --------------------------------------------
+* Bilanzschluessel Soll- und Haben sind gleich
+* --------------------------------------------
+        IF prkey-soll = prkey-haben.
+          PERFORM extract_soll_position.
+          EXTRACT konten.
+        ELSE.
+* --------------------------------------------------------
+* Bilanzschluessel Soll- und Haben sind  n i c h t  gleich
+* --------------------------------------------------------
+          PERFORM extract_soll_position.
+          EXTRACT konten.
+
+          PERFORM extract_haben_position.
+          EXTRACT konten.
+        ENDIF.
+
+* Aufnahme in Verdichtungstabelle falls erforderlich
+* --------------------------------------------------
+        IF prkey-verd = 'X'.
+          CLEAR vtab.
+          MOVE: sortbkrs      TO vtab-bukrs,
+                prkey-soll    TO vtab-prkys,
+                prkey-haben   TO vtab-prkyh,
+                prkey-verd    TO vtab-verds,
+                  '****'      TO vtab-gsber,
+                ctyp_waers    TO vtab-waers.
+
+          READ TABLE vtab.
+
+*   Berichts-Periode signifikant machen, da sonst kein Triggersatz
+*   extrahiert wird und demzufolge die nachfolgenden Kontensaetze
+*   ebenfalls uebergangen werden.
+*   --------------------------------------------------------------
+          IF sy-subrc = 0.
+            MOVE:   1         TO vtab-bsign,
+                    1         TO vtab-vsign.
+            MODIFY vtab INDEX sy-tabix.
+          ELSE.
+            MOVE:   1         TO vtab-bsign,
+                    1         TO vtab-vsign.
+            COLLECT vtab.
+          ENDIF.
+        ENDIF.
+    ENDCASE.
+  ENDDO.
+
+*EJECT
+END-OF-SELECTION.
+  FREE MEMORY ID 'CLASSIC_BALANCE_SDF'.                     "n2133360
+
+  CALL FUNCTION 'MESSAGES_SHOW'                             "n1345104
+    EXCEPTIONS                                              "n1345104
+      OTHERS = 0.                                           "n1345104
+
+* Tabelle I011P freigeben, wird nicht mehr benoetigt
+* --------------------------------------------------
+  FREE i011p.
+
+  IF bilagrid = 'X'                                               " ALV
+  OR bilatree = 'X'.                                              " ALV
+*.. output via ALV
+    IF bilanull IS INITIAL.
+*.... delete accounts with zero balance
+      PERFORM bspl_acct_zero_blnce_delete TABLES gt_bspl.
+    ENDIF.
+
+    PERFORM bspl_settings_create
+                        CHANGING gs_bspl_settings.
+
+*.. Prepare BSPL data regarding the account number type
+*   used for display (racct, altkt, bilkt)
+    PERFORM bspl_prepare_accno_type                         "n1588387
+      USING                                                 "n1588387
+        gs_bspl_settings                                    "n1588387
+      CHANGING                                              "n1588387
+        gt_bspl[].                                          "n1588387
+
+*    CALL FUNCTION 'BSPL_DATA_PREPARE'
+      CALL FUNCTION 'Z_FI_BSPL_DATA_PREPARE' "JJR
+      EXPORTING
+        is_settings        = gs_bspl_settings
+      TABLES
+        it_rfbila_alv_data = gt_bspl.
+
+*.. fill table of list commentary
+    PERFORM bspl_list_commentary_create
+                                 TABLES gt_bspltop.
+*.. create title of Grid Control
+*   PERFORM BSPL_GRID_TITLE_CREATE
+*                                CHANGING G_GRID_TITLE.
+*.. make headerlines invisible
+*   GS_GRID_SETTINGS-COLL_TOP_P = 'X'.
+    IF bilagrid = 'X'.
+*.... create bs p+l
+*      CALL FUNCTION 'BSPL_GRID_CREATE'
+      CALL FUNCTION 'Z_FI_BSPL_GRID_CREATE' "JJR
+        EXPORTING
+          is_settings        = gs_bspl_settings
+          it_list_commentary = gt_bspltop
+*         I_GRID_TITLE       = G_GRID_TITLE
+          id_badi_country    = p_cntry                      "n2145597
+          is_grid_settings   = gs_grid_settings.
+
+*     back to selection screen
+      list_createt = 'X'.
+    ENDIF.
+
+    IF bilatree = 'X'.
+*.... create structured balance list
+      CALL FUNCTION 'BSPL_TREE_CREATE'
+        EXPORTING
+          is_settings        = gs_bspl_settings
+          it_list_commentary = gt_bspltop.
+
+*     back to selection screen
+      list_createt = 'X'.
+    ENDIF.
+  ENDIF.                                                          " ALV
+
+*---------------------------------------------------------------------*
+*  Die in der Tabelle VTAB gesammelten Summen pro Verdichtungsgruppe  *
+*  werden analog den Kontensaetzen extrahiert.                        *
+*---------------------------------------------------------------------*
+  SORT vtab.
+  LOOP AT vtab.
+    CLEAR sort.
+    CLEAR date.
+*   --------------------------------------------
+*   Bilanzschluessel Soll- und Haben sind gleich
+*   --------------------------------------------
+    IF vtab-prkys = vtab-prkyh.
+      PERFORM extract_trigger_soll_position.
+      EXTRACT trigger.
+    ELSE.
+*   --------------------------------------------------------
+*   Bilanzschluessel Soll- und Haben sind  n i c h t  gleich
+*   --------------------------------------------------------
+*     Berichts- und Vergleichssaldo sind positiv
+*     ------------------------------------------
+      IF vtab-bsald GT 0 AND vtab-vsald GT 0.
+        PERFORM extract_trigger_soll_position.
+        EXTRACT trigger.
+      ENDIF.
+
+*     Berichts- und Vergleichssaldo sind negativ
+*     ------------------------------------------
+      IF vtab-bsald LT 0 AND vtab-vsald LT 0.
+        PERFORM extract_trigger_haben_position.
+        EXTRACT trigger.
+      ENDIF.
+
+*     Berichtssaldo ist negativ und Vergleichssaldo ist positiv
+*     ---------------------------------------------------------
+      IF vtab-bsald < 0 AND vtab-vsald > 0.
+        PERFORM extract_trigger_soll_position.
+        MOVE: '('        TO date-bklau,
+              ')'        TO date-bklzu.
+        EXTRACT trigger.
+        CLEAR sort.
+        CLEAR date.
+
+        PERFORM extract_trigger_haben_position.
+        MOVE: '('        TO date-vklau,
+              ')'        TO date-vklzu.
+        EXTRACT trigger.
+      ENDIF.
+
+*     Berichtssaldo ist positiv und Vergleichssaldo ist negativ
+*     ---------------------------------------------------------
+      IF vtab-bsald > 0 AND vtab-vsald < 0.
+        PERFORM extract_trigger_soll_position.
+        MOVE: '('        TO date-vklau,
+              ')'        TO date-vklzu.
+        EXTRACT trigger.
+        CLEAR sort.
+        CLEAR date.
+
+        PERFORM extract_trigger_haben_position.
+        MOVE: '('        TO date-bklau,
+              ')'        TO date-bklzu.
+        EXTRACT trigger.
+      ENDIF.
+
+*     Berichtssaldo ist negativ und Vergleichssaldo null
+*     --------------------------------------------------
+      IF vtab-bsald < 0 AND vtab-vsald = 0.
+*       aber signifikant
+*       ----------------
+        IF vtab-vsign = 1.
+          PERFORM extract_trigger_soll_position.
+          MOVE: '('        TO date-bklau,
+                ')'        TO date-bklzu.
+          EXTRACT trigger.
+          CLEAR sort.
+          CLEAR date.
+
+          PERFORM extract_trigger_haben_position.
+          EXTRACT trigger.
+*       aber nicht signifikant
+*       ----------------------
+        ELSE.
+          PERFORM extract_trigger_haben_position.
+          EXTRACT trigger.
+        ENDIF.
+      ENDIF.
+
+*     Berichtssaldo ist positiv und Vergleichssaldo null
+*     --------------------------------------------------
+      IF vtab-bsald > 0 AND vtab-vsald = 0.
+*       aber signifikant
+*       ----------------
+        IF vtab-vsign = 1.
+          PERFORM extract_trigger_soll_position.
+          EXTRACT trigger.
+          CLEAR sort.
+          CLEAR date.
+
+          PERFORM extract_trigger_haben_position.
+          MOVE: '('        TO date-bklau,
+                ')'        TO date-bklzu.
+          EXTRACT trigger.
+*       aber nicht signifikant
+*       ----------------------
+        ELSE.
+          PERFORM extract_trigger_soll_position.
+          EXTRACT trigger.
+        ENDIF.
+      ENDIF.
+
+*     Vergleichssaldo ist negativ und der Berichtssaldo ist null
+*     ----------------------------------------------------------
+      IF vtab-vsald < 0 AND vtab-bsald = 0.
+*       aber signifikant
+*       ----------------
+        IF vtab-bsign = 1.
+          PERFORM extract_trigger_soll_position.
+          MOVE: '('        TO date-vklau,
+                ')'        TO date-vklzu.
+          EXTRACT trigger.
+          CLEAR sort.
+          CLEAR date.
+
+          PERFORM extract_trigger_haben_position.
+          EXTRACT trigger.
+*       aber nicht signifikant
+*       ----------------------
+        ELSE.
+          PERFORM extract_trigger_haben_position.
+          EXTRACT trigger.
+        ENDIF.
+      ENDIF.
+
+*     Vergleichssaldo ist positiv und Berichtssaldo ist null
+*     ------------------------------------------------------
+      IF vtab-vsald > 0 AND vtab-bsald = 0.
+*       aber signifikant
+*       ----------------
+        IF vtab-bsign = 1.
+          PERFORM extract_trigger_soll_position.
+          EXTRACT trigger.
+          CLEAR sort.
+          CLEAR date.
+
+          PERFORM extract_trigger_haben_position.
+          MOVE: '('        TO date-vklau,
+                ')'        TO date-vklzu.
+          EXTRACT trigger.
+*       aber nicht signifikant
+*       ----------------------
+        ELSE.
+          PERFORM extract_trigger_soll_position.
+          EXTRACT trigger.
+        ENDIF.
+      ENDIF.
+
+*     Berichtssaldo ist null und Vergleichssaldo ist null
+*     ---------------------------------------------------
+      IF vtab-bsald = 0 AND vtab-vsald = 0.
+*       aber signifikant
+*       ----------------
+        IF vtab-vsign = 1.
+          PERFORM extract_trigger_haben_position.
+          MOVE: '('        TO date-bklau,
+                ')'        TO date-bklzu.
+          EXTRACT trigger.
+          CLEAR sort.
+          CLEAR date.
+        ENDIF.
+
+*       aber signifikant
+*       ----------------
+        IF vtab-bsign = 1.
+          PERFORM extract_trigger_soll_position.
+          MOVE: '('        TO date-vklau,
+                ')'        TO date-vklzu.
+          EXTRACT trigger.
+          CLEAR sort.
+          CLEAR date.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+*EJECT
+* Die extrahierten Daten werden sortiert und ausgegeben.
+* ------------------------------------------------------
+
+  IF bila_eis = 'X'.
+* Datenextract an SAP-EIS
+* -----------------------
+    PERFORM customize_data_transfer(rkcfisel) USING grpid sd_curtp
+                                                    eis_subrc .
+    IF eis_subrc GT 2 .
+      MESSAGE ID 'KX' TYPE 'E' NUMBER '809'.
+      EXIT.
+    ENDIF.
+
+    CALL FUNCTION 'KCD_MAPPING_INIT'
+      EXPORTING
+        repid                 = 'RFBILA00'
+        grpid                 = grpid
+*       NOLOCK                = ' '
+*       NO_GENERATION         = ' '
+*       NEW_PROTOCOL          = ' '
+      EXCEPTIONS
+        initialization_failed = 1
+        OTHERS                = 2.
+    IF sy-subrc <> 0.
+*   Fehler in der Übertragungsstruktur / Übertragung
+*   ------------------------------------------------
+      MESSAGE ID 'KX' TYPE 'E' NUMBER '913' WITH 'RFBILA00' grpid .
+      EXIT.
+    ENDIF.
+
+    SORT.
+    LOOP.
+      AT NEW sort-buk1.
+        t001-bukrs = sort-buk1.
+        READ TABLE t001.
+      ENDAT.
+
+      AT NEW sort-verd.
+*     Trigger-Kennzeichen loeschen
+        CLEAR trig-kz.
+      ENDAT.
+
+      AT trigger.
+        IF date-prkey = e1pos-prkey
+        OR date-prkey = e1neg-prkey
+        OR date-prkey = e2pos-prkey
+        OR date-prkey = e2neg-prkey.
+
+          IF date-prkey     = e1pos-prkey.
+            date-ergsl = t011-ergak.
+          ELSEIF date-prkey = e1neg-prkey.
+            date-ergsl = t011-ergpa.
+          ELSE.
+            date-ergsl = t011-erggv.
+          ENDIF.
+
+          ctyp_waers = date-waers.
+          IF planvers EQ space.
+            IF date-bklau NE '(' AND date-bklzu NE ')'.
+              sort-ktnr = '*ERGEBNIS*'.        " fix
+              PERFORM bila_eis_transfer USING date-bsald.
+            ENDIF.
+          ELSE.      " Plandaten
+            IF date-vklau NE '(' AND date-vklzu NE ')'.
+              sort-ktnr = '*ERGEBNIS*'.        " fix
+              PERFORM bila_eis_transfer USING date-vsald.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+        CLEAR trig-kz.
+        IF planvers EQ space.
+          IF date-bklau NE '(' AND date-bklzu NE ')'.
+*         Trigger-Kennzeichen merken
+*         --------------------------
+            MOVE  'T' TO trig-kz.
+          ENDIF.
+        ELSE.          " Plandaten
+          IF date-vklau NE '(' AND date-vklzu NE ')'.
+*         Trigger-Kennzeichen merken
+*         --------------------------
+            MOVE  'T' TO trig-kz.
+          ENDIF.
+        ENDIF.
+      ENDAT.
+
+      AT konten.
+        ctyp_waers = date-waers.
+        IF sort-verd = space.
+          IF planvers EQ space.
+            IF date-bklau NE '(' AND date-bklzu NE ')'.
+              PERFORM bila_eis_transfer USING date-bsald.
+            ENDIF.
+          ELSE.      " Plandaten
+            IF date-vklau NE '(' AND date-vklzu NE ')'.
+              PERFORM bila_eis_transfer USING date-vsald.
+            ENDIF.
+          ENDIF.
+        ELSE.
+          IF trig-kz = 'T'.
+*         Bei Verdichtungs-Schluessel ungleich Space muss der
+*         erste Satz der Gruppe ein Triggersatz gewesen sein.
+*         ----------------------------------------------------
+            IF planvers EQ space.
+              IF date-bklau NE '(' AND date-bklzu NE ')'.
+                PERFORM bila_eis_transfer USING date-bsald.
+              ENDIF.
+            ELSE.      " Plandaten
+              IF date-vklau NE '(' AND date-vklzu NE ')'.
+                PERFORM bila_eis_transfer USING date-vsald.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDAT.
+    ENDLOOP.
+
+    CALL FUNCTION 'KCD_MAPPING_EXECUTE'                   "QEH
+*      EXPORTING                                        "QEH
+*         TEST_RUN      = ' '                           "QEH
+*         RUN_MODE      = ' '                           "QEH
+*    TABLES                                             "QEH
+*         VARVL         =                               "QEH
+         EXCEPTIONS                                       "QEH
+              error_occured = 1                           "QEH
+              OTHERS        = 2.                          "QEH
+    eis_subrc = sy-subrc.                                 "QEH
+
+    SKIP 3.
+    MOVE text-040 TO sy-lisel.
+    REPLACE '$' WITH bilbjahr      INTO sy-lisel.
+    REPLACE '$' WITH b-monate-low  INTO sy-lisel.
+    REPLACE '$' WITH bilbjahr      INTO sy-lisel.
+    REPLACE '$' WITH b-monate-high INTO sy-lisel.
+    WRITE: / sy-lisel.
+    IF eis_subrc = 0.                                         "QEH
+      MESSAGE ID 'KX' TYPE 'S' NUMBER '832'.                "QEH
+    ELSE.                                                   "QEH
+      MESSAGE ID 'KX' TYPE 'S' NUMBER '819'.                "QEH
+    ENDIF.                                                    "QEH
+    STOP.                ">>>>>>>>>>  S T O P  >>>>>>>>>>>>>>
+  ENDIF.
+*ENHANCEMENT-POINT BEFORE_LIST SPOTS FI_BILA_PRINT .
+
+*EJECT
+  FORMAT COLOR COL_NORMAL INTENSIFIED OFF.
+  SORT.
+  LOOP.
+    AT NEW sort-buk1.
+*   Micro-Fiche Info
+*   ----------------
+      MOVE sort(4)     TO bhdgd-grpin.
+      MOVE sort-buk1   TO bhdgd-bukrs.
+      IF bilabkon = '1'.
+*     Buchungskreise einzeln
+*     ----------------------
+        CLEAR: ss.                               " INSERT - NOTE<126410>
+        MOVE bhdgd-bukrs TO bhdgd-werte.
+        PERFORM new-section(rsbtchh0).
+      ENDIF.
+      SELECT SINGLE * FROM t001
+                      WHERE bukrs = sort-buk1.
+
+      CLEAR h-text.
+      IF bilaskal(1) GT '0'.
+        MOVE '1' TO h-text.
+        WHILE sy-index LT 10 AND sy-index LE bilaskal(1).
+          ASSIGN h-text+sy-index(1) TO <f1>.
+          MOVE '0' TO <f1>.
+        ENDWHILE.
+      ENDIF.
+
+      IF repwaers = space.
+        MOVE date-waers TO h-text+10.
+      ELSE.
+        MOVE repwaers   TO h-text+10.
+      ENDIF.
+      CONDENSE h-text.
+
+      IF fi_lc_ex = '1'.
+*     Extract an LC gewuenscht.
+*     Gewinn/Verlust aus VTAB holen.
+*     ------------------------------
+        MOVE: space       TO vtab,
+              sort-buk1   TO vtab-bukrs,
+              '****'      TO vtab-gsber,
+              e1pos-prkey TO vtab-prkys,
+              e1neg-prkey TO vtab-prkyh,
+              'X'         TO vtab-verds.
+        READ TABLE vtab.
+        IF sy-subrc = 0.
+          IF planvers = space.
+*         Ist-Daten uebergeben
+*         --------------------
+            IF vtab-bsald GE 0.
+              h-ergsl = t011-ergpa.
+            ELSE.
+              h-ergsl = t011-ergak.
+            ENDIF.
+            h-saldo = vtab-bsald.
+          ELSE.
+*         Plan-Daten uebergeben
+*         VTAB-VSALD enthaelt Planzahlen
+*         ------------------------------
+            IF vtab-vsald GE 0.
+              h-ergsl = t011-ergpa.
+            ELSE.
+              h-ergsl = t011-ergak.
+            ENDIF.
+            h-saldo = vtab-vsald.
+          ENDIF.
+          PERFORM konz_extract(rgcbila0)
+                       USING  h-ergsl    " Ergebnisschluessel
+                              sort-buk1  " Buchungskreis
+                              bilavers                      "n1630595
+                              sd_gsb_s[]                    "wms086855
+                              planvers   " Planversion
+                             'ERGEBNIS'  " Kontonummer
+                              sort-gsb1  " Geschäftsbereich
+                              per-bjjv   " Berichtjahr
+                              h-saldo    " Saldo
+                              per-bmmv   " Berichtsmonat -von-
+                              per-bmmb   " Berichtsmonat -bis-
+                              gd_fname   " name for extract  "xrp250698
+                                         " to EC-CS          "xrp250698
+                              gd_pres    " flg: pres server  "xrp250698
+                              pa_rbcs    " receiver SEM-BCS  "xrp290904
+                              pa_aggr                       "n1630595
+                              fi_lc_ex                      "vhs134295
+                              ergsl-soll
+                              ergsl-haben
+                              space.                        "wes140906
+        ENDIF.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-gsb1.
+*   Micro-Fiche Info
+*   ----------------
+      MOVE sort(8)   TO bhdgd-grpin.
+
+      IF bilabkon = '1'                          " INSERT - NOTE<126410>
+     AND bilagkon = '1'.                         " INSERT - NOTE<126410>
+        CLEAR: ss.                       " INSERT - NOTE<126410>
+      ENDIF.                             " INSERT - NOTE<126410>
+
+      IF kalzeitr = 'X'.
+        MOVE text-023 TO varueb.
+        REPLACE 'BERPERVO' WITH kalzeitb-low   INTO varueb.
+        REPLACE 'BERPERBI' WITH kalzeitb-high  INTO varueb.
+        IF planvers = space.
+          REPLACE 'VERPERVO' WITH kalzeitv-low   INTO varueb.
+          REPLACE 'VERPERBI' WITH kalzeitv-high  INTO varueb.
+        ELSE.
+          REPLACE 'VERPERVO' WITH kalzeitb-low   INTO varueb.
+          REPLACE 'VERPERBI' WITH kalzeitb-high  INTO varueb.
+        ENDIF.
+      ELSE.
+        MOVE text-022 TO varueb.
+        REPLACE 'B1'    WITH per-bmmv          INTO varueb.
+        REPLACE 'B2JJ'  WITH per-bjjv          INTO varueb.
+        REPLACE 'B3'    WITH per-bmmb          INTO varueb.
+        REPLACE 'B4JJ'  WITH per-bjjb          INTO varueb.
+        IF planvers = space.
+          REPLACE 'V1'    WITH per-vmmv        INTO varueb.
+          REPLACE 'V2JJ'  WITH per-vjjv        INTO varueb.
+          REPLACE 'V3'    WITH per-vmmb        INTO varueb.
+          REPLACE 'V4JJ'  WITH per-vjjb        INTO varueb.
+        ELSE.
+          REPLACE 'V1'    WITH per-bmmv        INTO varueb.
+          REPLACE 'V2JJ'  WITH per-bjjv        INTO varueb.
+          REPLACE 'V3'    WITH per-bmmb        INTO varueb.
+          REPLACE 'V4JJ'  WITH per-bjjb        INTO varueb.
+        ENDIF.
+      ENDIF.
+
+      IF fi_lc_ex = '2'.
+*     Extract an LC gewuenscht.
+*     Gewinn/Verlust aus VTAB holen.
+*     ------------------------------
+        MOVE: space       TO vtab,
+              sort-buk1   TO vtab-bukrs,
+              sort-gsb1   TO vtab-gsber,
+              e1pos-prkey TO vtab-prkys,
+              e1neg-prkey TO vtab-prkyh,
+              'X'         TO vtab-verds.
+        READ TABLE vtab.
+        IF sy-subrc = 0.
+          IF planvers = space.
+*         Ist-Daten uebergeben
+*         --------------------
+            IF vtab-bsald GE 0.
+              h-ergsl = t011-ergpa.
+            ELSE.
+              h-ergsl = t011-ergak.
+            ENDIF.
+            h-saldo = vtab-bsald.
+          ELSE.
+*         Plan-Daten uebergeben
+*         VTAB-VSALD enthaelt Planzahlen
+*         ------------------------------
+            IF vtab-vsald GE 0.
+              h-ergsl = t011-ergpa.
+            ELSE.
+              h-ergsl = t011-ergak.
+            ENDIF.
+            h-saldo = vtab-vsald.
+          ENDIF.
+          PERFORM konz_extract(rgcbila0)
+                       USING  h-ergsl    " Ergebnisschluessel
+                              sort-buk1  " Buchungskreis
+                              bilavers                      "n1630595
+                              sd_gsb_s[]                    "wms086855
+                              planvers   " Planversion
+                             'ERGEBNIS'  " Kontonummer
+                              sort-gsb1  " Geschäftsbereich
+                              per-bjjv   " Berichtjahr
+                              h-saldo    " Saldo
+                              per-bmmv   " Berichtsmonat -von-
+                              per-bmmb   " Berichtsmonat -bis-
+                              gd_fname                      "xrp250698
+                              gd_pres                       "xrp250698
+                              pa_rbcs    " receiver SEM-BCS  "xrp290904
+                              pa_aggr                       "n1630595
+                              fi_lc_ex                      "vhs134295
+                              ergsl-soll
+                              ergsl-haben
+                              space.                        "wes140906
+        ENDIF.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-list.
+      NEW-PAGE.
+    ENDAT.
+
+    AT NEW sort-pky1.
+*   Summenzaehler loeschen
+      CLEAR s1.
+*   Texte fuer Gruppenanfang aus T011Q etc. besorgen
+      PERFORM text_gruppenanfang USING '1'.
+    ENDAT.
+
+    AT NEW sort-pky2.
+*   Summenzaehler loeschen
+      CLEAR s2.
+      IF sort-pky2 NE '00'.
+*     Texte fuer Gruppenanfang aus T011Q etc. besorgen
+        PERFORM text_gruppenanfang USING '2'.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-pky3.
+*   Summenzaehler loeschen
+      CLEAR s3.
+      IF sort-pky3 NE '00'.
+*     Texte fuer Gruppenanfang aus T011Q etc. besorgen
+        PERFORM text_gruppenanfang USING '3'.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-pky4.
+*   Summenzaehler loeschen
+      CLEAR s4.
+      IF sort-pky4 NE '00'.
+*     Texte fuer Gruppenanfang aus T011Q etc. besorgen
+        PERFORM text_gruppenanfang USING '4'.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-pky5.
+*   Summenzaehler loeschen
+      CLEAR s5.
+      IF sort-pky5 NE '00'.
+*     Texte fuer Gruppenanfang aus T011Q etc. besorgen
+        PERFORM text_gruppenanfang USING '5'.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-pky6.
+*   Summenzaehler loeschen
+      CLEAR s6.
+      IF sort-pky6 NE '00'.
+*     Texte fuer Gruppenanfang aus T011Q etc. besorgen
+        PERFORM text_gruppenanfang USING '6'.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-pky7.
+*   Summenzaehler loeschen
+      CLEAR s7.
+      IF sort-pky7 NE '00'.
+*     Texte fuer Gruppenanfang aus T011Q etc. besorgen
+        PERFORM text_gruppenanfang USING '7'.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-pky8.
+*   Summenzaehler loeschen
+      CLEAR s8.
+      IF sort-pky8 NE '00'.
+*     Texte fuer Gruppenanfang aus T011Q etc. besorgen
+        PERFORM text_gruppenanfang USING '8'.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-pky9.
+*   Summenzaehler loeschen
+      CLEAR s9.
+      IF sort-pky9 NE '00'.
+*     Texte fuer Gruppenanfang aus T011Q etc. besorgen
+        PERFORM text_gruppenanfang USING '9'.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-pky0.
+*   Summenzaehler loeschen
+      CLEAR s0.
+      IF sort-pky0 NE '00'.
+*     Texte fuer Gruppenanfang aus T011Q etc. besorgen
+        PERFORM text_gruppenanfang USING '0'.
+      ENDIF.
+    ENDAT.
+
+    AT NEW sort-verd.
+*   Trigger-Kennzeichen loeschen
+      CLEAR trig-kz.
+      IF sort-verd = 'X'.
+*     Zeile fuer Gruppenanfang reservieren
+        reserve = reserve + 1.
+      ENDIF.
+    ENDAT.
+
+    AT trigger.
+      ctyp_waers = date-waers.
+*   Trigger-Kennzeichen merken
+*   --------------------------
+      MOVE 'T' TO trig-kz.
+
+*   Addition fuer unterste Summenstufe hier nur fuer Verdichtungs-
+*   gruppe gleich 'X'.  Fuer ' ' bei AT KONTEN.
+*   Aber nur, wenn die Betraege nicht eingeklammert sind
+*   ----------------------------------------------------
+      IF date-bklau NE '(' AND date-bklzu NE ')'.
+        s0-bsum = s0-bsum + date-bsald.
+        IF NOT ( date-prkey(aktva_len) = aktva-prkey(aktva_len) OR
+                 date-prkey(pssva_len) = pssva-prkey(pssva_len) OR
+                 date-prkey(nzuon_len) = nzuon-prkey(nzuon_len) ).
+*       Staffelsummen addieren
+*       ----------------------
+          ss-bsum = ss-bsum + date-bsald.
+        ENDIF.
+      ELSE.
+*     Trigger-Kennzeichen merken
+*     --------------------------
+        MOVE 'B' TO trig-kz.
+      ENDIF.
+
+      IF date-vklau NE '(' AND date-vklzu NE ')'.
+        s0-vsum = s0-vsum + date-vsald.
+        IF NOT ( date-prkey(aktva_len) = aktva-prkey(aktva_len) OR
+                 date-prkey(pssva_len) = pssva-prkey(pssva_len) OR
+                 date-prkey(nzuon_len) = nzuon-prkey(nzuon_len) ).
+*       Staffelsummen addieren
+*       ----------------------
+          ss-vsum = ss-vsum + date-vsald.
+        ENDIF.
+      ELSE.
+*     Trigger-Kennzeichen merken
+*     --------------------------
+        MOVE 'V' TO trig-kz.
+      ENDIF.
+
+*   Textausgabe Gruppenanfang
+      PERFORM textausgabe_anfang.
+
+*      Ausgabe eines Triggersatzes
+*(DEL) IF BILASUMM CN '0123456789'.
+*        Einzelkontenbericht
+*(DEL)   PERFORM TRIGGER_AUSGABE.
+*(DEL) ENDIF.
+    ENDAT.
+
+    AT konten.
+      ctyp_waers = date-waers.
+      IF sort-verd NE 'X'.
+
+*     Addition fuer unterste Summenstufe hier nur fuer Verdichtungs
+*     gruppe ' '. Fuer Verdichtungsgruppe 'X' bei AT TRIGGER
+*     -------------------------------------------------------------
+        IF date-bklau NE '(' AND date-bklzu NE ')'.
+          s0-bsum = s0-bsum + date-bsald.
+          IF NOT ( date-prkey(aktva_len) = aktva-prkey(aktva_len) OR
+                   date-prkey(pssva_len) = pssva-prkey(pssva_len) OR
+                   date-prkey(nzuon_len) = nzuon-prkey(nzuon_len) ).
+*         Staffelsummen addieren
+*         ----------------------
+            ss-bsum = ss-bsum + date-bsald.
+          ENDIF.
+        ENDIF.
+
+        IF date-vklau NE '(' AND date-vklzu NE ')'.
+          s0-vsum = s0-vsum + date-vsald.
+          IF NOT ( date-prkey(aktva_len) = aktva-prkey(aktva_len) OR
+                   date-prkey(pssva_len) = pssva-prkey(pssva_len) OR
+                   date-prkey(nzuon_len) = nzuon-prkey(nzuon_len) ).
+*         Staffelsummen addieren
+*         ----------------------
+            ss-vsum = ss-vsum + date-vsald.
+          ENDIF.
+        ENDIF.
+
+*     Textausgabe Gruppenanfang
+*     -------------------------
+        PERFORM textausgabe_anfang.
+*     Ausgabe einer Kontenzeile
+*     -------------------------
+        IF p_summ CN '0123456789'.                          "n1486648
+*       Einzelkontenbericht
+          PERFORM konten_ausgabe.
+        ENDIF.
+      ELSE.
+
+*     Textausgabe Gruppenanfang
+        PERFORM textausgabe_anfang.
+
+*     Bei Verdichtungs-Schluessel gleich 'X'  muss der erste Satz
+*     der Gruppe ein Triggersatz gewesen sein.
+*     -----------------------------------------------------------
+        IF trig-kz <> space.
+*       Betraege ausklammern
+          IF trig-kz = 'B'.
+            MOVE: '(' TO date-bklau,
+                  ')' TO date-bklzu.
+          ENDIF.
+          IF trig-kz = 'V'.
+            MOVE: '(' TO date-vklau,
+                  ')' TO date-vklzu.
+          ENDIF.
+
+*       Ausgabe einer Kontenzeile
+          IF p_summ CN '0123456789'.                        "n1486648
+*         Einzelkontenbericht
+            PERFORM konten_ausgabe.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDAT.
+
+    AT END OF sort-pky0.
+      REFRESH i011q.
+      IF sort-pky0 NE '00'.
+*     Summenzeilen ausgeben
+        PERFORM text_gruppenende USING '0' s0-bsum s0-vsum.
+      ENDIF.
+      ADD-CORRESPONDING s0 TO s9.
+    ENDAT.
+
+    AT END OF sort-pky9.
+      IF sort-pky9 NE '00'.
+*     Summenzeilen ausgeben
+        PERFORM text_gruppenende USING '9' s9-bsum s9-vsum.
+      ENDIF.
+      ADD-CORRESPONDING s9 TO s8.
+    ENDAT.
+
+    AT END OF sort-pky8.
+      IF sort-pky8 NE '00'.
+*     Summenzeilen ausgeben
+        PERFORM text_gruppenende USING '8' s8-bsum s8-vsum.
+      ENDIF.
+      ADD-CORRESPONDING s8 TO s7.
+    ENDAT.
+
+    AT END OF sort-pky7.
+      IF sort-pky7 NE '00'.
+*     Summenzeilen ausgeben
+        PERFORM text_gruppenende USING '7' s7-bsum s7-vsum.
+      ENDIF.
+      ADD-CORRESPONDING s7 TO s6.
+    ENDAT.
+
+    AT END OF sort-pky6.
+      IF sort-pky6 NE '00'.
+*     Summenzeilen ausgeben
+        PERFORM text_gruppenende USING '6' s6-bsum s6-vsum.
+      ENDIF.
+      ADD-CORRESPONDING s6 TO s5.
+    ENDAT.
+
+    AT END OF sort-pky5.
+      IF sort-pky5 NE '00'.
+*     Summenzeilen ausgeben
+        PERFORM text_gruppenende USING '5' s5-bsum s5-vsum.
+      ENDIF.
+      ADD-CORRESPONDING s5 TO s4.
+    ENDAT.
+
+    AT END OF sort-pky4.
+      IF sort-pky4 NE '00'.
+*     Summenzeilen ausgeben
+        PERFORM text_gruppenende USING '4' s4-bsum s4-vsum.
+      ENDIF.
+      ADD-CORRESPONDING s4 TO s3.
+    ENDAT.
+
+    AT END OF sort-pky3.
+      IF sort-pky3 NE '00'.
+*     Summenzeilen ausgeben
+        PERFORM text_gruppenende USING '3' s3-bsum s3-vsum.
+      ENDIF.
+      ADD-CORRESPONDING s3 TO s2.
+    ENDAT.
+
+    AT END OF sort-pky2.
+      IF sort-pky2 NE '00'.
+*     Summenzeilen ausgeben
+        PERFORM text_gruppenende USING '2' s2-bsum s2-vsum.
+      ENDIF.
+      ADD-CORRESPONDING s2 TO s1.
+    ENDAT.
+
+    AT END OF sort-pky1.
+*   Summenzeilen ausgeben
+      PERFORM text_gruppenende USING '1' s1-bsum s1-vsum.
+    ENDAT.
+
+    AT END OF sort-list.
+      CHECK scr_print_to_form = no.    "SCRIPT
+      ULINE.
+    ENDAT.
+
+    AT END OF sort-gsb1.
+*   Micro-Fiche Info
+*   ----------------
+      MOVE sort(4)   TO bhdgd-grpin.
+    ENDAT.
+
+    AT END OF sort-buk1.
+*   Micro-Fiche Info
+*   ----------------
+      MOVE space     TO bhdgd-grpin.
+    ENDAT.
+
+* Hinweise ausgeben
+    AT LAST.
+      IF fi_lc_ex = '1' OR fi_lc_ex = '2'.
+        PERFORM konz_extract(rgcbila0)
+                     USING  space        " Ergebnisschluessel
+                            space        " Buchungskreis
+                            bilavers                        "n1630595
+                            sd_gsb_s[]                      "wms086855
+                            space        " Planversion
+                           '**ENDE**'    " Kontonummer
+                            space        " Geschäftsbereich
+                            space        " Berichtjahr
+                            space        " Saldo
+                            space        " Berichtsmonat -von-
+                            space        " Berichtsmonat -bis-
+                            gd_fname                        "xrp250698
+                            gd_pres                         "xrp250698
+                            pa_rbcs      " receiver SEM-BCS  "xrp290904
+                            pa_aggr                         "n1630595
+                            fi_lc_ex                        "vhs134295
+                            ergsl-soll
+                            ergsl-haben
+                            space.                          "wes140906
+      ENDIF.
+
+      list_createt = 'X'.
+    ENDAT.
+  ENDLOOP.
+
+  IF list_createt IS INITIAL.
+    CALL FUNCTION 'POPUP_NO_LIST'.
+  ENDIF.
+
+* eventuelle Fehlerausgabe.
+* -------------------------
+  CALL FUNCTION 'FI_MESSAGE_CHECK'
+    EXCEPTIONS
+      no_message = 04.
+
+  IF sy-subrc = 0.
+    MOVE text-114 TO bhdgd-line2+30(70).
+    NEW-PAGE.
+
+    CALL FUNCTION 'FI_MESSAGE_SORT'.
+    CALL FUNCTION 'FI_MESSAGES_ALV'.
+  ENDIF.
+*ENHANCEMENT-POINT BEFORE_PRINT SPOTS FI_BILA_PRINT .
+
+  IF scr_print_to_form = yes.                      "SCRIPT
+    EXPORT scr_data x011q TO MEMORY ID 'RFBILA00TOFORM'.
+    SUBMIT rfbifopr
+       WITH scr_form = scr_form
+       WITH scr_spra = bilaspra
+       WITH scr_devi = scr_devi
+       WITH bilabkon = bilabkon
+       WITH bilagkon = bilagkon
+       WITH bilaskal = bilaskal
+       WITH planvers = planvers
+       WITH per_bjjv = per-bjjv
+       WITH per_bmmv = per-bmmv
+       WITH per_bjjb = per-bjjb
+       WITH per_bmmb = per-bmmb
+       WITH per_vjjv = per-vjjv
+       WITH per_vmmv = per-vmmv
+       WITH per_vjjb = per-vjjb
+       WITH per_vmmb = per-vmmb
+    AND  RETURN.
+  ENDIF.
+
+* notice of departure from schedule manager
+  PERFORM schedman_start_stop USING 'STOP'.
+*EJECT
+*--------------------------------------------------------------------*
+*   U N T E R R O U T I N E N                                        *
+*--------------------------------------------------------------------*
+TOP-OF-PAGE.
+
+  CHECK scr_print_to_form = no.        "SCRIPT
+* Standard-Seitenkopf drucken
+* ---------------------------
+
+  FORMAT COLOR COL_HEADING INVERSE.
+  PERFORM batch-heading(rsbtchh0).
+
+  SET BLANK LINES ON.
+  WRITE: / space.                      " Leerzeile
+  WRITE: / text-024.                   " Buchungskreis
+  IF bilabkon >= '2'.
+    WRITE '****'    COLOR COL_BACKGROUND INTENSIFIED OFF
+                                         INVERSE OFF.
+  ELSE.
+    WRITE sort-buk1 COLOR COL_BACKGROUND INTENSIFIED OFF
+                                         INVERSE OFF.
+  ENDIF.
+
+  WRITE:   text-025.                   " Geschäftsbereich
+  IF bilagkon = '1'.
+    WRITE sort-gsb1 COLOR COL_BACKGROUND INTENSIFIED OFF
+                                         INVERSE OFF.
+  ELSE.
+    WRITE '****'    COLOR COL_BACKGROUND INTENSIFIED OFF
+                                         INVERSE OFF.
+  ENDIF.
+
+  WRITE:  99 text-026,                 " Beträge in
+             h-text COLOR COL_BACKGROUND INTENSIFIED OFF
+                                         INVERSE OFF.
+  ULINE.
+
+  FORMAT COLOR COL_HEADING INTENSIFIED INVERSE OFF.
+*                                                 "begin "n2820348
+*  IF bilaspra = '2'.                                        "n1888197
+  PERFORM top_of_page2.
+*  ELSE.                                                     "n1888197
+*    uc_initialize.
+*    uc_vline_offset: 0, 2, 7, 12, 63, 82, 101, 118, 126, 131.
+*    uc_headerline TEXT-021.
+*    WRITE: / l_line.
+*    uc_headerline varueb.
+*    WRITE: / l_line.
+*  ENDIF.                                                    "n1888197
+*                                                 "end "n2820348
+
+  IF planvers = space.
+    ULINE.
+  ELSE.
+    WRITE: text-006.
+  ENDIF.
+
+*--------------------------------------------------------------------
+*        FORM SUCHEN_ERGEBNISPOSITION
+*--------------------------------------------------------------------
+* Aus Tabelle T011  werden zunaechst die Ergebnisschluessel fuer
+*   - das Bilanzergebnis in der Bilanz (positiv)
+*   - das Bilanzergebnis in der Bilanz (negativ)
+*   - das Bilanzergebnis in der GuV    (positiv)
+*   - das Bilanzergebnis in der GuV    (negativ)
+*   - die Konten, die Aktiva repraesentieren
+*   - die Konten, die Passiva repraesentieren
+*   - die Konten, die nicht zugeordnet sind
+* besorgt.
+* Mit den Ergebnisschluesseln werden dann die dazugehoeringen Pro-
+* grammschluessel aus der Tabelle I011P gelesen.
+* Die Programmschluessel, die Aktiva, Passiva und 'Nicht zugeord-
+* neten Konten' repraesentieren werden zur Berechnung des Bilanz-
+* ergebnisses herangezogen.
+* Und zwar werden die Salden der Konten, deren Programmschluessel in
+* den ersten beiden Stellen mit den Programmschluesseln von Aktiva,
+* Passiva oder 'Nicht zugeordneten Konten' uebereinstimmen zur Be-
+* rechnung des Ergebnisses Bilanz, alle anderen Konten zur Berechnung
+* des Ergebnisses in der GuV herangezogen.
+*--------------------------------------------------------------------
+
+FORM suchen_ergebnis_position USING erg_version.
+* Tabelle X011P in umgekehrter Sortierfolge nach I011P uebernehmen
+* ----------------------------------------------------------------
+  LOOP AT x011p.
+    MOVE-CORRESPONDING x011p TO i011p.
+    APPEND i011p.
+  ENDLOOP.
+  SORT i011p.
+
+* dann aus Tabelle I011P den Programmschluessel fuer Bilanz besorgen
+* ------------------------------------------------------------------
+  READ TABLE i011p WITH KEY t011-ergak BINARY SEARCH.
+  IF sy-subrc = 0.
+*   Schluessel fuer positiv
+*   -----------------------
+    MOVE: i011p-prkey TO e1pos-prkey.
+  ENDIF.
+
+  READ TABLE i011p WITH KEY t011-ergpa BINARY SEARCH.
+  IF sy-subrc = 0.
+*   Schluessel fuer negativ
+*   -----------------------
+    MOVE: i011p-prkey TO e1neg-prkey.
+  ENDIF.
+
+* dann aus Tabelle I011P den Programmschluessel fuer G u V  besorgen
+* ------------------------------------------------------------------
+  READ TABLE i011p WITH KEY t011-erggv BINARY SEARCH.
+  IF sy-subrc = 0.
+*   Schluessel fuer positiv
+*   -----------------------
+    MOVE: i011p-prkey TO e2pos-prkey.
+  ENDIF.
+
+  READ TABLE i011p WITH KEY t011-erggv BINARY SEARCH.
+  IF sy-subrc = 0.
+*   Schluessel fuer negativ
+*   -----------------------
+    MOVE: i011p-prkey TO e2neg-prkey.
+  ENDIF.
+
+* dann aus Tabelle I011P den Programmschluessel fuer die nicht
+* zugeordneten Konten besorgen
+* ------------------------------------------------------------
+  READ TABLE i011p WITH KEY t011-zuord BINARY SEARCH.
+  IF sy-subrc = 0.
+    MOVE: i011p-prkey TO nzuon-prkey.
+    nzuon_len = i011p-stufe * 2.
+  ENDIF.
+
+* dann aus Tabelle I011P den Programmschluessel welcher Aktiva
+* repraesentiert besorgen.
+* ------------------------------------------------------------
+  READ TABLE i011p WITH KEY t011-aktva BINARY SEARCH.
+  IF sy-subrc = 0.
+    MOVE: i011p-prkey TO aktva-prkey.
+    aktva_len = i011p-stufe * 2.
+  ENDIF.
+
+* dann aus Tabelle I011P den Programmschluessel welcher Passiva
+* repraesentiert besorgen.
+* -------------------------------------------------------------
+  READ TABLE i011p WITH KEY t011-pssva BINARY SEARCH.
+  IF sy-subrc = 0.
+    MOVE: i011p-prkey TO pssva-prkey.
+    pssva_len = i011p-stufe * 2.
+  ENDIF.
+
+* aus Tabelle I011P den Programmschluessel welcher den
+* Bilanzanhang repraesentiert besorgen.
+* ------------------------------------------------------
+  READ TABLE i011p WITH KEY t011-anhng BINARY SEARCH.
+  IF sy-subrc = 0.
+    MOVE: i011p-prkey TO anhng-prkey.
+    anhng_len = i011p-stufe * 2.
+  ENDIF.
+ENDFORM.                    "SUCHEN_ERGEBNIS_POSITION
+
+*EJECT
+*--------------------------------------------------------------------*
+*        FORM FILL_BHDGD                                             *
+*--------------------------------------------------------------------*
+*  Standardseitenkopf fuellen
+*----------------------------
+FORM fill_bhdgd.
+  MOVE:    '0'      TO bhdgd-inifl,
+        sy-linsz    TO bhdgd-lines,
+        sy-uname    TO bhdgd-uname,
+        sy-repid    TO bhdgd-repid.
+  CASE fi_lc_ex.
+    WHEN '1'.
+      MOVE text-010   TO bhdgd-line2.
+    WHEN '2'.
+      MOVE text-011   TO bhdgd-line2.
+    WHEN OTHERS.
+      MOVE allgline   TO bhdgd-line2.
+  ENDCASE.
+  MOVE: space       TO bhdgd-bukrs,
+        mikfiche    TO bhdgd-miffl,
+        allglsep    TO bhdgd-separ,
+        'BUKRS'     TO bhdgd-domai.
+  SELECT SINGLE * FROM t011t WHERE
+                       spras = bilaspra
+                   AND versn = bilavers.
+  IF sy-subrc = 0.
+    MOVE t011t-vstxt TO bhdgd-line1.
+  ELSE.
+    MOVE sy-title    TO bhdgd-line1.
+  ENDIF.
+
+  IF bilapage > 0.
+    bilapage = bilapage - 1.
+    MOVE bilapage    TO bhdgd-start_pagno.
+  ENDIF.
+
+  IF bilabkon >= '2'.
+    MOVE bhdgd-bukrs TO bhdgd-werte.
+    PERFORM new-section(rsbtchh0).
+  ENDIF.
+ENDFORM.                    "FILL_BHDGD
+
+
+*EJECT
+*--------------------------------------------------------------------*
+*        FORM SALDO_GSBER                                            *
+*--------------------------------------------------------------------*
+* Saldoermittlung pro Geschaeftsbereich
+*--------------------------------------
+FORM saldo_gsber USING saldo_periode saldo_jahrc saldo_sign.
+  CASE saldo_periode.
+    WHEN 'B'.
+* Berichts-Periode
+* ----------------
+*   Bilanzkonten
+*   ------------
+      IF prkey-soll(aktva_len)  =  aktva-prkey(aktva_len) OR
+         prkey-soll(pssva_len)  =  pssva-prkey(pssva_len) OR
+         prkey-haben(aktva_len) =  aktva-prkey(aktva_len) OR
+         prkey-haben(pssva_len) =  pssva-prkey(pssva_len) OR
+        ( prkey-soll(nzuon_len) =  nzuon-prkey(nzuon_len) AND
+         prkey-haben(nzuon_len) =  nzuon-prkey(nzuon_len) ).
+*     Zeitraum bewegt sich innerhalb eines Jahres
+*     -------------------------------------------
+        IF per-bjjv = per-bjjb.
+          h-umonat = bper-embil.
+          h-omonat = bper-lmbil.
+*       Wenn keine Bewegungsbilanz, dann mit Saldo-Vortrag
+*       --------------------------------------------------
+          IF bilabtyp NE '2'.
+            h-saldo  = skc1a-umsav.
+          ENDIF.
+        ELSE.
+*       Zeitraum bewegt sich ueber Jahresgrenzen hinweg
+*       -----------------------------------------------
+*       Anfangsjahr
+*       -----------
+          IF saldo_jahrc = per-bjjv.
+            h-umonat = bper-embil.
+            h-omonat =    16.
+*         Wenn keine Bewegungsbilanz, dann mit Saldo-Vortrag
+*         --------------------------------------------------
+            IF bilabtyp NE '2'.
+              h-saldo  = skc1a-umsav.
+            ENDIF.
+          ENDIF.
+*       Endejahr
+*       --------
+          IF saldo_jahrc = per-bjjb.
+            h-umonat =     1.
+            h-omonat = bper-lmbil.
+          ENDIF.
+*       Jahr ist irgendwo zwischen Ober- und Untergrenze
+*       ------------------------------------------------
+          IF saldo_jahrc > per-bjjv.
+            IF saldo_jahrc < per-bjjb.
+              h-umonat =     1.
+              h-omonat =    16.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ELSE.
+*   GuV Konten
+*   ----------
+*     Zeitraum bewegt sich innerhalb eines Jahres
+*     -------------------------------------------
+        IF per-bjjv = per-bjjb.
+          h-umonat = bper-emguv.
+          h-omonat = bper-lmguv.
+*       Wenn keine Bewegungsbilanz, dann mit Saldo-Vortrag
+*       --------------------------------------------------
+          IF bilabtyp NE '2' AND bilabtyp NE '3'.
+            h-saldo  = skc1a-umsav.
+          ENDIF.
+        ELSE.
+*       Zeitraum bewegt sich ueber Jahresgrenzen hinweg
+*       -----------------------------------------------
+*       Anfangsjahr
+*       -----------
+          IF saldo_jahrc = per-bjjv.
+            h-umonat = bper-emguv.
+            h-omonat =    16.
+*         Wenn keine Bewegungsbilanz, dann mit Saldo-Vortrag
+*         --------------------------------------------------
+            IF bilabtyp NE '2' AND bilabtyp NE '3'.
+              h-saldo  = skc1a-umsav.
+            ENDIF.
+          ENDIF.
+*       Endejahr
+*       --------
+          IF saldo_jahrc = per-bjjb.
+            h-umonat =     1.
+            h-omonat = bper-lmguv.
+          ENDIF.
+*       Jahr ist irgendwo zwischen Ober- und Untergrenze
+*       ------------------------------------------------
+          IF saldo_jahrc > per-bjjv.
+            IF saldo_jahrc < per-bjjb.
+              h-umonat =     1.
+              h-omonat =    16.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+    WHEN 'V'.
+* Vergleichs-Periode
+* ------------------
+*   Bilanzkonten
+*   ------------
+      IF prkey-soll(aktva_len)  =  aktva-prkey(aktva_len) OR
+         prkey-soll(pssva_len)  =  pssva-prkey(pssva_len) OR
+         prkey-haben(aktva_len) =  aktva-prkey(aktva_len) OR
+         prkey-haben(pssva_len) =  pssva-prkey(pssva_len) OR
+        ( prkey-soll(nzuon_len) =  nzuon-prkey(nzuon_len) AND
+         prkey-haben(nzuon_len) =  nzuon-prkey(nzuon_len) ).
+*     Zeitraum bewegt sich innerhalb eines Jahres
+*     -------------------------------------------
+        IF per-vjjv = per-vjjb.
+          h-umonat = vper-embil.
+          h-omonat = vper-lmbil.
+*       Wenn keine Bewegungsbilanz, dann mit Saldo-Vortrag
+*       --------------------------------------------------
+          IF bilabtyp NE '2'.
+            h-saldo  = skc1a-umsav.
+          ENDIF.
+        ELSE.
+*       Zeitraum bewegt sich ueber Jahresgrenzen hinweg
+*       -----------------------------------------------
+*       Anfangsjahr
+*       -----------
+          IF saldo_jahrc = per-vjjv.
+            h-umonat = vper-embil.
+            h-omonat =    16.
+*         Wenn keine Bewegungsbilanz, dann mit Saldo-Vortrag
+*         --------------------------------------------------
+            IF bilabtyp NE '2'.
+              h-saldo  = skc1a-umsav.
+            ENDIF.
+          ENDIF.
+*       Endejahr
+*       --------
+          IF saldo_jahrc = per-vjjb.
+            h-umonat =     1.
+            h-omonat = vper-lmbil.
+          ENDIF.
+*       Jahr ist irgendwo zwischen Ober- und Untergrenze
+*       ------------------------------------------------
+          IF saldo_jahrc > per-vjjv.
+            IF saldo_jahrc < per-vjjb.
+              h-umonat =     1.
+              h-omonat =    16.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ELSE.
+*   GuV Konten
+*   ----------
+*     Zeitraum bewegt sich innerhalb eines Jahres
+*     -------------------------------------------
+        IF per-vjjv = per-vjjb.
+          h-umonat = vper-emguv.
+          h-omonat = vper-lmguv.
+*       Wenn keine Bewegungsbilanz, dann mit Saldo-Vortrag
+*       --------------------------------------------------
+          IF bilabtyp NE '2' AND bilabtyp NE '3'.
+            h-saldo  = skc1a-umsav.
+          ENDIF.
+        ELSE.
+*       Zeitraum bewegt sich ueber Jahresgrenzen hinweg
+*       -----------------------------------------------
+*       Anfangsjahr
+*       -----------
+          IF saldo_jahrc = per-vjjv.
+            h-umonat = vper-emguv.
+            h-omonat =    16.
+*         Wenn keine Bewegungsbilanz, dann mit Saldo-Vortrag
+*         --------------------------------------------------
+            IF bilabtyp NE '2' AND bilabtyp NE '3'.
+              h-saldo  = skc1a-umsav.
+            ENDIF.
+          ENDIF.
+*       Endejahr
+*       --------
+          IF saldo_jahrc = per-vjjb.
+            h-umonat =     1.
+            h-omonat = vper-lmguv.
+          ENDIF.
+*       Jahr ist irgendwo zwischen Ober- und Untergrenze
+*       ------------------------------------------------
+          IF saldo_jahrc > per-vjjv.
+            IF saldo_jahrc < per-vjjb.
+              h-umonat =     1.
+              h-omonat =    16.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+  ENDCASE.
+
+* Keinen Saldo ermitteln, wenn Eroeffnungsbilanz gewuenscht
+* ---------------------------------------------------------
+  IF bilabtyp NE '4'.
+    DO 16 TIMES VARYING h-um01s FROM skc1a-um01s NEXT skc1a-um02s
+                VARYING h-um01h FROM skc1a-um01h NEXT skc1a-um02h.
+      IF sy-index >= h-umonat AND sy-index <= h-omonat.
+*...... calculate balance
+        h-saldo = h-saldo + ( h-um01s - h-um01h ).
+        IF skc1a-umsav NE 0
+        OR h-um01s     NE 0
+        OR h-um01h     NE 0.
+*........ mark account as posted
+          saldo_sign = 1.
+        ENDIF.
+      ENDIF.
+    ENDDO.
+  ELSE.
+    IF skc1a-umsav NE 0.
+*.... mark account as posted
+      saldo_sign = 1.
+    ENDIF.
+  ENDIF.
+
+* Normierung der GuV-Werte falls erforderlich
+* -------------------------------------------
+  IF hochrech     =  'X'            AND
+    prkey-soll(aktva_len) NE aktva-prkey(aktva_len) AND
+    prkey-soll(pssva_len) NE pssva-prkey(pssva_len) AND
+    prkey-soll(nzuon_len) NE nzuon-prkey(nzuon_len).
+
+    CASE saldo_periode.
+      WHEN 'B'.
+*     Berichtsperiode
+*     ---------------
+        IF bper-anzmo > 0 AND bper-anzmo < 12.
+          h-saldo = ( h-saldo * 12 ) / bper-anzmo.
+        ENDIF.
+      WHEN 'V'.
+*     Vergleichsperiode
+*     -----------------
+        IF vper-anzmo > 0 AND vper-anzmo < 12.
+          h-saldo = ( h-saldo * 12 ) / vper-anzmo.
+        ENDIF.
+    ENDCASE.
+  ENDIF.
+
+* Waehrungsumrechnung falls erforderlich
+* --------------------------------------
+  IF repwaers NE space AND repwaers NE skc1a-hwaer.
+    MOVE h-saldo TO h-usald.
+*.. try at first china specific conversion
+    CALL FUNCTION 'OUTBOUND_CALL_00003220_P'
+      EXPORTING
+        i_land1          = t001-land1
+        date             = stichtag
+        periode          = saldo_periode
+        foreign_currency = repwaers
+        local_amount     = h-usald
+        local_currency   = skc1a-hwaer
+        rate             = 0
+        type_of_rate     = kurs_typ
+        read_tcurr       = 'X'
+      IMPORTING
+        foreign_amount   = h-saldo
+      EXCEPTIONS
+        nothing_found    = 1
+        OTHERS           = 2.
+
+    IF sy-subrc <> 0.
+      CALL FUNCTION 'CONVERT_TO_FOREIGN_CURRENCY'
+        EXPORTING
+          date             = stichtag
+          local_currency   = skc1a-hwaer
+          local_amount     = h-usald
+          foreign_currency = repwaers
+          type_of_rate     = kurs_typ
+        IMPORTING
+          foreign_amount   = h-saldo.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "SALDO_GSBER
+
+*EJECT
+*--------------------------------------------------------------------*
+*        FORM EXTRACT_SOLL_POSITION                                  *
+*--------------------------------------------------------------------*
+* Bestueckung eines EXTRACT-Satzes, wenn der Saldo positiv ist.
+*--------------------------------------------------------------
+FORM extract_soll_position.
+  MOVE: sortbkrs           TO sort-buk1,  " Buchungskreis
+        gtab-gsber         TO sort-gsb1,  " Geschaeftsbereich
+        prkey-soll(2)      TO sort-list,  " Listenteil
+        prkey-soll+00(2)   TO sort-pky1,                    " Stufe 1
+        prkey-soll+02(2)   TO sort-pky2,                    " Stufe 2
+        prkey-soll+04(2)   TO sort-pky3,                    " Stufe 3
+        prkey-soll+06(2)   TO sort-pky4,                    " Stufe 4
+        prkey-soll+08(2)   TO sort-pky5,                    " Stufe 5
+        prkey-soll+10(2)   TO sort-pky6,                    " Stufe 6
+        prkey-soll+12(2)   TO sort-pky7,                    " Stufe 7
+        prkey-soll+14(2)   TO sort-pky8,                    " Stufe 8
+        prkey-soll+16(2)   TO sort-pky9,                    " Stufe 9
+        prkey-soll+18(2)   TO sort-pky0,                    " Stufe 10
+        prkey-verd         TO sort-verd.  " Verdichtungsschluessel
+  IF bilabkon <= '2'.
+    MOVE skb1-bukrs        TO sort-buk2.  " Buchungskreis  (KONS)
+    MOVE zuon_saknr        TO sort-ktnr.  " Sachkonto
+    MOVE ska1-sakan        TO date-sakan. " Kontonummer
+  ELSE.
+    MOVE gtab-bukrs        TO sort-buk2.  " Buchungskreis  (KONS)
+    MOVE gtab-saknr        TO sort-ktnr.  " Sachkonto
+    MOVE gtab-sakan        TO date-sakan. " Kontonummer
+    IF gtab-sakan IS INITIAL.
+      MOVE zuon_saknr      TO sort-ktnr.  " Sachkonto
+      MOVE ska1-sakan      TO date-sakan. " Kontonummer
+    ENDIF.
+  ENDIF.
+  MOVE:
+        gtab-gsber         TO sort-gsb2,  " Geschaeftsber. (KONS)
+        prkey-soll         TO date-prkey, " Programmschluessel
+        ergsl-soll         TO date-ergsl, " Ergebnisschluessel
+        skat-txt50         TO date-skbez, " Kontobezeichnung
+        ska1-saknr         TO date-saknr, " Kontonummer    "VSK047132
+        gtab-bsald         TO date-bsald, " Saldo Berichtszeitr.
+        gtab-vsald         TO date-vsald, " Saldo Verglzeitr.
+        ctyp_waers         TO date-waers. " Waehrung
+* Geschaeftsbreichs-Konsolidierung ??
+* -----------------------------------
+  IF bilagkon = '2'.
+    MOVE '****' TO sort-gsb1.          " Geschaeftsbereich
+  ENDIF.
+ENDFORM.                    "EXTRACT_SOLL_POSITION
+
+*EJECT
+*--------------------------------------------------------------------*
+*        FORM EXTRACT_HABEN_POSITION                                 *
+*--------------------------------------------------------------------*
+* Bestueckung eines EXTRACT-Satzes, wenn der Saldo negativ ist.
+*--------------------------------------------------------------
+FORM extract_haben_position.
+  MOVE: sortbkrs           TO sort-buk1,  " Buchungskreis
+        gtab-gsber         TO sort-gsb1,  " Geschaeftsbereich
+        prkey-haben(2)     TO sort-list,  " Listenteil
+        prkey-haben+00(2)  TO sort-pky1,                    " Stufe 1
+        prkey-haben+02(2)  TO sort-pky2,                    " Stufe 2
+        prkey-haben+04(2)  TO sort-pky3,                    " Stufe 3
+        prkey-haben+06(2)  TO sort-pky4,                    " Stufe 4
+        prkey-haben+08(2)  TO sort-pky5,                    " Stufe 5
+        prkey-haben+10(2)  TO sort-pky6,                    " Stufe 6
+        prkey-haben+12(2)  TO sort-pky7,                    " Stufe 7
+        prkey-haben+14(2)  TO sort-pky8,                    " Stufe 8
+        prkey-haben+16(2)  TO sort-pky9,                    " Stufe 9
+        prkey-haben+18(2)  TO sort-pky0,                    " Stufe 10
+        prkey-verd         TO sort-verd.  " Verdichtungsschluessel
+  IF bilabkon <= '2'.
+    MOVE skb1-bukrs        TO sort-buk2.  " Buchungskreis  (KONS)
+    MOVE zuon_saknr        TO sort-ktnr.  " Sachkonto
+    MOVE ska1-sakan        TO date-sakan. " Kontonummer
+  ELSE.
+    MOVE gtab-bukrs        TO sort-buk2.  " Buchungskreis  (KONS)
+    MOVE gtab-saknr        TO sort-ktnr.  " Sachkonto
+    MOVE gtab-sakan        TO date-sakan. " Kontonummer
+    IF gtab-sakan IS INITIAL.
+      MOVE zuon_saknr      TO sort-ktnr.  " Sachkonto
+      MOVE ska1-sakan      TO date-sakan. " Kontonummer
+    ENDIF.
+  ENDIF.
+  MOVE:
+
+        gtab-gsber         TO sort-gsb2,  " Geschaeftsber. (KONS)
+        prkey-haben        TO date-prkey, " Programmschluessel
+        ergsl-haben        TO date-ergsl, " Ergebnisschluessel
+        skat-txt50         TO date-skbez, " Kontobezeichnung
+        ska1-saknr         TO date-saknr, " Kontonummer    "VSK047132
+        gtab-bsald         TO date-bsald, " Saldo Berichtszeitr.
+        gtab-vsald         TO date-vsald, " Saldo Verglzeitr.
+        ctyp_waers         TO date-waers. " Waehrung
+* Geschaeftsbreichs-Konsolidierung ??
+* -----------------------------------
+  IF bilagkon = '2'.
+    MOVE '****' TO sort-gsb1.          " Geschaeftsbereich
+  ENDIF.
+ENDFORM.                    "EXTRACT_HABEN_POSITION
+
+*EJECT
+*--------------------------------------------------------------------*
+*        FORM EXTRACT_TRIGGER_SOLL_POSITION                          *
+*--------------------------------------------------------------------*
+* Bestueckung eines EXTRACT-Satzes, wenn der Saldo positiv ist.
+*--------------------------------------------------------------
+FORM extract_trigger_soll_position.
+  MOVE: vtab-bukrs         TO sort-buk1,  " Buchungskreis
+        vtab-gsber         TO sort-gsb1,  " Geschaeftsbereich
+        vtab-prkys(2)      TO sort-list,  " Listenteil
+        vtab-prkys+00(2)   TO sort-pky1,                    " Stufe 1
+        vtab-prkys+02(2)   TO sort-pky2,                    " Stufe 2
+        vtab-prkys+04(2)   TO sort-pky3,                    " Stufe 3
+        vtab-prkys+06(2)   TO sort-pky4,                    " Stufe 4
+        vtab-prkys+08(2)   TO sort-pky5,                    " Stufe 5
+        vtab-prkys+10(2)   TO sort-pky6,                    " Stufe 6
+        vtab-prkys+12(2)   TO sort-pky7,                    " Stufe 7
+        vtab-prkys+14(2)   TO sort-pky8,                    " Stufe 8
+        vtab-prkys+16(2)   TO sort-pky9,                    " Stufe 9
+        vtab-prkys+18(2)   TO sort-pky0,                    " Stufe 10
+        vtab-verds         TO sort-verd,  " Verdichtungsschluessel
+        vtab-bukrs         TO sort-buk2,  " Buchungskreis  (KONS)
+        vtab-gsber         TO sort-gsb2,  " Geschaeftsber. (KONS)
+        vtab-prkys         TO date-prkey, " Programmschluessel
+        vtab-bsald         TO date-bsald, " Saldo Berichtszeitr.
+        vtab-vsald         TO date-vsald, " Saldo Verglzeitr.
+        vtab-waers         TO date-waers. " Währung
+* Geschaeftsbreichs-Konsolidierung ??
+* -----------------------------------
+  IF bilagkon = '2'.
+    MOVE '****' TO sort-gsb1.          " Geschaeftsbereich
+  ENDIF.
+ENDFORM.                    "EXTRACT_TRIGGER_SOLL_POSITION
+
+*EJECT
+*--------------------------------------------------------------------*
+*        FORM EXTRACT_TRIGGER_HABEN_POSITION                         *
+*--------------------------------------------------------------------*
+* Bestueckung eines EXTRACT-Satzes, wenn der Saldo negativ ist.
+*--------------------------------------------------------------
+FORM extract_trigger_haben_position.
+  MOVE: vtab-bukrs         TO sort-buk1,  " Buchungskreis
+        vtab-gsber         TO sort-gsb1,  " Geschaeftsbereich
+        vtab-prkyh(2)      TO sort-list,  " Listenteil
+        vtab-prkyh+00(2)   TO sort-pky1,                    " Stufe 1
+        vtab-prkyh+02(2)   TO sort-pky2,                    " Stufe 2
+        vtab-prkyh+04(2)   TO sort-pky3,                    " Stufe 3
+        vtab-prkyh+06(2)   TO sort-pky4,                    " Stufe 4
+        vtab-prkyh+08(2)   TO sort-pky5,                    " Stufe 5
+        vtab-prkyh+10(2)   TO sort-pky6,                    " Stufe 6
+        vtab-prkyh+12(2)   TO sort-pky7,                    " Stufe 7
+        vtab-prkyh+14(2)   TO sort-pky8,                    " Stufe 8
+        vtab-prkyh+16(2)   TO sort-pky9,                    " Stufe 9
+        vtab-prkyh+18(2)   TO sort-pky0,                    " Stufe 10
+        vtab-verds         TO sort-verd,  " Verdichtungsschluessel
+        vtab-bukrs         TO sort-buk2,  " Buchungskreis  (KONS)
+        vtab-gsber         TO sort-gsb2,  " Geschaeftsber. (KONS)
+        vtab-prkyh         TO date-prkey, " Programmschluessel
+        vtab-bsald         TO date-bsald, " Saldo Berichtszeitr.
+        vtab-vsald         TO date-vsald, " Saldo Verglzeitr.
+        vtab-waers         TO date-waers. " Währung
+* Geschaeftsbreichs-Konsolidierung ??
+* -----------------------------------
+  IF bilagkon = '2'.
+    MOVE '****' TO sort-gsb1.          " Geschaeftsbereich
+  ENDIF.
+ENDFORM.                    "EXTRACT_TRIGGER_HABEN_POSITION
+
+*EJECT
+*---------------------------------------------------------------------*
+*        FORM TEXT_GRUPPENANFANG                                      *
+*---------------------------------------------------------------------*
+*  Gruppenanfangstexte besorgen
+*  ----------------------------
+FORM text_gruppenanfang USING text_stufe.
+* Ergebnisschluessel in Abhaengigkeit der Gruppenstufe
+* aus der internen Tabelle X011P besorgen.
+* ----------------------------------------------------
+  CHECK p_summ = ' '                                        "n1486648
+     OR p_summ = '0'                                        "n1486648
+     OR ( text_stufe GE '1' AND
+          text_stufe LE p_summ ).                           "n1486648
+
+  CLEAR x011p.
+  CASE text_stufe.
+    WHEN '1'.
+      MOVE date-prkey(02)  TO x011p-prkey(02).
+    WHEN '2'.
+      MOVE date-prkey(04)  TO x011p-prkey(04).
+    WHEN '3'.
+      MOVE date-prkey(06)  TO x011p-prkey(06).
+    WHEN '4'.
+      MOVE date-prkey(08)  TO x011p-prkey(08).
+    WHEN '5'.
+      MOVE date-prkey(10)  TO x011p-prkey(10).
+    WHEN '6'.
+      MOVE date-prkey(12)  TO x011p-prkey(12).
+    WHEN '7'.
+      MOVE date-prkey(14)  TO x011p-prkey(14).
+    WHEN '8'.
+      MOVE date-prkey(16)  TO x011p-prkey(16).
+    WHEN '9'.
+      MOVE date-prkey(18)  TO x011p-prkey(18).
+    WHEN '0'.
+      MOVE date-prkey      TO x011p-prkey.
+  ENDCASE.
+  READ TABLE x011p WITH KEY x011p-prkey BINARY SEARCH.
+* nur weitermache wenn Eintrag gefunden wurde, da sonst
+* auch kein Text in Tabelle X011Q vorhanden ist.
+* ----------------------------------------------
+  CHECK sy-subrc = 0.
+
+* Texte nur bei neuem Suchargument ausgeben
+* -----------------------------------------
+  CHECK x011p-ergsl NE old-suarg1.
+  MOVE  x011p-ergsl TO old-suarg1.
+
+  LOOP AT x011q WHERE ergsl = x011p-ergsl
+                  AND txtyp = 'A'.
+    CLEAR i011q.
+    MOVE x011q-txt45 TO i011q-text.
+    APPEND i011q.
+    reserve = reserve + 1.
+    IF scr_print_to_form = yes.        "SCRIPT
+      PERFORM fill_scr_data USING  'A' x011q-ergsl.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    "TEXT_GRUPPENANFANG
+
+*EJECT
+*---------------------------------------------------------------------*
+*  FORM TEXT_GRUPPENENDE                                              *
+*---------------------------------------------------------------------*
+*  Gruppenendetexte besorgen
+*  -------------------------
+FORM text_gruppenende USING text_stufe text_bsum text_vsum.
+* Ergebnisschluessel in Abhaengigkeit der Gruppenstufe
+* aus der internen Tabelle X011P besorgen und ausgeben.
+* ----------------------------------------------------
+  CHECK p_summ = ' '                                        "n1486648
+     OR p_summ = '0'                                        "n1486648
+     OR ( text_stufe GE '1' AND
+          text_stufe LE p_summ ).                           "n1486648
+
+  CLEAR x011p.
+  CASE text_stufe.
+    WHEN '1'.
+      MOVE date-prkey(02)  TO x011p-prkey(02).
+    WHEN '2'.
+      MOVE date-prkey(04)  TO x011p-prkey(04).
+    WHEN '3'.
+      MOVE date-prkey(06)  TO x011p-prkey(06).
+    WHEN '4'.
+      MOVE date-prkey(08)  TO x011p-prkey(08).
+    WHEN '5'.
+      MOVE date-prkey(10)  TO x011p-prkey(10).
+    WHEN '6'.
+      MOVE date-prkey(12)  TO x011p-prkey(12).
+    WHEN '7'.
+      MOVE date-prkey(14)  TO x011p-prkey(14).
+    WHEN '8'.
+      MOVE date-prkey(16)  TO x011p-prkey(16).
+    WHEN '9'.
+      MOVE date-prkey(18)  TO x011p-prkey(18).
+    WHEN '0'.
+      MOVE date-prkey      TO x011p-prkey.
+  ENDCASE.
+  READ TABLE x011p WITH KEY x011p-prkey BINARY SEARCH.
+* nur weitermachen wenn Eintrag gefunden wurde, da sonst
+* auch kein Text in Tabelle X011Q vorhanden ist.
+* ------------------------------------------------------
+  CHECK sy-subrc    =  0.
+* nur weitermachen wenn Summenausgabe erwuenscht ist.
+* ---------------------------------------------------
+  CHECK x011p-summe <> space.
+  CASE x011p-summe.
+    WHEN 'E'.
+      CLEAR loopctr.
+      PERFORM fill_i011q USING 'E' text_stufe text_bsum text_vsum.
+
+    WHEN 'S'.
+      CLEAR loopctr.
+      PERFORM fill_i011q USING 'S' text_stufe ss-bsum ss-vsum.
+
+    WHEN 'X'.
+      CLEAR loopctr.
+      PERFORM fill_i011q USING 'E' text_stufe text_bsum text_vsum.
+      CLEAR loopctr.
+      PERFORM fill_i011q USING 'S' text_stufe ss-bsum ss-vsum.
+  ENDCASE.
+
+* Zeilenvorschuebe in Abhaengigkeit der Gruppenstufe
+* --------------------------------------------------
+  IF loopctr NE 0.
+    CLEAR i011q.
+    CASE text_stufe.
+      WHEN '1'.
+        MOVE    2   TO i011q-skip.
+        MOVE 'SKIP' TO i011q-text.
+        APPEND i011q.
+        reserve = reserve + 2.
+      WHEN '2'.
+        MOVE    1   TO i011q-skip.
+        MOVE 'SKIP' TO i011q-text.
+        APPEND i011q.
+        reserve = reserve + 1.
+      WHEN '3'.
+        MOVE    1   TO i011q-skip.
+        MOVE 'SKIP' TO i011q-text.
+        APPEND i011q.
+        reserve = reserve + 1.
+    ENDCASE.
+  ENDIF.
+
+* Texte und Summen ausgeben
+* -------------------------
+  RESERVE reserve LINES.
+  LOOP AT i011q.
+    CHECK scr_print_to_form = no.      "SCRIPT
+    FORMAT COLOR COL_KEY INTENSIFIED.
+    IF i011q-text(4) = 'SKIP'.
+      DO i011q-skip TIMES.
+        WRITE:     / space,
+              64(69) space COLOR COL_NORMAL INTENSIFIED OFF.
+        PERFORM fill_v_line.
+      ENDDO.
+    ELSE.
+      IF i011q-star(1) = '*'.
+*       Berechnung absolute Abweichung
+*       ------------------------------
+        h-saldo = i011q-bsum - i011q-vsum.
+
+*       Berechnung relative Abweichung
+*       ------------------------------
+        CLEAR: h-relab.
+        IF i011q-vsum NE 0.            " <= keine Division durch Null
+          PERFORM rel_abw_berechnen USING    i011q-bsum
+                                             i011q-vsum
+                                    CHANGING h-relab.
+        ENDIF.
+
+        WRITE: /14(50) i011q-text.
+
+        IF text_stufe = '1'.
+          FORMAT COLOR COL_TOTAL  INTENSIFIED.
+        ELSE.
+          FORMAT COLOR COL_TOTAL  INTENSIFIED OFF.
+        ENDIF.
+        PERFORM  betrags_ausgabe
+          USING  space                 " Klammer auf '('
+                 i011q-bsum            " Summe Berichtszeitraum
+                 space                 " Klammer zu  ')'
+                 space                 " Klammer auf '('
+                 i011q-vsum            " Summe Vergleichszeitraum
+                 space                 " Klammer zu  ')'
+                 h-saldo               " Absol. Abweichung
+                 h-relab               " Rel. Abweichung
+                 i011q-star.           " Summensterne
+      ELSE.
+        WRITE: /14(50) i011q-text,
+                64(69) space COLOR COL_NORMAL INTENSIFIED OFF.
+      ENDIF.
+      PERFORM fill_v_line.
+    ENDIF.
+  ENDLOOP.
+
+  REFRESH i011q.
+  CLEAR:  i011q,
+          reserve.
+ENDFORM.                    "TEXT_GRUPPENENDE
+
+*EJECT
+*---------------------------------------------------------------------*
+*  FORM FILL_I011Q                                                    *
+*---------------------------------------------------------------------*
+FORM fill_i011q USING fill_txtyp fill_stufe fill_bsum fill_vsum.
+  LOOP AT x011q WHERE ergsl = x011p-ergsl
+                  AND txtyp = fill_txtyp.
+
+    loopctr = loopctr + 1.
+    CLEAR i011q.
+    IF loopctr = 1.
+      CASE fill_stufe.
+        WHEN '1'.
+          MOVE  '*1*'      TO i011q-star.
+        WHEN '2'.
+          MOVE  '*2*'      TO i011q-star.
+        WHEN '3'.
+          MOVE  '*3*'      TO i011q-star.
+        WHEN '4'.
+          MOVE  '*4*'      TO i011q-star.
+        WHEN '5'.
+          MOVE  '*5*'      TO i011q-star.
+        WHEN '6'.
+          MOVE  '*6*'      TO i011q-star.
+        WHEN '7'.
+          MOVE  '*7*'      TO i011q-star.
+        WHEN '8'.
+          MOVE  '*8*'      TO i011q-star.
+        WHEN '9'.
+          MOVE  '*9*'      TO i011q-star.
+        WHEN '0'.
+          MOVE  '*10*'     TO i011q-star.
+      ENDCASE.
+      IF x011q-txt45 NE space.
+        MOVE x011q-txt45 TO i011q-text.
+      ELSE.
+        MOVE x011q-ergsl TO i011q-text.
+      ENDIF.
+      MOVE: fill_bsum  TO i011q-bsum,  " Summe Berichtszeitraum
+            fill_vsum  TO i011q-vsum.  " Summe Vergleichszeitraum
+
+      IF scr_print_to_form = yes.      "SCRIPT
+        PERFORM fill_scr_data USING fill_txtyp x011p-ergsl.
+      ENDIF.
+
+    ELSE.
+      IF x011q-txt45 NE space.
+        MOVE x011q-txt45 TO i011q-text.
+      ELSE.
+        MOVE x011q-ergsl TO i011q-text.
+      ENDIF.
+    ENDIF.
+    APPEND i011q.
+    reserve = reserve + 1.
+  ENDLOOP.
+
+* Summenausgabe, wenn kein Eintrag gefunden wurde.
+* ------------------------------------------------
+  CLEAR i011q.
+  IF loopctr = 0.
+    MOVE: fill_bsum TO i011q-bsum,
+          fill_vsum TO i011q-vsum.
+    CASE fill_stufe.
+      WHEN '1'.
+        MOVE  '*1*'      TO i011q-star.
+      WHEN '2'.
+        MOVE  '*2*'      TO i011q-star.
+      WHEN '3'.
+        MOVE  '*3*'      TO i011q-star.
+      WHEN '4'.
+        MOVE  '*4*'      TO i011q-star.
+      WHEN '5'.
+        MOVE  '*5*'      TO i011q-star.
+      WHEN '6'.
+        MOVE  '*6*'      TO i011q-star.
+      WHEN '7'.
+        MOVE  '*7*'      TO i011q-star.
+      WHEN '8'.
+        MOVE  '*8*'      TO i011q-star.
+      WHEN '9'.
+        MOVE  '*9*'      TO i011q-star.
+      WHEN '0'.
+        MOVE  '*10*'     TO i011q-star.
+    ENDCASE.
+    APPEND i011q.
+    reserve = reserve + 1.
+    IF scr_print_to_form = yes.        "SCRIPT
+      PERFORM fill_scr_data USING fill_txtyp x011p-ergsl.
+    ENDIF.
+  ENDIF.
+ENDFORM.                                                    "FILL_I011Q
+
+*EJECT
+*---------------------------------------------------------------------*
+*  FORM TEXTAUSGABE_ANFANG                                            *
+*---------------------------------------------------------------------*
+FORM textausgabe_anfang.
+  CHECK scr_print_to_form = no.        "SCRIPT
+* Eine Zeile fuer den ersten Posten reservieren
+* ---------------------------------------------
+  reserve = reserve + 1.
+  RESERVE reserve LINES.
+
+  LOOP AT i011q.
+    FORMAT COLOR COL_KEY INTENSIFIED.
+    IF i011q-text(4) = 'SKIP'.
+      DO i011q-skip TIMES.
+        WRITE:    / space,
+             64(69) space COLOR COL_NORMAL INTENSIFIED OFF.
+        PERFORM fill_v_line.
+      ENDDO.
+    ELSE.
+      WRITE: /14(45) i011q-text,       " Text
+              64(69) space COLOR COL_NORMAL INTENSIFIED OFF.
+      PERFORM fill_v_line.
+    ENDIF.
+  ENDLOOP.
+
+  REFRESH i011q.
+  CLEAR:  i011q,
+          reserve.
+ENDFORM.                    "TEXTAUSGABE_ANFANG
+
+*EJECT
+*--------------------------------------------------------------------*
+*        FORM GET_BUPE_VIA_DATE                                      *
+*--------------------------------------------------------------------*
+* Berichts- und Vergleichsperioden ueber Datum besorgen
+*------------------------------------------------------
+FORM get_per_via_date.
+* Berichtszeitraum VON besorgen
+* -----------------------------
+  CALL FUNCTION 'GET_CURRENT_YEAR'
+    EXPORTING
+      bukrs = skb1-bukrs
+      date  = kalzeitb-low
+    IMPORTING
+      curry = per-bjjv
+      currm = per-bmmv.
+
+* Berichtszeitraum BIS besorgen
+* -----------------------------
+  CALL FUNCTION 'GET_CURRENT_YEAR'
+    EXPORTING
+      bukrs = skb1-bukrs
+      date  = kalzeitb-high
+    IMPORTING
+      curry = per-bjjb
+      currm = per-bmmb.
+
+  SELECT SINGLE * FROM t009y WHERE periv = t001-periv AND
+                                   gjahr = per-bjjb.
+  IF ( sy-subrc <> 0 AND per-bmmb = '12' ) OR
+     ( sy-subrc = 0 AND per-bmmb = t009y-anzbp ).
+    per-bmmb = '16'.
+  ENDIF.
+
+* Vergleichszeitraum VON besorgen
+* -------------------------------
+  CALL FUNCTION 'GET_CURRENT_YEAR'
+    EXPORTING
+      bukrs = skb1-bukrs
+      date  = kalzeitv-low
+    IMPORTING
+      curry = per-vjjv
+      currm = per-vmmv.
+
+* Vergleichszeitraum BIS besorgen
+* -------------------------------
+  CALL FUNCTION 'GET_CURRENT_YEAR'
+    EXPORTING
+      bukrs = skb1-bukrs
+      date  = kalzeitv-high
+    IMPORTING
+      curry = per-vjjb
+      currm = per-vmmb.
+
+  SELECT SINGLE * FROM t009y WHERE periv = t001-periv AND
+                                   gjahr = per-vjjb.
+  IF ( sy-subrc <> 0 AND per-vmmb = '12' ) OR
+     ( sy-subrc = 0 AND per-vmmb = t009y-anzbp ).
+    per-vmmb = '16'.
+  ENDIF.
+ENDFORM.                    "GET_PER_VIA_DATE
+
+*EJECT
+*--------------------------------------------------------------------*
+*        FORM KONTEN_AUSGABE                                         *
+*--------------------------------------------------------------------*
+
+FORM konten_ausgabe.
+  CHECK scr_print_to_form = no.        "SCRIPT
+* Berechnung absolute Abweichung
+* ------------------------------
+  h-saldo = date-bsald - date-vsald.
+
+* Berechnung relative Abweichung
+* ------------------------------
+  CLEAR: h-relab.
+  IF date-vsald NE 0.                  " <= keine Division durch Null
+    PERFORM rel_abw_berechnen USING    date-bsald
+                                       date-vsald
+                              CHANGING h-relab.
+  ENDIF.
+
+  FORMAT COLOR COL_KEY INTENSIFIED.
+  WRITE:
+        /2 sort-verd,                  " Verdichtungsschluessel
+           sort-buk2,                  " Buchungskreis     (KONS)
+           sort-gsb2,                  " Geschaeftsbereich (KONS)
+           date-sakan,                 " Sachkonto
+      (40) date-skbez.                 " Kontobezeichnung
+
+  FORMAT COLOR COL_NORMAL INTENSIFIED OFF.
+  PERFORM  betrags_ausgabe
+    USING  date-bklau                  " Klammer auf '('
+           date-bsald                  " Saldo Berichtszeitraum
+           date-bklzu                  " Klammer zu  ')'
+           date-vklau                  " Klammer auf '('
+           date-vsald                  " Saldo Vergleichszeitraum
+           date-vklzu                  " Klammer zu  ')'
+              h-saldo                  " Absol. Abweichung
+              h-relab                  " Rel. Abweichung
+                space.                 " Summensterne
+
+  PERFORM fill_v_line.
+
+  IF fi_lc_ex = '1'
+  OR fi_lc_ex = '2'.
+*   Extract an LC gewuenscht.
+*   -------------------------
+    IF planvers = space.
+*     IF DATE-BKLAU NE '(' AND DATE-BKLZU NE ')'.             "wes190202
+      IF date-bklau NE '(' AND date-bklzu NE ')' OR         "wes190202
+         date-bsald IS INITIAL.                             "wes190202
+*       Ist-Daten uebergeben
+*       --------------------
+        PERFORM konz_extract(rgcbila0)
+                     USING  date-ergsl " Ergebnisschluessel
+                            sort-buk1  " Buchungskreis
+                            bilavers                        "n1630595
+                            sd_gsb_s[]                      "wms086855
+                            planvers   " Planversion
+*                          sort-ktnr  " Kontonummer        "VSK047132
+                            date-saknr                      "VSK047132
+                            sort-gsb1  " Geschäftsbereich
+                            per-bjjv   " Berichtjahr
+                            date-bsald " Saldo
+                            per-bmmv   " Berichtsmonat -von-
+                            per-bmmb   " Berichtsmonat -bis-
+                            gd_fname                        "xrp250698
+                            gd_pres                         "xrp250698
+                            pa_rbcs    " receiver SEM-BCS  "xrp290904
+                            pa_aggr                         "n1630595
+                            fi_lc_ex                        "vhs134295
+                            ergsl-soll
+                            ergsl-haben
+                            trig-kz.                        "wes140906
+      ENDIF.
+    ELSE.
+*     IF DATE-VKLAU NE '(' AND DATE-VKLZU NE ')'.             "wes190202
+      IF date-vklau NE '(' AND date-vklzu NE ')' OR         "wes190202
+         date-vsald IS INITIAL.                             "wes190202
+*       Plan-Daten uebergeben
+*       DATE-VSALD enthaelt Planzahlen
+*       ------------------------------
+        PERFORM konz_extract(rgcbila0)
+                     USING  date-ergsl " Ergebnisschluessel
+                            sort-buk1  " Buchungskreis
+                            bilavers                        "n1630595
+                            sd_gsb_s[]                      "wms086855
+                            planvers   " Planversion
+*                          sort-ktnr  " Kontonummer        "VSK047132
+                            date-saknr                      "VSK047132
+                            sort-gsb1  " Geschäftsbereich
+                            per-bjjv   " Berichtjahr
+                            date-vsald " Saldo
+                            per-bmmv   " Berichtsmonat -von-
+                            per-bmmb   " Berichtsmonat -bis-
+                            gd_fname                        "xrp250698
+                            gd_pres                         "xrp250698
+                            pa_rbcs    " receiver SEM-BCS  "xrp290904
+                            pa_aggr                         "n1630595
+                            fi_lc_ex                        "vhs134295
+                            ergsl-soll
+                            ergsl-haben
+                            trig-kz.                        "wes140906
+      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "KONTEN_AUSGABE
+
+*EJECT
+*--------------------------------------------------------------------*
+*        FORM TRIGGER_AUSGABE                                        *
+*--------------------------------------------------------------------*
+FORM trigger_ausgabe.
+* Berechnung absolute Abweichung
+* ------------------------------
+  h-saldo = date-bsald - date-vsald.
+
+* Berechnung relative Abweichung
+* ------------------------------
+  CLEAR: h-relab.
+  IF date-vsald NE 0.                  " <= keine Division durch Null
+    PERFORM rel_abw_berechnen USING    date-bsald
+                                       date-vsald
+                              CHANGING h-relab.
+  ENDIF.
+
+  FORMAT COLOR COL_KEY INTENSIFIED.
+  WRITE:
+        /  sort-verd.                  " Verdichtungsschluessel
+
+  FORMAT COLOR COL_NORMAL INTENSIFIED OFF.
+  PERFORM  betrags_ausgabe
+    USING  date-bklau                  " Klammer auf '('
+           date-bsald                  " Saldo Berichtszeitraum
+           date-bklzu                  " Klammer zu  ')'
+           date-vklau                  " Klammer auf '('
+           date-vsald                  " Saldo Vergleichszeitraum
+           date-vklzu                  " Klammer zu  ')'
+              h-saldo                  " Absol. Abweichung
+              h-relab                  " Rel. Abweichung
+                space.                 " Summensterne
+  PERFORM fill_v_line.
+ENDFORM.                    "TRIGGER_AUSGABE
+
+*EJECT
+*--------------------------------------------------------------------*
+*        FORM BETRAGS_AUSGABE                                        *
+*--------------------------------------------------------------------*
+FORM betrags_ausgabe USING betr_bklau  " Klammer auf '('
+                           betr_bsald  " Saldo Berichtszeitraum
+                           betr_bklzu  " Klammer zu  ')'
+                           betr_vklau  " Klammer auf '('
+                           betr_vsald  " Saldo Vergleichszeitraum
+                           betr_vklzu  " Klammer zu  ')'
+                           betr_saldo  " Absol. Abweichung
+                           betr_relab  " Rel. Abweichung
+                           betr_stern. " Summensterne
+
+  CASE bilaskal.
+    WHEN '0/0'.
+      IF repwaers = space.
+*   Wenn keine Skalierung und keine Konsolidierungswaehrung
+*   gewaehlt wurde werden die Betraege in Hauswaehrung ausgegeben.
+*   --------------------------------------------------------------
+        WRITE:   65  betr_bklau,       " Klammer auf '('
+              66(16) betr_bsald CURRENCY ctyp_waers, " Saldo Ber.zeitr.
+                 82  betr_bklzu,       " Klammer zu  ')'
+                 84  betr_vklau,       " Klammer auf '('
+              85(16) betr_vsald CURRENCY ctyp_waers, "Saldo Vergl.zeitr.
+                101  betr_vklzu,       " Klammer zu  ')'
+             103(16) betr_saldo CURRENCY ctyp_waers, " Absol. Abweichung
+              120(7) betr_relab NO-ZERO,             " Rel. Abweichung
+              128(4) betr_stern.       " Summensterne
+
+      ELSE.
+
+*   Wenn keine Skalierung aber Konsolidierungswaehrung gewaehlt
+*   wurde werden die Betraege in der im Parameter 'Konsolidierungs-
+*   waehrung gewaehlten Waehrung ausgegeben.
+*   ---------------------------------------------------------------
+        WRITE:   65  betr_bklau,       " Klammer auf '('
+              66(16) betr_bsald CURRENCY repwaers,   " Saldo Ber.zeitr.
+                 82  betr_bklzu,       " Klammer zu  ')'
+                 84  betr_vklau,       " Klammer auf '('
+              85(16) betr_vsald CURRENCY repwaers,   "Saldo Vergl.zeitr.
+                101  betr_vklzu,       " Klammer zu  ')'
+             103(16) betr_saldo CURRENCY repwaers,   " Absol. Abweichung
+              120(7) betr_relab NO-ZERO,             " Rel. Abweichung
+              128(4) betr_stern.       " Summensterne
+      ENDIF.
+
+    WHEN OTHERS.
+      IF repwaers = space.
+*   Wird Skalierung aber keine Konsolidierungswaehrung gewaehlt,
+*   werden die Betraege in Hauswaehrung gemaess Skalierung ausgegeben.
+*   ------------------------------------------------------------------
+        WRITE:   65  betr_bklau,       " Klammer auf '('
+              66(16) betr_bsald CURRENCY ctyp_waers  " Saldo Ber.zeitr.
+                     ROUND bilaskal(1) DECIMALS bilaskal+2(1),
+                 82  betr_bklzu,       " Klammer zu  ')'
+                 84  betr_vklau,       " Klammer auf '('
+              85(16) betr_vsald CURRENCY ctyp_waers  "Saldo Vergl.zeitr.
+                     ROUND bilaskal(1) DECIMALS bilaskal+2(1),
+                101  betr_vklzu,       " Klammer zu  ')'
+             103(16) betr_saldo CURRENCY ctyp_waers  " Absol. Abweichung
+                     ROUND bilaskal(1) DECIMALS bilaskal+2(1),
+              120(7) betr_relab NO-ZERO,             " Rel. Abweichung
+              128(4) betr_stern.       " Summensterne
+      ELSE.
+
+*   Wenn Skalierung und Konsolidierungswaehrung gewaehlt wurde
+*   werden die Betraege in der im Parameter 'Konsolidierungswaehrung'
+*   gewaehlten Waehrung gemaess Skalierung ausgegeben.
+*   -----------------------------------------------------------------
+        WRITE:   65  betr_bklau,       " Klammer auf '('
+              66(16) betr_bsald CURRENCY repwaers    " Saldo Ber.zeitr.
+                     ROUND bilaskal(1) DECIMALS bilaskal+2(1),
+                 82  betr_bklzu,       " Klammer zu  ')'
+                 84  betr_vklau,       " Klammer auf '('
+              85(16) betr_vsald CURRENCY repwaers    "Saldo Vergl.zeitr.
+                     ROUND bilaskal(1) DECIMALS bilaskal+2(1),
+                101  betr_vklzu,       " Klammer zu  ')'
+             103(16) betr_saldo CURRENCY repwaers    " Absol. Abweichung
+                     ROUND bilaskal(1) DECIMALS bilaskal+2(1),
+              120(7) betr_relab NO-ZERO,             " Rel. Abweichung
+              128(4) betr_stern.       " Summensterne
+      ENDIF.
+  ENDCASE.
+ENDFORM.                    "BETRAGS_AUSGABE
+
+*EJECT
+*---------------------------------------------------------------------*
+*        FORM REL_ABW_BERECHNEN                                       *
+*---------------------------------------------------------------------*
+FORM rel_abw_berechnen USING    value(rel_bsum)
+                                value(rel_vsum)
+                       CHANGING value(rel_abw).
+  DATA: vbetr LIKE h-amount.
+  vbetr = rel_vsum.
+  IF vbetr < 0.
+    vbetr = vbetr * -1.
+  ENDIF.
+  IF bilavart = '1'.                                        "1665383
+    rel_abw = ( rel_bsum - rel_vsum ) * 1000 / vbetr.       "1665383
+  ELSEIF bilavart = '2'.                                    "1665383
+    rel_abw = ( rel_bsum * 1000 ) / vbetr.                  "1665383
+  ELSEIF bilavart = '3'.                                    "1665383
+    rel_abw = ( rel_bsum - rel_vsum ) * 1000 / rel_vsum.    "1665383
+  ELSEIF bilavart = '4'.                                    "1665383
+    rel_abw = ( rel_bsum * 1000 ) / rel_vsum.               "1665383
+  ELSE.                                                     "1665383
+    CLEAR rel_abw.                                          "1665383
+    MESSAGE s754(fe).                                       "1665383
+  ENDIF.
+ENDFORM.                    "REL_ABW_BERECHNEN
+
+*---------------------------------------------------------------------*
+*        FORM FILL_V_LINE                                             *
+*---------------------------------------------------------------------*
+FORM fill_v_line.
+  WRITE:   1(1) sy-vline INTENSIFIED OFF,
+           3(1) sy-vline INTENSIFIED OFF,
+           8(1) sy-vline INTENSIFIED OFF,
+          13(1) sy-vline INTENSIFIED OFF,
+          64(1) sy-vline INTENSIFIED OFF,
+          83(1) sy-vline INTENSIFIED OFF,
+         102(1) sy-vline INTENSIFIED OFF,
+         119(1) sy-vline INTENSIFIED OFF,
+         127(1) sy-vline INTENSIFIED OFF,
+         132(1) sy-vline INTENSIFIED OFF.
+ENDFORM.                    "FILL_V_LINE
+
+*---------------------------------------------------------------------*
+*        FORM ERGEBNIS_BERECHNEN                                      *
+*---------------------------------------------------------------------*
+FORM berechne_ergebnis.
+*   Berechnung Ergebnis (Berichtsjahr)
+  IF gtab-bsald GE 0.
+    MOVE  prkey-soll    TO h-prkey.
+  ELSE.
+    MOVE  prkey-haben   TO h-prkey.
+  ENDIF.
+
+  IF h-prkey    NE nzuon-prkey
+ AND h-prkey(anhng_len) NE anhng-prkey(anhng_len).
+    CLEAR vtab.
+    MOVE: sortbkrs       TO vtabkey-bukrs,
+          gtab-gsber     TO vtabkey-gsber,
+          ctyp_waers     TO vtabkey-waers.
+
+    IF h-prkey(aktva_len) =  aktva-prkey(aktva_len) OR
+       h-prkey(pssva_len) =  pssva-prkey(pssva_len).
+*       Ergebnis Bilanz
+      MOVE: e1pos-prkey  TO vtabkey-prkys,
+            e1neg-prkey  TO vtabkey-prkyh,
+               'X'       TO vtabkey-verds.
+    ELSE.
+*       Ergebnis G u V
+      MOVE: e2pos-prkey  TO vtabkey-prkys,
+            e2neg-prkey  TO vtabkey-prkyh,
+               'X'       TO vtabkey-verds.
+    ENDIF.
+
+    READ TABLE vtab WITH KEY vtabkey.
+    IF sy-subrc = 0.
+      IF NOT ( h-sign IS INITIAL ).
+        MOVE  h-sign     TO vtab-bsign.
+      ENDIF.
+*       * -1 Ergebnis erscheint als Saldo auf der anderen Bilanzseite
+      h-saldo = gtab-bsald * -1.
+      ADD   h-saldo     TO vtab-bsald.
+      MODIFY vtab INDEX sy-tabix.
+    ELSE.
+      MOVE-CORRESPONDING vtabkey TO vtab.
+      IF NOT ( h-sign IS INITIAL ).
+        MOVE  h-sign     TO vtab-bsign.
+      ENDIF.
+*       * -1 Ergebnis erscheint als Saldo auf der anderen Bilanzseite
+      h-saldo = gtab-bsald * -1.
+      ADD   h-saldo     TO vtab-bsald.
+      COLLECT vtab.
+    ENDIF.
+  ENDIF.
+
+*   Berechnung Ergebnis (Vergleichsjahr)
+  IF gtab-vsald GE 0.
+    MOVE  prkey-soll    TO h-prkey.
+  ELSE.
+    MOVE  prkey-haben   TO h-prkey.
+  ENDIF.
+
+  IF h-prkey    NE nzuon-prkey
+ AND h-prkey(anhng_len) NE anhng-prkey(anhng_len).
+    CLEAR vtab.
+    MOVE: sortbkrs       TO vtabkey-bukrs,
+          gtab-gsber     TO vtabkey-gsber,
+          ctyp_waers     TO vtabkey-waers.
+
+    IF h-prkey(aktva_len) =  aktva-prkey(aktva_len) OR
+       h-prkey(pssva_len) =  pssva-prkey(pssva_len).
+*       Ergebnis Bilanz
+      MOVE: e1pos-prkey  TO vtabkey-prkys,
+            e1neg-prkey  TO vtabkey-prkyh,
+               'X'       TO vtabkey-verds.
+    ELSE.
+*        Ergebnis G u V
+      MOVE: e2pos-prkey  TO vtabkey-prkys,
+            e2neg-prkey  TO vtabkey-prkyh,
+               'X'       TO vtabkey-verds.
+    ENDIF.
+
+    READ TABLE vtab WITH KEY vtabkey.
+    IF sy-subrc = 0.
+      IF NOT ( h-sign IS INITIAL ).
+        MOVE  h-sign     TO vtab-vsign.
+      ENDIF.
+*       * -1 Ergebnis erscheint als Saldo auf der anderen Bilanzseite
+      h-saldo = gtab-vsald * -1.
+      ADD   h-saldo     TO vtab-vsald.
+      MODIFY vtab INDEX sy-tabix.
+    ELSE.
+      MOVE-CORRESPONDING vtabkey TO vtab.
+      IF NOT ( h-sign IS INITIAL ).
+        MOVE  h-sign     TO vtab-vsign.
+      ENDIF.
+*       * -1 Ergebnis erscheint als Saldo auf der anderen Bilanzseite
+      h-saldo = gtab-vsald * -1.
+      ADD   h-saldo     TO vtab-vsald.
+      COLLECT vtab.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "BERECHNE_ERGEBNIS
+
+*---------------------------------------------------------------------*
+*        FORM BILA_EIS_TRANSFER                                       *
+*---------------------------------------------------------------------*
+FORM bila_eis_transfer USING eis_saldo.
+  eis_rec-versn = bilavers.
+  eis_rec-pvers = planvers.
+  eis_rec-basis = date-ergsl.
+  eis_rec-konto = sort-ktnr.
+  eis_rec-bukrs = sort-buk2.
+  eis_rec-gsber = sort-gsb2.
+  eis_rec-bjahr = bilbjahr.
+  eis_rec-bmvon = b-monate-low.
+  eis_rec-bmbis = b-monate-high.
+  eis_rec-waers = ctyp_waers.
+  eis_rec-betrg = eis_saldo.
+  PERFORM transfer_fi_data_to_eis(rkcfisel) USING  eis_rec .
+ENDFORM.                    "BILA_EIS_TRANSFER
+
+*---------------------------------------------------------------------*
+*        FORM SCHEDMAN_START_STOP                                     *
+*---------------------------------------------------------------------*
+FORM schedman_start_stop USING p_command.
+* local statics
+  STATICS: ls_key_static LIKE schedman_key.
+*local data declaration
+  DATA: gs_key      LIKE schedman_key.
+  DATA: gt_spono    LIKE schedman_spool.
+
+  DATA: ld_worklist_flag(1).
+  DATA: ls_detail   LIKE schedman_detail_user.
+  DATA: lt_selkrit  LIKE schedman_selkrit OCCURS 0 WITH HEADER LINE.
+  DATA: lt_param    LIKE schedman_selkrit OCCURS 0 WITH HEADER LINE.
+  DATA: ls_witem    LIKE scma_witem.
+  DATA: ls_event    LIKE scma_event.
+  DATA: ls_ext      LIKE schedman_ext.
+  DATA: ls_message  LIKE schedman_message,
+        ld_objects  LIKE smmain-nr_of_objects,
+        ld_aplstat  LIKE smmain-aplstat.
+
+* muss in scmatasks
+  ls_detail-repid       = sy-repid.
+  ls_detail-variante    = sy-slset.      "<<die variante
+  ls_detail-application = 'FI-GL'.
+* save some select-options
+  CLEAR lt_selkrit.
+  lt_selkrit-structure  = 'BKPF'.
+  lt_selkrit-field      = 'BUKRS'.
+  LOOP AT sd_bukrs.
+    MOVE-CORRESPONDING sd_bukrs TO lt_selkrit.
+    APPEND lt_selkrit.
+  ENDLOOP.
+
+  lt_param-entry     = 1.
+  lt_param-optio     = 'EQ'.
+  lt_param-structure = 'BKPF'.
+  lt_param-field     = 'GJAHR'.
+  lt_param-low       = bilbjahr.
+  APPEND lt_param.
+
+  lt_param-optio     = 'BT'.
+  lt_param-structure = 'RFSDO'.
+  lt_param-field     = 'BILABMON'.
+  lt_param-low       = b-monate-low.
+  lt_param-high      = b-monate-high.
+  APPEND lt_param.
+
+  IF allgline NE space.
+    lt_param-structure = 'RFPDO'.
+    lt_param-field     = 'ALLGLINE'.
+    lt_param-low       = allgline.
+    APPEND lt_param.
+  ENDIF.
+
+
+  IF p_command = 'START'.
+    ls_witem-wf_witem = wf_witem.
+    ls_witem-wf_wlist = wf_wlist.
+    CALL FUNCTION 'KPEP_MONI_INIT_RECORD'
+      EXPORTING
+        ls_detail  = ls_detail
+        ls_witem   = ls_witem
+      IMPORTING
+        ls_key     = ls_key_static
+      TABLES
+        lt_selkrit = lt_selkrit
+        lt_param   = lt_param.
+
+  ELSEIF p_command = 'STOP'.
+    ld_aplstat  = '0'.
+    ls_event-wf_witem = wf_witem.
+    ls_event-wf_okey  = wf_okey.
+    IF list_createt IS INITIAL.
+      ls_event-wf_event = 'ERROR'.
+    ELSE.
+      ls_event-wf_event = 'FINISHED'.
+    ENDIF.
+    CALL FUNCTION 'KPEP_MONI_CLOSE_RECORD'
+      EXPORTING
+        ls_key        = ls_key_static
+        ls_scma_event = ls_event
+      CHANGING
+        ld_aplstat    = ld_aplstat
+      EXCEPTIONS
+*       NO_ID_GIVEN   = 1
+        OTHERS        = 0.
+
+    IF sy-subrc <> 0.
+*     MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*             WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+  ENDIF.
+
+  COMMIT WORK.           " <<<<<<<<<<  C O M M I T  W O R K  >>>>>>>
+
+ENDFORM.                    "SCHEDMAN_START_STOP
+
+INCLUDE bila&i02.                      "SCRIPT
+*&---------------------------------------------------------------------*
+*&      Form  FNAME_FOR_ECCS_GET
+*&---------------------------------------------------------------------*
+*       get file name for extract file to EC-CS
+*----------------------------------------------------------------------*
+*      <--CD_FNAME          name of file for extract
+*      <--CD_PRES           flag: presentation server
+*      <--CD_LEAVE_PROGRAM  flag: leave program
+*----------------------------------------------------------------------*
+FORM fname_for_eccs_get                                     "xrp250698
+                        CHANGING cd_fname LIKE fc03tab-pl00_lfile
+                                 cd_pres  LIKE fcintab-flg_pres
+                                 cd_leave_program.
+*- local data ---------------------------------------------------------*
+  DATA: ld_indmc LIKE t000k-indmc.
+  DATA: ld_indlc LIKE t000k-indlc.                          "xrp260704
+*----------------------------------------------------------------------*
+** begin xrp060400                     "begin xrp040803
+*  CALL FUNCTION 'FC_T000K_READ'
+*    IMPORTING
+*      E_INDMC                  = LD_INDMC
+*    EXCEPTIONS
+*      OTHERS                   = 1.
+*  IF SY-SUBRC <> 0.
+**    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+**            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+*  ENDIF.
+*
+**  SELECT SINGLE INDMC FROM T000K INTO LD_INDMC.
+** end xrp060400
+*  SELECT SINGLE INDMC                                      "xrp260704
+*    FROM T000k                                             "xrp260704
+*    INTO LD_INDMC.                     "end xrp040803      "xrp260704
+*                                                           "xrp260704
+*  CHECK LD_INDMC = 'X'.                                    "xrp260704
+
+  CALL FUNCTION 'FC_T000K_READ'                             "xrp260704
+    IMPORTING                                               "xrp260704
+      e_indmc = ld_indmc                                    "xrp260704
+      e_indlc = ld_indlc.                                   "xrp260704
+
+  CHECK ld_indmc = 'X'                                      "xrp260704
+  OR    ld_indlc = 'X'.                                     "xrp260704
+
+  CALL SELECTION-SCREEN 2000 STARTING AT 2 2.
+* SY-SUBRC <> 0. => User cancelled popup
+  IF sy-subrc <> 0.
+    CLEAR: pa_fname, pa_pres, pa_appl.
+    cd_leave_program = 'X'.
+    EXIT.
+  ENDIF.
+* User didn't cancel => use filename supplied
+  cd_fname = pa_fname.
+  IF pa_pres = 'X'.
+    cd_pres = 'X'.
+  ELSE.
+    cd_pres = ' '.
+  ENDIF.
+ENDFORM.                    " FNAME_FOR_ECCS_GET
+
+*&---------------------------------------------------------------------*
+*&      Form  CURRENCY_INFORMATION_GET
+*&---------------------------------------------------------------------*
+FORM currency_information_get CHANGING p_ctyp_waers.
+* local data declaration
+  STATICS: ls_x001 LIKE x001.
+
+  IF sd_curtp IS INITIAL
+  OR sd_curtp = '10'.
+    p_ctyp_waers = t001-waers.
+  ELSE.
+    IF skb1-bukrs IS INITIAL.                               "n1255009
+      skb1-bukrs = t001-bukrs.                              "n1255009
+    ENDIF.                                                  "n1255009
+    IF ls_x001-bukrs <> skb1-bukrs.
+      CLEAR: ls_x001.
+      CALL FUNCTION 'FI_CURRENCY_INFORMATION'
+        EXPORTING
+          i_bukrs                = skb1-bukrs
+        IMPORTING
+          e_x001                 = ls_x001
+        EXCEPTIONS
+          currency_2_not_defined = 1
+          currency_3_not_defined = 2
+          OTHERS                 = 3.
+    ENDIF.
+
+    IF sd_curtp = ls_x001-curt2.
+      p_ctyp_waers = ls_x001-hwae2.
+    ENDIF.
+    IF sd_curtp = ls_x001-curt3.
+      p_ctyp_waers = ls_x001-hwae3.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " CURRENCY_INFORMATION_GET
+
+*&---------------------------------------------------------------------*
+*&      Form  BSPL_LIST_COMMENTARY_CREATE
+*&---------------------------------------------------------------------*
+FORM bspl_list_commentary_create
+                          TABLES pt_top TYPE slis_t_listheader.
+* local data declarations
+  DATA: ls_top   TYPE slis_listheader.
+  DATA: ls_tcurt LIKE tcurt.
+  DATA: lf_text(200) TYPE c.
+
+* header line
+  CLEAR ls_top.
+  ls_top-typ  = 'H'.
+  ls_top-info = t011t-vstxt.
+  APPEND ls_top TO pt_top.
+
+* Ledger
+  CLEAR ls_top.
+  ls_top-typ  = 'S'.
+  IF sd_rldnr[] IS INITIAL.
+*.. import ledger from memory
+*.. export was done by Log. DB SDF
+    IMPORT fagl_bhdgd_rldnr TO ls_top-key
+           FROM MEMORY ID con_fagl_bhdgd_rldnr.
+    IF sy-subrc = 0.                                        "n1696349
+      sd_rldnr-sign   = 'I'.                                "n1696349
+      sd_rldnr-option = 'EQ'.                               "n1696349
+      sd_rldnr-low    = ls_top-key.                         "n1696349
+      APPEND sd_rldnr.                                      "n1696349
+    ENDIF.                                                  "n1696349
+  ELSE.
+    READ TABLE sd_rldnr INDEX 1.
+    ls_top-key = sd_rldnr-low.
+  ENDIF.
+  IF NOT ( ls_top-key IS INITIAL ).
+    ls_top-info = text-210.
+    APPEND ls_top TO pt_top.
+  ENDIF.
+
+* currency type
+  DATA: l_curtpvalue LIKE dd07l-domvalue_l.
+  DATA: l_curtptext  LIKE dd07t-ddtext.
+  IF sd_curtp IS INITIAL.
+    sd_curtp = '10'.
+  ENDIF.
+  l_curtpvalue = sd_curtp.
+  CALL FUNCTION 'FI_CUST_READ_DOMVALUETEXT'
+    EXPORTING
+      domname        = 'CURTP'
+      domvalue       = l_curtpvalue
+      spras          = bilaspra
+    IMPORTING
+      ddtext         = l_curtptext
+    EXCEPTIONS
+      text_not_found = 1.
+  IF sy-subrc <> 0.
+    CLEAR l_curtptext.
+  ENDIF.
+  CLEAR ls_top.
+  ls_top-typ  = 'S'.
+  ls_top-key  = sd_curtp.
+  ls_top-info = text-202.
+  REPLACE '$' WITH l_curtptext INTO ls_top-info.
+  APPEND ls_top TO pt_top.
+
+* currency
+  READ TABLE gt_bspl INDEX 1.
+  SELECT SINGLE * FROM tcurt INTO ls_tcurt
+                 WHERE spras = bilaspra
+                   AND waers = gt_bspl-waers.
+  CLEAR ls_top.
+  ls_top-typ  = 'S'.
+  ls_top-key  = gt_bspl-waers.
+  CONCATENATE text-026
+              ls_tcurt-ltext
+         INTO ls_top-info SEPARATED BY ' '.
+  APPEND ls_top TO pt_top.
+
+* reporting period
+  CLEAR ls_top.
+  ls_top-typ  = 'S'.
+
+  CONCATENATE per-bjjv '.'    " Ber.Jahr  von
+              per-bmmv ' - '  " Ber.Monat von
+              per-bjjb '.'    " Ber.Jahr  bis
+              per-bmmb        " Ber.Monat bis
+  INTO ls_top-key.
+  ls_top-info = text-200.
+  APPEND ls_top TO pt_top.
+
+* comparison period
+  CLEAR ls_top.
+  ls_top-typ  = 'S'.
+  IF planvers IS INITIAL.
+    CONCATENATE per-vjjv '.'    " Ver.Jahr  von
+                per-vmmv ' - '  " Ver.Monat von
+                per-vjjb '.'    " Ver.Jahr  bis
+                per-vmmb        " Ver.Monat bis
+    INTO ls_top-key.
+  ELSE.
+    CONCATENATE per-bjjv '.'    " Ber.Jahr  von
+                per-bmmv ' - '  " Ber.Monat von
+                per-bjjb '.'    " Ber.Jahr  bis
+                per-bmmb        " Ber.Monat bis
+    INTO ls_top-key.
+  ENDIF.
+  ls_top-info = text-201.
+  IF NOT planvers IS INITIAL.
+    lf_text = text-006.
+    REPLACE ALL OCCURRENCES OF '-' IN lf_text WITH space.
+    CONDENSE lf_text.
+    CONCATENATE ls_top-info ' ('
+                lf_text     ')'
+    INTO ls_top-info.
+  ENDIF.
+  APPEND ls_top TO pt_top. CLEAR ls_top.
+
+* additional heading
+  IF NOT ( allgline IS INITIAL ).
+    CLEAR ls_top.
+    ls_top-typ  = 'S'.
+    ls_top-info = allgline.
+    APPEND ls_top TO pt_top.
+  ENDIF.
+ENDFORM.                    " BSPL_LIST_COMMENTARY_CREATE
+
+*&---------------------------------------------------------------------*
+*&      Form  BSPL_GRID_TITLE_CREATE
+*&---------------------------------------------------------------------*
+FORM bspl_grid_title_create
+                   CHANGING value(p_grid_title).
+* local data declaration
+  DATA: ls_tcurt LIKE tcurt.
+
+  READ TABLE gt_bspl INDEX 1.
+  SELECT SINGLE * FROM tcurt INTO ls_tcurt
+                 WHERE spras = bilaspra
+                   AND waers = gt_bspl-waers.
+  CONCATENATE t011t-vstxt
+               '-'
+              text-026
+              gt_bspl-waers
+              ls_tcurt-ltext
+         INTO p_grid_title SEPARATED BY ' '.
+ENDFORM.                    " BSPL_GRID_TITLE_CREATE
+
+*&---------------------------------------------------------------------*
+*&      Form  BSPL_ALV_VARIANT_F4
+*&---------------------------------------------------------------------*
+FORM bspl_alv_variant_f4 USING    value(p_repid)
+                                  value(p_handle)
+                         CHANGING p_variant.
+* local data declarations
+  DATA: ls_variant LIKE disvariant.
+
+  ls_variant-report   = p_repid.
+  ls_variant-handle   = p_handle.
+  ls_variant-username = sy-uname.
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant         = ls_variant
+      i_save             = 'A'
+      i_display_via_grid = 'X'
+    IMPORTING
+      es_variant         = ls_variant.
+  IF sy-subrc = 0.
+    p_variant = ls_variant-variant.
+  ENDIF.
+ENDFORM.                    " BSPL_ALV_VARIANT_F4
+
+*&---------------------------------------------------------------------*
+*&      Form  BSPL_SETTINGS_CREATE
+*&---------------------------------------------------------------------*
+FORM bspl_settings_create
+                 CHANGING ps_bspl_settings LIKE rfbila_alv_settings.
+  DESCRIBE TABLE sd_bukrs LINES sy-tfill.
+  IF sy-tfill = 1.
+    READ TABLE sd_bukrs INDEX 1.
+    IF sd_bukrs-option = 'EQ'
+   AND sd_bukrs-sign   = 'I'.
+      ps_bspl_settings-bukrs   = sd_bukrs-low.
+    ENDIF.
+  ENDIF.
+  ps_bspl_settings-fs_version  = bilavers.
+  ps_bspl_settings-fs_language = bilaspra.
+  ps_bspl_settings-altacct     = allgaltk.
+  ps_bspl_settings-comptype    = bilavart.
+  ps_bspl_settings-classic     = bilalist..
+  ps_bspl_settings-grid        = bilagrid.
+  ps_bspl_settings-tree        = bilatree.
+  ps_bspl_settings-strucblnce  = bilastsl.
+  ps_bspl_settings-repid       = con_repid.
+  ps_bspl_settings-title       = sy-title.
+  ps_bspl_settings-allgline    = allgline.
+  ps_bspl_settings-page_no     = bilapage.
+  ps_bspl_settings-grid_vari   = bilagvar.
+  ps_bspl_settings-tree_vari   = bilatvar.
+  ps_bspl_settings-zeroacct    = bilanull.                  "n2391263
+  ps_bspl_settings-totals_level = bilasumm.                 "n1486648
+  ps_bspl_settings-rep_year_from      = per-bjjv. "begin "n1696349
+  ps_bspl_settings-rep_period_from    = per-bmmv.
+  ps_bspl_settings-rep_year_to        = per-bjjb.
+  ps_bspl_settings-rep_period_to      = per-bmmb.
+  IF planvers IS INITIAL.
+    ps_bspl_settings-cmp_year_from    = per-vjjv.
+    ps_bspl_settings-cmp_period_from  = per-vmmv.
+    ps_bspl_settings-cmp_year_to      = per-vjjb.
+    ps_bspl_settings-cmp_period_to    = per-vmmb.
+  ELSE.
+    ps_bspl_settings-cmp_year_from    = per-bjjv.
+    ps_bspl_settings-cmp_period_from  = per-bmmv.
+    ps_bspl_settings-cmp_year_to      = per-bjjb.
+    ps_bspl_settings-cmp_period_to    = per-bmmb.
+  ENDIF.
+  IF  bilabtyp <> '2'
+  AND bilabtyp <> '4'.
+    CLEAR ps_bspl_settings-rep_period_from.       " Ber.Monat von
+    CLEAR ps_bspl_settings-cmp_period_from.       " Ver.Monat von
+  ENDIF.                                          "end "n1696349
+
+ENDFORM.                    " BSPL_SETTINGS_CREATE
+
+*&---------------------------------------------------------------------*
+*&      Form  GT_BSPL_FILL
+*&---------------------------------------------------------------------*
+FORM gt_bspl_fill USING value(p_period).
+  IF t004-ktopl NE ska1-ktopl.
+    SELECT SINGLE * FROM t004 WHERE
+                              ktopl = ska1-ktopl.
+  ENDIF.
+  CLEAR: gt_bspl.
+  gt_bspl-rldnr  =  skc1a-rldnr.
+  gt_bspl-ktopl  =  ska1-ktopl.
+  gt_bspl-racct  =  ska1-saknr.
+  gt_bspl-kktpl  =  t004-kktpl.
+  gt_bspl-bilkt  =  ska1-bilkt.
+  IF t001-ktop2 IS NOT INITIAL.                             "n1349761
+    gt_bspl-ktop2  =  t001-ktop2.
+  ELSE.                                                     "n1349761
+    gt_bspl-ktop2  =  ska1-ktopl.                           "n1349761
+  ENDIF.                                                    "n1349761
+  gt_bspl-altkt  =  skb1-altkt.
+  gt_bspl-rbukrs =  skb1-bukrs.
+  gt_bspl-rbusa  =  skc1a-gsber.
+  gt_bspl-curtp  =  skc1a-curtp.
+  gt_bspl-waers  =  ctyp_waers.
+  gt_bspl-saldo  =  h-saldo.
+  gt_bspl-ryear  =  g_ryear.
+  gt_bspl-poper  =  g_poper.
+  CASE p_period.
+    WHEN 'B'.
+*.... sign for reporting period
+      gt_bspl-period_sign = '1'.
+    WHEN 'V'.
+*.... sign for comparison perid
+      gt_bspl-period_sign = '2'.
+  ENDCASE.
+  COLLECT gt_bspl.
+
+ENDFORM.                    " GT_BSPL_FILL
+
+*&---------------------------------------------------------------------*
+*&      Form  BSPL_ACCT_ZERO_BLNCE_DELETE
+*&---------------------------------------------------------------------*
+FORM bspl_acct_zero_blnce_delete TABLES pt_bspl TYPE tt_bspl.
+* local data declarations
+  RANGES: lr_racct FOR ska1-saknr.
+  DATA:   BEGIN OF lt_balance OCCURS 10000,
+            rbukrs         TYPE bukrs,
+            l_balance1     LIKE h-amount,
+            l_balance2     LIKE h-amount,
+          END OF lt_balance.
+  DATA:   l_racct        LIKE ska1-saknr.
+
+  SORT pt_bspl BY racct.
+  LOOP AT pt_bspl.
+
+    IF l_racct <> pt_bspl-racct
+   AND NOT ( l_racct IS INITIAL ).
+*....save accounts with zero balances
+      LOOP AT lt_balance WHERE l_balance1 <> 0
+                            OR l_balance2 <> 0.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc <> 0.
+        lr_racct-sign    = 'I'.
+        lr_racct-option  = 'EQ'.
+        lr_racct-low     = l_racct.
+        APPEND lr_racct.
+      ENDIF.
+      REFRESH lt_balance.
+    ENDIF.
+
+    l_racct = pt_bspl-racct.
+    CLEAR lt_balance.
+    IF pt_bspl-period_sign = '1'.
+      lt_balance-l_balance1 = pt_bspl-saldo.
+      lt_balance-rbukrs     = pt_bspl-rbukrs.
+      COLLECT lt_balance.
+    ELSEIF pt_bspl-period_sign = '2'.
+      lt_balance-l_balance2 = pt_bspl-saldo.
+      lt_balance-rbukrs     = pt_bspl-rbukrs.
+      COLLECT lt_balance.
+    ENDIF.
+
+  ENDLOOP.
+
+* handle the last account
+  LOOP AT lt_balance WHERE l_balance1 <> 0
+                        OR l_balance2 <> 0.
+    EXIT.
+  ENDLOOP.
+  IF sy-subrc <> 0.
+    lr_racct-sign    = 'I'.
+    lr_racct-option  = 'EQ'.
+    lr_racct-low     = l_racct.
+    APPEND lr_racct.
+  ENDIF.
+
+  IF NOT ( lr_racct[] IS INITIAL ).
+    DELETE pt_bspl WHERE racct IN lr_racct.
+  ENDIF.
+
+ENDFORM.                    " BSPL_ACCT_ZERO_BLNCE_DELETE
+
+GET ska1 LATE.
+  CHECK: bilabkon = '3'.
+  DATA: l_bsald LIKE gtab-bsald,
+        l_vsald LIKE gtab-vsald.
+
+  DO 2 TIMES.
+    CASE sy-index.
+      WHEN 1.
+*
+* Die in der Tabelle GTAB gesammelten Geschaeftsbereich
+* werden um Kontonummer, Bezeichnung etc. ergaenzt und
+* Zwischendatenbestand geschrieben. (mit EXTRACT).
+*
+        SORT gtab.
+        LOOP AT gtab.
+          CLEAR sort.
+          CLEAR date.
+*         restore PRKEY's
+          prkey-soll  = gtab-prkys.
+          prkey-haben = gtab-prkyh.
+          prkey-verd  = gtab-verd.
+
+          IF bilagkon <> '1'.
+            AT NEW saknr.
+              SUM.
+              PERFORM berechne_ergebnis.
+              l_bsald = gtab-bsald.
+              l_vsald = gtab-vsald.
+            ENDAT.
+          ELSE.
+            PERFORM berechne_ergebnis.
+            l_bsald = gtab-bsald.
+            l_vsald = gtab-vsald.
+          ENDIF.
+
+          IF bilanull NE 'X'.
+            IF fi_lc_ex IS INITIAL.
+*       nur Konten mit Saldo <> Null
+              CHECK gtab-bsald NE 0
+                 OR gtab-vsald NE 0.
+            ENDIF.
+          ELSE.
+*     auch Konten mit Saldo Null
+            IF gtab-bsald EQ 0 AND gtab-vsald EQ 0.
+*       Defaultmäßig Konten ohne Löschvormerkung
+              IF loe-vorm NE 'X'.
+                CHECK ska1-xloev = space.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+
+*   Merken, ob Konto im Berichts- oder Vergl.zeitraum signifikant war
+*
+          IF gtab-bsign NE 0.
+            h-sign = gtab-bsign.
+          ENDIF.
+          IF gtab-vsign NE 0.
+            h-sign = gtab-vsign.
+          ENDIF.
+
+*   Pruefen, ob Konto zu einer Verdichtungsgruppe gehoehrt
+*
+          CASE prkey-verd.
+            WHEN ' '.                  " <=== dann nicht
+
+*
+*     Bilanzschluessel Soll- und Haben sind gleich
+*
+              IF prkey-soll = prkey-haben.
+                PERFORM extract_soll_position.
+                EXTRACT konten.
+              ELSE.
+
+*
+*     Bilanzschluessel Soll- und Haben sind  n i c h t  gleich
+*
+*       Berichts- und Vergleichssaldo sind positiv
+*
+                IF l_bsald GE 0 AND l_vsald GE 0.
+                  PERFORM extract_soll_position.
+                  EXTRACT konten.
+                ENDIF.
+
+*       Berichts- und Vergleichssaldo sind negativ
+*
+                IF l_bsald LE 0 AND l_vsald LE 0.
+                  PERFORM extract_haben_position.
+                  EXTRACT konten.
+                ENDIF.
+
+*       Berichtssaldo ist negativ und Vergleichssaldo ist positiv
+*
+                IF l_bsald < 0 AND l_vsald > 0.
+                  PERFORM extract_soll_position.
+                  MOVE: '('        TO date-bklau,
+                        ')'        TO date-bklzu.
+                  EXTRACT konten.
+                  CLEAR sort.
+                  CLEAR date.
+
+                  PERFORM extract_haben_position.
+                  MOVE: '('        TO date-vklau,
+                        ')'        TO date-vklzu.
+                  EXTRACT konten.
+                ENDIF.
+
+*       Berichtssaldo ist positiv und Vergleichssaldo ist negativ
+*
+                IF l_bsald > 0 AND l_vsald < 0.
+                  PERFORM extract_soll_position.
+                  MOVE: '('        TO date-vklau,
+                        ')'        TO date-vklzu.
+                  EXTRACT konten.
+                  CLEAR sort.
+                  CLEAR date.
+
+                  PERFORM extract_haben_position.
+                  MOVE: '('        TO date-bklau,
+                        ')'        TO date-bklzu.
+                  EXTRACT konten.
+                ENDIF.
+              ENDIF.
+            WHEN OTHERS.
+
+*
+*     Bilanzschluessel Soll- und Haben sind gleich
+*
+              IF prkey-soll = prkey-haben.
+                PERFORM extract_soll_position.
+                EXTRACT konten.
+              ELSE.
+*
+*     Bilanzschluessel Soll- und Haben sind  n i c h t  gleich
+*
+                PERFORM extract_soll_position.
+                EXTRACT konten.
+                CLEAR sort.
+                CLEAR date.
+                PERFORM extract_haben_position.
+                EXTRACT konten.
+              ENDIF.
+          ENDCASE.
+        ENDLOOP.
+
+*EJECT
+      WHEN 2.
+* -------------------------------------------------------------------
+* Hier gehts nur weiter, wenn Konten mit Saldo = 0 gewuenscht werden,
+* fuer die aber keine GLDB-Saetze vorhanden sind.
+* -------------------------------------------------------------------
+
+* Saldo = 0 erwuenscht ??
+        CHECK bilanull = 'X'.
+
+* Defaultmäßig Konten ohne Löschvormerkung
+        IF loe-vorm NE 'X'.
+          CHECK ska1-xloev = space.
+        ENDIF.
+
+* Konto darf nicht signifikant sein, keine GLDB-Saetze haben.
+        CHECK h-sign =  0.
+
+* GL Account must be well known in at least one Ccode
+        CHECK NOT ( prkey IS INITIAL ).
+
+* Felder fuer die Extract-Routine vorbereiten
+        CLEAR: gtab,
+               sort,
+               date.
+
+* Gesber kennzeichnen, dass keine GLDB-Saetze vorhanden sind
+        MOVE '****' TO gtab-gsber.
+
+        IF repwaers IS NOT INITIAL.                         "n1397380
+          ctyp_waers  = repwaers.                           "n1397380
+        ENDIF.                                              "n1397380
+
+        IF ctyp_waers IS INITIAL.
+          PERFORM currency_information_get
+                                CHANGING ctyp_waers.
+        ENDIF.
+
+        IF bilagrid = 'X'
+        OR bilatree = 'X'.
+*.. prepare fields for dummy records
+          CLEAR: h-saldo.
+*          skc1a-gsber = '****'.                            "n1399773
+          skc1a-gsber = space.                              "n1399773
+          skc1a-curtp = sd_curtp.
+          skc1a-rldnr = g_rldnr.
+          IF sd_curtp IS INITIAL.
+            skc1a-curtp = '10'.
+          ENDIF.
+*.. fill table for ALV Grid- and ALV Tree-Control
+*         PERFORM gt_bspl_fill USING 'B'.                   "n1399773
+          CONTINUE.
+        ENDIF.
+
+* --------------------------------------------
+* Bilanzschluessel Soll- und Haben sind gleich
+* --------------------------------------------
+        IF prkey-soll = prkey-haben.
+          PERFORM extract_soll_position.
+          EXTRACT konten.
+        ELSE.
+* --------------------------------------------------------
+* Bilanzschluessel Soll- und Haben sind  n i c h t  gleich
+* --------------------------------------------------------
+          PERFORM extract_soll_position.
+          EXTRACT konten.
+
+          PERFORM extract_haben_position.
+          EXTRACT konten.
+        ENDIF.
+
+* Aufnahme in Verdichtungstabelle falls erforderlich
+* --------------------------------------------------
+        IF prkey-verd = 'X'.
+          CLEAR vtab.
+          MOVE: sortbkrs      TO vtab-bukrs,
+                prkey-soll    TO vtab-prkys,
+                prkey-haben   TO vtab-prkyh,
+                prkey-verd    TO vtab-verds,
+                  '****'      TO vtab-gsber,
+                ctyp_waers    TO vtab-waers.
+
+          READ TABLE vtab.
+
+*   Berichts-Periode signifikant machen, da sonst kein Triggersatz
+*   extrahiert wird und demzufolge die nachfolgenden Kontensaetze
+*   ebenfalls uebergangen werden.
+*   --------------------------------------------------------------
+          IF sy-subrc = 0.
+            MOVE:   1         TO vtab-bsign,
+                    1         TO vtab-vsign.
+            MODIFY vtab INDEX sy-tabix.
+          ELSE.
+            MOVE:   1         TO vtab-bsign,
+                    1         TO vtab-vsign.
+            COLLECT vtab.
+          ENDIF.
+        ENDIF.
+    ENDCASE.
+  ENDDO.
+
+*EJECT
+
+* Pruefen Berichtsperioden
+* ------------------------
+*&---------------------------------------------------------------------*
+*&      Form  check_output_options
+*&---------------------------------------------------------------------*
+FORM check_output_options .       "new since note 1060564
+*----------------------------------------------------------------------*
+  DATA ld_msgty                 TYPE msgts.                 "n1360969
+*----------------------------------------------------------------------*
+  DEFINE msg_add.
+    if 1 = 2.
+      message e098(fr) with space space space space.
+    endif.
+    if ld_msgty <> '-'.                                     "n1360969
+      call function 'MESSAGE_STORE'
+        exporting
+          arbgb = 'FR'
+          msgty = 'W'
+          msgv1 = sy-msgv1
+          msgv2 = sy-msgv2
+          msgv3 = &1
+          msgv4 = sy-msgv4
+          txtnr = 098.
+    endif.                                                  "n1360969
+  END-OF-DEFINITION. "msg_add
+*----------------------------------------------------------------------*
+
+* begin "n1360969
+  CALL FUNCTION 'READ_CUSTOMIZED_MESSAGE'
+    EXPORTING
+      i_arbgb = 'FR'
+      i_dtype = 'W'
+      i_msgnr = '098'
+    IMPORTING
+      e_msgty = ld_msgty.
+* end "n1360969
+
+* Processing only necessary if ALV Grid or ALV Tree is selected
+  CHECK bilagrid <> space
+  OR    bilatree <> space.
+
+* begin "n1486648
+  CALL FUNCTION 'MESSAGES_INITIALIZE'.
+
+  IF bilalist IS NOT INITIAL.
+    sy-tabix = bilasumm.
+    IF sy-tabix > 9.
+      bilasumm = 9.
+      PERFORM get_textpool
+        USING
+          'BILALIST'
+        CHANGING
+          sy-msgv1.
+      PERFORM get_textpool
+        USING
+          'BILASUMM'
+        CHANGING
+          sy-msgv2.
+      msg_add bilasumm.
+    ENDIF.
+  ENDIF.
+* end "n1486648
+
+* Get text for ALV Grid
+  IF bilagrid = abap_true.
+    PERFORM get_textpool
+      USING
+        'BILAGRID'
+      CHANGING
+        sy-msgv1.
+* Get text for ALV Tree
+  ELSE.
+    PERFORM get_textpool
+      USING
+        'BILATREE'
+      CHANGING
+        sy-msgv1.
+  ENDIF.
+* Get text for Classical List
+  PERFORM get_textpool
+    USING
+      'BILALIST'
+    CHANGING
+      sy-msgv4.
+
+* Check Company code summarization
+  IF bilabkon <> '3'.
+    bilabkon = '3'.
+    PERFORM get_textpool
+      USING
+        'BILABKON'
+      CHANGING
+        sy-msgv2.
+    msg_add bilabkon.
+  ENDIF.
+
+* For ALV Grid
+* For ALV Tree
+* Check Business area summarization
+  IF bilagrid <> space
+  OR bilatree <> space.
+    IF bilagkon <> '3'.
+      bilagkon = '3'.
+      PERFORM get_textpool
+        USING
+          'BILAGKON'
+        CHANGING
+          sy-msgv2.
+      msg_add bilagkon.
+    ENDIF.
+  ENDIF.
+
+* Check Scaling
+  IF bilaskal <> '0/0'.
+    bilaskal = '0/0'.
+    PERFORM get_textpool
+      USING
+        'BILASKAL'
+      CHANGING
+        sy-msgv2.
+    msg_add bilaskal.
+  ENDIF.
+
+* Check List Separation
+  IF allglsep <> space.
+    allglsep = space.
+    PERFORM get_textpool
+      USING
+        'ALLGLSEP'
+      CHANGING
+        sy-msgv2.
+    msg_add allglsep.
+  ENDIF.
+
+* Check Microfiche Line
+  IF mikfiche <> space.
+    mikfiche = space.
+    PERFORM get_textpool
+      USING
+        'MIKFICHE'
+      CHANGING
+        sy-msgv2.
+    msg_add allglsep.
+  ENDIF.
+
+* begin "n1486648
+* Summary Report
+*  IF bilasumm <> space.
+*    bilasumm = space.
+*    PERFORM get_textpool
+*      USING
+*        'BILASUMM'
+*      CHANGING
+*        sy-msgv2.
+*    msg_add bilasumm.
+*  ENDIF.
+* end "n1486648
+
+* Extrakt to Consolidation
+  IF fi_lc_ex <> space.
+    fi_lc_ex = space.
+    PERFORM get_textpool
+      USING
+        'FI_LC_EX'
+      CHANGING
+        sy-msgv2.
+    msg_add fi_lc_ex.
+  ENDIF.
+
+* Extrakt to EIS
+  IF bila_eis <> space.
+    bila_eis = space.
+    PERFORM get_textpool
+      USING
+        'BILA_EIS'
+      CHANGING
+        sy-msgv2.
+    msg_add bila_eis.
+  ENDIF.
+
+* Start Page Numbering
+  IF bilapage <> space.
+    bilapage = space.
+    PERFORM get_textpool
+      USING
+        'BILAPAGE'
+      CHANGING
+        sy-msgv2.
+    msg_add bilapage.
+  ENDIF.
+
+* Print on Form
+  IF scr_form <> space.
+    scr_form = space.
+    PERFORM get_textpool
+      USING
+        'SCR_FORM'
+      CHANGING
+        sy-msgv2.
+    msg_add scr_form.
+  ENDIF.
+
+* Print on Printer
+  IF scr_devi <> space.
+    scr_devi = space.
+    PERFORM get_textpool
+      USING
+        'SCR_DEVI'
+      CHANGING
+        sy-msgv2.
+    msg_add scr_devi.
+  ENDIF.
+
+  IF pa_choff IS INITIAL.                                   "xrp240209
+    CALL FUNCTION 'MESSAGES_SHOW'
+      EXPORTING
+        show_linno = abap_false
+      EXCEPTIONS
+        OTHERS     = 0.
+  ENDIF.                                                    "xrp240209
+
+ENDFORM.                    " check_output_options
+*&---------------------------------------------------------------------*
+*&      Form  get_textpool
+*&---------------------------------------------------------------------*
+FORM get_textpool                 "new since note 1060564
+  USING
+    id_key         TYPE textpoolky
+  CHANGING
+    cd_msgv        TYPE symsgv.
+*----------------------------------------------------------------------*
+  STATICS st_textpool           TYPE STANDARD TABLE OF textpool.
+*----------------------------------------------------------------------*
+  DATA    ls_textpool           TYPE textpool.
+*----------------------------------------------------------------------*
+  IF st_textpool IS INITIAL.
+    READ TEXTPOOL sy-repid INTO st_textpool LANGUAGE sy-langu.
+    DELETE st_textpool WHERE id <> 'S'.
+  ENDIF.
+
+  READ TABLE st_textpool
+    INTO ls_textpool
+    WITH KEY
+      key = id_key
+    BINARY SEARCH.
+  IF sy-subrc = 0.
+    cd_msgv = ls_textpool-entry+8.
+  ELSE.
+    cd_msgv = id_key.
+  ENDIF.
+
+
+ENDFORM.                    " get_textpool
+
+INCLUDE rfbila00_f01.
+INCLUDE rfbila00_f02.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR planvers.          "n1434376
+  PERFORM value_request_planvers.                           "n1434376
+
+*&---------------------------------------------------------------------*
+*&      Form  VALUE_REQUEST_PLANVERS
+*&---------------------------------------------------------------------*
+FORM value_request_planvers . "new since "n1434376
+*----------------------------------------------------------------------*
+  DATA lt_dynpfields          TYPE STANDARD TABLE OF dynpread.
+  DATA ls_dynpfields          TYPE dynpread.
+  DATA ld_glflex_active       TYPE boole_d.
+*----------------------------------------------------------------------*
+  CALL FUNCTION 'FAGL_CHECK_GLFLEX_ACTIVE'
+    IMPORTING
+      e_glflex_active = ld_glflex_active
+    EXCEPTIONS
+      OTHERS          = 0.
+  IF ld_glflex_active IS NOT INITIAL.
+    CALL FUNCTION 'DYNP_VALUES_READ'
+      EXPORTING
+        dyname             = 'RFBILA00'
+        dynumb             = '1000'
+        translate_to_upper = 'X'
+        request            = 'A'
+      TABLES
+        dynpfields         = lt_dynpfields.
+    READ TABLE lt_dynpfields
+      INTO ls_dynpfields
+      WITH KEY
+        fieldname = 'SD_RLDNR-LOW'.
+    IF sy-subrc = 0.
+      skc1a-rldnr = ls_dynpfields-fieldvalue.
+    ELSE.
+
+      skc1a-rldnr = sd_rldnr-low.
+    ENDIF.
+  ELSE.
+    skc1a-rldnr = '0'.
+  ENDIF.
+
+  CALL FUNCTION 'F4IF_FIELD_VALUE_REQUEST'
+    EXPORTING
+      tabname     = 'SKC1A'
+      fieldname   = 'RVERS'
+      dynpprog    = 'RFBILA00'
+      dynpnr      = '1'
+      dynprofield = 'PLANVERS'.
+
+ENDFORM.                    " VALUE_REQUEST_PLANVERS
+
+INCLUDE rfbila00_f03.                                       "n1588387
+INCLUDE rfbila00_f04.                                       "n1740109
+INCLUDE rfbila00_f05.                                       "n1740109
+INCLUDE rfbila00_f06.                                       "n1787406
+INCLUDE rfbila00_f07.                                       "n1944061

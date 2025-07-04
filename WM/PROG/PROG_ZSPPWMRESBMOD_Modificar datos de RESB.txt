@@ -1,0 +1,113 @@
+*&---------------------------------------------------------------------*
+*& Report  ZSPPWMRESBMOD
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+REPORT ZSPPWMRESBMOD.
+* add jtm Programa que arregla las reservas de consumo de bobina
+* Tenemos una user exit EXIT_SAPLCOSD_001 que cambia el ASP de cada componente
+* pero puede que no funcione si la OF se crea como copia o bien cuando no
+* se añade un nuevo componente
+tableS: caufvd,
+        PKHD.
+select-OPTIONS: s_aufnr for caufvd-aufnr,
+                s_werks for caufvd-werks,
+                s_auart for caufvd-AUART,
+                s_gstrp for CAUFVD-GSTRP,
+                s_gltrp for CAUFVD-GLTRP.
+at SELECTION-SCREEN OUTPUT.
+  loop at SCREEN.
+     if screen-name cs 'S_WERKS'.
+        screen-input = 0.
+     endif.
+     modify SCREEN.
+  endloop.
+INITIALIZATION.
+  s_werks+0(3) = 'IEQ'.
+  s_werks-low  = '2001'. append s_werks.
+  s_werks-low  = '2003'. append s_werks.
+START-OF-SELECTION.
+* A. Seleccionamos las ordenes
+  select * into TABLE @data(tT_ofs) from caufv where AUfnr in @s_aufnr
+                                                 and werks in @s_werks
+                                                 and AUART in @s_auart
+                                                 and gstrp in @s_gstrp
+                                                 and gltrp in @s_gltrp.
+  loop at tT_ofs into datA(rT_ofs).
+*      A.1 bloqueamos la orden
+       CALL FUNCTION 'ENQUEUE_ESORDER'
+         EXPORTING
+*          MODE_AUFK            = 'E'
+*          MANDT                = SY-MANDT
+           AUFNR                = rT_ofs-aufnr
+*          X_AUFNR              = ' '
+*          _SCOPE               = '2'
+*          _WAIT                = ' '
+*          _COLLECT             = ' '
+        EXCEPTIONS
+          FOREIGN_LOCK         = 1
+          SYSTEM_FAILURE       = 2
+          OTHERS               = 3
+                 .
+       check sy-subrc eq 0.
+*      A.2 Está liberada   (en la RESB los campos LGNUM, LGTYP y LGPLA solo áparecen con la OF liberada
+       select SINGLE count( * )  from jest where objnr eq rT_ofs-objnr
+                                             and stat  eq 'I0002'
+                                             and inact ne abap_true.
+       check sy-subrc eq 0.
+*      A.3 Miro las reservas = componentes de la OF
+       select * into TABLE @data(tT_resb) from resb where aufnr eq @rT_ofs-aufnr.
+       check sy-subrc eq 0.
+       delete tT_resb WHERE sortf is INITIAL.
+*      A.4 Solo me interesan aquellas que son de WM
+       loop at tT_resb into data(rT_resb) where lgnum is not INITIAL
+                                            and sortf is NOT INITIAL . " aqui es donde se indica que ASP es
+          TRANSLATE rT_resb-sortf to UPPER CASE.
+*         A.5 Existe esa ASP nueva
+          select SINGLE * into @data(PVBE) from PVBE where prvbe eq @rT_resb-sortf
+                                                       and werks eq @rT_ofs-werks.
+          check sy-subrc eq 0
+            and pvbe-prvbe ne rT_resb-prvbe.
+          data sw_cont type flag.
+          sw_cont = space.
+*         A.6 Reviso los ciclos de control de esa ASP
+          select * into TABLE @data(tt_pkhd) from PKHD where werks eq @rT_resb-werks
+                                                         and prvbe eq @pvbe-prvbe.
+
+          check sy-subrc eq 0.
+*         A.7 ahora miro si existe para ese mterial o para el generico MATERIAL = INITIAL
+          read TABLE tt_pkhd into data(rT_pkhd) with key matnr = rT_resb-matnr.
+          if sy-subrc eq 0.
+            move abap_true to sw_cont.
+          else.
+            delete tt_pkhd where matnr is not INITIAL.
+            read TABLE tt_pkhd into rT_pkhd index 1.
+            if sy-subrc eq 0.
+               move abap_true to sw_cont.
+            endif.
+          endif.
+          check sw_cont eq abap_true.
+*         A.8 Existe CC para ese ASP nuevo y material ==> Actualizo tabla componentes o RESB
+          update resb set prvbe = pvbe-prvbe
+                          lgtyp = rT_pkhd-lgtyp
+                          lgpla = rT_pkhd-lgpla
+                         where rsnum eq rT_resb-rsnum
+                           and rspos eq rT_resb-rspos.
+
+
+       endloop.
+*      A.9 Desbloqueo OF
+       CALL FUNCTION 'DEQUEUE_ESORDER'
+         EXPORTING
+*          MODE_AUFK       = 'E'
+*          MANDT           = SY-MANDT
+           AUFNR           = rT_ofs-aufnr
+*          X_AUFNR         = ' '
+*          _SCOPE          = '3'
+*          _SYNCHRON       = ' '
+*          _COLLECT        = ' '
+                 .
+
+  endloop.

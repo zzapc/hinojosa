@@ -1,0 +1,187 @@
+FUNCTION zui5_cm_imprimir_documentos.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_WERKS) TYPE  WERKS_D
+*"     VALUE(I_LGORT) TYPE  LGORT_D
+*"     VALUE(I_TRANSPORTE) TYPE  TKNUM
+*"     VALUE(I_MENSAJES) TYPE  CHAR100 OPTIONAL
+*"  EXPORTING
+*"     VALUE(O_DOCUMENTOS) TYPE  ZSCMTT_BINARIO_IMPRESION
+*"     VALUE(O_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+  TYPES: BEGIN OF ty_s_mensajes,
+           kappl TYPE nast-kappl,
+           kschl TYPE nast-kschl,
+         END OF ty_s_mensajes.
+
+  DATA: lv_decodedx   TYPE xstring,
+        r_objky       TYPE RANGE OF nast-objky,
+        lt_mensajes_2 TYPE TABLE OF ty_s_mensajes,
+        lv_mensaje    TYPE zscms_binario_impresion-mensaje.
+
+  DATA: r_lgort TYPE RANGE OF lgort_d.
+  PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '048' 'ZUI5_CM_IMPRIMIR_DOCUMENTOS' '' '' ''CHANGING o_return.
+
+  "Recuperamos los mensajes seleccionados
+  SPLIT i_mensajes AT ';' INTO TABLE DATA(lt_mensaje_1).
+  IF lt_mensaje_1 IS NOT INITIAL.
+    LOOP AT lt_mensaje_1 INTO DATA(ls_mensaje_1).
+      APPEND INITIAL LINE TO lt_mensajes_2 ASSIGNING FIELD-SYMBOL(<ls_mensaje_2>).
+      SPLIT ls_mensaje_1 AT '/' INTO <ls_mensaje_2>-kappl <ls_mensaje_2>-kschl.
+    ENDLOOP.
+  ENDIF.
+
+  i_transporte = |{ i_transporte ALPHA = IN }|.
+
+  IF i_lgort IS NOT INITIAL.
+    r_lgort = VALUE #( ( sign = 'I' option = 'EQ' low = i_lgort ) ).
+  ENDIF.
+
+  SELECT * FROM
+    zscm_imprimir
+    INTO TABLE @DATA(lt_mensajes)
+    WHERE werks = @i_werks
+    AND lgort IN @r_lgort
+    AND activo = 'X'.
+  IF sy-subrc = 0.
+    "Borramos los registros no seleccionados
+    IF lt_mensajes_2 IS NOT INITIAL.
+      LOOP AT lt_mensajes INTO DATA(ls_mensa1).
+        DATA(lv_tabix) = sy-tabix.
+        READ TABLE  lt_mensajes_2 TRANSPORTING NO FIELDS WITH KEY kappl = ls_mensa1-kappl kschl = ls_mensa1-kschl .
+        IF sy-subrc IS NOT INITIAL.
+          DELETE lt_mensajes INDEX lv_tabix.
+        ENDIF.
+      ENDLOOP.
+
+    ENDIF.
+    IF lt_mensajes IS NOT INITIAL.
+      r_objky = VALUE #( ( sign = 'I'
+                           option = 'EQ'
+                           low = i_transporte  ) ).
+
+      "Recuperamos las entregas relacionadas con el transporte.
+      SELECT vbeln
+        FROM vttp
+        INTO TABLE @DATA(lt_entregas)
+        WHERE tknum = @i_transporte.
+      IF sy-subrc = 0.
+        LOOP AT lt_entregas INTO DATA(ls_ent).
+          APPEND VALUE #( sign = 'I'
+                              option = 'EQ'
+                              low = ls_ent-vbeln  ) TO r_objky.
+        ENDLOOP.
+      ENDIF.
+
+      "Recuperamos los mensajes en la NAST
+      SELECT *
+        FROM nast
+        INTO TABLE @DATA(lt_nast)
+        FOR ALL ENTRIES IN @lt_mensajes
+        WHERE kappl = @lt_mensajes-kappl
+        AND kschl = @lt_mensajes-kschl
+        AND objky IN @r_objky.
+      IF sy-subrc = 0.
+        LOOP AT lt_mensajes INTO DATA(ls_mensaje).
+          CLEAR: lv_decodedx.
+          lv_mensaje = ls_mensaje-kappl && '/' && ls_mensaje-kschl && '/'.
+          CASE ls_mensaje-kappl.
+            WHEN 'V7'. "Impresión Docuemntos transporte.
+              lv_mensaje = lv_mensaje && i_transporte.
+              READ TABLE lt_nast INTO DATA(ls_mens) WITH KEY kappl = ls_mensaje-kappl kschl = ls_mensaje-kschl objky = i_transporte .
+              IF sy-subrc IS INITIAL.
+                CASE ls_mensaje-kschl.
+                  WHEN 'ZT02'."	Carta Porte_Print_Pac
+                    PERFORM imprimir_zt02 USING i_transporte ls_mensaje-kappl ls_mensaje-kschl CHANGING lv_decodedx o_return.
+
+                  WHEN OTHERS.
+                    PERFORM mensajes_pasos USING 'ZUI5_CM' 'W' '018' ls_mensaje-kappl ls_mensaje-kschl '' ''CHANGING o_return.
+                    CONTINUE.
+                ENDCASE.
+              ELSE.
+                PERFORM mensajes_pasos USING 'ZUI5_CM' 'W' '047' ls_mensaje-kappl ls_mensaje-kschl '' ''CHANGING o_return.
+                CONTINUE.
+              ENDIF.
+
+              PERFORM mensajes_pasos USING 'ZUI5_CM' 'W' '049' ls_mensaje-kappl ls_mensaje-kschl i_transporte  ''CHANGING o_return.
+              IF lv_decodedx IS NOT INITIAL.
+                APPEND INITIAL LINE TO o_documentos ASSIGNING FIELD-SYMBOL(<ls_documento>).
+                <ls_documento>-werks = i_werks.
+                <ls_documento>-lgort = i_lgort.
+                <ls_documento>-tknum = i_transporte.
+                <ls_documento>-mensaje = lv_mensaje.
+
+                <ls_documento>-mime_type = 'application/pdf'.
+
+                CALL METHOD cl_http_utility=>if_http_utility~encode_x_base64
+                  EXPORTING
+                    unencoded = lv_decodedx
+                  RECEIVING
+                    encoded   = <ls_documento>-binario_base64.
+
+              ENDIF.
+            WHEN 'V2'. "Impresión Documentos Entrega.
+              LOOP AT lt_entregas INTO DATA(ls_entrega).
+                CLEAR: lv_decodedx.
+                lv_mensaje = ls_mensaje-kappl && '/' && ls_mensaje-kschl && '/' && ls_entrega-vbeln.
+
+                READ TABLE lt_nast INTO ls_mens WITH KEY kappl = ls_mensaje-kappl kschl = ls_mensaje-kschl objky = ls_entrega-vbeln .
+                IF sy-subrc IS INITIAL.
+                  CASE ls_mensaje-kschl.
+                    WHEN 'ZLD5'."	Alb Print Packaging
+                      PERFORM imprimir_zld5 USING ls_entrega-vbeln ls_mensaje-kappl ls_mensaje-kschl CHANGING lv_decodedx o_return.
+
+                    WHEN 'ZL10'. "Packing List Pacs
+                      PERFORM imprimir_zl10 USING ls_entrega-vbeln ls_mensaje-kappl ls_mensaje-kschl CHANGING lv_decodedx o_return.
+
+                    WHEN OTHERS.
+                      PERFORM mensajes_pasos USING 'ZUI5_CM' 'W' '018' ls_mensaje-kappl ls_mensaje-kschl '' ''CHANGING o_return.
+                      CONTINUE.
+                  ENDCASE.
+                ELSE.
+                  PERFORM mensajes_pasos USING 'ZUI5_CM' 'W' '047' ls_mensaje-kappl ls_mensaje-kschl '' ''CHANGING o_return.
+                  CONTINUE.
+                ENDIF.
+
+                PERFORM mensajes_pasos USING 'ZUI5_CM' 'W' '049' ls_mensaje-kappl ls_mensaje-kschl ls_entrega-vbeln  ''CHANGING o_return.
+*
+                IF lv_decodedx IS NOT INITIAL.
+                  APPEND INITIAL LINE TO o_documentos ASSIGNING <ls_documento>.
+                  <ls_documento>-werks = i_werks.
+                  <ls_documento>-lgort = i_lgort.
+                  <ls_documento>-tknum = i_transporte.
+                  <ls_documento>-mensaje = lv_mensaje.
+
+                  <ls_documento>-mime_type = 'application/pdf'.
+
+                  CALL METHOD cl_http_utility=>if_http_utility~encode_x_base64
+                    EXPORTING
+                      unencoded = lv_decodedx
+                    RECEIVING
+                      encoded   = <ls_documento>-binario_base64.
+
+                ENDIF.
+              ENDLOOP.
+
+            WHEN OTHERS.
+              PERFORM mensajes_pasos USING 'ZUI5_CM' 'W' '018' ls_mensaje-kappl ls_mensaje-kschl '' ''CHANGING o_return.
+
+              CONTINUE.
+          ENDCASE.
+
+
+        ENDLOOP.
+      ELSE.
+        PERFORM mensajes_pasos USING 'ZUI5_CM' 'W' '016' '' '' '' ''CHANGING o_return.
+      ENDIF.
+    ELSE.
+      PERFORM mensajes_pasos USING 'ZUI5_CM' 'W' '017' 'ZSCM_IMPRIMIR' '' '' ''CHANGING o_return.
+    ENDIF.
+  ELSE.
+    PERFORM mensajes_pasos USING 'ZUI5_CM' 'W' '017' 'ZSCM_IMPRIMIR' '' '' ''CHANGING o_return.
+  ENDIF.
+
+  PERFORM guardar_log USING i_transporte o_return.
+
+ENDFUNCTION.

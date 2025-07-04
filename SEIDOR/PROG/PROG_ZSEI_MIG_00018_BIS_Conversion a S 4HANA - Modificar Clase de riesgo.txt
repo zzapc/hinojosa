@@ -1,0 +1,297 @@
+*---------------------------------------------------------------------*
+* Report ZSEI_MIG_00018
+*---------------------------------------------------------------------*
+REPORT zsei_mig_00018_bis.
+
+TABLES: ibupacustomer, ukmbp_cms.
+
+DATA:
+  ls_ukmbp_cms_sgm   TYPE ukmbp_cms_sgm,
+  lt_filetable       TYPE filetable,
+  ls_filetable       LIKE LINE OF lt_filetable,
+  lv_rc              TYPE i,
+  lt_data            TYPE cvis_ei_extern_t,
+  ls_data            LIKE LINE OF lt_data,
+  ls_role            TYPE bus_ei_bupa_roles,
+  ls_return_map      TYPE mdg_bs_bp_msgmap_t,
+  lt_return          TYPE bapiretm,
+  ls_return          TYPE bapireti,
+  xl_error           TYPE bapiret2,
+  i_data             TYPE cvis_ei_extern_t,
+  s_data             LIKE LINE OF i_data,
+  partner_relation   TYPE burs_ei_extern_t,
+  s_partner_relation LIKE LINE OF partner_relation,
+  e_return           TYPE bapiretm,
+  lt_log             TYPE STANDARD TABLE OF bapiret2,
+  ls_log             TYPE bapiret2,
+  gt_ibupacustomer   TYPE TABLE OF ibupacustomer,
+  gs_ibupacustomer   TYPE ibupacustomer,
+  gt_ukmbp_cms_sgm   TYPE TABLE OF ukmbp_cms_sgm,
+  gs_ukmbp_cms_sgm   TYPE ukmbp_cms_sgm.
+
+CONSTANTS:
+  c_update TYPE c VALUE 'U',
+  c_insert TYPE c VALUE 'I',
+  c_delete TYPE c VALUE 'D'.
+
+SELECTION-SCREEN BEGIN OF BLOCK va1 WITH FRAME TITLE TEXT-001.
+  SELECT-OPTIONS: s_bp   FOR ibupacustomer-businesspartner OBLIGATORY.
+  PARAMETERS: p_risk     TYPE ukmbp_cms-risk_class OBLIGATORY.
+* PARAMETERS: p_sgmnt    TYPE ukmbp_cms_sgm-credit_sgmnt OBLIGATORY.
+
+  PARAMETERS: p_test      TYPE as4flag.
+
+SELECTION-SCREEN END OF BLOCK va1.
+
+START-OF-SELECTION.
+
+  REFRESH: gt_ukmbp_cms_sgm, gt_ibupacustomer.
+
+  SELECT *
+    INTO CORRESPONDING FIELDS OF TABLE gt_ibupacustomer
+    FROM ibupacustomer
+   WHERE businesspartner IN s_bp.
+
+  IF sy-subrc = 0.
+
+    LOOP AT gt_ibupacustomer INTO gs_ibupacustomer.
+
+      REFRESH: lt_data, ls_data-partner-central_data-role-roles.
+      CLEAR:   ls_data.
+
+******************************Modify customer**********************
+      ls_data-partner-header-object_task = c_update.
+
+      ls_data-partner-header-object_instance-bpartnerguid = gs_ibupacustomer-businesspartneruuid.
+      ls_data-partner-header-object_instance-bpartner     = gs_ibupacustomer-businesspartner.
+
+*     ls_data-customer-header-object_task = c_update.
+*     ls_data-customer-header-object_instance-kunnr = gs_ibupacustomer-customer.
+
+      CLEAR: ls_role.
+      ls_role-task              = c_update.
+      ls_role-data_key          = 'UKM000'.
+      ls_role-data-rolecategory = 'UKM000'.
+      ls_role-data-valid_from   = sy-datum.
+*     ls_role-data-valid_to     = '99991231'.
+*     ls_role-currently_valid   = abap_true.
+      ls_role-datax-valid_from  = abap_true.
+*     ls_role-datax-valid_to    = abap_true.
+      APPEND ls_role TO ls_data-partner-central_data-role-roles.
+*     ls_data-partner-central_data-role-current_state = abap_false.
+
+*     ls_data-partner-ukmbp_data-segments-current_state   = abap_true.
+      ls_data-partner-ukmbp_data-profile-data-risk_class  = p_risk.
+      ls_data-partner-ukmbp_data-profile-datax-risk_class = abap_true.
+
+*****************Finally fill the main data structure**************
+
+      APPEND ls_data TO lt_data.
+
+************************** validating BP data ********************
+
+      CLEAR: ls_return_map.
+      CALL METHOD cl_md_bp_maintain=>validate_single
+        EXPORTING
+          iv_test_run_mode = ''
+          i_data           = ls_data
+        IMPORTING
+          et_return_map    = ls_return_map.
+
+      READ TABLE ls_return_map ASSIGNING FIELD-SYMBOL(<fs_errora>) WITH KEY type = 'A'.
+      IF sy-subrc IS NOT INITIAL.
+
+        READ TABLE ls_return_map ASSIGNING FIELD-SYMBOL(<fs_error>) WITH KEY type = 'E'.
+        IF  sy-subrc IS NOT INITIAL.
+
+          REFRESH: lt_return.
+          CALL METHOD cl_md_bp_maintain=>maintain
+            EXPORTING
+              i_test_run = ''
+              i_data     = lt_data
+            IMPORTING
+              e_return   = lt_return.
+
+          CLEAR: xl_error.
+          LOOP AT lt_return ASSIGNING FIELD-SYMBOL(<fs_return>).
+            READ TABLE <fs_return>-object_msg ASSIGNING FIELD-SYMBOL(<fs_returne>) WITH KEY type = 'E'.
+            IF <fs_returne> IS ASSIGNED.
+              MOVE-CORRESPONDING <fs_returne> TO xl_error.
+              PERFORM add_message TABLES lt_log USING xl_error-type xl_error-id xl_error-number xl_error-message_v1 xl_error-message_v2 xl_error-message_v3 xl_error-message_v4.
+              IF p_test EQ 'X'.
+                EXIT.
+              ENDIF.
+            ENDIF.
+
+            READ TABLE <fs_return>-object_msg ASSIGNING FIELD-SYMBOL(<fs_returna>) WITH KEY type = 'A'.
+            IF <fs_returna> IS ASSIGNED.
+              MOVE-CORRESPONDING <fs_returna> TO xl_error.
+              PERFORM add_message TABLES lt_log USING xl_error-type xl_error-id xl_error-number xl_error-message_v1 xl_error-message_v2 xl_error-message_v3 xl_error-message_v4.
+              IF p_test EQ 'X'.
+                EXIT.
+              ENDIF.
+            ENDIF.
+            UNASSIGN <fs_returna>.
+          ENDLOOP.
+
+          IF p_test EQ space.
+            IF xl_error IS INITIAL.
+
+***************************** Commit BAPI *************************
+              CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                EXPORTING
+                  wait = abap_true.
+
+            ELSE.
+
+              CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+*               IMPORTING
+*                 RETURN        = RETURN
+                .
+
+
+            ENDIF.
+          ENDIF.
+
+        ELSE.
+
+          PERFORM add_message TABLES lt_log USING <fs_error>-type <fs_error>-id <fs_error>-number <fs_error>-message_v1 <fs_error>-message_v2 <fs_error>-message_v3 <fs_error>-message_v4.
+
+        ENDIF.
+
+      ELSE.
+
+        PERFORM add_message TABLES lt_log USING <fs_errora>-type <fs_errora>-id <fs_errora>-number <fs_errora>-message_v1 <fs_errora>-message_v2 <fs_errora>-message_v3 <fs_errora>-message_v4.
+
+      ENDIF.
+
+    ENDLOOP.
+
+  ENDIF.
+
+  PERFORM show_error_log USING 'ZMIG_LOG' 'ZMIG_LOG' '' 'X'.
+
+*---------------------------------------------------------------------*
+* Form refresh_log
+*---------------------------------------------------------------------*
+FORM refresh_log  TABLES lt_result STRUCTURE bapiret2.
+
+  REFRESH: lt_result.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Form ADD_MESSAGE
+*---------------------------------------------------------------------*
+FORM add_message  TABLES lt_result STRUCTURE bapiret2 USING p_msgty p_msgid p_msgno p_msgv1 p_msgv2 p_msgv3 p_msgv4.
+
+  DATA:
+    ls_result LIKE LINE OF lt_result.
+
+  CLEAR: ls_result.
+  ls_result-type       = p_msgty.
+  ls_result-id         = p_msgid.
+  ls_result-number     = p_msgno.
+  ls_result-message_v1 = p_msgv1.
+  ls_result-message_v2 = p_msgv2.
+  ls_result-message_v3 = p_msgv3.
+  ls_result-message_v4 = p_msgv4.
+  APPEND ls_result TO lt_result.
+
+ENDFORM.
+
+*--------------------------- ------------------------------------------*
+* Form SHOW_ERROR_LOG
+*---------------------------------------------------------------------*
+FORM show_error_log USING object subobject popup save.
+
+  DATA:
+    lt_log_handle       TYPE bal_t_logh,
+    l_s_display_profile TYPE bal_s_prof,
+    gv_log_handle       TYPE balloghndl,
+    l_s_log             TYPE bal_s_log,
+    l_s_msg             TYPE bal_s_msg.
+
+  CLEAR: sy-batch.
+
+* Define some header data of this log
+  l_s_log-extnumber  = 'Log'.
+  l_s_log-object     = object.
+  l_s_log-subobject  = subobject.
+  l_s_log-aldate     = sy-datum.
+  l_s_log-altime     = sy-uzeit.
+  l_s_log-aluser     = sy-uname.
+  l_s_log-alprog     = sy-repid.
+  l_s_log-del_before = 'X'.
+  l_s_log-aldate_del = sy-datum + '00000014'.
+
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log                 = l_s_log
+    IMPORTING
+      e_log_handle            = gv_log_handle
+    EXCEPTIONS
+      log_header_inconsistent = 1
+      OTHERS                  = 2.
+
+  APPEND gv_log_handle TO lt_log_handle.
+
+  LOOP AT lt_log INTO ls_log.
+
+    l_s_msg-msgty     = ls_log-type.
+    l_s_msg-msgid     = ls_log-id.
+    l_s_msg-msgno     = ls_log-number.
+    l_s_msg-msgv1     = ls_log-message_v1.
+    l_s_msg-msgv2     = ls_log-message_v2.
+    l_s_msg-msgv3     = ls_log-message_v3.
+    l_s_msg-msgv4     = ls_log-message_v4.
+
+    CALL FUNCTION 'BAL_LOG_MSG_ADD'
+      EXPORTING
+        i_log_handle     = gv_log_handle
+        i_s_msg          = l_s_msg
+      EXCEPTIONS
+        log_not_found    = 1
+        msg_inconsistent = 2
+        log_is_full      = 3
+        OTHERS           = 4.
+
+  ENDLOOP.
+
+* Get a prepared profile
+  IF popup IS NOT INITIAL.
+    CALL FUNCTION 'BAL_DSP_PROFILE_POPUP_GET'
+      IMPORTING
+        e_s_display_profile = l_s_display_profile.
+  ELSE.
+    CALL FUNCTION 'BAL_DSP_PROFILE_NO_TREE_GET'
+      IMPORTING
+        e_s_display_profile = l_s_display_profile.
+  ENDIF.
+
+  l_s_display_profile-use_grid   = 'X'.
+  l_s_display_profile-cwidth_opt = 'X'.
+
+  IF save IS NOT INITIAL.
+    CALL FUNCTION 'BAL_DB_SAVE'
+      EXPORTING
+        i_save_all       = 'X'
+      EXCEPTIONS
+        log_not_found    = 1
+        save_not_allowed = 2
+        numbering_error  = 3
+        OTHERS           = 4.
+  ENDIF.
+
+  CALL FUNCTION 'BAL_DSP_LOG_DISPLAY'
+    EXPORTING
+      i_s_display_profile  = l_s_display_profile
+      i_t_log_handle       = lt_log_handle
+    EXCEPTIONS
+      profile_inconsistent = 1
+      internal_error       = 2
+      no_data_available    = 3
+      no_authority         = 4
+      OTHERS               = 5.
+
+ENDFORM.

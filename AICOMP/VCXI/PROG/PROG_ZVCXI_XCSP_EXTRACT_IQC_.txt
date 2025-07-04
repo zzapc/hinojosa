@@ -1,0 +1,579 @@
+*&---------------------------------------------------------------------*
+*& Report ZVCXI_XCSP_EXTRACT_IQC
+*&---------------------------------------------------------------------*
+*& This report extracts Production Order Feedback to IQ.catalyst
+*&---------------------------------------------------------------------*
+report ZVCXI_XCSP_EXTRACT_IQC no standard page heading line-size 1000.
+
+types: begin of YS_ARBPL,
+         WERKS type WERKS_D,
+         ARBPL type ARBPL,
+         LCVAL type /VCXI/VSMC_LCVAL,
+       end of YS_ARBPL.
+
+types: begin of YS_EXTRACT,
+         MATNR     type MATNR,
+         AUFNR     type AUFNR,
+         VORNR     type VORNR,
+         WERKS     type WERKS_D,
+         ARBPL     type ARBPL,
+         T_FEATURE type /VCXI/CKI_TT_FEATURE,
+       end of YS_EXTRACT.
+
+
+data: GF_ARBPL        type ARBPL,
+      GF_GSTRI        type CO_GSTRI,
+      GF_AUFNR        type AUFNR,
+      LF_CUOBJ        type CUOBJ,
+      LF_VORNR        type VORNR,
+      LF_JSON_REQUEST type /UI2/CL_JSON=>JSON.
+data: LS_MSRS    type /VCXI/VSM_S_MSRS,
+      LS_FEATURE type /VCXI/CKI_S_FEATURE.
+data: LT_ARBPL         type table of YS_ARBPL,
+      LT_RTE           type /VCXI/VKCR_TT_RTE,
+      LT_FEATURE       type /VCXI/CKI_TT_FEATURE,
+      LT_EXTRACT       type table of YS_EXTRACT,
+      LT_FTNAM         type /VCXI/CKI_TT_FTNAM,
+      LT_EXTRACT_ARBPL type /VCXI/CKI_TT_EXTRACT,
+      LT_COMPONENT     type CL_ABAP_STRUCTDESCR=>COMPONENT_TABLE,
+      LT_OUTPUT        type table of STRING.
+data: LR_SVCEL       type ref to /VCXI/CL_VKSRA_SVC_ELEMENT,
+      LR_EA_MACHINE  type ref to ZCL_VCXI_XCSP_EA_MACHINE,
+      LR_TYPEDESCR   type ref to CL_ABAP_TYPEDESCR,
+      LR_STRUCTDESCR type ref to CL_ABAP_STRUCTDESCR,
+      LR_TABLEDESCR  type ref to CL_ABAP_TABLEDESCR,
+      LR_DYNTAB      type ref to DATA,
+      LR_ARBPL       type ref to /VCXI/CL_VSMC_ARBPL,
+      LR_MGRPV_SPEED type ref to /VCXI/CL_VSMC_MGRPV_SPEED,
+      LR_CX_CKX      type ref to /VCXI/CX_CKX.
+field-symbols: <T_DYNTAB> type TABLE,
+               <S_DYNTAB> type ANY.
+
+
+***##################################################################
+*** SELECTION-SCREEN
+***##################################################################
+parameters: PA_DESCR type /VCXI/CKX_DESCR.
+selection-screen skip 1.
+
+parameters:     PA_WERKS type WERKS_D memory id WRK.
+select-options: SO_ARBPL for GF_ARBPL.
+
+select-options: SO_GSTRI for GF_GSTRI,
+                SO_AUFNR for GF_AUFNR.
+
+selection-screen skip 1.
+parameters: PA_MXSEL type TBMAXSEL default 10.
+selection-screen skip 1.
+
+selection-screen begin of block OUT with frame title text-OUT.
+  parameters: PA_IQC  type FLAG radiobutton group OUT user-command OUT default 'X'.
+  selection-screen begin of block IQC with frame title text-IQC.
+    parameters: PA_DATE  type DATS default SY-DATUM,
+                PA_MDLVC type /VCXI/CKI_MDLVC as checkbox,
+                PA_MDLVT type /VCXI/CKI_MDLVT as checkbox.
+
+    selection-screen skip 1.
+    selection-screen begin of block EXT with frame title text-EXT.
+      parameters: PA_EXTST type FLAG as checkbox,
+                  PA_EXTRS type FLAG as checkbox,
+                  PA_EXTTT type FLAG as checkbox,
+                  PA_EXTWA type FLAG as checkbox.
+    selection-screen end of block EXT.
+  selection-screen end of block IQC.
+
+  parameters: PA_CSV  type FLAG radiobutton group OUT,
+              PA_SALV type FLAG radiobutton group OUT.
+selection-screen end of block OUT.
+
+
+***##################################################################
+*** INITIALIZATION
+***##################################################################
+initialization.
+
+  PA_DESCR = |Extraction on { SY-DATLO date = iso } { SY-TIMLO time = iso } by { SY-UNAME }|.
+
+***##################################################################
+*** AT SELECTION-SCREEN OUTPUT
+***##################################################################
+at selection-screen output.
+
+  loop at screen.
+    if PA_IQC ne ABAP_TRUE.
+      if SCREEN-NAME cs 'PA_DATE'  or
+         SCREEN-NAME cs 'PA_MDLVC' or
+         SCREEN-NAME cs 'PA_MDLVT' or
+         SCREEN-NAME cs 'PA_EXTST' or
+         SCREEN-NAME cs 'PA_EXTRS' or
+         SCREEN-NAME cs 'PA_EXTTT' or
+         SCREEN-NAME cs 'PA_EXTWA'.
+        SCREEN-ACTIVE = 0.
+      endif.
+    endif.
+    modify screen.
+  endloop.
+
+***##################################################################
+*** S T A R T - O F - S E L E C T I O N
+***##################################################################
+start-of-selection.
+
+  try.
+***   Find relevant Production Order Operations with their Confirmations
+      select AFVC~AUFPL, AFVC~APLZL, AFVC~PLNFL, AFVC~VORNR, AFVC~ARBID,
+             CRHD~WERKS, CRHD~ARBPL,
+             AFKO~AUFNR, AFKO~PLNTY, AFKO~PLNNR, AFKO~PLNAL,
+             AFPO~MATNR, AFPO~CUOBJ, AFPO~KDAUF, AFPO~KDPOS, AFPO~KDEIN,
+             AFVV~LMNGA, AFVV~XMNGA, AFVV~MEINH, AFVV~ISM01, AFVV~ILE01, AFVV~ISM02, AFVV~ILE02, AFVV~ISM03, AFVV~ILE03,
+             MARC~CUOBJ as MARC_CUOBJ
+             from AFVC
+            inner join CRHD
+              on  CRHD~OBJID eq AFVC~ARBID
+            inner join AFKO
+              on  AFKO~AUFPL eq AFVC~AUFPL
+            inner join AFPO
+              on  AFPO~AUFNR eq AFKO~AUFNR
+            inner join AFVV
+              on  AFVV~AUFPL eq AFVC~AUFPL
+              and AFVV~APLZL eq AFVC~APLZL
+            inner join AFRU
+              on  AFRU~RUECK eq AFVC~RUECK
+              and AFRU~RMZHL eq AFVC~RMZHL
+            inner join MARC
+              on  MARC~MATNR eq AFPO~MATNR
+              and MARC~WERKS eq AFPO~PWERK
+            where CRHD~OBJTY eq 'A'
+             and  CRHD~WERKS eq @PA_WERKS
+             and  CRHD~ARBPL in @SO_ARBPL
+             and  AFRU~AUERU eq 'X'          "Final Confirmation
+             and  AFRU~STZHL eq @SPACE       "Confirmation Counter of Cancelled Confirmation
+             and  AFKO~GSTRI in @SO_GSTRI
+             and  AFKO~AUFNR in @SO_AUFNR
+            order by AFPO~CUOBJ, AFVC~VORNR
+            into table @data(LT_PRODORDOPER)
+              up to @PA_MXSEL rows.
+
+      if SY-SUBRC ne 0.
+        message |No Production Orders found| type 'I'.
+      endif.
+
+***   Count Result
+      data(LF_COUNT) = LINES( LT_PRODORDOPER ).
+
+***--------------------------------------------------------------------------------------------------------------------
+***   Extract Feature
+      loop at LT_PRODORDOPER assigning field-symbol(<S_PRODORDOPER>).
+        perform PROGRESS_INDICATOR using LF_COUNT              SY-TABIX
+                                         <S_PRODORDOPER>-AUFNR <S_PRODORDOPER>-ARBPL.
+
+***     New Configuration
+        if <S_PRODORDOPER>-CUOBJ ne LF_CUOBJ.
+          LF_CUOBJ = <S_PRODORDOPER>-CUOBJ.
+
+          try.
+***           Adjust Route through Routing Supervisor
+              perform UPDATE_RTESEL using LF_CUOBJ
+                                          <S_PRODORDOPER>-AUFNR.
+
+***           Get Routing
+              /VCXI/CL_VKCR_GATEWAY=>GET_BOMRTE( exporting IF_GVCIN   = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( LF_CUOBJ )
+                                                           IS_BRG_RTE = value #( PLNTY = <S_PRODORDOPER>-PLNTY
+                                                                                 PLNNR = <S_PRODORDOPER>-PLNNR
+                                                                                 PLNAL = <S_PRODORDOPER>-PLNAL )
+                                                 importing ET_RTE  = LT_RTE ).
+              clear LF_VORNR.  "reset
+
+            catch /VCXI/CX_CKX into LR_CX_CKX.
+***           Remove all other Production Orders with this Configuration
+              delete LT_PRODORDOPER where CUOBJ = LF_CUOBJ.
+              LR_CX_CKX->SHOW_MESSAGE( IF_TYPE = 'S' ).  "Only log the message
+              continue.
+          endtry.
+        endif.
+
+***     Ensure the Work Center of VC matches the Production Order
+        check value #( LT_RTE[ PLNFL = <S_PRODORDOPER>-PLNFL
+                               VORNR = <S_PRODORDOPER>-VORNR ]-ARBPL optional ) eq <S_PRODORDOPER>-ARBPL.
+
+        if <S_PRODORDOPER>-VORNR ne LF_VORNR.
+***       Get SmartVC Element of Operation
+          LR_SVCEL = value #( LT_RTE[ PLNFL = <S_PRODORDOPER>-PLNFL
+                                      VORNR = <S_PRODORDOPER>-VORNR ]-R_SVCEL optional ).
+          if LR_SVCEL is bound.
+            try.
+                LR_EA_MACHINE ?= LR_SVCEL->GET_CLSEA( ).
+              catch CX_SY_MOVE_CAST_ERROR.
+                clear LR_EA_MACHINE.
+            endtry.
+          endif.
+
+          if LR_EA_MACHINE is bound.
+***         Get all Feature
+            LT_FEATURE = LR_EA_MACHINE->GET_FEATURE( ).
+          endif.
+        endif.
+
+***     Adjust Units
+        if <S_PRODORDOPER>-ILE01 is not initial.
+          ZCL_VCXI_XCS_SERVICE_UNIT=>CONVERT_UNIT( exporting IF_VALUE_IN  = <S_PRODORDOPER>-ISM01
+                                                             IF_UOM_IN    = <S_PRODORDOPER>-ILE01
+                                                             IF_UOM_OUT   = 'MIN'
+                                                   importing EF_VALUE_OUT = <S_PRODORDOPER>-ISM01
+                                                             EF_UOM_OUT   = <S_PRODORDOPER>-ILE01 ).
+        endif.
+        if <S_PRODORDOPER>-ILE02 is not initial.
+          ZCL_VCXI_XCS_SERVICE_UNIT=>CONVERT_UNIT( exporting IF_VALUE_IN  = <S_PRODORDOPER>-ISM02
+                                                             IF_UOM_IN    = <S_PRODORDOPER>-ILE02
+                                                             IF_UOM_OUT   = 'MIN'
+                                                   importing EF_VALUE_OUT = <S_PRODORDOPER>-ISM02
+                                                             EF_UOM_OUT   = <S_PRODORDOPER>-ILE02 ).
+        endif.
+        if <S_PRODORDOPER>-ILE03 is not initial.
+          ZCL_VCXI_XCS_SERVICE_UNIT=>CONVERT_UNIT( exporting IF_VALUE_IN  = <S_PRODORDOPER>-ISM03
+                                                             IF_UOM_IN    = <S_PRODORDOPER>-ILE03
+                                                             IF_UOM_OUT   = 'MIN'
+                                                   importing EF_VALUE_OUT = <S_PRODORDOPER>-ISM03
+                                                             EF_UOM_OUT   = <S_PRODORDOPER>-ILE03 ).
+        endif.
+
+***     Calculate Run Speed
+        if <S_PRODORDOPER>-ISM02 is not initial.
+          LS_MSRS-MSRST     = 60.
+          LS_MSRS-MSRST_UOM = 'MIN'.
+          LS_MSRS-MSRSR     = ( <S_PRODORDOPER>-LMNGA + <S_PRODORDOPER>-XMNGA ) / <S_PRODORDOPER>-ISM02 * LS_MSRS-MSRST.
+          LS_MSRS-MSRSR_UOM = <S_PRODORDOPER>-MEINH.
+        endif.
+
+***     Add Entry for Production Order Operation
+        append value #( MATNR     = <S_PRODORDOPER>-MATNR
+                        AUFNR     = <S_PRODORDOPER>-AUFNR
+                        VORNR     = <S_PRODORDOPER>-VORNR
+                        WERKS     = <S_PRODORDOPER>-WERKS
+                        ARBPL     = <S_PRODORDOPER>-ARBPL
+                        T_FEATURE = LT_FEATURE
+                      ) to LT_EXTRACT assigning field-symbol(<S_EXTRACT>).
+        collect value YS_ARBPL( WERKS = <S_PRODORDOPER>-WERKS
+                                ARBPL = <S_PRODORDOPER>-ARBPL
+*                                LCVAL =
+                              ) into LT_ARBPL.
+
+***     Adjust Features
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'opQty'              FTVAL = <S_PRODORDOPER>-LMNGA + <S_PRODORDOPER>-XMNGA )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'opQtyYield'         FTVAL = <S_PRODORDOPER>-LMNGA )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'setupTime'          FTVAL = <S_PRODORDOPER>-ISM01 )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'runSpeed'           FTVAL = LS_MSRS-MSRSR )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'runTime'            FTVAL = <S_PRODORDOPER>-ISM02 )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'teardownTime'       FTVAL = <S_PRODORDOPER>-ISM03 )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'scrap'              FTVAL = <S_PRODORDOPER>-XMNGA )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+
+***     Informative Feature
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'workCenter'         FTVAL = <S_PRODORDOPER>-ARBPL )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'product'            FTVAL = <S_PRODORDOPER>-MATNR )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'productionOrder'    FTVAL = <S_PRODORDOPER>-AUFNR )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+        /VCXI/CL_CKI_IQC=>MODIFY_FEATURE( exporting IS_FEATURE = value #( FTNAM = 'operation'          FTVAL = <S_PRODORDOPER>-VORNR )
+                                          changing  CT_FEATURE = <S_EXTRACT>-T_FEATURE ).
+
+***     Get all Feature
+        loop at <S_EXTRACT>-T_FEATURE into LS_FEATURE.
+          collect LS_FEATURE-FTNAM into LT_FTNAM.
+        endloop.
+
+      endloop.
+
+
+***--------------------------------------------------------------------------------------------------------------------
+***   Prepare a column for each Feature in dynamic tabel
+      CL_ABAP_TYPEDESCR=>DESCRIBE_BY_NAME( exporting  P_NAME         = '/VCXI/CKX_STRING'
+                                           receiving  P_DESCR_REF    = LR_TYPEDESCR
+                                           exceptions TYPE_NOT_FOUND = 1 ).
+      if SY-SUBRC ne 0.
+        /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+      endif.
+      loop at LT_FTNAM into data(LF_FTNAM).
+        append value #( NAME = LF_FTNAM
+                        TYPE = cast #( LR_TYPEDESCR )
+                      ) to LT_COMPONENT.
+      endloop.
+
+***   Create data type for dynamic table
+      try.
+          LR_STRUCTDESCR = CL_ABAP_STRUCTDESCR=>CREATE( P_COMPONENTS = LT_COMPONENT ).
+          LR_TABLEDESCR  = CL_ABAP_TABLEDESCR=>CREATE(  P_LINE_TYPE  = LR_STRUCTDESCR ).
+
+        catch CX_SY_TYPE_CREATION into data(LR_CX_SY_TYPE_CREATION).
+          /VCXI/CX_CKX=>RAISE_CKX_BY_PREVIOUS( LR_CX_SY_TYPE_CREATION ).
+      endtry.
+
+      create data LR_DYNTAB type handle LR_TABLEDESCR.
+
+***   Fill Dynamic Table
+      assign LR_DYNTAB->* to <T_DYNTAB>.
+      loop at LT_EXTRACT assigning <S_EXTRACT>.
+        append initial line to <T_DYNTAB> assigning <S_DYNTAB>.
+
+***     Fill all Columns
+        loop at LT_COMPONENT into data(LS_COMPONENT).
+          assign component LS_COMPONENT-NAME of structure <S_DYNTAB> to field-symbol(<F_COLUMN>).
+          if SY-SUBRC eq 0.
+            <F_COLUMN> = value #( <S_EXTRACT>-T_FEATURE[ FTNAM = LS_COMPONENT-NAME ]-FTVAL optional ).
+          endif.
+        endloop.
+      endloop.
+
+***--------------------------------------------------------------------------------------------------------------------
+***   Prepare Output
+      case ABAP_TRUE.
+***     Upload to IQ.catalyst
+        when PA_IQC.
+          loop at LT_ARBPL into data(LS_ARBPL).
+            try.
+***             Get Work Center Instance
+                LR_ARBPL = /VCXI/CL_VSMC_ARBPL=>GET_INSTANCE_BY_ARBPL( IF_WERKS = LS_ARBPL-WERKS
+                                                                       IF_ARBPL = LS_ARBPL-ARBPL ).
+
+***             Get Speed Machine Group Version
+                LR_MGRPV_SPEED ?= LR_ARBPL->GET_MGRPV_BY_DATE( IF_DATE  = PA_DATE
+                                                               IF_MMGRP = /VCXI/CL_VSMC_MGRP=>C_MMGRP_SPEED
+                                                               IF_LCVAL = LS_ARBPL-LCVAL ).
+                check LR_MGRPV_SPEED is bound and
+                      LR_MGRPV_SPEED->R_MGRP is bound and
+                      LR_MGRPV_SPEED->R_MGRP->R_MTYPE is bound.
+
+***             Get Extraction for current Work Center
+                LT_EXTRACT_ARBPL = value #( for LS_EXTRACT in LT_EXTRACT where ( WERKS = LS_ARBPL-WERKS and
+                                                                                 ARBPL = LS_ARBPL-ARBPL ) ( T_FEATURE = LS_EXTRACT-T_FEATURE ) ).
+
+***             Upload Setup Time
+                if PA_EXTST eq ABAP_TRUE.
+                  if LR_MGRPV_SPEED->S_MDS-MDSST eq /VCXI/CL_VSMC_MGRPV_SPEED=>C_MDS_IQC and
+                     LR_MGRPV_SPEED->R_MGRP->R_MTYPE->S_IMT-IMTST is not initial.
+                    /VCXI/CL_CKI_IQC=>ADD_TRAINING_DATA( IF_IQCMT   = LR_MGRPV_SPEED->R_MGRP->R_MTYPE->S_IMT-IMTST
+                                                         IS_CNTXT   = LR_ARBPL->GET_IQC_CNTXT( )
+                                                         IF_DESCR   = PA_DESCR
+                                                         IT_EXTRACT = LT_EXTRACT_ARBPL
+                                                         IT_FTNAM   = LT_FTNAM
+                                                         IF_MDLVC   = PA_MDLVC
+                                                         IF_MDLVT   = PA_MDLVT ).
+                  else.
+***                 Setup Time of &1 is not setup for IQ.catalyst
+                    /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'W'
+                                                          IF_MSGID = 'ZVCXI_XCSP'
+                                                          IF_MSGNO = '501'
+                                                          IF_MSGV1 = LR_ARBPL->/VCXI/IF_CKX_OBJECT~GET_ID( ) ).
+                  endif.
+                endif.
+
+***             Upload Run Speed
+                if PA_EXTRS eq ABAP_TRUE.
+                  if LR_MGRPV_SPEED->S_MDS-MDSRS eq /VCXI/CL_VSMC_MGRPV_SPEED=>C_MDS_IQC and
+                     LR_MGRPV_SPEED->R_MGRP->R_MTYPE->S_IMT-IMTRS is not initial.
+                    /VCXI/CL_CKI_IQC=>ADD_TRAINING_DATA( IF_IQCMT   = LR_MGRPV_SPEED->R_MGRP->R_MTYPE->S_IMT-IMTRS
+                                                         IS_CNTXT   = LR_ARBPL->GET_IQC_CNTXT( )
+                                                         IF_DESCR   = PA_DESCR
+                                                         IT_EXTRACT = LT_EXTRACT_ARBPL
+                                                         IT_FTNAM   = LT_FTNAM
+                                                         IF_MDLVC   = PA_MDLVC
+                                                         IF_MDLVT   = PA_MDLVT ).
+                  else.
+***                 Run Speed of &1 is not setup for IQ.catalyst
+                    /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'W'
+                                                          IF_MSGID = 'ZVCXI_XCSP'
+                                                          IF_MSGNO = '502'
+                                                          IF_MSGV1 = LR_ARBPL->/VCXI/IF_CKX_OBJECT~GET_ID( ) ).
+                  endif.
+                endif.
+
+***             Upload Teardown Time
+                if PA_EXTTT eq ABAP_TRUE.
+                  if LR_MGRPV_SPEED->S_MDS-MDSTT eq /VCXI/CL_VSMC_MGRPV_SPEED=>C_MDS_IQC and
+                     LR_MGRPV_SPEED->R_MGRP->R_MTYPE->S_IMT-IMTTT is not initial.
+                    /VCXI/CL_CKI_IQC=>ADD_TRAINING_DATA( IF_IQCMT   = LR_MGRPV_SPEED->R_MGRP->R_MTYPE->S_IMT-IMTTT
+                                                         IS_CNTXT   = LR_ARBPL->GET_IQC_CNTXT( )
+                                                         IF_DESCR   = PA_DESCR
+                                                         IT_EXTRACT = LT_EXTRACT_ARBPL
+                                                         IT_FTNAM   = LT_FTNAM
+                                                         IF_MDLVC   = PA_MDLVC
+                                                         IF_MDLVT   = PA_MDLVT ).
+                  else.
+***                 Teardown Time of &1 is not setup for IQ.catalyst
+                    /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'W'
+                                                          IF_MSGID = 'ZVCXI_XCSP'
+                                                          IF_MSGNO = '503'
+                                                          IF_MSGV1 = LR_ARBPL->/VCXI/IF_CKX_OBJECT~GET_ID( ) ).
+                  endif.
+                endif.
+
+***             Upload Waste
+                if PA_EXTWA eq ABAP_TRUE.
+                  if LR_MGRPV_SPEED->S_MDS-MDSWA eq /VCXI/CL_VSMC_MGRPV_SPEED=>C_MDS_IQC and
+                     LR_MGRPV_SPEED->R_MGRP->R_MTYPE->S_IMT-IMTWA is not initial.
+                    /VCXI/CL_CKI_IQC=>ADD_TRAINING_DATA( IF_IQCMT   = LR_MGRPV_SPEED->R_MGRP->R_MTYPE->S_IMT-IMTWA
+                                                         IS_CNTXT   = LR_ARBPL->GET_IQC_CNTXT( )
+                                                         IF_DESCR   = PA_DESCR
+                                                         IT_EXTRACT = LT_EXTRACT_ARBPL
+                                                         IT_FTNAM   = LT_FTNAM
+                                                         IF_MDLVC   = PA_MDLVC
+                                                         IF_MDLVT   = PA_MDLVT ).
+                  else.
+***                 Waste of &1 is not setup for IQ.catalyst
+                    /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'W'
+                                                          IF_MSGID = 'ZVCXI_XCSP'
+                                                          IF_MSGNO = '504'
+                                                          IF_MSGV1 = LR_ARBPL->/VCXI/IF_CKX_OBJECT~GET_ID( ) ).
+                  endif.
+                endif.
+
+              catch /VCXI/CX_CKX into LR_CX_CKX.
+                LR_CX_CKX->SHOW_MESSAGE( IF_TYPE = 'I' ).
+            endtry.
+          endloop.
+
+***     Frontend Output as CSV
+        when PA_CSV.
+***       Header
+          loop at LT_COMPONENT into LS_COMPONENT.
+            if SY-TABIX ne 1.
+              write CL_ABAP_CHAR_UTILITIES=>HORIZONTAL_TAB no-gap.
+            endif.
+            write: LS_COMPONENT-NAME no-gap.
+          endloop.
+
+          loop at <T_DYNTAB> assigning <S_DYNTAB>.
+            new-line.
+***         Fill all Columns
+            loop at LT_COMPONENT into LS_COMPONENT.
+              if SY-TABIX ne 1.
+                write CL_ABAP_CHAR_UTILITIES=>HORIZONTAL_TAB no-gap.
+              endif.
+              assign component LS_COMPONENT-NAME of structure <S_DYNTAB> to <F_COLUMN>.
+              if SY-SUBRC eq 0.
+                write: <F_COLUMN> no-gap.
+              endif.
+            endloop.
+          endloop.
+
+***     Frontend Output via Simple ALV
+        when PA_SALV.
+          try.
+***           Create Simple ALV
+              CL_SALV_TABLE=>FACTORY( importing R_SALV_TABLE = data(LR_SALV)
+                                      changing  T_TABLE      = <T_DYNTAB> ).
+
+***           Default and Export Functions
+              LR_SALV->GET_FUNCTIONS( )->SET_DEFAULT( ).
+              LR_SALV->GET_FUNCTIONS( )->SET_GROUP_EXPORT( ).
+
+***           Adjust Columns
+              data(LR_COLUMNS) = LR_SALV->GET_COLUMNS( ).
+              loop at LT_COMPONENT into LS_COMPONENT.
+                data(LR_COLUMN) = LR_COLUMNS->GET_COLUMN( COLUMNNAME = conv #( TO_UPPER( LS_COMPONENT-NAME ) ) ).
+                LR_COLUMN->SET_SHORT_TEXT(  VALUE = conv #( LS_COMPONENT-NAME ) ).
+                LR_COLUMN->SET_MEDIUM_TEXT( VALUE = conv #( LS_COMPONENT-NAME ) ).
+                LR_COLUMN->SET_LONG_TEXT(   VALUE = conv #( LS_COMPONENT-NAME ) ).
+              endloop.
+
+***           Display
+              LR_SALV->DISPLAY( ).
+            catch CX_SALV_ERROR into data(LR_CX_SALV_ERROR).
+              /VCXI/CX_CKX=>RAISE_CKX_BY_PREVIOUS( LR_CX_SALV_ERROR ).
+          endtry.
+
+      endcase.
+
+    catch /VCXI/CX_CKX into LR_CX_CKX.
+      LR_CX_CKX->SHOW_MESSAGE( ).
+  endtry.
+
+*&---------------------------------------------------------------------*
+*& Form UPDATE_RTESEL
+*&---------------------------------------------------------------------*
+*& Update Selected Route based on Work Center Sequence
+*&---------------------------------------------------------------------*
+form UPDATE_RTESEL  using    IF_CUOBJ type CUOBJ
+                             IF_AUFNR type AUFNR
+                    raising  /VCXI/CX_CKX.
+
+  data: LT_ARBPL  type /VCXI/CKX_TT_OBJECT.
+
+
+  call function 'CUCB_INITIALIZER'.
+
+*** Get SmartVC and Ignore Lock Status
+  data(LR_SVC) = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( LF_CUOBJ ) ).
+  LR_SVC->IGNORE_LOCK( ).
+
+*** Get Routing Supervisor
+  data(LT_SVCEL) = LR_SVC->GET_SVC_ELEMENTS( IF_IEALI = 'R_RTESPV' ).
+  check LT_SVCEL is not initial.
+  data(LR_EA_RTESPV) = cast ZCL_VCXI_XCSR_EA_RTESPV( cast /VCXI/CL_VKSRA_SVC_ELEMENT( LT_SVCEL[ 1 ] )->GET_CLSEA( ) ).
+
+
+*** Get list of Work Center
+  select AFVC~VORNR, CRHD~WERKS, CRHD~ARBPL
+         from AFVC
+        inner join CRHD
+          on  CRHD~OBJID eq AFVC~ARBID
+        inner join AFKO
+          on  AFKO~AUFPL eq AFVC~AUFPL
+        where AFKO~AUFNR eq @IF_AUFNR
+        order by AFVC~VORNR
+        into table @data(LT_OPERATION).
+  loop at LT_OPERATION into data(LS_OPERATION).
+    append /VCXI/CL_VSMC_ARBPL=>GET_INSTANCE_BY_ARBPL( IF_WERKS = LS_OPERATION-WERKS
+                                                       IF_ARBPL = LS_OPERATION-ARBPL ) to LT_ARBPL.
+  endloop.
+
+*** Find Route and Fill Production with it
+  data(LR_BL_PRTE) = LR_EA_RTESPV->FIND_BL_PRTE( IT_ARBPL = LT_ARBPL ).
+  LR_EA_RTESPV->SET_RTESEL( IR_BL_PRTE = LR_BL_PRTE ).
+  LR_EA_RTESPV->FILL_PROD( ).
+
+*** Update Data Connector with current Data
+  LR_SVC->UPDATE_DC( ).
+
+endform.
+*&---------------------------------------------------------------------*
+*& Form PROGRESS_INDICATOR
+*&---------------------------------------------------------------------*
+*& Show Process Indicator
+*&---------------------------------------------------------------------*
+form PROGRESS_INDICATOR  using    IF_COUNT type I
+                                  IF_TABIX type I
+                                  IF_AUFNR type AUFNR
+                                  IF_ARBPL type ARBPL.
+
+  data: LF_MSG  type STRING,
+        LF_PERC type I.
+
+
+  LF_PERC = 100 * IF_TABIX / IF_COUNT.
+  LF_MSG = CONDENSE( |{ IF_TABIX }/{ IF_COUNT }: Production Order { <S_PRODORDOPER>-AUFNR } / Work Center { <S_PRODORDOPER>-ARBPL }| ).
+
+*** Redispatch
+  call function 'TH_REDISPATCH'.
+
+  if SY-BATCH is initial and
+     LF_PERC is not initial.
+*** Progress Indicator
+    call function 'SAPGUI_PROGRESS_INDICATOR'
+      exporting
+        PERCENTAGE = LF_PERC
+        TEXT       = LF_MSG.
+  else.
+*** Message in Job Log
+    message LF_MSG type 'S'.
+  endif.
+
+endform.

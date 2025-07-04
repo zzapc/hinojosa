@@ -1,0 +1,210 @@
+
+class ZCL_VCXI_PXE_CAD_OUTB_SDOC definition
+  public
+  inheriting from ZCL_VCXI_PXE_CAD_OUTB
+  create public .
+
+public section.
+
+  methods CONSTRUCTOR
+    importing
+      !IF_VBELN type VBELN
+      !IF_UNAME type UNAME default SY-UNAME
+    raising
+      /VCXI/CX_CKX .
+
+  methods SEND
+    redefinition .
+protected section.
+
+  types:
+    YT_POSNR type table of POSNR with key table_line .
+
+  data F_VBELN type VBELN .
+
+  methods GET_POSNR
+    importing
+      !IR_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC
+    returning
+      value(RT_POSNR) type YT_POSNR
+    raising
+      /VCXI/CX_CKX .
+  methods SEND_POSNR
+    importing
+      !IR_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC
+      !IF_POSNR type POSNR
+    raising
+      /VCXI/CX_CKX .
+private section.
+endclass. "ZCL_VCXI_PXE_CAD_OUTB_SDOC definition
+class ZCL_VCXI_PXE_CAD_OUTB_SDOC implementation.
+  method CONSTRUCTOR.
+
+    SUPER->CONSTRUCTOR( IF_NREXT = conv #( IF_VBELN )
+                        IF_UNAME = IF_UNAME ).
+    ME->F_VBELN = IF_VBELN.
+
+  endmethod.
+  method GET_POSNR.
+
+    loop at IR_BOB_SDOC->T_VBAP into data(LS_VBAP)
+                               where CUOBJ is not initial.
+***   Get SmartVC API Instance
+      data(LR_SVC) = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LS_VBAP-CUOBJ ) ).
+
+***   Get CAD Interface - Project
+      data(LR_EA_CADIF_PRJ) = ME->GET_CADIF_PRJ( IR_SVC = LR_SVC ).
+      check LR_EA_CADIF_PRJ is bound.
+
+***   Check Project Status
+      case LR_EA_CADIF_PRJ->GET_CADPS( ).
+        when 'RD'.     " Ready for Design
+          append LS_VBAP-POSNR to RT_POSNR.
+        when 'RTA'.    " Ready for Technical Approval
+          append LS_VBAP-POSNR to RT_POSNR.
+        when 'CLS'.    " Closed
+          continue.
+        when others.
+          if LS_VBAP-ABGRU is not initial and
+             LR_EA_CADIF_PRJ->GET_CADPI( ) is not initial.
+            append LS_VBAP-POSNR to RT_POSNR.
+          else.
+            continue.
+          endif.
+      endcase.
+    endloop.
+
+  endmethod.
+  method SEND.
+
+    try.
+***------------------------------------------------------------------------------------------------
+***     Create Business Object
+        data(LR_BOB_SDOC) = new ZCL_VCXI_XCI_BOB_SDOC( ).
+
+***     Load existing Sales Document
+        LR_BOB_SDOC->INIT_FROM_DB( IF_VBELN      = ME->F_VBELN
+                                   IS_ORDER_VIEW = value #( HEADER     = ABAP_TRUE
+                                                            ITEM       = ABAP_TRUE
+                                                            SDSCHEDULE = ABAP_TRUE
+                                                            BUSINESS   = ABAP_TRUE
+                                                            PARTNER    = ABAP_TRUE
+                                                            SDCOND     = ABAP_TRUE
+                                                            CONFIGURE  = ABAP_TRUE ) ).
+
+***------------------------------------------------------------------------------------------------
+***     Get positions relevant for outbound processing
+        data(LT_POSNR) = ME->GET_POSNR( IR_BOB_SDOC = LR_BOB_SDOC ).
+        ME->R_BAL->ADD_BAL_BY_BAPIRET2( IS_BAPIRET2 = value #( TYPE       = 'I'
+                                                               ID         = '/VCXI/CKX'
+                                                               NUMBER     = '000'
+                                                               MESSAGE_V1 = LINES( LT_POSNR )
+                                                               MESSAGE_V2 = ' relevant Item(s)' ) ).
+        check LT_POSNR is not initial.
+
+***------------------------------------------------------------------------------------------------
+***     Lock Sales Document
+        LR_BOB_SDOC->ENQUEUE( ).
+
+***     Send relevant Positions
+        loop at LT_POSNR into data(LF_POSNR).
+          ME->SEND_POSNR( IR_BOB_SDOC = LR_BOB_SDOC
+                          IF_POSNR    = LF_POSNR ).
+        endloop.
+
+***     All data sent
+        ME->R_BAL->ADD_BAL_BY_BAPIRET2( IS_BAPIRET2 = value #( TYPE       = 'I'
+                                                               ID         = '/VCXI/CKX'
+                                                               NUMBER     = '000'
+                                                               MESSAGE_V1 = LINES( LT_POSNR )
+                                                               MESSAGE_V2 = ' Item(s) sent' ) ).
+
+***     Change Sales Document
+        data(LR_MSG) = LR_BOB_SDOC->SAVE( IF_TESTRUN = ABAP_FALSE ).
+        ME->R_BAL->ADD_BAL_BY_MSG( IR_MSG = LR_MSG ).
+
+***     Release Lock of Sales Docuemnt
+        LR_BOB_SDOC->DEQUEUE( ).
+
+      catch /VCXI/CX_CKX into data(LR_CX_CKX).
+        ME->R_BAL->ADD_BAL_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+        raise exception LR_CX_CKX.
+    endtry.
+
+  endmethod.
+  method SEND_POSNR.
+
+    data: LF_CUOBJ type CUOBJ,
+          LF_SUBRC type SYSUBRC.
+    data: LT_CADPS_NEXT   type ZVCXI_PXS_TT_CADPS.
+    data: LR_SVC             type ref to /VCXI/CL_VKSRA_SVC,
+          LR_EA_CADIF_PRJ    type ref to ZCL_VCXI_PXSS_EA_CADIF_PRJ,
+          LR_SVCEL_CADIF_PRJ type ref to /VCXI/CL_VKSRA_SVC_ELEMENT.
+
+***------------------------------------------------------------------------------------------------
+*** Run Configuration of Item (in Change Mode)
+    LF_CUOBJ = IR_BOB_SDOC->RUN_CONFIG( IF_POSNR = IF_POSNR ).
+
+*** Get SmartVC API Instance
+    LR_SVC = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LF_CUOBJ ) ).
+
+***------------------------------------------------------------------------------------------------
+*** Get CAD Interface - Project
+    LR_EA_CADIF_PRJ = ME->GET_CADIF_PRJ( IR_SVC = LR_SVC ).
+    check LR_EA_CADIF_PRJ is bound.
+
+*** Call HTTP Client with CAD Inferface Information XML
+    LF_SUBRC = ME->CALL_HTTP( IF_OWNER   = |Item { IF_POSNR alpha = out }|
+                              IF_BODY    = LR_EA_CADIF_PRJ->GET_XML( )
+                              IF_RFCDEST = LR_EA_CADIF_PRJ->GET_RFCDEST( ) ).
+    check LF_SUBRC eq 0.
+
+*** Set next Status
+    if IR_BOB_SDOC->T_VBAP[ POSNR = IF_POSNR ]-ABGRU is initial.
+      LR_EA_CADIF_PRJ->GET_CADPS( importing ET_CADPS_NEXT = LT_CADPS_NEXT ).
+      if LT_CADPS_NEXT is not initial.
+        LR_EA_CADIF_PRJ->SET_CADPS( IF_CADPS = LT_CADPS_NEXT[ 1 ] ).
+      endif.
+    else.
+***   Mark as Closed
+      LR_EA_CADIF_PRJ->SET_CADPS( IF_CADPS = 'CLS' ).
+    endif.
+
+***------------------------------------------------------------------------------------------------
+*** Run Configuration afterwards to ensure Routing Supervisor gets executed
+    LR_SVC->UPDATE_DC( ).
+
+***#################################### Temp Fix ##################################################
+*** As RUN_CONFIG doesn't update the VC values if inconsistent. As the second CVC profile run
+*** doesn't recognice a change on SVC, the counter is not increased by SVC and LO-VC doesn't
+*** recognice a change.
+***################################################################################################
+    data(LS_CFGS_REFINST) = value #( IR_BOB_SDOC->T_CFGS_REFINST[ POSEX = IF_POSNR ] optional ).
+    check LS_CFGS_REFINST is not initial.
+    data(LF_GVCIN) = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LF_CUOBJ ).
+
+    loop at IR_BOB_SDOC->T_CFGS_VALUE assigning field-symbol(<S_CFGS_VALUE>)
+                                      where CONFIG_ID = LS_CFGS_REFINST-CONFIG_ID
+                                       and  INST_ID   = LS_CFGS_REFINST-INST_ID.
+      data(LS_VALUE) = /VCXI/CL_VKCR_GATEWAY=>GET_VALUE( IF_GVCIN = LF_GVCIN
+                                                         IF_ATNAM = conv #( <S_CFGS_VALUE>-CHARC ) ).
+      case LS_VALUE-ATFOR.
+        when 'CHAR'.
+          <S_CFGS_VALUE> = corresponding #( base ( <S_CFGS_VALUE> ) LS_VALUE mapping VALUE      = ATWRT
+                                                                                     VALUE_LONG = ATWRT ).
+      endcase.
+    endloop.
+***################################################################################################
+
+*** Run Configuration to update LO-VC consistency etc.
+    IR_BOB_SDOC->RUN_CONFIG( IF_POSNR = IF_POSNR ).
+
+***------------------------------------------------------------------------------------------------
+*** Get SmartVC API Instance
+    LR_SVC = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = IR_BOB_SDOC->T_VBAP[ POSNR = IF_POSNR ]-CUOBJ ) ).
+
+*** Create Integration Data for SmartVC based on CAD Interface - Project
+    ME->BUILD_IDAT( IR_SVC   = LR_SVC
+                    IF_POSNR = IF_POSNR ).
+
+  endmethod.

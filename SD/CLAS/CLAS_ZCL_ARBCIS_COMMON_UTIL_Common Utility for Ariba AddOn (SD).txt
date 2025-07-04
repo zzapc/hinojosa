@@ -1,0 +1,365 @@
+
+class ZCL_ARBCIS_COMMON_UTIL definition
+  public
+  create public .
+
+public section.
+
+  class-methods AUTHORIZATION_CHECK
+    importing
+      value(OBJECT) type ANY
+      value(AUTHORIZATION_OBJECT) type XUOBJECT
+    raising
+      CX_ARBCIS_APPL .
+  class-methods FILL_BAPIX_STRUCTURE
+    importing
+      !I_INPUT type ANY
+    changing
+      !C_OUTPUT type ANY .
+  class-methods GET_TIMEZONE_OFFSET
+    returning
+      value(R_TIMEZONE) type CHAR6 .
+  class-methods GET_UUID_PROXY
+    returning
+      value(UUID) type ARBCIS_UUID_CONTENT .
+  class-methods DATE_TIME_GMT
+    importing
+      !I_DATE type SY-DATUM
+      !I_TIME type SY-UZEIT optional
+    returning
+      value(R_DATETIME) type ARBCIS_GLOBAL_DATE_TIME .
+  class-methods SPLIT_STRING_TO_TABLE
+    importing
+      value(IS_TEXT) type STRING
+    exporting
+      value(ET_TEXT_LINES) type ARBCIS_TLINE_T .
+  class-methods CONCAT_TABLE_TO_STRING
+    importing
+      value(IT_TEXT_LINES) type ARBCIS_TLINE_T
+    exporting
+      value(ES_TEXT) type STRING .
+  class-methods GET_LOGICAL_SYSTEM
+    exporting
+      value(EV_LOGICAL_SYSTEM) type LOGSYS .
+  class-methods FILL_MESSAGE_HEADER
+    importing
+      value(IV_DATE) type DATUM optional
+      value(IV_TIME) type UZEIT optional
+    exporting
+      value(ES_MESSAGE_HEADER) type ARBCIS_BUS_DOC_MSG_HDR .
+  class-methods CHECK_FOR_RELEVANCE
+    importing
+      value(DOCUMENT_NUMBER) type ANY
+      value(DOCUMENT_TYPE) type ARBCIS_DOCUMENT_TYPE_CODE
+    exporting
+      value(EV_IS_RELEVANT) type FLAG
+      value(ES_SO_VERS) type ARBCIS_SO_VERS .
+  class-methods GET_MESSAGE_TEXT
+    importing
+      value(IT_MSG_DET_TAB) type BAPIRETTAB
+    returning
+      value(ET_MESSAGES) type STRING_TABLE .
+protected section.
+private section.
+
+  constants GC_MSG_CLASS_NAME type ARBGB value 'ARBCIS_MESSAGE'. "#EC NOTEXT
+  class-data GS_SALES_ORDER_VERS type ARBCIS_SO_VERS .
+endclass. "ZCL_ARBCIS_COMMON_UTIL definition
+class ZCL_ARBCIS_COMMON_UTIL implementation.
+METHOD AUTHORIZATION_CHECK.
+  CONSTANTS:
+  lc_execution(2)         TYPE c VALUE '16',
+  lc_activity(5)          TYPE c VALUE 'ACTVT',
+*Authorization Object for Add On Program
+  lc_authorization_prg(10)    TYPE c VALUE 'ARBCIS_PRG',
+*Authorization Object for Add On class
+  lc_authorization_cls(10)    TYPE c VALUE 'ARBCIS_CLS',
+*Authorization object for SPRO.
+  lc_authorization_spr(10)    TYPE c VALUE 'ARBCIS_SPR'.
+
+  DATA: lv_authorization(10) TYPE c,
+        lv_object_id(10)     TYPE c.
+
+  CLEAR: lv_object_id, lv_authorization.
+
+  IF authorization_object EQ lc_authorization_cls.
+    lv_object_id = 'CLASSNAME'.
+  ELSEIF authorization_object EQ lc_authorization_prg OR
+         authorization_object EQ lc_authorization_spr.
+    lv_object_id = 'PROGRAM'.
+  ENDIF.
+  lv_authorization = authorization_object.
+* Checking whether the user executing the transaction has
+* authorization to execute the Program/class
+  AUTHORITY-CHECK OBJECT lv_authorization
+             ID lv_object_id FIELD object
+             ID lc_activity  FIELD lc_execution.
+
+** If user does not have authorization, then the process is
+** terminated and an exception is thrown saying NO_AUTHORIZATION
+  IF sy-subrc <> 0.
+    CASE sy-subrc.
+      WHEN 4.
+        RAISE EXCEPTION TYPE cx_arbcis_appl
+                        EXPORTING message_id     = gc_msg_class_name
+                                  message_number = '001'
+                                  message_type   = 'E'.
+      WHEN 12.
+        RAISE EXCEPTION TYPE cx_arbcis_appl
+                        EXPORTING message_id     = gc_msg_class_name
+                                  message_number = '002'
+                                  message_type   = 'E'.
+      WHEN 24.
+        RAISE EXCEPTION TYPE cx_arbcis_appl
+                        EXPORTING message_id     = gc_msg_class_name
+                                  message_number = '003'
+                                  message_type   = 'E'.
+      WHEN OTHERS.
+        RAISE EXCEPTION TYPE cx_arbcis_appl
+                        EXPORTING message_id     = gc_msg_class_name
+                                  message_number = '016'
+                                  message_type   = 'E'.
+    ENDCASE.
+  ENDIF.
+ENDMETHOD.
+METHOD CHECK_FOR_RELEVANCE.
+*Local Types
+  TYPES: BEGIN OF lty_vbeln,
+          vbeln TYPE vbeln,
+         END OF lty_vbeln.
+  DATA:
+*Local Variables
+        lv_so_cnt TYPE i,
+        lv_so_vers_cnt TYPE i,
+*Local Structure
+        ls_vbco6 TYPE vbco6,
+        ls_vbeln TYPE lty_vbeln,
+        ls_vbfa  TYPE vbfa,
+*Local Table
+        lt_vbfa  TYPE TABLE OF vbfa,
+        lt_sales_order_vers TYPE TABLE OF arbcis_so_vers,
+        lt_vbeln TYPE TABLE OF lty_vbeln.
+
+*In case of outbound delivery and Invoice, fetch the corresponding sales order and check
+*if the sales order exists in the SO history table.
+*In case of Order confirmation, as the sales order is known, check if it exists in SO history
+*table directly.
+  IF document_type EQ 'OutboundDelivery' OR
+     document_type EQ 'InvoiceRequest'.
+    ls_vbco6-vbeln = document_number.
+    CALL FUNCTION 'RV_ORDER_FLOW_INFORMATION'
+      EXPORTING
+        comwa         = ls_vbco6
+      TABLES
+        vbfa_tab      = lt_vbfa
+      EXCEPTIONS
+        no_vbfa       = 1
+        no_vbuk_found = 2
+        OTHERS        = 3.
+    IF lt_vbfa IS NOT INITIAL.
+*      DELETE lt_vbfa WHERE vbtyp_n NE 'C'.          "Delete other relevant documents which are not sales order
+      DELETE ADJACENT DUPLICATES FROM lt_vbfa COMPARING vbeln.
+      LOOP AT lt_vbfa INTO ls_vbfa.
+        ls_vbeln = ls_vbfa-vbeln.
+        APPEND ls_vbeln TO lt_vbeln.
+      ENDLOOP.
+    ENDIF.
+  ELSE.
+    ls_vbeln = document_number.
+    APPEND ls_vbeln TO lt_vbeln.
+  ENDIF.
+
+  CLEAR: gs_sales_order_vers, lt_sales_order_vers.
+  IF lt_vbeln IS NOT INITIAL.
+*Check if all the sales order corresponding to the importing document exists in SO history table.
+    SELECT *
+           FROM arbcis_so_vers
+           INTO TABLE lt_sales_order_vers
+           FOR ALL ENTRIES IN lt_vbeln
+           WHERE vbeln = lt_vbeln-vbeln.
+    IF lt_sales_order_vers IS NOT INITIAL.
+      DESCRIBE TABLE lt_vbeln LINES lv_so_cnt.
+      DESCRIBE TABLE lt_sales_order_vers LINES lv_so_vers_cnt.
+*      IF lv_so_cnt = lv_so_vers_cnt.
+        READ TABLE lt_sales_order_vers INDEX 1 INTO gs_sales_order_vers.
+        IF sy-subrc IS INITIAL .
+          es_so_vers     = gs_sales_order_vers.
+          ev_is_relevant = abap_true.
+        ENDIF.
+*      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDMETHOD.
+METHOD CONCAT_TABLE_TO_STRING.
+  DATA:
+*Local structures
+        ls_text_line  TYPE tline.
+
+  CLEAR: ls_text_line, es_text.
+  LOOP AT it_text_lines INTO ls_text_line.
+    CONCATENATE es_text ls_text_line-tdline INTO es_text SEPARATED BY space.
+  ENDLOOP.
+ENDMETHOD.
+METHOD DATE_TIME_GMT.
+  DATA:
+    lv_time      TYPE sy-uzeit,
+    lv_ts        TYPE timestamp.
+
+  lv_time = i_time.
+  IF lv_time IS INITIAL.
+    lv_time = sy-uzeit.
+  ENDIF.
+  CONVERT DATE                 i_date
+          TIME                 lv_time
+*          DAYLIGHT SAVING TIME sy-dayst    "IG-12835
+          INTO TIME STAMP      lv_ts
+          TIME ZONE            sy-zonlo.
+  r_datetime = lv_ts.
+ENDMETHOD.
+METHOD FILL_BAPIX_STRUCTURE.
+  DATA: lr_struct TYPE REF TO cl_abap_structdescr,
+        lr_field  TYPE REF TO cl_abap_elemdescr.
+
+  FIELD-SYMBOLS: <comp>   LIKE LINE OF cl_abap_structdescr=>components,
+                 <output> TYPE any,
+                 <input>  TYPE any.
+
+  lr_struct ?= cl_abap_typedescr=>describe_by_data( c_output ).
+
+  CHECK lr_struct IS BOUND.
+  LOOP AT lr_struct->components ASSIGNING <comp>.
+    UNASSIGN: <output>, <input>.
+* It will take only BAPIX fields into consideration
+    ASSIGN COMPONENT <comp>-name OF STRUCTURE c_output TO <output>.
+    ASSIGN COMPONENT <comp>-name OF STRUCTURE i_input  TO <input>.
+    CHECK <output> IS ASSIGNED AND <input> IS ASSIGNED.
+* Get element description
+    lr_field ?= cl_abap_typedescr=>describe_by_data( <output> ).
+    IF lr_field->absolute_name EQ '\TYPE=BAPIUPDATE'.
+      IF NOT <input> IS INITIAL.
+        <output> = cl_mmpur_constants=>yes.
+      ENDIF.
+    ELSE.
+      IF NOT <input> IS INITIAL.
+        <output> = <input>.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+ENDMETHOD.
+METHOD FILL_MESSAGE_HEADER.
+  DATA:
+*Local Structures
+        ls_so_vers TYPE arbcis_so_vers,
+        ls_t000    TYPE t000,
+*Local Variable
+        lv_test_system TYPE cccategory,
+        lv_log_system  TYPE logsys,
+        lv_date        TYPE datum,
+        lv_time        TYPE uzeit .
+
+  CLEAR: ls_so_vers, ls_t000, lv_date, lv_time.
+  ls_so_vers = gs_sales_order_vers.
+  es_message_header-id-content = cl_arbcis_common_util=>get_uuid_proxy( ).
+  es_message_header-uuid-content = es_message_header-id-content.
+
+  lv_date = iv_date.
+  IF lv_date IS INITIAL.
+    lv_date = sy-datum.
+  ENDIF.
+
+  lv_time = iv_time.
+  IF lv_time IS INITIAL.
+    lv_time = sy-uzeit.
+  ENDIF.
+
+  es_message_header-creation_date_time = cl_arbcis_common_util=>date_time_gmt( i_date = lv_date i_time = lv_time ).
+  es_message_header-ariba_network_id-buyer_ariba_network_id = ls_so_vers-buy_anid.
+  es_message_header-ariba_network_id-supplier_ariba_network_id = ls_so_vers-sup_anid.
+
+  SELECT SINGLE *
+           FROM t000
+           INTO ls_t000
+           WHERE mandt = sy-mandt.
+
+  lv_test_system = ls_t000-cccategory.
+  es_message_header-sender_business_system_id = ls_t000-logsys.
+
+  IF lv_test_system NE 'P'. " Not a Production environment
+    es_message_header-test_data_indicator = abap_true.
+  ENDIF.
+  es_message_header-recipient_business_system_id = 'CIG'.
+ENDMETHOD.
+METHOD GET_LOGICAL_SYSTEM.
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = ev_logical_system
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+ENDMETHOD.
+METHOD GET_MESSAGE_TEXT.
+  DATA: lv_msg TYPE string,
+        ls_msg TYPE bapiret2.
+
+  LOOP AT it_msg_det_tab INTO ls_msg.
+    IF ls_msg-id IS NOT INITIAL.
+      MESSAGE ID   ls_msg-id
+            TYPE   ls_msg-type
+            NUMBER ls_msg-number
+            WITH   ls_msg-message_v1
+                   ls_msg-message_v2
+                   ls_msg-message_v3
+                   ls_msg-message_v4
+            INTO   lv_msg.
+    ELSEIF ls_msg-message IS NOT INITIAL.
+      lv_msg = ls_msg-message.
+    ENDIF.
+    APPEND lv_msg TO et_messages.
+  ENDLOOP.
+
+ENDMETHOD.
+METHOD GET_TIMEZONE_OFFSET.
+  DATA:
+    lv_offset TYPE tznutcdiff,
+    lv_sign   TYPE tznutcsign.
+
+  CALL FUNCTION 'TZON_GET_OFFSET'
+    EXPORTING
+      if_timezone      = sy-zonlo
+      if_local_date    = sy-datum
+      if_local_time    = sy-uzeit
+    IMPORTING
+      ef_utcdiff       = lv_offset
+      ef_utcsign       = lv_sign
+    EXCEPTIONS
+      conversion_error = 1
+      OTHERS           = 2.
+  IF sy-subrc <> 0.
+* For any exception, return the default timezone '+00:00'
+    lv_offset = '00:00'.
+    lv_sign   = '+'.
+  ENDIF.
+  CONCATENATE lv_sign lv_offset INTO r_timezone.
+ENDMETHOD.
+METHOD GET_UUID_PROXY.
+*  Declaration
+  DATA : lv_guid TYPE guid_32.
+*Generate 32Char GUID
+  CALL FUNCTION 'GUID_CREATE'
+    IMPORTING
+      ev_guid_32 = lv_guid.
+*Convert GUID to OutboundGuid of 36Characters
+  cl_gdt_conversion=>guid_outbound(
+    EXPORTING
+      im_guid_c = lv_guid
+    IMPORTING
+      ex_value  = uuid
+     ).
+ENDMETHOD.
+METHOD SPLIT_STRING_TO_TABLE.
+  CALL FUNCTION 'VB_CP_CONVERT_STRING_2_ITF'
+    EXPORTING
+      i_string = is_text
+    TABLES
+      et_table = et_text_lines.
+ENDMETHOD.

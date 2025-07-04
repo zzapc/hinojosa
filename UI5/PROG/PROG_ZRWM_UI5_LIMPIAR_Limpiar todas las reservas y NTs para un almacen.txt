@@ -1,0 +1,137 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRWM_UI5_LIMPIAR
+*&
+*&---------------------------------------------------------------------*
+*& Autor: Carlos Vivó Jiménez
+*& Fecha: 15.01.2021
+*&
+*& Proyecto: Consumos UI5 CB
+*& Funcionalidad: borrar en masa todas las reservas y NTs de aprov.
+*&
+*&---------------------------------------------------------------------*
+REPORT zrwm_ui5_limpiar.
+
+TABLES: ltbk, ltbp.
+
+SELECTION-SCREEN BEGIN OF BLOCK 1.
+PARAMETERS: lgnum TYPE lgnum OBLIGATORY,
+            werks TYPE werks_d OBLIGATORY.
+SELECT-OPTIONS: s_nlpla FOR ltbk-nlpla.
+
+
+PARAMETERS: fin     RADIOBUTTON GROUP 1,
+            delete  RADIOBUTTON GROUP 1, " borrar las reservas sin finalizar que no tengan NT
+            del_all RADIOBUTTON GROUP 1. " borrar las reservas finalizadas o sin finalizar que no tengan NT
+SELECTION-SCREEN END OF BLOCK 1.
+
+START-OF-SELECTION.
+  DATA: class TYPE REF TO zcl_si_prod_replenishment_ui5.
+  RANGES: r_kzear FOR resb-kzear.
+
+  CREATE OBJECT class.
+
+  class->ga_lgnum = lgnum.
+  class->ga_werks = werks.
+
+
+  IF s_nlpla IS NOT INITIAL.
+    SELECT lgpla FROM lagp
+      WHERE lgnum EQ @lgnum
+        AND lgpla IN @s_nlpla
+      INTO TABLE @DATA(t_nlpla).
+  ENDIF.
+
+
+
+  DATA(vl_clave_hardcodes) = COND repid( WHEN lgnum = class->gac_lgnum_bernabeu THEN class->gac_clave_hardcodes_bernabeu
+                                                                                   ELSE class->gac_clave_hardcodes_pacs ).
+
+  DATA(vl_cla_nemesis) = COND xfeld( WHEN lgnum = class->gac_lgnum_bernabeu THEN 'X' ELSE space ).
+
+
+
+  class->dame_hardcodes( vl_clave_hardcodes ).
+
+  IF t_nlpla IS INITIAL.
+    class->borra_nt_abiertas( ).
+  ELSE.
+    LOOP AT t_nlpla INTO DATA(nlpla).
+      class->borra_nt_abiertas( EXPORTING iv_nlpla = nlpla-lgpla ).
+    ENDLOOP.
+  ENDIF.
+
+  IF del_all IS INITIAL.
+    r_kzear = VALUE #( sign = 'I' option = 'EQ' low = abap_true ).
+  ENDIF.
+
+
+  IF s_nlpla IS INITIAL.
+    SELECT a~rsnum, a~rspos
+    FROM resb AS a
+    INTO TABLE @DATA(lt_resb)
+          WHERE a~kzear IN @r_kzear
+          AND a~werks = @werks
+          AND a~bwart = '291'
+          AND NOT EXISTS ( SELECT tbnum FROM ltbk WHERE rsnum = a~rsnum AND statu <> 'E' AND lgnum = @lgnum ).
+*        GROUP BY a~rsnum, a~rspos.
+  ELSE.
+    SELECT a~rsnum a~rspos
+    FROM resb AS a
+    INTO TABLE lt_resb
+          WHERE a~kzear IN r_kzear
+          AND a~werks = werks
+          AND a~bwart = '291'
+          AND NOT EXISTS ( SELECT tbnum FROM ltbk WHERE rsnum = a~rsnum AND statu <> 'E' AND lgnum = lgnum )
+          AND EXISTS ( SELECT tbnum FROM ltbk WHERE rsnum = a~rsnum AND nlpla IN s_nlpla AND lgnum = lgnum ).
+  ENDIF.
+
+  CHECK sy-subrc = 0.
+
+  DATA lt_itm_chg TYPE TABLE OF bapi2093_res_item_change WITH DEFAULT KEY.
+  DATA lt_itm_chgx TYPE TABLE OF bapi2093_res_item_changex WITH DEFAULT KEY.
+  DATA lt_ret TYPE bapiret2_tab.
+
+  IF fin IS NOT INITIAL.
+    LOOP AT lt_resb INTO DATA(ls_resb).
+      CLEAR: lt_itm_chgx, lt_itm_chg, lt_ret.
+
+      APPEND VALUE bapi2093_res_item_change( res_item = ls_resb-rspos withdrawn = abap_true ) TO lt_itm_chg.
+      APPEND VALUE bapi2093_res_item_changex( res_item = ls_resb-rspos withdrawn = abap_true ) TO lt_itm_chgx.
+
+      CALL FUNCTION 'BAPI_RESERVATION_CHANGE'
+        EXPORTING
+          reservation               = ls_resb-rsnum
+        TABLES
+          reservationitems_changed  = lt_itm_chg
+          reservationitems_changedx = lt_itm_chgx
+          return                    = lt_ret.
+
+      LOOP AT lt_ret TRANSPORTING NO FIELDS WHERE type CA 'XAE'.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ENDLOOP.
+      IF sy-subrc NE 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = abap_false.
+      ENDIF.
+    ENDLOOP.
+  ELSE.
+    LOOP AT lt_resb INTO ls_resb.
+      CLEAR lt_ret.
+
+      CALL FUNCTION 'BAPI_RESERVATION_DELETE'
+        EXPORTING
+          reservation = ls_resb-rsnum
+        TABLES
+          return      = lt_ret.
+
+      LOOP AT lt_ret TRANSPORTING NO FIELDS WHERE type CA 'XAE'.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ENDLOOP.
+      IF sy-subrc NE 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = abap_false.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.

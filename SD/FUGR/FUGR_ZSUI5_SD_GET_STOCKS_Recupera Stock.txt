@@ -1,0 +1,268 @@
+FUNCTION zsui5_sd_get_stocks.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_KUNNR) TYPE  KUNNR OPTIONAL
+*"     VALUE(I_EJERCICIO) TYPE  MJAHR OPTIONAL
+*"     VALUE(I_BACKOFFICE) TYPE  LIFNR OPTIONAL
+*"     VALUE(I_REGIO) TYPE  REGIO OPTIONAL
+*"     VALUE(I_CP) TYPE  PSTLZ OPTIONAL
+*"     VALUE(I_HISTORICO) TYPE  FLAG OPTIONAL
+*"     VALUE(IR_VKORG) TYPE  RSELOPTION OPTIONAL
+*"  EXPORTING
+*"     VALUE(E_RETURN) TYPE  BAPIRET2_T
+*"     VALUE(E_STOCK) TYPE  ZSUI5TT_SD_STOCK
+*"----------------------------------------------------------------------
+  DATA: ls_return TYPE bapiret2,
+        ls_stock  TYPE zsui5s_sd_stock,
+        lv_datum  TYPE sy-datum,
+        lt_mdsux  TYPE TABLE OF  mdsu.
+
+  DATA:
+    r_kunnr TYPE RANGE OF kunnr,
+    r_regio TYPE RANGE OF regio,
+    r_cp    TYPE RANGE OF pstlz.
+
+  DATA: r_back_ofiice TYPE RANGE OF lifnr.
+  IF i_backoffice IS NOT INITIAL.
+    r_back_ofiice = VALUE #( ( sign = 'I' option = 'EQ' low = i_backoffice ) ) .
+  ENDIF.
+
+
+  DATA: r_vkorg     TYPE sd_vkorg_ranges.
+  "Obtenemos los VKORG del usuario
+  CALL FUNCTION 'ZSUI5_SD_GET_VKORG'
+* EXPORTING
+*   I_OBJCT        =
+    IMPORTING
+      et_vkorg = r_vkorg.
+
+  IF i_kunnr IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_kunnr ASSIGNING FIELD-SYMBOL(<ls_kunnr>).
+    <ls_kunnr>-option = 'EQ'.
+    <ls_kunnr>-sign = 'I'.
+    <ls_kunnr>-low = i_kunnr.
+  ENDIF.
+
+  IF i_cp IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_cp ASSIGNING FIELD-SYMBOL(<ls_cp>).
+    <ls_cp>-option = 'EQ'.
+    <ls_cp>-sign = 'I'.
+    <ls_cp>-low = i_cp.
+  ENDIF.
+
+  IF i_regio IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_regio ASSIGNING FIELD-SYMBOL(<ls_regio>).
+    <ls_regio>-option = 'EQ'.
+    <ls_regio>-sign = 'I'.
+    <ls_regio>-low = i_regio.
+  ENDIF.
+
+  IF i_ejercicio IS NOT INITIAL.
+    lv_datum = i_ejercicio && '12' && '31'.
+  ELSE.
+    lv_datum = sy-datum(4) && '12' && '31'.
+  ENDIF.
+  SELECT  a~matnr, ka~kunnr, ka~name1 AS kunnrname, m~werks, m~lgort, mk~maktx, k~kdmat, k~postx, m~labst AS stock_libre, m~insme AS stock_calidad, m~retme AS stock_devolucion, m~speme AS stock_bloqueado,
+    ma~meins
+    FROM knvp AS vp
+    INNER JOIN kna1 AS ka ON ka~kunnr = vp~kunnr
+*    INNER JOIN kna1 AS k2 ON ka~kunnr = vp~kunn2
+    INNER JOIN kotg933  AS a ON a~kunnr = ka~kunnr
+      INNER JOIN mard AS m ON m~matnr = a~matnr
+      INNER JOIN  tvkwz AS t ON vp~vkorg = t~vkorg AND m~werks = t~werks
+      INNER JOIN mara AS ma ON ma~matnr = m~matnr
+      INNER JOIN makt AS mk ON mk~matnr = ma~matnr AND mk~spras = @sy-langu
+      LEFT JOIN knmt AS k ON k~kunnr = a~kunnr AND k~matnr = a~matnr
+    INTO TABLE @DATA(lt_data)
+    WHERE vp~lifnr IN @r_back_ofiice AND vp~parvw = 'A1'
+    AND ka~regio IN @r_regio
+    AND ka~pstlz IN @r_cp
+    AND a~kunnr IN @r_kunnr
+     AND a~kappl = 'V'
+    AND a~kschl = 'ZA01'
+    AND a~vkorg IN @r_vkorg
+    AND a~vtweg = '10'
+    AND a~spart = '10'
+    AND a~matnr NE @space
+    AND a~datbi >= @lv_datum
+    AND a~datab <= @lv_datum
+    AND ma~mtart NOT IN ( 'ZUTI', 'ZCLI', 'ZTRO' ).
+  IF sy-subrc NE 0.
+    CLEAR ls_return.
+    ls_return-id = 'ZSSD_UI5'.
+    ls_return-type = 'E'.
+    ls_return-number = '001'.
+    ls_return-message_v1 = |{ i_kunnr ALPHA = OUT }|.
+    APPEND ls_return TO e_return.
+  ELSE.
+    "Obtenemos la ruta para el WebGUI de la Tx XD02
+    DATA: lv_hostname TYPE string,
+          lv_port     TYPE string.
+    CALL FUNCTION 'TH_GET_VIRT_HOST_DATA'
+      EXPORTING
+        protocol       = 0
+        virt_idx       = 0
+*       LOCAL          = 1
+      IMPORTING
+        hostname       = lv_hostname
+        port           = lv_port
+      EXCEPTIONS
+        not_found      = 1
+        internal_error = 2
+        OTHERS         = 3.
+    IF sy-subrc = 0.
+      CHECK lt_data IS NOT INITIAL.
+
+      "Obtenemos las HU existentes en la LQUA
+      SELECT b~lgnum, b~lqnum, b~matnr, b~werks, a~lgort, b~meins, b~verme, c~lhmg1
+        FROM t320 AS a
+        INNER JOIN lqua AS b ON b~lgnum = a~lgnum AND b~werks = a~werks
+        INNER JOIN mlgn AS c ON c~matnr = b~matnr AND c~lgnum = b~lgnum
+        INTO TABLE @DATA(lt_lqua)
+        FOR ALL ENTRIES IN @lt_data
+        WHERE a~lgort = @lt_data-lgort
+        AND a~werks = @lt_data-werks
+        AND b~matnr = @lt_data-matnr
+        AND b~lenum NE @space.
+
+      "Obtenemos los datos para el cálculo de los Palets.
+      SELECT matnr, lhmg1, lgnum
+        FROM mlgn
+        INTO TABLE @DATA(lt_mlgn)
+        FOR ALL ENTRIES IN @lt_data
+        WHERE matnr = @lt_data-matnr
+*        AND lgnum = '201'
+        AND lety1 = 'PL'.
+
+      "Obtenemos el lgnum
+      SELECT werks, lgnum
+        FROM t320
+        INTO TABLE @DATA(lt_lgnum)
+         FOR ALL ENTRIES IN @lt_data
+              WHERE werks = @lt_data-werks.
+
+      "Obtenemos el Stock Especial si sobkz ne space y stock asignado
+      SELECT a~matnr, a~werks, a~lgort, a~kalab
+        FROM mska AS a
+        INNER JOIN vbak AS b ON b~vbeln = a~vbeln AND b~kunnr = @i_kunnr
+        INTO TABLE @DATA(lt_mska)
+        FOR ALL ENTRIES IN @lt_data
+        WHERE a~matnr = @lt_data-matnr
+        AND a~werks = @lt_data-werks
+        AND a~lgort = @lt_data-lgort
+        AND a~sobkz NE @space
+        .
+
+      "Obtenemos stock asignado
+      SELECT a~matnr, a~werks, a~lgort, a~kalab
+        FROM mska AS a
+        INTO TABLE @DATA(lt_mska2)
+        FOR ALL ENTRIES IN @lt_data
+        WHERE a~matnr = @lt_data-matnr
+        AND a~werks = @lt_data-werks
+        AND a~lgort = @lt_data-lgort.
+
+      "Obtenemos el Stock en Consigna
+      SELECT a~matnr, a~werks,  a~kulab
+         FROM msku  AS a
+         INNER JOIN knvp  AS b ON b~kunn2 = a~kunnr  AND b~vtweg = '10' AND b~spart = '10' AND b~parvw = 'SB'
+         INTO TABLE @DATA(lt_msku)
+         FOR ALL ENTRIES IN @lt_data
+        WHERE a~matnr = @lt_data-matnr
+         AND a~werks = @lt_data-werks
+         AND a~sobkz = 'W'
+         AND b~kunnr = @lt_data-kunnr
+         AND a~lfgja = @i_ejercicio
+         AND b~vkorg IN @r_vkorg.
+
+
+      LOOP AT lt_data ASSIGNING FIELD-SYMBOL(<ls_data>).
+        CLEAR ls_stock.
+        MOVE-CORRESPONDING <ls_data> TO ls_stock.
+
+        "Obtenemos el Stock Asignado
+*        CALL FUNCTION 'MD_STOCK_REQUIREMENTS_LIST_API'
+*          EXPORTING
+*            matnr                    = ls_stock-matnr
+*            werks                    = ls_stock-werks
+*          TABLES
+*            mdsux                    = lt_mdsux
+*          EXCEPTIONS
+*            material_plant_not_found = 1
+*            plant_not_found          = 2
+*            OTHERS                   = 3.
+*        IF sy-subrc = 0.
+*          LOOP AT lt_mdsux INTO DATA(ls_mdsux) WHERE delkz = 'WB'.
+*            ADD ls_mdsux-mng05 TO ls_stock-stock_asignado.
+*          ENDLOOP.
+*        ENDIF.
+*        ls_stock-stock_total = ls_stock-stock_asignado + ls_stock-stock_bloqueado + ls_stock-stock_calidad + ls_stock-stock_devolucion +
+*                                ls_stock-stock_devolucion + ls_stock-stock_libre + ls_stock-stock_libre_asig_cli + ls_stock-stock_libre_no_asig.
+
+
+        "Calculamos el Stock Especial
+        LOOP AT lt_mska INTO DATA(ls_mska) WHERE matnr = ls_stock-matnr AND werks = ls_stock-werks AND lgort = ls_stock-lgort.
+          ADD ls_mska-kalab TO ls_stock-stock_libre_no_asig .
+        ENDLOOP.
+
+        "Calculamos el Stock Asignado
+        LOOP AT lt_mska2 INTO DATA(ls_mska2) WHERE matnr = ls_stock-matnr AND werks = ls_stock-werks AND lgort = ls_stock-lgort.
+          ADD ls_mska2-kalab TO ls_stock-stock_asignado.
+        ENDLOOP.
+
+        "Calculamos el Stock Consigna
+        LOOP AT lt_msku INTO DATA(ls_msku) WHERE matnr = ls_stock-matnr AND werks = ls_stock-werks.
+          ADD ls_msku-kulab TO ls_stock-stock_libre_asig_cli.
+        ENDLOOP.
+
+        ls_stock-stock_libre = ls_stock-stock_libre ."- ls_stock-stock_asignado.
+
+        ls_stock-stock_total = ls_stock-stock_bloqueado + ls_stock-stock_calidad + ls_stock-stock_devolucion + ls_stock-stock_asignado +
+                                       ls_stock-stock_devolucion + ls_stock-stock_libre + ls_stock-stock_libre_asig_cli + ls_stock-stock_libre_no_asig.
+
+        IF ls_stock-stock_libre < 0.
+          ls_stock-stock_libre = 0.
+        ENDIF.
+
+        "Solo mostramos los que su stock total sea mayor que cero.
+        IF ls_stock-stock_total IS INITIAL.
+          CONTINUE.
+        ENDIF.
+
+        READ TABLE lt_lgnum INTO DATA(ls_lgnum) WITH KEY werks = ls_stock-werks.
+        IF sy-subrc = 0.
+          READ TABLE lt_mlgn INTO DATA(ls_mlgn) WITH KEY matnr = ls_stock-matnr lgnum = ls_lgnum-lgnum.
+          IF sy-subrc = 0 AND ls_mlgn-lhmg1 NE 0.
+            ls_stock-valor_teorico_completo = trunc( ls_stock-stock_asignado / ls_mlgn-lhmg1 ).
+            ls_stock-valor_teorico_picos = frac( ls_stock-stock_asignado / ls_mlgn-lhmg1 ) * ls_mlgn-lhmg1.
+          ENDIF.
+        ENDIF.
+        ls_stock-ejercicio = i_ejercicio.
+
+        "Calculamos los Pallets y Picos.
+        LOOP AT lt_lqua INTO DATA(ls_lqua) WHERE matnr = ls_stock-matnr AND werks = ls_stock-werks AND lgort = ls_stock-lgort.
+          DATA(lv_dif) = ls_lqua-verme - ls_lqua-lhmg1.
+          IF lv_dif = 0.
+            ADD 1 TO ls_stock-valor_real_completo.
+          ELSE.
+            ADD 1 TO ls_stock-valor_real_picos.
+          ENDIF.
+        ENDLOOP.
+
+        IF ls_stock-stock_asignado NE 0.
+          ls_stock-navegar_mmbe = 'X'.
+        ENDIF.
+
+        ls_stock-url_kunnr = 'http://'&& lv_hostname && ':' && lv_port && '/sap/bc/gui/sap/its/webgui?~transaction=*XD03%20RF02D-KUNNR=' && ls_stock-kunnr .
+        ls_stock-url_mmbe = 'http://'&& lv_hostname && ':' && lv_port && '/sap/bc/gui/sap/its/webgui?~transaction=*MMBE%20MS_MATNR-LOW=' && ls_stock-matnr .
+
+        APPEND ls_stock TO e_stock.
+
+      ENDLOOP.
+
+    ENDIF.
+  ENDIF.
+
+
+ENDFUNCTION.

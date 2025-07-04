@@ -1,0 +1,180 @@
+FUNCTION zswm_unir_picos_ui5.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(TCODE) TYPE  TCODE OPTIONAL
+*"     VALUE(UNAME) TYPE  SY-UNAME DEFAULT SY-UNAME
+*"     VALUE(OPERARIO) TYPE  ZLNUM_OPER OPTIONAL
+*"     VALUE(TT_REGISTROS) TYPE  ZSWM_READ_EXIDV_STR_TT OPTIONAL
+*"     VALUE(NLTYP) TYPE  LTAP-NLTYP OPTIONAL
+*"     VALUE(NLPLA) TYPE  LTAP-NLPLA OPTIONAL
+*"  EXPORTING
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_TT
+*"     VALUE(LGTYP_OUT) TYPE  LGTYP
+*"     VALUE(LGPLA_OUT) TYPE  LGPLA
+*"     VALUE(LENUM_OUT) TYPE  LENUM
+*"----------------------------------------------------------------------
+  DATA:
+    zswm_ui5_ivnum TYPE zswm_ui5_ivnum,
+    zswm_ui5_ivpos TYPE zswm_ui5_ivpos.
+  DATA: data_u            TYPE zswm_data_ui5_eeeoo_str,
+        r_param           TYPE zswm_data_ui5_param_str,
+        r_funcionalidades TYPE zswm_data_ui5_func_str.
+
+  PERFORM break USING 'ZSWM_UNIR_PICOS_UI5'.
+
+  CALL FUNCTION 'ZSWM_GET_DATA_USER_UI5'
+    EXPORTING
+      uname      = uname
+      statu      = 'X'
+      no_gen_log = abap_true
+      tcode      = tcode
+    IMPORTING
+      data_user  = data_u
+*     ERROR      =
+*     TT_LOG     =
+    .
+  data_u-operario = operario.
+  DATA: registro_out   TYPE zswm_read_exidv_str,
+        registro_first TYPE zswm_read_exidv_str.
+  CLEAR: registro_first, registro_out.
+  DATA: BEGIN OF t_lotes OCCURS 0,
+          charg TYPE charg_d,
+          exidv type exidv,   " add jtm 22.06.2022
+*         comentario: inicialmente el número de bulto de la unificación se sacaba del rango de UAS de WM
+*         Como hay diferencias entre este código y lo que viene de OMP
+*             UAS WM 10 digitos 1000000000 a 1999999999
+*             OMP    13 digitos CCCCNNNNNNNNN siendo CCCC el centro
+*         para que bartender pueda reimprimir bien se debe poner todo el stock en un bulto de los ya existentes
+        END   OF t_lotes.
+  CLEAR : t_lotes[].
+  DATA: ctd_total TYPE menge_d.
+  CLEAR ctd_total.
+  DATA tt_bultos TYPE zswm_read_exidv_str_tt.
+  CLEAR tt_bultos[].
+  LOOP AT tt_registros INTO DATA(rt_reg).
+    DATA(sw_tabix) = sy-tabix.
+    PERFORM read_lenum USING rt_reg-lenum tcode data_u '' '' CHANGING registro_out error tt_log.
+    IF error EQ abap_true.
+      EXIT.
+    ENDIF.
+*    ----------------------------------------------------------------------------------------------------------------------------------------------
+*    Correo 12.05.2022 Asunto RE: HINOJOSA: Tema picos
+*    Por aterrizarlo…solo podemos permitir la fusión de picos con el mismo estado: libre, calidad, cliente…
+*    Pues hagamos lo siguiente…el primer pico es el que manda…si es stock libre…solo permitimos seleccionar picos
+*    de libre…en caso de seleccionar picos con estado diferente, lanzamos mensaje de error y que lo trabajen manualmente para cambiar el estado.
+*    ----------------------------------------------------------------------------------------------------------------------------------------------
+
+*   Se podrá unificar stock de libre calidad y bloqueado
+     IF rt_reg-bestq eq 'S'
+     or rt_reg-bestq eq 'Q'.
+      MOVE abap_true TO error.
+*       Ua & con tipo de stock &/&. Imposible unificar pico
+      PERFORM mensaje USING 'E' 'ZSWM_UI5' '111' rt_reg-lenum rt_reg-bestq rt_reg-bestq_txt  space CHANGING tt_log[].
+*    ELSEIF rt_reg-sobkz NE space.
+*      MOVE abap_true TO error.
+**       Ua & con stock de cliente. Imposible unificar pico
+*      PERFORM mensaje USING 'E' 'ZSWM_UI5' '112' rt_reg-lenum space space space CHANGING tt_log[].
+    ELSE.
+      IF sw_tabix EQ 1.
+        registro_first = registro_out.
+      ELSE.
+        IF registro_first-matnr NE registro_out-matnr.
+          DATA: matnr_01 TYPE mara-matnr,
+                matnr_02 TYPE mara-matnr.
+          matnr_01  = |{ registro_first-matnr ALPHA = OUT }|.
+          matnr_02  = |{ registro_out-matnr ALPHA = OUT }|.
+
+          MOVE abap_true TO error.
+*         Imposible unir picos. Registros con materiales distintos &/&
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '105' matnr_01 matnr_02 space space CHANGING tt_log[].
+        ELSEIF registro_first-bestq NE registro_out-bestq.
+          MOVE abap_true TO error.
+*          Imposible unir picos. Registros con status de stock distintos &/&
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '106' registro_first-bestq registro_out-bestq space space CHANGING tt_log[].
+
+        ELSEIF registro_first-sobkz NE registro_out-sobkz.
+          MOVE abap_true TO error.
+*          Imposible unir picos. Reg. con indicador de stock especial distintos &/&
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '107' registro_first-sobkz registro_out-sobkz space space CHANGING tt_log[].
+
+        ELSEIF registro_first-sonum NE registro_out-sonum.
+          MOVE abap_true TO error.
+*          Imposible unir picos. Reg. con Numero de stock especial distintos &/&
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '108' registro_first-sonum registro_out-sonum space space CHANGING tt_log[].
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    IF error EQ abap_true.
+      EXIT.
+    ENDIF.
+    t_lotes-charg = registro_out-charg.
+    t_lotes-exidv = registro_out-lenum. " add jtm 22.06.2022
+    COLLECT t_lotes.
+    ADD registro_out-verme TO ctd_total.
+    APPEND registro_out TO tt_bultos.
+  ENDLOOP.
+  IF nltyp IS INITIAL
+  OR nlpla IS INITIAL.
+    nltyp = registro_out-lgtyp.
+    nlpla = registro_out-lgpla.
+  ENDIF.
+  CHECK error NE abap_true.
+  SELECT SINGLE * INTO @DATA(mlgn) FROM mlgn WHERE matnr EQ @registro_first-matnr
+                                               AND lgnum EQ @data_u-lgnum.
+
+*  IF mlgn-lhmg1 < ctd_total.
+**     Cantidad unión & mayor que paletización material &
+*    MOVE abap_true TO error.
+*    DATA: ctd_uni(12), ctd_tot(12).
+*    WRITE mlgn-lhme1 TO ctd_uni LEFT-JUSTIFIED UNIT registro_out-meins.
+*    WRITE ctd_total  TO ctd_uni LEFT-JUSTIFIED UNIT registro_out-meins.
+*    PERFORM mensaje USING 'E' 'ZSWM_UI5' '109' ctd_uni ctd_tot space space CHANGING tt_log[].
+*  ENDIF.
+  CHECK error NE abap_true.
+  SORT t_lotes. READ TABLE t_lotes INDEX 1.
+
+* cambiar jtm 22.06.2022
+*  DATA exidv TYPE exidv.
+*  CALL FUNCTION 'ZSWM_GET_EXIDV_NUMBER'
+*    EXPORTING
+*      lgnum  = data_u-lgnum
+*    IMPORTING
+*      exidv  = exidv
+*      error  = error
+*      tt_log = tt_log.
+*  IF error NE abap_true.
+    PERFORM cambiar_lotes USING tt_bultos t_lotes-charg data_u-lgnum CHANGING error tt_log.
+    IF error NE abap_true.
+      PERFORM unificar_bultos USING tt_bultos data_u-lgnum nltyp nlpla t_lotes-charg
+*            exidv
+            t_lotes-exidv
+            CHANGING error tt_log.
+    ENDIF.
+*  ENDIF.
+
+  CHECK error NE abap_true.
+  MOVE nltyp TO lgtyp_out.
+  MOVE nlpla TO lgpla_out.
+*  MOVE exidv TO lenum_out.
+  move t_lotes-exidv to lenum_out.
+* add jtm 01.09.2022
+                    CALL FUNCTION 'ZSWM_PRINT_EXIDV'
+                    EXPORTING
+                      tcode    = tcode
+                      uname    = uname
+                      operario = operario
+                      LENUM    = lenum_out
+                      mvttype  = 'A'
+                    IMPORTING
+                      error    = error
+                      tt_log   = tt_log.
+
+* fin de add jtm 01.09.2022
+*  fin de cambiar jtm 22.06.2022
+*  select SINGLE * into @data(mlgn) from mlgn where MATNR eq @registro_first-matnr
+*                                               and lgnum eq @data_u-lgnum.
+
+
+ENDFUNCTION.

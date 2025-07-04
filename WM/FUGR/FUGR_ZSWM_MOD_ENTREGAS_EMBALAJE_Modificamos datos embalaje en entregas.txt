@@ -1,0 +1,156 @@
+FUNCTION zswm_mod_entregas_embalaje.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  CHANGING
+*"     REFERENCE(CT_XLIKP) TYPE  SHP_LIKP_T OPTIONAL
+*"     REFERENCE(CT_XLIPS) TYPE  SHP_LIPS_T OPTIONAL
+*"----------------------------------------------------------------------
+  CALL FUNCTION 'ZSWM_BREAK_USER_EXIT'.
+
+  DATA tt_set TYPE zswm_set_get_values_str_tt.
+  DATA rr_vhilm TYPE zswm_vhilm_ranges_tt.
+  DATA t_emb_alt LIKE zswmvhilm OCCURS 0 WITH HEADER LINE.
+  CALL FUNCTION 'ZSWM_SET_GET_VALUES'
+    EXPORTING
+      shortname = 'ZSWM_PLANCHA'
+*     NO_AUTHORITY_CHECK       = 'X'
+*     LANGU     = SYST-LANGU
+*     TT_FIELDNAME             =
+    IMPORTING
+*     ERROR     =
+*     TT_LOG    =
+      tt_set    = tt_set
+*     RR_WERKS  =
+*     RR_PSTYV  =
+      rr_vhilm  = rr_vhilm.
+
+  LOOP AT ct_xlikp INTO DATA(rt_xlikp) WHERE vbtyp EQ 'J'                " entrega salida
+                                          OR vbtyp EQ '7'                " Entrega entrante
+                                          OR vbtyp EQ 'T'.               " devolución
+
+    CASE rt_xlikp-vbtyp.
+      WHEN 'J'.
+*        add jtm 31.10.2022 busco si la expedición es con embalaje alternativo
+        CLEAR t_emb_alt[].
+        LOOP AT ct_xlips INTO DATA(rt_xlips_conte) WHERE vbeln EQ rt_xlikp-vbeln.
+          CHECK rt_xlips_conte-charg IS NOT INITIAL.
+          SELECT SINGLE * INTO CORRESPONDING FIELDS OF t_emb_alt FROM zswmvhilm WHERE werks EQ rt_xlips_conte-werks
+                                                                                  AND matnr EQ rt_xlips_conte-matnr
+                                                                                  AND charg EQ rt_xlips_conte-charg
+                                                                                  AND lvorm NE abap_true.
+          CHECK sy-subrc EQ 0 AND t_emb_alt-vhilm IS NOT INITIAL.
+          APPEND t_emb_alt.
+        ENDLOOP.
+*        fin de add jtm 31.10.2022
+*        Marcaremos que no se genere movimiento de MCIA
+        LOOP AT ct_xlips INTO DATA(rt_xlips) WHERE vbeln EQ rt_xlikp-vbeln
+                                               AND posnr+0(1) EQ '9'.    " garantizamos que es posicion automatica
+          DATA(sw_tabix) = sy-tabix.
+          READ TABLE tt_set INTO DATA(rt_set) WITH KEY shortname = 'ZSWM_PLANCHA_WERKS'.
+          CHECK sy-subrc EQ 0.
+*            1) Aplica a los centros??
+          LOOP AT rt_set-tt_set_lines_basic INTO DATA(rt_set_lines_basic) WHERE from <= rt_xlips-werks
+                                                                            AND to   >= rt_xlips-werks.
+            EXIT.
+          ENDLOOP.
+          CHECK sy-subrc EQ 0.
+*            2) Aplica al tipo de material de embalaje??
+          SELECT SINGLE vhart INTO @DATA(vhart) FROM mara WHERE matnr EQ @rt_xlips-matnr.
+          CHECK sy-subrc EQ 0.
+          READ TABLE tt_set INTO rt_set WITH KEY shortname = 'ZSWM_PLANCHA_TME_NO_EXP'.
+          CHECK sy-subrc EQ 0.
+          LOOP AT rt_set-tt_set_lines_basic INTO rt_set_lines_basic  WHERE from <= vhart
+                                                                       AND to   >= vhart.
+            EXIT.
+          ENDLOOP.
+          CHECK sy-subrc EQ 0.
+*            3) Aplica al tipo de posición de entrega??
+          READ TABLE tt_set INTO rt_set WITH KEY shortname = 'ZSWM_PLANCHA_POS_NO_EXP'.
+          CHECK sy-subrc EQ 0.
+          LOOP AT rt_set-tt_set_lines_basic INTO rt_set_lines_basic  WHERE from <= rt_xlips-pstyv
+                                                                       AND to   >= rt_xlips-pstyv.
+            EXIT.
+          ENDLOOP.
+          CHECK sy-subrc EQ 0.
+*           Si es embalaje alternativo si se expide su material de embalaje " add jtm 31.10.2022
+          READ TABLE t_emb_alt WITH KEY vhilm = rt_xlips-matnr.
+          CHECK sy-subrc NE 0.
+          rt_xlips-nowab = abap_true.  " no relevante para MOV.MCIA
+          MODIFY ct_xlips FROM rt_xlips INDEX sw_tabix.
+        ENDLOOP.
+      WHEN '7'
+        OR 'T'. " devoluciones
+*        Completaremos el almacén y en caso de material dummy no moveremos stock
+        LOOP AT ct_xlips INTO rt_xlips WHERE vbeln      EQ rt_xlikp-vbeln
+                                         AND posnr+0(1) EQ '9'    . " garantizamos que es posicion automatica
+*                                           AND lgort      IS INITIAL.
+          sw_tabix = sy-tabix.
+          READ TABLE tt_set INTO rt_set WITH KEY shortname = 'ZSWM_PLANCHA_WERKS'.
+          CHECK sy-subrc EQ 0.
+*            1) Aplica a los centros??
+          LOOP AT rt_set-tt_set_lines_basic INTO rt_set_lines_basic WHERE from <= rt_xlips-werks
+                                                                            AND to   >= rt_xlips-werks.
+            EXIT.
+          ENDLOOP.
+          CHECK sy-subrc EQ 0.
+*            2) Aplica al tipo de material de embalaje??
+          SELECT SINGLE vhart INTO vhart FROM mara WHERE matnr EQ rt_xlips-matnr.
+          CHECK sy-subrc EQ 0.
+          READ TABLE tt_set INTO rt_set WITH KEY shortname = 'ZSWM_PLANCHA_TME_NO_EXP'.
+          CHECK sy-subrc EQ 0.
+          LOOP AT rt_set-tt_set_lines_basic INTO rt_set_lines_basic  WHERE from <= vhart
+                                                                       AND to   >= vhart.
+            EXIT.
+          ENDLOOP.
+          CHECK sy-subrc EQ 0.
+*            read TABLE tt_set into rt_set with key shortname = 'ZSWM_PLANCHA_HER_VHILM'.
+*           Para buscar el almacén de destino del PALET
+          IF rt_xlips-lgort IS INITIAL.
+            SELECT SINGLE raube INTO @DATA(raube) FROM mara WHERE matnr EQ @rt_xlips-matnr.
+            CHECK sy-subrc EQ 0.
+            SELECT SINGLE * INTO @DATA(tvkol) FROM tvkol WHERE vstel EQ @rt_xlikp-vstel
+                                                           AND werks EQ @rt_xlips-werks
+                                                           AND raube EQ @raube.
+            IF sy-subrc EQ 0
+              AND tvkol-lgort IS NOT INITIAL.
+              rt_xlips-lgort = tvkol-lgort.
+            ENDIF.
+          ENDIF.
+          IF rt_xlips-matnr IN rr_vhilm.
+            rt_xlips-nowab = abap_true.  " no relevante para MOV.MCIA
+          ENDIF.
+
+          "Centros de Montaje
+          IF rt_xlikp-lfart EQ 'EL' AND rt_xlikp-vstel CP 'CM*'.
+            rt_xlips-nowab = abap_true. " no relevante para MOV.MCIA
+          ENDIF.
+          "Centros de Montaje
+
+          MODIFY ct_xlips FROM rt_xlips INDEX sw_tabix.
+
+        ENDLOOP.
+**          IF rt_xlikp-lfart EQ 'EL'.
+**            LOOP AT ct_xlips INTO rt_xlips WHERE vbeln      EQ rt_xlikp-vbeln.
+**              sw_tabix = sy-tabix.
+**              READ TABLE tt_set INTO rt_set WITH KEY shortname = 'ZSWM_PLANCHA_TME_NO_EXP'.
+**              CHECK sy-subrc EQ 0.
+**              LOOP AT rt_set-tt_set_lines_basic INTO rt_set_lines_basic  WHERE from <= vhart
+**                                                                           AND to   >= vhart.
+**                EXIT.
+**              ENDLOOP.
+**              CHECK sy-subrc EQ 0.
+**              CASE rt_xlips-pstyv.
+**                WHEN 'ELN'. rt_xlips-pstyv = 'ZELN'.
+**                WHEN 'ELP'. rt_xlips-pstyv = 'ZELP'.
+**              ENDCASE.
+**              MODIFY ct_xlips FROM rt_xlips INDEX sw_tabix.
+**            ENDLOOP.
+**          ENDIF.
+    ENDCASE.
+  ENDLOOP.
+
+
+
+
+
+ENDFUNCTION.

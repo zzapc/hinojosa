@@ -1,0 +1,374 @@
+*&---------------------------------------------------------------------*
+*& Report  ZDYN_WS_ROUTTY_EXP_SYNC
+*&
+*&---------------------------------------------------------------------*
+*&  Synchronize data between Routty Express and SAP
+*&  Get output documents
+*&  Send master data and document data updates
+*&---------------------------------------------------------------------*
+REPORT zdyn_ws_routty_exp_sync.
+
+INCLUDE zdyn_ws_routty_exp_sync_top.
+INCLUDE zdyn_ws_routty_sync_sel.
+INCLUDE zdyn_ws_routty_sync_f01.
+NODES: vbrk, kna1.
+
+INITIALIZATION.
+  gc_ta_gen = con_ta_rex_gen.
+  gc_ta_map = con_ta_rex_map.
+  gc_ta_arc = con_ta_rex_arc.
+  gc_ta_ari = con_ta_rex_ari.
+  gc_ta_xmp = con_ta_xmp.
+  gc_ta_xml = con_ta_xml.
+  CREATE OBJECT go_file.
+
+START-OF-SELECTION.
+
+  CLEAR: gt_messages, gc_log_object, gc_log_subobject.
+
+  SELECT SINGLE * FROM zdyn_rex_tgen INTO CORRESPONDING FIELDS OF gst_config
+                  WHERE sysid = sy-sysid
+                    AND id    = pid.
+
+  gst_config-skip_attach_add = prt_satt.
+
+* now dynamic class generation.
+  IF NOT gst_config-clsname IS INITIAL.
+    TRY.
+        CREATE OBJECT go_routty_rest TYPE (gst_config-clsname)
+          EXPORTING
+            ist_config              = gst_config
+            ib_masterdata_to_file   = pmd_file
+            is_masterdata_pathname  = pmd_path
+            ib_masterdata_file_test = pmd_test.
+    ENDTRY.
+  ENDIF.
+  IF go_routty_rest IS NOT BOUND.
+    CREATE OBJECT go_routty_rest
+      EXPORTING
+        ist_config              = gst_config
+        ib_masterdata_to_file   = pmd_file
+        is_masterdata_pathname  = pmd_path
+        ib_masterdata_file_test = pmd_test.
+  ENDIF.
+
+  IF pauth = abap_true OR pmd_file = abap_false AND prf_file = abap_false AND psd_file = abap_false.
+    go_routty_rest->prepare_client( EXCEPTIONS OTHERS = 1 ).
+    IF sy-subrc <> 0.
+      go_routty_rest->log_write( EXPORTING  ic_log_object     = gc_log_object
+                                            ic_log_subobject  = gc_log_subobject
+                                            ic_extnumber      = 'Communication'(com)
+                                            ii_level          = pmsglv
+                                 EXCEPTIONS OTHERS            = 1 ).
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+* Company codes used to select master data
+  IF sel_comp IS NOT INITIAL.
+    go_routty_rest->set_company_codes( it_sel_comp_codes  = sel_comp[] ).
+  ENDIF.
+
+  gb_ok = abap_true.
+  zdyn_lic_cl_checker=>check_license( EXPORTING ic_product       = con_lic_component
+                                      IMPORTING eb_license_valid = gb_ok
+                                      CHANGING  ct_messages      = gt_messages ).
+  IF gb_ok EQ abap_false.
+    gt_msg = go_routty_rest->map_bapiret2_to_bal( gt_messages ).
+
+    go_routty_rest->log_write( EXPORTING  ic_log_object       = gc_log_object
+                                          ic_log_subobject    = gc_log_subobject
+                                          ic_extnumber        = 'Routty License test'(lic)
+                                          it_msg              = gt_msg
+                               EXCEPTIONS OTHERS              = 0 ).
+    RETURN.
+  ENDIF.
+
+* Get the additional dynamic selection criteria
+  PERFORM read_logical_db CHANGING gt_dyn_sel.
+
+********************************************************************************************
+* Connection test
+  IF pauth = abap_true.
+    go_routty_rest->ping_system( ).
+
+    gt_messages_full = zdyn_cl_msg=>get_messages_full( ib_skip_duplicates = abap_false
+                                                       ii_level           = pmsglv ).
+    go_routty_rest->log_write( EXPORTING  ic_log_object     = gc_log_object
+                                          ic_log_subobject  = gc_log_subobject
+                                          ic_extnumber      = 'Routty Connection test'(o01)
+                                          it_msg_full       = gt_messages_full
+                               EXCEPTIONS OTHERS            = 0 ).
+  ENDIF.
+
+********************************************************************************************
+* Master data
+  IF psap = abap_true.
+
+    gb_ok = go_routty_rest->mo_access_protection->set_for_master_data( ic_module = zdyn_if_product_info=>con_module_routty
+                                                                       ic_id     = gst_config-api_key ).
+    IF gb_ok = abap_false.
+      PERFORM lock_msg.
+      RETURN.
+    ENDIF.
+
+    go_routty_rest->set_langu( sel_lang[] ).
+
+********************************************************************************************
+*   Companies
+    IF NOT sel_comp IS INITIAL AND NOT pccode IS INITIAL.
+*     we need to get CompanyGroupId = '0' in case unique vendros or customers are to be used
+      go_routty_rest->set_company( ib_unique_id = punique ).
+      go_routty_rest->add_confirmation_msg( EXPORTING ic_object = 'Companies'(o02) ).
+    ENDIF.
+
+********************************************************************************************
+**   Costcenter
+*    IF NOT pdelkost IS INITIAL OR NOT sel_kost IS INITIAL.
+*      go_routty_rest->set_costcenters( EXPORTING ib_delete     = pdelkost
+*                                                 it_sel_kostl  = sel_kost[] ).
+*      go_routty_rest->add_confirmation_msg( EXPORTING ic_object = 'Cost Center'(o06) ).
+*    ENDIF.
+*
+*********************************************************************************************
+**   Currency
+*    IF NOT pdelcurr IS INITIAL OR NOT sel_curr IS INITIAL.
+*      go_routty_rest->set_currencies( EXPORTING ib_delete     = pdelcurr
+*                                                it_sel_waers  = sel_curr[] ).
+*      go_routty_rest->add_confirmation_msg( EXPORTING ic_object = 'Currency'(o03) ).
+*    ENDIF.
+*
+********************************************************************************************
+*   Customers
+    IF NOT pdelcust IS INITIAL OR NOT sel_cust IS INITIAL.
+      go_routty_rest->set_customers( EXPORTING ib_delete     = pdelcust
+                                               it_sel_kunnr  = sel_cust[]
+                                               it_dyn_sel    = gt_dyn_sel
+                                               id_date       = pchdatc
+                                               ib_bankdata   = pbanksc
+                                               ib_unique_id  = punique ).
+      go_routty_rest->add_confirmation_msg( EXPORTING ic_object = 'Customer'(o14) ).
+    ENDIF.
+
+********************************************************************************************
+**   Payment Terms
+*    IF NOT sel_pt IS INITIAL.
+*      go_routty_rest->set_paymentterms( EXPORTING ib_delete     = pdelpt
+*                                                  it_sel_zterm  = sel_pt[] ).
+*      go_routty_rest->add_confirmation_msg( EXPORTING ic_object    = 'Payment Terms'(o04) ).
+*    ENDIF.
+*
+*********************************************************************************************
+**   Tax Codes
+*    IF NOT sel_tax IS INITIAL.
+*      go_routty_rest->set_vatcodes( EXPORTING ib_delete     = pdeltax
+*                                              it_sel_mwskz  = sel_tax[] ).
+*      go_routty_rest->add_confirmation_msg( EXPORTING ic_object = 'Tax codes'(o05) ).
+*    ENDIF.
+*
+*********************************************************************************************
+**   GL Accounts
+*    IF NOT pdelsak IS INITIAL OR NOT sel_sak IS INITIAL.
+*      go_routty_rest->set_glaccounts( EXPORTING ib_delete     = pdelsak
+*                                                it_sel_saknr  = sel_sak[] ).
+*      go_routty_rest->add_confirmation_msg( EXPORTING ic_object = 'G/L Accounts'(o07) ).
+*    ENDIF.
+*
+*********************************************************************************************
+**   Projects (WBS elements)
+*    IF NOT pdimp IS INITIAL AND NOT sel_psp IS INITIAL.
+*      go_routty_rest->set_wbs_elements( EXPORTING it_sel_opt     = sel_psp[]
+*                                                  ic_dimension   = pdimp
+*                                                  ib_delete      = pdelpsp
+*                                                  id_change_date = pchdatp ).
+*      go_routty_rest->add_confirmation_msg( EXPORTING ic_object = 'Project (WBS element)'(o08) ).
+*    ENDIF.
+*
+*********************************************************************************************
+**   Order (internal)
+*    IF NOT pdima IS INITIAL AND NOT sel_auf IS INITIAL.
+*      go_routty_rest->set_orders( EXPORTING it_sel_opt     = sel_auf[]
+*                                            ic_dimension   = pdima
+*                                            ib_delete      = pdelauf
+*                                            id_change_date = pchdata ).
+*      go_routty_rest->add_confirmation_msg( EXPORTING ic_object = 'Order'(o09) ).
+*    ENDIF.
+*
+********************************************************************************************
+*   Suppliers
+    IF NOT pdellief IS INITIAL OR NOT sel_lief IS INITIAL.
+      go_routty_rest->set_suppliers( EXPORTING ib_delete        = pdellief
+                                               it_sel_lifnr     = sel_lief[]
+                                               it_dyn_sel       = gt_dyn_sel
+                                               id_date          = pchdatl
+                                               ib_bankdata      = pbanks
+*                                               ib_bankdata_del  = pdelbank
+                                               ib_unique_id     = punique ).
+      go_routty_rest->add_confirmation_msg( EXPORTING ic_object = 'Supplier (Vendor)'(o10) ).
+    ENDIF.
+
+********************************************************************************************
+**   Purchase Orders
+*    IF NOT selerdat IS INITIAL OR
+*       NOT sel_po IS INITIAL OR
+*       NOT pchdat IS INITIAL.
+*      CLEAR gt_ebeln.
+*      zdyn_cl_bapi=>mo->get_po_list( EXPORTING it_sel_po          = sel_po[]
+*                                               ic_comp_code       = pbukrs
+*                                               it_sel_create_date = selerdat[]
+*                                               id_change_date     = pchdat
+*                                     IMPORTING et_po_list         = gt_ebeln ).
+*      IF NOT gt_ebeln IS INITIAL.
+*        go_routty_rest->set_purchase_orders( EXPORTING ib_delete   = pdelpo
+*                                                       ib_gm       = pgm
+*                                                       it_ebeln    = gt_ebeln ).
+*        go_routty_rest->add_confirmation_msg( EXPORTING ic_object = 'Purchase Orders'(o11) ).
+*      ENDIF.
+*    ENDIF.
+
+********************************************************************************************
+*   Messages at the end of master data processing
+    gt_messages_full = zdyn_cl_msg=>get_messages_full( ib_skip_duplicates = abap_false
+                                                       ii_level           = pmsglv ).
+    IF NOT gt_messages_full IS INITIAL.
+      IF papplg = abap_true.
+        gc_log_object    = con_log_object.
+        gc_log_subobject = con_log_subobject_master.
+      ENDIF.
+      go_routty_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+                                            ic_log_subobject = gc_log_subobject
+                                            ic_extnumber     = 'Routty master data'(o12)
+                                            it_msg_full      = gt_messages_full
+                                 EXCEPTIONS OTHERS           = 1 ).
+    ENDIF.
+
+  ENDIF. " end of master data processing
+
+********************************************************************************************
+* Output documents (Invoices)
+  IF prso = abap_true.
+
+    gb_ok = go_routty_rest->mo_access_protection->set_for_doc_receive( ic_module = zdyn_if_product_info=>con_module_routty
+                                                                       ic_id     = gst_config-api_key ).
+    IF gb_ok = abap_false.
+      PERFORM lock_msg.
+      RETURN.
+    ENDIF.
+
+*   If the 'read from' file is selected, the data will be taken from that file and transferred to SAP.
+*   If the 'receive to' file is selected, the data will be received from RSO and stored in the local machine.
+    go_routty_rest->mo_file->set_doc_file_params( EXPORTING ib_doc_to_file  = prt_file
+                                                            is_doc_pathname = prt_path
+                                                            ib_file_to_doc  = prf_file
+                                                            is_doc_filename = prf_fnam ).
+    go_routty_rest->inbound_process( ic_xslt          = gst_config-xslt
+                                     ib_skip_feedback = prt_fdbk ).
+
+    gt_messages_full = zdyn_cl_msg=>get_messages_full( ib_skip_duplicates = abap_false
+                                                       ii_level           = pmsglv ).
+    IF NOT gt_messages_full IS INITIAL.
+      IF papplg = abap_true.
+        gc_log_object    = con_log_object.
+        gc_log_subobject = con_log_subobject_document.
+      ENDIF.
+      go_routty_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+                                            ic_log_subobject = gc_log_subobject
+                                            ic_extnumber     = 'Routty output documents'(o15)
+                                            it_msg_full      = gt_messages_full
+                                 EXCEPTIONS OTHERS           = 0 ).
+    ENDIF.
+  ENDIF.
+
+********************************************************************************************
+* Send documents (sales invoices)
+  IF psnd = abap_true.
+
+    gb_ok = go_routty_rest->mo_access_protection->set_for_doc_send( ic_module = zdyn_if_product_info=>con_module_routty
+                                                                    ic_id     = gst_config-api_key ).
+    IF gb_ok = abap_false.
+      PERFORM lock_msg.
+      RETURN.
+    ENDIF.
+
+    go_routty_rest->mo_file->set_doc_file_params( EXPORTING ib_doc_to_file  = psd_file
+                                                            is_doc_pathname = psd_path ).
+    go_routty_rest->set_parallel_processing( exporting ib_active        = psd_para
+                                                       ic_server_group  = psd_grp
+                                                       ii_max_processes = psd_proc
+                                                       ii_packge_size   = psd_pack ).
+    go_routty_rest->set_input_documents( it_sel_sales_doc   = sdl_vbel[]
+                                         it_sel_doc_type    = sdl_fkar[]
+                                         it_sel_comp_code   = sdl_comp[]
+                                         it_sel_customer    = sdl_cust[]
+                                         it_sel_application = sdl_kapp[]
+                                         it_sel_msg_type    = sdl_ksch[]
+                                         it_dyn_sel         = gt_dyn_sel
+                                         ib_require_attach  = psd_rat
+                                         it_sel_create_date = sdl_date[]
+                                         ib_generate_pdf    = psd_pdf
+                                         ib_add_attachments = psd_att
+                                         ib_use_register    = psd_reg ).
+
+    gt_messages_full = zdyn_cl_msg=>get_messages_full( ib_skip_duplicates = abap_false
+                                                       ii_level           = pmsglv ).
+    IF NOT gt_messages_full IS INITIAL.
+      IF papplg = abap_true.
+        gc_log_object    = con_log_object.
+        gc_log_subobject = con_log_subobject_document.
+      ENDIF.
+      go_routty_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+                                            ic_log_subobject = gc_log_subobject
+                                            ic_extnumber     = 'Routty output documents'(o15)
+                                            it_msg_full      = gt_messages_full
+                                 EXCEPTIONS OTHERS           = 0 ).
+    ENDIF.
+  ENDIF.
+
+********************************************************************************************
+* Send AP documents
+  IF psnp = abap_true.
+
+    gb_ok = go_routty_rest->mo_access_protection->set_for_doc_send_ap( ic_module = zdyn_if_product_info=>con_module_routty
+                                                                       ic_id     = gst_config-api_key ).
+    IF gb_ok = abap_false.
+      PERFORM lock_msg.
+      RETURN.
+    ENDIF.
+
+    go_routty_rest->mo_file->set_doc_file_params( EXPORTING ib_doc_to_file  = psp_file
+                                                            is_doc_pathname = psp_path ).
+    go_routty_rest->set_input_documents_ap( it_sel_comp_code    = spl_comp[]
+                                            it_sel_doc_num      = spl_beln[]
+                                            it_sel_fiscal_year  = spl_gjar[]
+                                            it_sel_doc_type     = spl_blar[]
+                                            it_sel_ref_num      = spl_xbln[]
+                                            it_sel_ent_date     = spl_cpud[]
+                                            is_land             = psp_lan
+                                            is_tax_num          = psp_tax
+                                            ip_round            = psp_rnd
+                                            ib_normal           = psp_nor
+                                            ib_corr             = psp_cor
+                                            ib_final            = psp_fin
+                                            ib_flip_sign        = psp_sig ).
+*                                            ib_use_register     = psp_reg ).
+
+    gt_messages_full = zdyn_cl_msg=>get_messages_full( ib_skip_duplicates = abap_false
+                                                       ii_level           = pmsglv ).
+    IF NOT gt_messages_full IS INITIAL.
+      IF papplg = abap_true.
+        gc_log_object    = con_log_object.
+        gc_log_subobject = con_log_subobject_document.
+      ENDIF.
+      go_routty_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+                                            ic_log_subobject = gc_log_subobject
+                                            ic_extnumber     = 'Routty output AP documents'(o16)
+                                            it_msg_full      = gt_messages_full
+                                 EXCEPTIONS OTHERS           = 0 ).
+    ENDIF.
+  ENDIF.
+
+*********************************************************************************************
+
+  go_routty_rest->mo_access_protection->unset( ).
+
+*********************************************************************************************

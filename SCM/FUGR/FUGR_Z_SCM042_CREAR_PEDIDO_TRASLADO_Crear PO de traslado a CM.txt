@@ -1,0 +1,214 @@
+FUNCTION z_scm042_crear_pedido_traslado.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_KUNNR_CM) TYPE  KUNNR
+*"     VALUE(I_VKORG) TYPE  VKORG
+*"     VALUE(IS_HEADER) TYPE  BAPIMEPOHEADER OPTIONAL
+*"     VALUE(IT_ITEM) TYPE  BAPIMEPOITEM_TP
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_TT
+*"     VALUE(E_EBELN) TYPE  EBELN
+*"----------------------------------------------------------------------
+* JGM 02.2024 GAPCM042 Aplicativo Gestión de Desvíos:
+* Crear pedido de traslado (PO) a partir de datos del CM
+* y de datos de la entrega de venta original (items).
+*--------------------------------------------------------------------*
+  CONSTANTS:
+    lc_bsart TYPE ekko-bsart VALUE 'ZPT4',
+    lc_ekgrp TYPE ekko-ekgrp VALUE '205',
+    lc_waers TYPE ekko-waers VALUE 'EUR'.
+
+  DATA: lv_lgort_cm TYPE lgort_d,
+        lv_werks_cm TYPE werks_d,
+        lv_posnr    TYPE bapimepoitem-po_item,
+        lv_ebeln    TYPE bapimepoheader-po_number.
+
+  DATA: ls_poheader    TYPE bapimepoheader,
+        ls_poheaderx   TYPE bapimepoheaderx,
+        ls_poitem      TYPE bapimepoitem,
+        ls_poitemx     TYPE bapimepoitemx,
+        ls_poschedule  TYPE bapimeposchedule,
+        ls_poschedulex TYPE bapimeposchedulx.
+
+  DATA: lt_poitem      TYPE TABLE OF bapimepoitem,
+        lt_poitemx     TYPE TABLE OF bapimepoitemx,
+        lt_poschedule  TYPE TABLE OF bapimeposchedule,
+        lt_poschedulex TYPE TABLE OF bapimeposchedulx,
+        lt_return      TYPE bapiret2_tt.
+
+  DATA: lr_type_error TYPE RANGE OF bapi_mtype.
+
+
+  lr_type_error = VALUE #( sign = 'I' option = 'EQ' ( low = 'E' ) ( low = 'A' ) ).
+
+  "Almacén y Centro del CM.
+  CALL FUNCTION 'Z_SCM042_CLIENTE_CM'
+    EXPORTING
+      i_kunnr = i_kunnr_cm
+      i_vkorg = i_vkorg
+    IMPORTING
+      e_lgort = lv_lgort_cm
+      e_werks = lv_werks_cm.
+
+  IF lv_lgort_cm IS NOT INITIAL AND lv_werks_cm IS NOT INITIAL.
+
+    SELECT SINGLE lifnr, ekorg
+      FROM t001w
+      WHERE werks EQ @lv_werks_cm
+      INTO ( @DATA(lv_lifnr), @DATA(lv_ekorg) ).
+
+    SELECT SINGLE bukrs
+      INTO @DATA(lv_bukrs)
+      FROM tvko
+      WHERE vkorg EQ @i_vkorg.
+
+    CLEAR: ls_poheader,
+           ls_poheaderx.
+
+    "Cabecera:
+    IF is_header-doc_type IS INITIAL.
+      ls_poheader-doc_type = lc_bsart.
+    ELSE.
+      ls_poheader-doc_type = is_header-doc_type.
+    ENDIF.
+
+    IF is_header-pur_group IS INITIAL.
+      ls_poheader-pur_group = lc_ekgrp.
+    ELSE.
+      ls_poheader-pur_group = is_header-pur_group.
+    ENDIF.
+
+    IF is_header-suppl_plnt IS INITIAL.
+      ls_poheader-suppl_plnt = lv_werks_cm.
+    ELSE.
+      ls_poheader-suppl_plnt = is_header-suppl_plnt.
+    ENDIF.
+
+    IF is_header-vendor IS INITIAL.
+      ls_poheader-vendor = lv_lifnr.
+    ELSE.
+      ls_poheader-vendor = is_header-vendor.
+    ENDIF.
+
+    IF is_header-purch_org IS INITIAL.
+      ls_poheader-purch_org = lv_ekorg.
+    ELSE.
+      ls_poheader-purch_org = is_header-purch_org.
+    ENDIF.
+
+    IF is_header-comp_code IS INITIAL.
+      ls_poheader-comp_code = lv_bukrs.
+    ELSE.
+      ls_poheader-comp_code = is_header-comp_code.
+    ENDIF.
+
+    IF is_header-currency IS INITIAL.
+      ls_poheader-currency = lc_waers.
+    ELSE.
+      ls_poheader-currency = is_header-currency.
+    ENDIF.
+
+    IF is_header-doc_date IS INITIAL.
+      ls_poheader-doc_date = sy-datum.
+    ELSE.
+      ls_poheader-doc_date = is_header-doc_date.
+    ENDIF.
+
+    IF is_header-created_by IS INITIAL.
+      ls_poheader-created_by = sy-uname.
+    ELSE.
+      ls_poheader-created_by = is_header-created_by.
+    ENDIF.
+
+    ls_poheaderx-doc_type   = 'X'.
+    ls_poheaderx-pur_group  = 'X'.
+    ls_poheaderx-suppl_plnt = 'X'.
+    ls_poheaderx-vendor     = 'X'.
+    ls_poheaderx-purch_org  = 'X'.
+    ls_poheaderx-comp_code  = 'X'.
+    ls_poheaderx-currency   = 'X'.
+    ls_poheaderx-doc_date   = 'X'.
+    ls_poheaderx-created_by = 'X'.
+
+    "Posiciones:
+    CLEAR lv_posnr.
+    LOOP AT it_item INTO DATA(ls_item).
+      ADD 10 TO lv_posnr.
+
+      ls_poitem-po_item  = lv_posnr.
+      ls_poitem-material = ls_item-material.  "matnr
+      ls_poitem-quantity = ls_item-quantity.  "menge
+      ls_poitem-po_unit  = ls_item-po_unit.   "meins
+      ls_poitem-plant    = ls_item-plant.     "werks
+*      ls_poitem-batch    = ls_item-batch.     "charg -NO se pasa lote.
+      ls_poitem-stge_loc = lv_lgort_cm.       "lgort del CM.
+      ls_poitem-suppl_stloc = ls_item-suppl_stloc.  "reslo ->lgort entrega.
+
+      APPEND ls_poitem TO lt_poitem.
+      CLEAR ls_poitem.
+
+      ls_poitemx-po_item  = lv_posnr.
+      ls_poitemx-material = 'X'.
+      ls_poitemx-quantity = 'X'.
+      ls_poitemx-po_unit  = 'X'.
+      ls_poitemx-plant    = 'X'.
+*      ls_poitemx-batch    = 'X'. "NO.
+      ls_poitemx-stge_loc = 'X'.
+      ls_poitemx-suppl_stloc = 'X'.
+
+      APPEND ls_poitemx TO lt_poitemx.
+      CLEAR ls_poitemx.
+
+      "Repartos:
+      ls_poschedule-po_item = lv_posnr.
+      ls_poschedule-delivery_date = sy-datum.
+
+      APPEND ls_poschedule TO lt_poschedule.
+      CLEAR ls_poschedule.
+
+      ls_poschedulex-po_item = lv_posnr.
+      ls_poschedulex-delivery_date = 'X'.
+
+      APPEND ls_poschedulex TO lt_poschedulex.
+      CLEAR ls_poschedulex.
+    ENDLOOP.
+
+    CALL FUNCTION 'BAPI_PO_CREATE1'
+      EXPORTING
+        poheader         = ls_poheader
+        poheaderx        = ls_poheaderx
+      IMPORTING
+        exppurchaseorder = lv_ebeln
+      TABLES
+        return           = lt_return
+        poitem           = lt_poitem
+        poitemx          = lt_poitemx
+        poschedule       = lt_poschedule
+        poschedulex      = lt_poschedulex.
+
+    LOOP AT lt_return TRANSPORTING NO FIELDS WHERE type IN lr_type_error.
+      EXIT.
+    ENDLOOP.
+    IF sy-subrc EQ 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+
+      e_ebeln = lv_ebeln.
+
+      "Mensaje creación PO.
+      et_return = VALUE #( FOR wa_ret IN lt_return WHERE ( type EQ 'S' AND id EQ '06' AND number EQ '017')
+                         ( CORRESPONDING #( wa_ret ) ) ).
+    ENDIF.
+
+    "Mensajes de error de la bapi.
+    DELETE lt_return WHERE type NOT IN lr_type_error.
+    APPEND LINES OF lt_return TO et_return.
+  ELSE.
+    "error no es CM?
+  ENDIF.
+
+ENDFUNCTION.

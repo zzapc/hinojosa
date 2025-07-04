@@ -1,0 +1,449 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZSSD_ICOC_STOCK_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  GET_DATA
+*&---------------------------------------------------------------------*
+FORM get_data .
+
+  "BUKRS VKORG VTWEG SPART KUNNR WERKS LGORT MATNR LABST MEINS
+  DATA: t_data_aux TYPE TABLE OF zareaventas_stock.
+
+*  SELECT f~bukrs, a~vkorg, a~vtweg, a~spart, a~kunnr, b~werks, b~lgort, a~matnr, c~meins, b~labst
+*    INTO TABLE @DATA(t_kotg933)
+*    FROM kotg933 AS a
+*      INNER JOIN mard AS b ON a~matnr = b~matnr
+*      INNER JOIN mara AS c ON b~matnr = c~matnr
+*      INNER JOIN t001w AS e ON b~werks = e~werks
+*      INNER JOIN t001k AS f ON e~bwkey = f~bwkey
+*    WHERE a~datbi >= @sy-datum AND a~datab <= @sy-datum
+*      AND a~vkorg IN @s_vkorg
+*      AND a~vtweg IN @s_vtweg
+*      AND a~spart IN @s_spart
+*      AND a~kunnr IN @s_kunnr.
+
+  SELECT f~bukrs, a~vkorg, a~vtweg, a~spart, a~kunnr, b~werks, b~lgort, a~matnr, c~meins, SUM( b~gesme ) AS labst
+      INTO TABLE @DATA(t_kotg933)
+      FROM kotg933 AS a
+        INNER JOIN lqua AS b ON a~matnr = b~matnr
+        INNER JOIN mara AS c ON b~matnr = c~matnr
+        INNER JOIN t001w AS e ON b~werks = e~werks
+        INNER JOIN t001k AS f ON e~bwkey = f~bwkey
+      WHERE a~datbi >= @sy-datum AND a~datab <= @sy-datum
+        AND a~vkorg IN @s_vkorg
+        AND a~vtweg IN @s_vtweg
+        AND a~spart IN @s_spart
+        AND a~kunnr IN @s_kunnr
+        AND a~matnr IN @s_matnr
+    GROUP BY f~bukrs, a~vkorg, a~vtweg, a~spart, a~kunnr, b~werks, b~lgort, a~matnr, c~meins.
+
+
+  " SMT - INI - 02.05.2023 12:11:11 - Buscamos stock en consigna
+
+  IF t_kotg933 IS NOT INITIAL.
+
+    SELECT * INTO TABLE @DATA(t_knvp) FROM knvp AS a INNER JOIN msku AS b ON a~kunn2 = b~kunnr FOR ALL ENTRIES IN @t_kotg933 WHERE a~kunnr = @t_kotg933-kunnr AND parvw = 'WE' AND b~sobkz = 'W'.
+
+
+  ENDIF.
+
+  gt_data = CORRESPONDING #( t_kotg933 ).
+
+
+  LOOP AT t_knvp INTO DATA(l_knvp).
+    READ TABLE gt_data ASSIGNING FIELD-SYMBOL(<data>) WITH KEY kunnr = l_knvp-a-kunnr matnr = l_knvp-b-matnr lgort = space.
+    IF sy-subrc = 0.
+      <data>-labst = <data>-labst + l_knvp-b-kulab.
+    ELSE.
+      READ TABLE gt_data INTO DATA(l_pos_copia) WITH KEY kunnr = l_knvp-a-kunnr matnr = l_knvp-b-matnr.
+      IF sy-subrc = 0.
+        l_pos_copia-labst = l_pos_copia-labst + l_knvp-b-kulab.
+        l_pos_copia-lgort = ''.
+        APPEND l_pos_copia TO gt_data.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  " SMT - FIN - 02.05.2023 12:11:26 -  Buscamos stock en consigna
+
+  " SMT - INI - 02.05.2023 12:08:44 - sOLO STOCK POR CLIENTE
+*  SELECT f~bukrs, a~vkorg, a~vtweg, a~spart, d~kunnr, b~werks, b~lgort, a~matnr, c~meins, b~labst
+*    INTO TABLE @DATA(t_kotg934)
+*    FROM kotg934 AS a
+*      INNER JOIN mard AS b ON a~matnr = b~matnr
+*      INNER JOIN mara AS c ON b~matnr = c~matnr
+*      INNER JOIN knvp AS d ON a~kunwe = d~kunn2
+*      INNER JOIN t001w AS e ON b~werks = e~werks
+*      INNER JOIN t001k AS f ON e~bwkey = f~bwkey
+*    WHERE a~datbi >= @sy-datum AND a~datab <= @sy-datum
+*      AND a~vkorg IN @s_vkorg
+*      AND a~vtweg IN @s_vtweg
+*      AND a~spart IN @s_spart
+*      AND d~kunnr IN @s_kunnr
+*      AND d~kunn2 IN @s_kunwe
+*      AND d~parvw = 'WE'.
+
+  " SMT - FIN - 02.05.2023 12:08:54 - sOLO STOCK POR CLIENTE
+
+
+*  t_data_aux = CORRESPONDING #( t_kotg934 ).
+
+  LOOP AT gt_data INTO DATA(l_pos) WHERE labst = 0.
+
+    DATA(l_tabix) = sy-tabix.
+
+    DATA(l_datum) = sy-datum.
+
+    l_datum = l_datum - 1.
+
+    SELECT SINGLE COUNT( * ) FROM mseg WHERE kunnr = l_pos-kunnr AND matnr = l_pos-matnr AND budat_mkpf = l_datum AND shkzg = 'H'..
+    IF sy-subrc <> 0.
+      DELETE gt_data INDEX l_tabix.
+      CONTINUE.
+    ENDIF.
+
+
+  ENDLOOP.
+
+
+  APPEND LINES OF t_data_aux TO gt_data.
+
+
+*  DELETE gt_data WHERE labst = 0.
+
+  SORT gt_data BY bukrs vkorg vtweg spart kunnr werks lgort matnr labst meins.
+
+  DELETE ADJACENT DUPLICATES FROM gt_data COMPARING ALL FIELDS.
+
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS
+*&---------------------------------------------------------------------*
+FORM process .
+
+  CONSTANTS: c_edi_extern   TYPE edi_rcvpor VALUE 'SALESFORCE', "ZHPP_01',
+             c_rcvprn       TYPE edi_rcvprn VALUE 'SALESFORCE', "'ZHPPCLNT100',
+             c_ls_d         TYPE edi_rcvprt VALUE 'LS',
+             c_ls_r         TYPE edi_sndprt VALUE 'LS',
+             c_zmsg         TYPE edi_mestyp VALUE 'ZSTOCK_P01',
+             c_zstpm_orders TYPE edi_idoctp VALUE 'ZSTOCK_P01',
+             c_zstock       TYPE segname VALUE 'ZAREAVENTAS_STOCK'.
+
+  DATA: ls_idoc_header       TYPE edidc,
+        lt_idoc_comm_control TYPE TABLE OF edidc,
+        ls_idoc_comm_control TYPE edidc,
+        lt_return            TYPE bapiret2_t,
+        ls_return            TYPE bapiret2,
+        ls_return1           TYPE bapiret1,
+        t_edidd              TYPE edidd_tt,
+        t_edidd_aux          TYPE edidd_tt.
+
+  DATA: l_edidd   TYPE edidd,
+        seg_stock TYPE zareaventas_stock,
+        p_gt_data TYPE TABLE OF zareaventas_stock.
+
+  DATA lv_auxlevel TYPE edi_segnum.
+
+  IF sy-batch = 'X'.
+
+    p_gt_data = gt_data.
+
+  ELSE.
+
+    PERFORM filas_seleccionadas USING alv
+                              CHANGING p_gt_data.
+  ENDIF.
+
+  l_edidd-segnam = c_zstock.
+
+  lv_auxlevel = 0.
+
+
+  LOOP AT p_gt_data INTO DATA(l_data).
+
+    lv_auxlevel = lv_auxlevel + 1.
+
+    seg_stock = CORRESPONDING #( l_data ).
+
+    seg_stock-labst = trunc( l_data-labst ).
+
+    seg_stock-labst = condense( seg_stock-labst ).
+
+    CALL FUNCTION 'CONVERSION_EXIT_CUNIT_OUTPUT'
+      EXPORTING
+        input          = seg_stock-meins
+*       language       = SY-LANGU
+      IMPORTING
+*       long_text      =
+        output         = seg_stock-meins
+*       short_text     =
+      EXCEPTIONS
+        unit_not_found = 1
+        OTHERS         = 2.
+    IF sy-subrc <> 0.
+*     MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    l_edidd-sdata = seg_stock.
+    l_edidd-segnum = lv_auxlevel.
+    APPEND l_edidd TO t_edidd.
+
+  ENDLOOP.
+
+  ls_idoc_header-mandt  = sy-mandt.
+  ls_idoc_header-direct = '1'.
+  ls_idoc_header-rcvpor = c_edi_extern.
+  ls_idoc_header-rcvprt = c_ls_d.
+  ls_idoc_header-rcvprn = c_rcvprn.
+  ls_idoc_header-sndprt = c_ls_r.
+  ls_idoc_header-sndprn = sy-uname.
+  ls_idoc_header-mestyp = c_zmsg.
+  ls_idoc_header-idoctp = c_zstpm_orders.
+
+  SORT t_edidd BY segnum ASCENDING.
+
+
+  CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE' "IN UPDATE TASK
+    EXPORTING
+      master_idoc_control            = ls_idoc_header
+    TABLES
+      communication_idoc_control     = lt_idoc_comm_control
+      master_idoc_data               = t_edidd
+    EXCEPTIONS
+      error_in_idoc_control          = 1
+      error_writing_idoc_status      = 2
+      error_in_idoc_data             = 3
+      sending_logical_system_unknown = 4
+      OTHERS                         = 5.
+  IF sy-subrc <> 0.
+    "KO
+    ls_return-type        = sy-msgty.
+    ls_return-number      = sy-msgno.
+    ls_return-id          = sy-msgid.
+    ls_return-message_v1  = sy-msgv1.
+    ls_return-message_v2  = sy-msgv2.
+    ls_return-message_v3  = sy-msgv3.
+    ls_return-message_v4  = sy-msgv4.
+    APPEND ls_return TO lt_return.
+  ELSE.
+    "OK
+    READ TABLE lt_idoc_comm_control INTO DATA(ls_control_record_out) INDEX 1.
+    CHECK sy-subrc = 0.
+    DATA(docnum) = ls_control_record_out-docnum.
+    ls_return-type        = 'S'.
+    ls_return-number      = '398'.
+    ls_return-id          = '00'.
+    ls_return-message_v1  = docnum.
+    APPEND ls_return TO lt_return.
+
+    IF sy-batch IS INITIAL.
+
+      MESSAGE s398(00) WITH 'IDOC creado correctamente'.
+    ENDIF.
+
+  ENDIF.
+
+* Hacemos un COMMIT para el Idoc
+*  CALL FUNCTION 'DEQUEUE_ALL'.
+*  COMMIT WORK AND WAIT.
+  CALL FUNCTION 'DB_COMMIT'.
+  CALL FUNCTION 'DEQUEUE_ALL'.
+  COMMIT WORK AND WAIT.
+
+
+
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form LOAD_DATA_INTO_GRID
+*&---------------------------------------------------------------------*
+*& text
+*&---------------------------------------------------------------------*
+*      -->P_GT_OUTPUT  text
+*      -->P_CONTAINER  text
+*      -->P_       text
+*      -->P_VARIANT  text
+*      -->P_       text
+*      <--P_ALV  text
+*      <--P_LAYOUT  text
+*      <--P_FIELDCAT  text
+*      <--P_EXCLUDIN  text
+*&---------------------------------------------------------------------*
+FORM load_data_into_grid TABLES tabla       TYPE STANDARD TABLE
+                         USING contenedor  TYPE REF TO cl_gui_custom_container
+                               nombre_cont TYPE        scrfname
+                               variant     LIKE        disvariant
+                               estruc      LIKE        dd02l-tabname
+                     CHANGING  alv         TYPE REF TO cl_gui_alv_grid
+                               layout      TYPE        lvc_s_layo
+                               it_fieldcat TYPE        lvc_t_fcat
+                               excludin    TYPE        ui_functions.
+
+  IF alv IS INITIAL.
+    IF cl_gui_alv_grid=>offline( ) IS INITIAL.
+
+      "CREATE OBJECT eventos.
+
+      CREATE OBJECT contenedor
+        EXPORTING
+          container_name = nombre_cont
+        EXCEPTIONS
+          OTHERS         = 1.
+
+      CREATE OBJECT alv
+        EXPORTING
+          i_parent = contenedor
+        EXCEPTIONS
+          OTHERS   = 1.
+
+      CALL METHOD alv->register_edit_event
+        EXPORTING
+          i_event_id = cl_gui_alv_grid=>mc_evt_modified
+        EXCEPTIONS
+          error      = 1
+          OTHERS     = 2.
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                   WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      ENDIF.
+
+    ELSE.
+
+*      CREATE OBJECT alv
+*        EXPORTING
+*          i_parent = or_doc.
+
+    ENDIF.
+
+    PERFORM preparefieldcatalog USING    estruc
+                                CHANGING it_fieldcat.
+
+    PERFORM preparelayout       CHANGING layout.
+    PERFORM rellenar_toolbar    CHANGING excludin.
+
+
+    CALL METHOD alv->register_edit_event
+      EXPORTING
+        i_event_id = cl_gui_alv_grid=>mc_evt_modified.
+
+    CALL METHOD alv->set_table_for_first_display
+      EXPORTING
+        is_variant           = variant
+        i_save               = 'A'
+        is_layout            = layout
+        it_toolbar_excluding = excludin
+      CHANGING
+        it_outtab            = tabla[]
+        it_fieldcatalog      = it_fieldcat
+      EXCEPTIONS
+        OTHERS               = 1.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                 WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ELSE.
+
+    CALL METHOD alv->refresh_table_display
+      EXPORTING
+        is_stable = gs_stable.
+  ENDIF.
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form PREPAREFIELDCATALOG
+*&---------------------------------------------------------------------*
+FORM preparefieldcatalog USING    estruc       LIKE dd02l-tabname
+                         CHANGING it_fieldcat1 TYPE lvc_t_fcat.
+
+  DATA: l_fieldcat TYPE LINE OF lvc_t_fcat.
+
+  REFRESH it_fieldcat1.
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_buffer_active        = 'X'
+      i_structure_name       = estruc
+      i_bypassing_buffer     = 'X'
+    CHANGING
+      ct_fieldcat            = it_fieldcat1[]
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+  LOOP AT it_fieldcat1 INTO l_fieldcat.
+    CASE l_fieldcat-fieldname.
+      WHEN 'BUKRS'.
+        l_fieldcat-coltext = 'Sociedad'.
+      WHEN 'VKORG'.
+        l_fieldcat-coltext = 'Org. Ventas'.
+      WHEN 'VTWEG'.
+        l_fieldcat-coltext = 'Canal Dist.'.
+      WHEN 'SPART'.
+        l_fieldcat-coltext = 'Sector'.
+      WHEN 'KUNNR'.
+        l_fieldcat-coltext = 'Cliente'.
+      WHEN 'WERKS'.
+        l_fieldcat-coltext = 'Centro'.
+      WHEN 'LGORT'.
+        l_fieldcat-coltext = 'Almacén'.
+      WHEN 'MATNR'.
+        l_fieldcat-coltext = 'Material'.
+      WHEN 'LABST'.
+        l_fieldcat-coltext = 'Stock Libre'.
+      WHEN 'MEINS'.
+        l_fieldcat-coltext = 'UMB'.
+      WHEN OTHERS.
+    ENDCASE.
+    MODIFY it_fieldcat1 FROM l_fieldcat.
+  ENDLOOP.
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*& Form PREPARELAYOUT
+*&---------------------------------------------------------------------*
+FORM preparelayout CHANGING cwa_layout TYPE lvc_s_layo.
+
+  cwa_layout-zebra      = 'X'.
+  cwa_layout-cwidth_opt = 'X'.
+  cwa_layout-sel_mode   = 'A'.
+*  cwa_layout-sel_mode = space.
+*  cwa_layout-no_rowmark = abap_false.
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*& Form RELLENAR_TOOLBAR
+*&---------------------------------------------------------------------*
+FORM rellenar_toolbar CHANGING excluirtool TYPE ui_functions.
+
+  REFRESH: excluirtool.
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form FILAS_SELECCIONADAS
+*&---------------------------------------------------------------------*
+FORM filas_seleccionadas USING alv TYPE REF TO cl_gui_alv_grid
+                      CHANGING pt_output_sel.
+
+  TYPES: tt_lines LIKE gt_data. "WITH EMPTY KEY.
+
+  CALL METHOD alv->get_selected_rows
+    IMPORTING
+      et_index_rows = DATA(it_rows).
+
+  IF it_rows IS NOT INITIAL.
+    DATA(pt_output_aux) = VALUE tt_lines( FOR wa_indx IN it_rows ( gt_data[ wa_indx-index ] ) ).
+  ENDIF.
+
+  pt_output_sel = pt_output_aux.
+
+ENDFORM.                    " filas_seleccionadas

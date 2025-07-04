@@ -1,0 +1,1956 @@
+*----------------------------------------------------------------------*
+*   INCLUDE J_3RMOBVEDF10                                              *
+*&---------------------------------------------------------------------*
+*&      Form  purchase_invoice_processing
+*&---------------------------------------------------------------------*
+form purchase_invoice_processing
+    tables p_key_rbkp  type tt_key_rbkp         "#EC *
+           p_bkpf_rbkp type tt_bkpf_rbkp.
+
+data:
+    l_lines       type sytabix,
+    lw_bkpf_rbkp  type type_bkpf_rbkp,
+
+    lt_rbkp       type tt_rbkp,
+    lt_bkpf_rbkp1 type tt_bkpf_rbkp1,
+
+    lw_rbkp       type type_rbkp,
+    lw_bkpf_rbkp1 type type_bkpf_rbkp.
+
+describe table p_key_rbkp lines l_lines.
+
+refresh: p_bkpf_rbkp.
+
+check not l_lines is initial.
+
+* get FI invoices which are chained with logistic invoices
+select a~bukrs a~belnr a~gjahr a~stblg
+       a~stjah a~awtyp a~awkey a~tcode
+    from bkpf as a
+    into table p_bkpf_rbkp
+    for all entries in p_key_rbkp
+    where bukrs = p_key_rbkp-bukrs
+      and belnr = p_key_rbkp-belnr.
+*      AND gjahr = p_key_rbkp-gjahr.
+
+check sy-subrc is initial.
+sort p_bkpf_rbkp by bukrs belnr gjahr.                         "1860088
+
+* fill logistic invoice numbers
+loop at p_bkpf_rbkp into lw_bkpf_rbkp.
+
+    l_lines = sy-tabix.
+
+    if lw_bkpf_rbkp-awkey is initial or
+        lw_bkpf_rbkp-awtyp ne gc_awtyp_rmrp.
+        delete p_bkpf_rbkp index l_lines.
+        continue.
+    endif.
+
+    lw_bkpf_rbkp-firbk = lw_bkpf_rbkp-awkey(10).
+    lw_bkpf_rbkp-fijhr = lw_bkpf_rbkp-awkey+10(4).
+
+    modify p_bkpf_rbkp from lw_bkpf_rbkp index l_lines.
+
+endloop.
+
+* get logistic invoices
+select
+    belnr gjahr vgart stblg stjah
+    from rbkp
+    into table lt_rbkp
+    for all entries in p_bkpf_rbkp
+    where belnr = p_bkpf_rbkp-firbk
+      and gjahr = p_bkpf_rbkp-fijhr.
+
+if not sy-subrc is initial.
+    refresh p_bkpf_rbkp.
+    exit.
+endif.
+
+*
+loop at p_bkpf_rbkp into lw_bkpf_rbkp.
+
+    l_lines = sy-tabix.
+    read table lt_rbkp into lw_rbkp
+        with key belnr = lw_bkpf_rbkp-firbk
+                 gjahr = lw_bkpf_rbkp-fijhr
+    binary search.
+
+    if sy-subrc is initial.
+        if lw_rbkp-stblg is initial.
+            delete p_bkpf_rbkp index l_lines.
+            continue.
+        else.
+            lw_bkpf_rbkp-stblr = lw_rbkp-stblg.
+            lw_bkpf_rbkp-stjar = lw_rbkp-stjah.
+            modify p_bkpf_rbkp from lw_bkpf_rbkp index l_lines.
+        endif.
+    else.
+        delete p_bkpf_rbkp index l_lines.
+        continue.
+    endif.
+
+endloop.
+
+lt_bkpf_rbkp1[] = p_bkpf_rbkp[].
+
+loop at p_bkpf_rbkp into lw_bkpf_rbkp.
+
+    l_lines = sy-tabix.
+
+    read table lt_bkpf_rbkp1 into lw_bkpf_rbkp1
+        with key firbk = lw_bkpf_rbkp-stblr
+                 fijhr = lw_bkpf_rbkp-stjar
+    binary search.
+
+    if sy-subrc is initial.
+        lw_bkpf_rbkp-stblg = lw_bkpf_rbkp1-belnr.
+        lw_bkpf_rbkp-stjah = lw_bkpf_rbkp1-gjahr.
+        modify p_bkpf_rbkp from lw_bkpf_rbkp index l_lines.
+    endif.
+
+endloop.
+
+endform.                    " purchase_invoice_processing
+*&---------------------------------------------------------------------*
+*&      Form  fill_partners
+*&---------------------------------------------------------------------*
+form fill_partners
+    tables ppt_mseg            type tt_mseg
+           ppt_mkpf            type tt_mkpf
+    using p_tb_type            type c
+          p_datehigh           type d
+          ppt_mseg_mkpf        type tt_mseg_mkpf
+    changing ppt_kdauf         type tt_kdauf
+             ppt_partners_sale type tt_partners_sale
+             ppt_ebeln         type tt_ebeln
+             ppt_partners_pay1 type tt_partners_pay1
+             ppt_partners_pay2 type tt_partners_pay2
+             ppt_werks_from    type tt_werks_from
+             ppt_routers       type tt_routers.
+*             ppt_routers1      type tt_routers1.
+*             ppt_xblnr         TYPE tt_xblnr.
+
+data:
+    lcur_rec     type i,
+    l_vgbel      type vgbel,
+    l_route      type route,
+    l_vgpos      type vgpos,
+    l_vbtyp_n    type vbtyp_n,
+    l_vtweg      type vtweg,
+    lw_mkpf      type type_mkpf,
+    lw_mseg      type type_mseg,
+    lw_kdauf     type type_kdauf,
+    lw_xblnr     type type_xblnr,
+    lw_ebeln     type type_ebeln,
+    lw_mseg_mkpf type type_mseg_mkpf,
+    lw_routers   type type_routers,
+    lt_routers   type tt_routers,
+    lt_xblnr     type tt_xblnr.
+
+
+refresh: ppt_kdauf, ppt_partners_sale, ppt_ebeln,
+         ppt_partners_pay1, ppt_partners_pay2,
+         ppt_werks_from, ppt_routers. " , ppt_xblnr.
+
+if p_tb_type = gc_symbol_0.
+    loop at ppt_mseg into lw_mseg
+        where kdauf ne space.
+        read table ppt_kdauf transporting no fields
+            with key kdauf = lw_mseg-kdauf
+                     kdpos = lw_mseg-kdpos
+            binary search.
+        if not sy-subrc is initial.
+            lw_kdauf-kdauf = lw_mseg-kdauf.
+            lw_kdauf-kdpos = lw_mseg-kdpos.
+            insert lw_kdauf into table ppt_kdauf.
+        endif.
+    endloop.
+    loop at ppt_mkpf into lw_mkpf
+        where budat <= p_datehigh and
+             xblnr(10) co '0123456789'.
+        read table lt_xblnr transporting no fields
+            with key xblnr = lw_mkpf-xblnr(10)
+            binary search.
+        if not sy-subrc is initial.
+            lw_xblnr-xblnr = lw_mkpf-xblnr(10).
+            insert lw_xblnr into table lt_xblnr.
+        endif.
+    endloop.
+else.
+    loop at ppt_mseg_mkpf into lw_mseg_mkpf
+        where kdauf ne space
+           or ( budat <= p_datehigh and
+             xblnr(10) co '0123456789' ).
+
+        if lw_mseg_mkpf-kdauf ne space.
+            read table ppt_kdauf transporting no fields
+                with key kdauf = lw_mseg_mkpf-kdauf
+                         kdpos = lw_mseg_mkpf-kdpos
+                binary search.
+            if not sy-subrc is initial.
+                lw_kdauf-kdauf = lw_mseg_mkpf-kdauf.
+                lw_kdauf-kdpos = lw_mseg_mkpf-kdpos.
+                insert lw_kdauf into table ppt_kdauf.
+            endif.
+        endif.
+        if lw_mseg_mkpf-budat <= p_datehigh and
+             lw_mseg_mkpf-xblnr(10) co '0123456789'.
+            read table lt_xblnr transporting no fields
+                with key xblnr = lw_mseg_mkpf-xblnr(10)
+                binary search.
+            if not sy-subrc is initial.
+                lw_xblnr-xblnr = lw_mseg_mkpf-xblnr(10).
+                insert lw_xblnr into table lt_xblnr.
+            endif.
+        endif.
+    endloop.
+endif.
+
+describe table ppt_kdauf lines lcur_rec.
+
+if lcur_rec > 0.
+* it_partners - temporary table with distribution channel &
+* customer name
+    select a~vbeln b~parvw b~kunnr c~name1 e~vtweg
+        from vbuk as a
+            inner join vbpa as b
+                on b~vbeln = a~vbeln
+            inner join vbak as e
+                on e~vbeln = a~vbeln
+            inner join kna1 as c
+                on c~kunnr = e~kunnr
+        into table ppt_partners_sale
+        for all entries in ppt_kdauf
+            where a~vbeln = ppt_kdauf-kdauf
+               and b~vbeln = ppt_kdauf-kdauf
+               and e~vbeln = ppt_kdauf-kdauf
+               and ( b~parvw = gc_parvw_ag
+                  or b~parvw = gc_parvw_we ).
+* it_routers1 - temporary table with route
+*    SELECT a~vbelv a~posnv b~route
+*        FROM vbfa AS a
+*            INNER JOIN likp AS b
+*                ON a~vbeln = b~vbeln
+*    INTO TABLE ppt_routers1
+*    FOR ALL ENTRIES IN ppt_kdauf
+*    WHERE a~vbelv = ppt_kdauf-kdauf
+*      AND a~posnv = ppt_kdauf-kdpos
+*      AND a~vbtyp_n = gc_vbtyp_j.
+endif.
+
+* it_routers - temporary table with distribution channel &
+* route for moving document with reference to sale order
+describe table lt_xblnr lines lcur_rec.
+
+if not lcur_rec is initial.
+
+    loop at lt_xblnr into lw_xblnr.
+        select single a~route b~vgbel b~vgpos
+            from likp as a
+                inner join lips as b
+                on b~vbeln = a~vbeln
+            into (l_route, l_vgbel, l_vgpos)
+            where a~vbeln = lw_xblnr-xblnr.    "#EC *
+
+        check sy-subrc is initial.
+
+        select single vbtyp_v
+            from vbfa
+            into l_vbtyp_n
+            where vbelv eq l_vgbel
+              and posnv eq l_vgpos
+              and vbeln eq lw_xblnr-xblnr
+              and vbtyp_n eq gc_vbtyp_j.   "#EC *
+
+        check sy-subrc is initial.
+
+        select single vtweg from vbak
+            into l_vtweg
+            where vbeln = l_vgbel.
+
+        check sy-subrc is initial.
+
+        lw_routers-mblnr   = lw_xblnr-xblnr.
+        lw_routers-vbtyp_v = l_vbtyp_n.
+        lw_routers-route   = l_route.
+        lw_routers-vtweg   = l_vtweg.
+
+        insert lw_routers into table lt_routers.
+
+    endloop.
+
+    describe table lt_routers lines lcur_rec.
+
+    if not lcur_rec is initial.
+        if p_tb_type = gc_symbol_0.
+            loop at ppt_mkpf into lw_mkpf
+                where budat <= p_datehigh and
+                     xblnr(10) co '0123456789'.
+                read table lt_routers into lw_routers
+                    with key mblnr = lw_mkpf-xblnr(10)
+                    binary search.
+                if sy-subrc is initial.
+                    lw_routers-mblnr = lw_mkpf-mblnr.
+                    insert lw_routers into table ppt_routers.
+                endif.
+            endloop.
+        else.
+            loop at ppt_mseg_mkpf into lw_mseg_mkpf
+                where budat <= p_datehigh and
+                     xblnr(10) co '0123456789'.
+                read table lt_routers into lw_routers
+                    with key mblnr = lw_mseg_mkpf-xblnr(10)
+                    binary search.
+                if sy-subrc is initial.
+                    lw_routers-mblnr = lw_mseg_mkpf-mblnr.
+                    insert lw_routers into table ppt_routers.
+                endif.
+            endloop.
+        endif.
+    endif.
+*    SELECT a~mblnr c~vbtyp_v d~route b~vtweg
+*        FROM likp AS d
+*            INNER JOIN mkpf AS a
+*                ON a~xblnr = d~vbeln
+*            INNER JOIN vbfa AS c
+*                ON c~vbeln = a~xblnr
+*            INNER JOIN vbak AS b
+*                ON b~vbeln = c~vbelv
+*        INTO TABLE ppt_routers
+*        FOR ALL ENTRIES IN ppt_xblnr
+*            WHERE d~vbeln = ppt_xblnr-xblnr.
+endif.
+
+if p_tb_type = gc_symbol_0.
+    loop at ppt_mseg into lw_mseg
+        where ebeln  ne space.
+        read table ppt_ebeln transporting no fields
+            with key ebeln = lw_mseg-ebeln
+                     ebelp = lw_mseg-ebelp
+            binary search.
+        if not sy-subrc is initial.
+             lw_ebeln-ebeln = lw_mseg-ebeln.
+             lw_ebeln-ebelp = lw_mseg-ebelp.
+             insert lw_ebeln into table ppt_ebeln.
+        endif.
+    endloop.
+else.
+    loop at ppt_mseg_mkpf into lw_mseg_mkpf
+        where ebeln  ne space.
+        read table ppt_ebeln transporting no fields
+            with key ebeln = lw_mseg_mkpf-ebeln
+                     ebelp = lw_mseg_mkpf-ebelp
+            binary search.
+        if not sy-subrc is initial.
+             lw_ebeln-ebeln = lw_mseg_mkpf-ebeln.
+             lw_ebeln-ebelp = lw_mseg_mkpf-ebelp.
+             insert lw_ebeln into table ppt_ebeln.
+        endif.
+    endloop.
+endif.
+
+describe table ppt_ebeln lines lcur_rec.
+
+if lcur_rec > 0.
+* producer list table
+    select a~ebeln a~ebelp a~mfrnr b~name1
+        from ekpo as a
+            inner join lfa1 as b
+                on a~mfrnr = b~lifnr
+        into table ppt_partners_pay1
+        for all entries in ppt_ebeln
+            where a~ebeln = ppt_ebeln-ebeln
+              and a~ebelp = ppt_ebeln-ebelp.
+* provider list table
+    select a~ebeln a~lifnr b~name1
+        from ekko as a
+            inner join lfa1 as b
+                on a~lifnr = b~lifnr
+        into table ppt_partners_pay2
+        for all entries in ppt_ebeln
+            where a~ebeln = ppt_ebeln-ebeln.
+* provider plant list table
+    select ebeln reswk
+        from ekko
+        into table ppt_werks_from
+        for all entries in ppt_ebeln
+            where ebeln = ppt_ebeln-ebeln.
+endif.
+
+endform.                    " fill_partners
+*&---------------------------------------------------------------------*
+*&      Form  quantity_sum_mseg_doc_getting
+*&---------------------------------------------------------------------*
+form quantity_sum_mseg_doc_getting
+     using pt_acctit     type tt_acctit
+           pw_mseg_mkpf  type type_mseg_mkpf
+           pw_listmat    type type_listmat
+           pw_bsim_budat type budat
+           pt_overval    type tt_overvalue
+           p_is_mm       TYPE type_1c                          "1088124
+           pt_mseg_mkpf  type tt_mseg_mkpf_mb                  "1782012
+    changing pt_bwtar_change type tt_bwtar_change              "1247791
+             p_menge     type menge_d
+             p_dmbtr     type j_3rfinsum
+             p_wrbtr     type wrbtr
+             p_incld     type type_1c.
+
+data:
+    l_aworg    type aworg,
+    lw_overval type type_overval,
+    lw_acctit  type type_acctit,
+    lw_bwtar   type type_bwtar_change.                         "1247791
+
+field-symbols:                                                 "1247791
+    <fs_bwtar_new>  type type_bwtar_change,                    "1247791
+    <fs_bwtar_old>  type type_bwtar_change.                    "1247791
+
+write pw_mseg_mkpf-mjahr to l_aworg.
+
+if pw_mseg_mkpf-shkzg = gc_shkzg_s.
+
+    If pw_mseg_mkpf-bustm = gc_bustm_mu00.                     "1247791
+*     get correct quantity in case of valuation type change    "1247791
+      perform fill_bwtar_doc
+          using pw_mseg_mkpf
+                pw_listmat
+          changing lw_bwtar.
+*     get quantity from another line if it is already processed
+      lw_bwtar-bwtar = pw_mseg_mkpf-umbar.
+      Read Table pt_bwtar_change From lw_bwtar
+           Assigning <fs_bwtar_old>.
+      if <fs_bwtar_old> is assigned.
+        if <fs_bwtar_old>-menge is not initial.
+          p_menge = - <fs_bwtar_old>-menge.
+        endif.
+      endif.
+      if sy-subrc is not initial or p_menge is initial.
+*       this line is to be processed first
+        lw_bwtar-bwtar = pw_mseg_mkpf-bwtar.
+        Read Table pt_bwtar_change From lw_bwtar
+             Assigning <fs_bwtar_new>.
+        if <fs_bwtar_new> is assigned.
+          p_menge = <fs_bwtar_new>-lbkum
+            + <fs_bwtar_new>-endremn
+            + <fs_bwtar_new>-deltlbkumk
+            - <fs_bwtar_new>-deltlbkumd.
+          <fs_bwtar_new>-menge = p_menge.
+        endif.
+      endif.
+      p_dmbtr = p_menge * pw_mseg_mkpf-dmbtr / pw_mseg_mkpf-menge.
+      p_wrbtr = p_menge * pw_mseg_mkpf-wrbtr / pw_mseg_mkpf-menge.
+
+    Else.                                                      "1247791
+      p_menge = pw_mseg_mkpf-menge.
+      p_dmbtr = pw_mseg_mkpf-dmbtr.
+      p_wrbtr = pw_mseg_mkpf-wrbtr.
+    Endif.
+
+else.
+
+    If pw_mseg_mkpf-bustm = gc_bustm_mu00.                     "1247791
+*     get correct quantity in case of valuation type change    "1247791
+      perform fill_bwtar_doc
+          using pw_mseg_mkpf
+                pw_listmat
+          changing lw_bwtar.
+*     get quantity from another line if it is already processed
+      lw_bwtar-bwtar = pw_mseg_mkpf-umbar.
+      Read Table pt_bwtar_change From lw_bwtar
+           Assigning <fs_bwtar_new>.
+      if <fs_bwtar_new> is assigned.
+        if <fs_bwtar_new>-menge is not initial.
+          p_menge = - <fs_bwtar_new>-menge.
+        endif.
+      endif.
+      if sy-subrc is not initial or p_menge is initial.
+*       this line is to be processed first
+        lw_bwtar-bwtar = pw_mseg_mkpf-bwtar.
+        Read Table pt_bwtar_change From lw_bwtar
+             Assigning <fs_bwtar_old>.
+        if <fs_bwtar_old> is assigned.
+          p_menge = - ( <fs_bwtar_old>-lbkum
+            + <fs_bwtar_old>-endremn
+            + <fs_bwtar_old>-deltlbkumk
+            - <fs_bwtar_old>-deltlbkumd ).
+          <fs_bwtar_old>-menge = p_menge.
+        endif.
+      endif.
+      p_dmbtr = p_menge * pw_mseg_mkpf-dmbtr / pw_mseg_mkpf-menge.
+      p_wrbtr = p_menge * pw_mseg_mkpf-wrbtr / pw_mseg_mkpf-menge.
+
+    Else.                                                      "1247791
+      p_menge = - pw_mseg_mkpf-menge.
+      p_dmbtr = - pw_mseg_mkpf-dmbtr.
+      p_wrbtr = - pw_mseg_mkpf-wrbtr.
+    Endif.
+endif.
+
+if p_dmbtr = 0 and p_menge ne 0.                               "1650775
+    if ( pw_mseg_mkpf-bustw = gc_bustw_wa14 and                "1114898
+         pw_mseg_mkpf-vprsv = gc_vprsv ) or                    "1114898
+         pw_mseg_mkpf-bustw = gc_bustw_wf01.                   "1114898
+        p_dmbtr = 0.
+    else.
+        if p_dmbtr is initial.
+            if not pw_mseg_mkpf-lbkum is initial.
+                p_dmbtr = pw_mseg_mkpf-salk3
+                    * p_menge / pw_mseg_mkpf-lbkum.
+            else.
+                p_dmbtr = 0.
+            endif.
+        endif.
+        if gv_acctit_get = abap_true.                          "1782012 start
+          if not pt_mseg_mkpf[] is initial.
+            select
+            awtyp awref aworg posnr
+            kstat bukrs belnr gjahr budat
+            vorgn prvrg_sv ktosl bschl
+            shkzg pswbt koart matnr
+            menge werks bwart buzid
+            sobkz bwkey bwtar xbilk
+            xmfrw kzuml
+                zeile hkont
+                mat_kdauf
+                mat_kdpos
+                mat_pspnr
+                from acctit
+            into table pt_acctit
+            for all entries in pt_mseg_mkpf
+            where awtyp = gc_awtyp_mkpf
+              and awref = pt_mseg_mkpf-mblnr
+              and gjahr = pt_mseg_mkpf-gjahr
+              and ktosl = gc_ktosl.
+          else.
+            refresh pt_acctit.
+          endif.
+          clear gv_acctit_get.
+        endif.                                                 "1782012 end
+        if not pt_acctit[] is initial.
+            loop at pt_acctit into lw_acctit
+                where awtyp = gc_awtyp_mkpf
+                  and awref = pw_mseg_mkpf-mblnr
+                  and aworg = l_aworg
+                  and bwtar = pw_listmat-bwtar
+                  and zeile = pw_mseg_mkpf-zeile
+                  and budat = pw_mseg_mkpf-budat.              "1095184
+
+                  p_dmbtr = lw_acctit-pswbt.
+                  if p_dmbtr is initial.
+                      p_incld = gc_true.
+                  endif.
+            endloop.
+        endif.
+    endif.
+endif.
+
+endform.                    " quantity_sum_mseg_doc_getting
+*&---------------------------------------------------------------------*
+*&      Form  kotierungs_findung
+*&---------------------------------------------------------------------*
+form kotierungs_findung
+    using p_sobkz type sobkz
+          pw_mseg_mkpf type type_mseg_mkpf
+    changing
+        p_xktid type j_3rmktnrtype
+        p_xktnr type j_3rmvkntr
+        p_xitem type j_3rmitems.
+
+clear: p_xktid, p_xktnr, p_xitem.
+
+case p_sobkz.
+    when gc_spec_w.
+* special stock at customer
+        if not pw_mseg_mkpf-kunnr is initial.
+            move: text-206 to p_xktid,
+                  pw_mseg_mkpf-kunnr to p_xktnr.
+        endif.
+    when gc_spec_v.
+* special stock at customer
+        if not pw_mseg_mkpf-kunnr is initial.
+            move: text-206 to p_xktid,
+                  pw_mseg_mkpf-kunnr to p_xktnr.
+        endif.
+    when gc_spec_e.
+* special stock for customer order
+        if not pw_mseg_mkpf-kdauf is initial.
+            move: text-203 to p_xktid,
+                  pw_mseg_mkpf-kdauf to p_xktnr,
+                  pw_mseg_mkpf-kdpos to p_xitem.
+        endif.
+    when gc_spec_q.
+* special stock for project
+        if not pw_mseg_mkpf-ps_psp_pnr is initial.
+            move: text-210 to p_xktid.
+            write pw_mseg_mkpf-ps_psp_pnr to p_xktnr.
+        endif.
+    when others.
+* Receiving storage location
+        if not pw_mseg_mkpf-umlgo is initial
+           and not pw_mseg_mkpf-umwrk is initial
+           and pw_mseg_mkpf-lgort ne pw_mseg_mkpf-umlgo.
+           move: text-211     to p_xktid,
+                pw_mseg_mkpf-umwrk  to p_xktnr,
+                '/'           to p_xktnr+4,
+                pw_mseg_mkpf-umlgo  to p_xktnr+5.
+* Cost centre
+        elseif not pw_mseg_mkpf-kostl is initial.
+            move: text-209 to p_xktid,
+                pw_mseg_mkpf-kostl to p_xktnr.
+* Vendor
+        elseif not pw_mseg_mkpf-lifnr is initial.
+            move: text-207 to p_xktid,
+                pw_mseg_mkpf-lifnr to p_xktnr.
+* Asset
+        elseif not pw_mseg_mkpf-anln1 is initial.
+            move: text-208 to p_xktid,
+                pw_mseg_mkpf-anln1 to p_xktnr.
+* Plant sender / plant receiver
+        elseif not pw_mseg_mkpf-umwrk is initial
+            and pw_mseg_mkpf-werks ne pw_mseg_mkpf-umwrk.
+            move: text-204 to p_xktid,
+                pw_mseg_mkpf-umwrk to p_xktnr.
+* Storage location sender / Storage location receiver
+            if not pw_mseg_mkpf-umlgo is initial.
+                move '/' to p_xktnr+4.
+                move pw_mseg_mkpf-umlgo to p_xktnr+5.
+            endif.
+* CO order
+        elseif not pw_mseg_mkpf-aufnr is initial.
+            move: text-202 to p_xktid,
+                pw_mseg_mkpf-aufnr to p_xktnr.
+* Purchase order
+        elseif not pw_mseg_mkpf-ebeln is initial.
+            move: text-201 to p_xktid,
+                pw_mseg_mkpf-ebeln to p_xktnr,
+* Purchase order item
+                pw_mseg_mkpf-ebelp to p_xitem.
+        elseif not pw_mseg_mkpf-charg is initial.
+            move: text-213 to p_xktid,
+                pw_mseg_mkpf-charg to p_xktnr.
+        elseif not pw_mseg_mkpf-charg_del is initial.          "1114541
+            move: text-213 to p_xktid,                         "1114541
+                pw_mseg_mkpf-charg_del to p_xktnr.             "1114541
+        elseif not pw_mseg_mkpf-kunnr is initial.
+            move: text-206 to p_xktid,
+                pw_mseg_mkpf-kunnr to p_xktnr.
+        endif.
+* GL account
+        if p_xktid is initial.
+            move: text-200 to p_xktid,
+                pw_mseg_mkpf-sakto to p_xktnr.
+        endif.
+endcase.
+
+
+endform.                    " kotierungs_findung
+
+*&---------------------------------------------------------------------
+*&      Form  overvalue_doc_splitting
+*&---------------------------------------------------------------------
+*FORM overvalue_doc_splitting
+*    TABLES ppt_listmat TYPE TT_listmat
+*           ppt_docmat  TYPE TT_docmat
+*           p_so_budat   type tt_so_budat
+*    CHANGING pt_overval TYPE tt_overvalue.  "#EC *
+*
+*DATA:
+*    l_prcntcur TYPE i, " for scale
+*    l_prcntall TYPE i, " for scale
+*    l_prcntshw TYPE i, " for scale
+*    l_prcnttmp TYPE i, " for scale
+*    l_dmbtr    type J_3RFINSUM,
+*    l_lgort    LIKE mard-lgort,
+*    l_belnr    LIKE bkpf-belnr,
+*    l_rec      type sytabix,
+**    l_rec1     type sytabix,
+*    l_lbkumcur TYPE type_gazprst,
+*    l_lbkumcom TYPE type_gazprst,
+*
+*    lt_ind1_listmat TYPE tt_ind3_listmat,
+*    lt_ind1_docmat TYPE tt_ind1_docmat,
+*
+*    lt_ind2_docmat LIKE SORTED TABLE OF type_docmat
+*        WITH NON-UNIQUE KEY
+*            buzei xbelnr xbukrs pspnr vbeln posnr
+*        WITH HEADER LINE,
+*    lt_ind3_docmat LIKE SORTED TABLE OF type_docmat
+*        WITH NON-UNIQUE KEY
+*            xmatnr werk bwtar budat
+*        WITH HEADER LINE,
+*    lt_ind1_docover TYPE SORTED TABLE OF type_overval
+*        WITH NON-UNIQUE KEY xbelnr lgort
+*        WITH HEADER LINE,
+*
+*    lw_ind1_docmat TYPE type_docmat.
+*
+*FIELD-SYMBOLS: <fs_over> TYPE type_overval.
+*
+** fill index table
+*lt_ind1_listmat[] = ppt_listmat[].
+*lt_ind1_docmat[]  = ppt_docmat[].
+*DESCRIBE TABLE pt_overval LINES l_prcntall.
+*IF l_prcntall IS INITIAL.
+*    EXIT.
+*ENDIF.
+*
+** calc material quantity in each storage for division
+** cost document overvalue
+*LOOP AT pt_overval ASSIGNING <fs_over>.
+*    ADD 1 TO l_prcntcur.
+**    l_rec = sy-tabix.
+** if document is overvalue
+**    IF <fs_over>-invoice IS INITIAL.
+**        l_belnr = <fs_over>-bvorg(10).
+**        IF NOT l_belnr IS INITIAL
+**            AND l_belnr NE <fs_over>-xbelnr.
+*    IF NOT <fs_over>-bvorg(10) IS INITIAL
+*        AND <fs_over>-bvorg(10) NE <fs_over>-xbelnr.
+*        CONTINUE.
+*    ENDIF.
+*    PERFORM calc_quantity_date
+*        USING <fs_over>
+*              lt_ind1_listmat
+*              lt_ind1_docmat
+*              p_so_budat-high
+*        CHANGING
+*              l_lbkumcom
+*              l_lbkumcur.
+**              <fs_over>-lbkumcommon
+**              <fs_over>-lbkumcurrent.
+*    CLEAR l_dmbtr.
+** if document is invoice
+**    ELSE.
+**        MOVE: 1 TO <fs_over>-lbkumcommon,
+**              1 TO <fs_over>-lbkumcurrent.
+**    ENDIF.
+*    IF l_lbkumcom NE 0.
+**    IF <fs_over>-lbkumcommon NE 0.
+*        IF <fs_over>-xdmshb_in NE 0.
+*            l_dmbtr = <fs_over>-xdmshb_in
+**                * <fs_over>-lbkumcurrent
+**                / <fs_over>-lbkumcommon.
+*                * l_lbkumcur
+*                / l_lbkumcom.
+*            IF l_dmbtr NE 0.
+*                <fs_over>-xdmshb_in = l_dmbtr.
+*            ENDIF.
+*        ELSE.
+*            l_dmbtr = <fs_over>-xdmshb_out
+**                * <fs_over>-lbkumcurrent
+**                / <fs_over>-lbkumcommon.
+*                * l_lbkumcur
+*                / l_lbkumcom.
+*            IF l_dmbtr NE 0.
+*                <fs_over>-xdmshb_out = l_dmbtr.
+*            ENDIF.
+*        ENDIF.
+*    ENDIF.
+*    IF NOT l_dmbtr IS INITIAL.
+*        <fs_over>-lbkumcurrent = l_lbkumcur.
+*        <fs_over>-lbkumcommon  = l_lbkumcom.
+*        CLEAR: ppt_docmat, lw_ind1_docmat.
+*        MOVE-CORRESPONDING <fs_over> TO ppt_docmat.     "#EC ENHOK
+*        MOVE-CORRESPONDING <fs_over> TO lw_ind1_docmat. "#EC ENHOK
+*        APPEND ppt_docmat.
+*        INSERT lw_ind1_docmat INTO TABLE lt_ind1_docmat.
+*    ENDIF.
+** recording a scale step 5 per cent
+*    IF g_bkgrd IS INITIAL.
+*        PERFORM run_scale
+*            USING l_prcntall l_prcntcur text-015
+*            CHANGING l_prcntshw l_prcnttmp.
+*    ENDIF.
+*ENDLOOP.
+*
+** fill index table
+*lt_ind1_docover[] = pt_overval[].
+** fill amount in bind document from document overvalue
+*LOOP AT pt_overval ASSIGNING <fs_over>.
+**    WHERE invoice IS INITIAL.   "#EC CI_XYZ
+*    ADD 1 TO l_prcntcur.
+*    l_rec = sy-tabix.
+**    l_belnr = <fs_over>-bvorg(10).
+**    IF l_belnr IS INITIAL OR
+**        l_belnr EQ <fs_over>-xbelnr.
+*    IF <fs_over>-bvorg(10) IS INITIAL
+*        OR <fs_over>-bvorg(10) EQ <fs_over>-xbelnr.
+*        CONTINUE.
+*    ELSE.
+*        l_lgort = <fs_over>-lgort.
+*        CLEAR: l_lbkumcom, l_lbkumcur.
+*        READ TABLE lt_ind1_docover
+*            WITH KEY xbelnr = l_belnr
+*                     lgort  = l_lgort
+*            BINARY SEARCH.
+*        IF sy-subrc IS INITIAL.
+*            l_lbkumcur = lt_ind1_docover-lbkumcurrent.
+*            l_lbkumcom = lt_ind1_docover-lbkumcommon.
+*        ELSE.
+** a document was post before date begin the report
+*            READ TABLE pt_overval ASSIGNING <fs_over>
+*                INDEX l_rec.
+*            PERFORM calc_quantity_date
+*                USING <fs_over>
+*                      lt_ind1_listmat
+*                      lt_ind1_docmat
+*                      p_so_budat-high
+*                  CHANGING
+*                      l_lbkumcom l_lbkumcur.
+*        ENDIF.
+*    ENDIF.
+*    READ TABLE pt_overval INDEX l_rec ASSIGNING <fs_over>.
+*    CHECK sy-subrc IS INITIAL.
+*    CLEAR l_dmbtr.
+*    <fs_over>-lbkumcurrent = l_lbkumcur.
+*    <fs_over>-lbkumcommon  = l_lbkumcom.
+*    IF <fs_over>-lbkumcommon NE 0.
+**        l_rec1 = sy-tabix.
+*        IF <fs_over>-xdmshb_in NE 0.
+*            l_dmbtr = <fs_over>-xdmshb_in
+*                * <fs_over>-lbkumcurrent
+*                / <fs_over>-lbkumcommon.
+*            <fs_over>-xdmshb_in = l_dmbtr.
+*        ELSE.
+*            l_dmbtr = <fs_over>-xdmshb_out
+*                * <fs_over>-lbkumcurrent
+*                / <fs_over>-lbkumcommon.
+*            <fs_over>-xdmshb_out = l_dmbtr.
+*        ENDIF.
+*    ENDIF.
+*    IF NOT l_dmbtr IS INITIAL.
+**        IF sy-subrc IS INITIAL.
+**            MODIFY doc_overvalue INDEX l_rec1.
+**        ENDIF.
+*        CLEAR: ppt_docmat, lw_ind1_docmat.
+*        MOVE-CORRESPONDING <fs_over> TO ppt_docmat.       "#EC ENHOK
+*        MOVE-CORRESPONDING <fs_over> TO lw_ind1_docmat. "#EC ENHOK
+*        APPEND ppt_docmat.
+*        INSERT lw_ind1_docmat INTO TABLE lt_ind1_docmat.
+*    ENDIF.
+** recording a scale step 5 per cent
+*    IF g_bkgrd IS INITIAL.
+*        PERFORM run_scale
+*            USING l_prcntall l_prcntcur text-016
+*            CHANGING l_prcntshw l_prcnttmp.
+*    ENDIF.
+*ENDLOOP.
+*
+** free work memory
+*REFRESH: lt_ind1_listmat, lt_ind1_docover.
+*FREE lt_ind1_docover.
+*CLEAR: lw_ind1_docmat.
+*
+** fill index table
+*lt_ind2_docmat[]  = ppt_docmat[].
+*lt_ind3_docmat[]  = ppt_docmat[].
+*
+** two lines for debug
+*CLEAR sy-subrc.
+*CHECK sy-subrc IS INITIAL.
+*
+*LOOP AT pt_overval ASSIGNING <fs_over>.
+*    READ TABLE lt_ind2_docmat
+*        WITH KEY buzei  = <fs_over>-buzei
+*                 xbelnr = <fs_over>-xbelnr
+*                 xbukrs = <fs_over>-xbukrs
+*                 pspnr  = <fs_over>-pspnr
+*                 vbeln  = <fs_over>-vbeln
+*                 posnr  = <fs_over>-posnr
+*        BINARY SEARCH.
+*
+*    CHECK NOT sy-subrc IS INITIAL.
+*
+*    CLEAR l_lgort.
+** for overvalue document warehouse definition
+*    LOOP AT lt_ind3_docmat
+*        WHERE xmatnr = <fs_over>-xmatnr
+*          AND werk   = <fs_over>-werk
+*          AND bwtar  = <fs_over>-bwtar.
+*
+*        CHECK lt_ind3_docmat-lgort = <fs_over>-lgort.
+*        l_lgort = <fs_over>-lgort.
+*        CHECK lt_ind3_docmat-budat <= <fs_over>-budat.
+*        l_lgort = lt_ind3_docmat-lgort.
+*
+*        CLEAR: ppt_docmat, lt_ind2_docmat, lt_ind3_docmat.
+*        MOVE-CORRESPONDING <fs_over> TO ppt_docmat.        "#EC ENHOK
+*        MOVE-CORRESPONDING <fs_over> TO lt_ind2_docmat.  "#EC ENHOK
+*        MOVE-CORRESPONDING <fs_over> TO lt_ind3_docmat.  "#EC ENHOK
+*        IF ppt_docmat-xdmshb_in IS INITIAL
+*            AND docmat-xdmshb_out IS INITIAL.
+*            EXIT.
+*        ENDIF.
+*        ppt_docmat-lgort = l_lgort.
+*        lt_ind2_docmat-lgort = l_lgort.
+*        lt_ind3_docmat-lgort = l_lgort.
+*        APPEND ppt_docmat.
+*        INSERT TABLE lt_ind2_docmat.
+*        INSERT TABLE lt_ind3_docmat.
+*        CLEAR l_lgort.
+*        EXIT.
+*    ENDLOOP.
+*    IF NOT l_lgort IS INITIAL.
+*        CLEAR: ppt_docmat, lt_ind2_docmat, lt_ind3_docmat.
+*        MOVE-CORRESPONDING <fs_over> TO ppt_docmat.        "#EC ENHOK
+*        IF ppt_docmat-xdmshb_in IS INITIAL
+*            AND docmat-xdmshb_out IS INITIAL.
+*            CONTINUE.
+*        ENDIF.
+*        MOVE-CORRESPONDING <fs_over> TO lt_ind2_docmat.  "#EC ENHOK
+*        MOVE-CORRESPONDING <fs_over> TO lt_ind3_docmat.  "#EC ENHOK
+*        ppt_docmat-lgort = l_lgort.
+*        lt_ind2_docmat-lgort = l_lgort.
+*        lt_ind3_docmat-lgort = l_lgort.
+*        APPEND ppt_docmat.
+*        INSERT TABLE lt_ind2_docmat.
+*        INSERT TABLE lt_ind3_docmat.
+*    ENDIF.
+*ENDLOOP.
+*
+*ENDFORM.                    " overvalue_doc_splitting
+*&---------------------------------------------------------------------
+*&      Form  calc_quantity_date
+*&---------------------------------------------------------------------
+*FORM calc_quantity_date
+*    USING pw_over         TYPE type_overval
+*          pt_ind1_listmat TYPE tt_ind3_listmat
+*          pt_ind1_docmat  TYPE tt_ind1_docmat
+*          pso_budat_high  LIKE bkpf-budat
+*    CHANGING p_lbkumcom   TYPE type_gazprst
+*             p_lbkumcur   TYPE type_gazprst.
+*
+*DATA:
+*    l_menge type J_3RFINSUM,
+*    lw_ind1_listmat LIKE listmat,
+*    lw_ind1_docmat  LIKE docmat.
+*
+*LOOP AT pt_ind1_listmat INTO lw_ind1_listmat
+*    WHERE xmatnr = pw_over-xmatnr
+*      AND bwtar  = pw_over-bwtar
+*      AND werk   = pw_over-werk
+*      AND xsaknr = pw_over-xhkont.
+*
+*    IF lw_ind1_listmat-lgort = pw_over-lgort
+*        AND lw_ind1_listmat-sobkz = pw_over-sobkz
+*        AND lw_ind1_listmat-tblsb = pw_over-tblsb
+*        AND lw_ind1_listmat-pspnr = pw_over-pspnr
+*        AND lw_ind1_listmat-vbeln = pw_over-vbeln
+*        AND lw_ind1_listmat-posnr = pw_over-posnr.
+*
+** calc quantity in current storage on date end period
+*        ADD lw_ind1_listmat-endremn TO p_lbkumcur.
+*    ENDIF.
+** calc quantity in current plant on date end period
+*    ADD lw_ind1_listmat-endremn TO p_lbkumcom.
+*ENDLOOP.
+*
+*LOOP AT pt_ind1_docmat INTO lw_ind1_docmat
+*    WHERE xmatnr = pw_over-xmatnr
+*      AND bwtar = pw_over-bwtar
+*      AND werk  = pw_over-werk
+*      AND hkont = pw_over-hkont.
+*
+*
+*    CHECK lw_ind1_docmat-budat >= pw_over-budat
+**    CHECK lw_ind1_docmat-budat > pw_over-budat
+*        AND lw_ind1_docmat-budat <= pso_budat_high.
+** calc quantity in storage and in plant for date overvalue
+*    IF lw_ind1_docmat-lgort EQ pw_over-lgort
+*        AND lw_ind1_docmat-sobkz EQ pw_over-sobkz
+*        AND lw_ind1_docmat-tblsb = pw_over-tblsb
+*        AND lw_ind1_docmat-pspnr = pw_over-pspnr
+*        AND lw_ind1_docmat-vbeln = pw_over-vbeln
+*        AND lw_ind1_docmat-posnr = pw_over-posnr.
+*
+*        IF lw_ind1_docmat-xmensh_in IS INITIAL.
+*            l_menge = ABS( lw_ind1_docmat-xmensh_out ).
+*            ADD l_menge TO p_lbkumcur.
+*            ADD l_menge TO p_lbkumcom.
+*        ELSE.
+*            SUBTRACT lw_ind1_docmat-xmensh_in
+*                        FROM p_lbkumcur.
+*            SUBTRACT lw_ind1_docmat-xmensh_in
+*                        FROM p_lbkumcom.
+*        ENDIF.
+*    ELSE.
+*        IF lw_ind1_docmat-xmensh_in IS INITIAL.
+*            l_menge = ABS( lw_ind1_docmat-xmensh_out ).
+*            ADD l_menge TO p_lbkumcom.
+*        ELSE.
+*            SUBTRACT lw_ind1_docmat-xmensh_in
+*                FROM p_lbkumcom.
+*        ENDIF.
+*    ENDIF.
+*ENDLOOP.
+*
+*ENDFORM.                    " calc_quantity_date
+*&---------------------------------------------------------------------
+*&      Form  overvalue_doc_splitting
+*&---------------------------------------------------------------------
+form overvalue_doc_splitting
+    tables ppt_listmat  type tt_listmat
+           ppt_docmat   type tt_docmat
+           p_so_budat   type tt_so_budat
+    changing pt_overval_temp type tt_overvalue.  "#EC *        "1650775
+
+data:
+    l_prcntcur type i, " for scale
+    l_prcntall type i, " for scale
+    l_prcntshw type i, " for scale
+    l_prcnttmp type i, " for scale
+    l_dmbtr    type j_3rfinsum,
+    l_lgort    type lgort_d,
+    l_belnr    type belnr_d,
+    l_rec      type sytabix,
+    l_lbkumcur type type_gazprst,
+    l_lbkumcom type type_gazprst,
+
+    lv_lgort_cleared  type boole_d,                            "1506298
+    lv_listmat_sorted type boole_d,                            "1506298
+    lv_index          like sy-tabix,                           "1557283
+    lv_index2         like sy-tabix,                           "1604108
+
+    lt_ind2_docmat type sorted table of type_docmat
+        with non-unique key xbukrs xbelnr buzei pspnr vbeln posnr,
+    lt_docmat_temp type tt_docmat,                             "1650775
+    pt_overval     type standard table of type_overval,        "1650775
+    lt_ind1_docover type sorted table of type_overval
+        with non-unique key xbelnr lgort,
+
+    lw_docmat      type type_docmat,
+    lw_ind2_docmat type type_docmat,
+    lw_ind3_docmat type type_docmat,
+    lw_ind1_docover type type_overval.
+
+field-symbols: <fs_over>    type type_overval,
+               <fs_over_2>  type type_overval,                 "1557283
+               <fs_listmat> type type_listmat.
+
+loop at ppt_listmat assigning <fs_listmat>.
+    <fs_listmat>-begremn = <fs_listmat>-begremn + <fs_listmat>-lbkum.
+    <fs_listmat>-endremn = <fs_listmat>-endremn + <fs_listmat>-lbkum.
+endloop.
+
+describe table pt_overval_temp lines l_prcntall.               "1650775
+if l_prcntall is initial.
+    exit.
+endif.
+
+* delete unnecessary zero lines and overvalue documents        "1604108 start
+  loop at ppt_listmat assigning <fs_listmat>
+      where endremn = 0 and begremn = 0 and banner_doc is initial.
+    lv_index = sy-tabix.
+    lv_lgort_cleared = abap_true.
+    loop at pt_overval_temp assigning <fs_over>                "1650775
+        where field_link = <fs_listmat>-field_link.
+      lv_index2 = sy-tabix.
+      loop at pt_overval_temp transporting no fields           "1650775
+          where xbukrs = <fs_over>-xbukrs and
+                xmatnr = <fs_over>-xmatnr and
+                xhkont = <fs_over>-xhkont and
+                bwtar  = <fs_over>-bwtar  and
+                xbwkey = <fs_over>-xbwkey and
+                budat  = <fs_over>-budat  and
+                xbelnr = <fs_over>-xbelnr and
+                buzei  = <fs_over>-buzei  and
+                field_link ne <fs_over>-field_link.
+        exit.
+      endloop.
+      if sy-subrc = 0.
+        delete pt_overval_temp index lv_index2.                "1650775
+      else.
+        lv_lgort_cleared = abap_false.
+      endif.
+    endloop.
+    if lv_lgort_cleared = abap_true.
+      delete ppt_listmat index lv_index.
+    endif.
+  endloop.
+  clear lv_lgort_cleared.                                      "1604108 end
+
+sort ppt_docmat stable by xmatnr bwtar werk                    "1557283
+  tblsb pspnr vbeln posnr linkk lgort charg sobkz budat.       "1650775
+sort ppt_listmat by xmatnr bwtar werk                          "1557283
+  tblsb pspnr vbeln posnr linkk lgort charg sobkz.             "1650775 start
+pt_overval = pt_overval_temp.
+refresh pt_overval_temp.
+sort pt_overval by xmatnr bwtar werk
+  tblsb pspnr vbeln posnr linkk lgort charg sobkz budat.       "1650775 end
+
+* calc material quantity in each storage for division
+* cost document overvalue
+loop at pt_overval assigning <fs_over>.
+    add 1 to l_prcntcur.
+*    l_rec = sy-tabix.
+* if document is overvalue
+    if <fs_over>-invoice is initial.
+        l_belnr = <fs_over>-bvorg(10).
+        if not l_belnr is initial
+            and l_belnr ne <fs_over>-xbelnr.
+            continue.
+        endif.
+        perform calc_quantity_date
+            using <fs_over>
+                  ppt_listmat[]                                "1557283
+                  ppt_docmat[]                                 "1557283
+                  p_so_budat-high
+            changing
+                  <fs_over>-lbkumcommon
+                  <fs_over>-lbkumcurrent.
+        clear l_dmbtr.
+* if document is invoice
+    else.
+        move: 1 to <fs_over>-lbkumcommon,
+              1 to <fs_over>-lbkumcurrent.
+    endif.
+    if <fs_over>-lbkumcommon ne 0.
+        if <fs_over>-xdmshb_in ne 0.
+            l_dmbtr = <fs_over>-xdmshb_in
+                * <fs_over>-lbkumcurrent
+                / <fs_over>-lbkumcommon.
+            <fs_over>-xdmshb_in = l_dmbtr.
+        else.
+            l_dmbtr = <fs_over>-xdmshb_out
+                * <fs_over>-lbkumcurrent
+                / <fs_over>-lbkumcommon.
+            <fs_over>-xdmshb_out = l_dmbtr.
+        endif.
+    endif.
+    if not l_dmbtr is initial.
+        clear: lw_docmat.                                      "1557283
+        move-corresponding <fs_over> to lw_docmat.       "#EC ENHOK
+        insert lw_docmat into table lt_docmat_temp.            "1650775
+    endif.
+*   recording a step 'Calculating quantity mat. in storage'    "1417445
+    if g_bkgrd is initial.
+        check gv_wan is initial.                               "1417445
+        perform run_scale
+            using l_prcntall l_prcntcur text-015
+            changing l_prcntshw l_prcnttmp.
+    endif.
+endloop.
+if lt_docmat_temp is not initial.                              "1650775 start
+  append lines of lt_docmat_temp to ppt_docmat.
+  refresh lt_docmat_temp.
+  sort ppt_docmat stable by xmatnr bwtar werk
+    tblsb pspnr vbeln posnr linkk lgort charg sobkz budat.
+endif.                                                         "1650775 end
+
+* fill index table
+lt_ind1_docover[] = pt_overval[].
+* fill amount in bind document from document overvalue
+loop at pt_overval assigning <fs_over_2>                       "1557283
+    where invoice is initial
+      and not bvorg is initial.
+    add 1 to l_prcntcur.
+    l_rec = sy-tabix.
+    l_belnr = <fs_over_2>-bvorg(10).                           "1557283
+    if l_belnr is initial or
+        l_belnr eq <fs_over_2>-xbelnr.                         "1557283
+        continue.
+    else.
+        l_lgort = <fs_over_2>-lgort.                           "1557283
+        clear: l_lbkumcom, l_lbkumcur.
+        read table lt_ind1_docover into lw_ind1_docover
+            with key xbelnr = l_belnr
+                     lgort  = l_lgort
+            binary search.
+        if sy-subrc is initial.
+            l_lbkumcur = lw_ind1_docover-lbkumcurrent.
+            l_lbkumcom = lw_ind1_docover-lbkumcommon.
+        else.
+* a document was post before date begin the report
+            read table pt_overval index l_rec assigning <fs_over>.
+                perform calc_quantity_date
+                    using <fs_over>
+                          ppt_listmat[]                        "1557283
+                          ppt_docmat[]                         "1557283
+                          p_so_budat-high
+                      changing
+                          l_lbkumcom l_lbkumcur.
+        endif.
+    endif.
+    read table pt_overval index l_rec assigning <fs_over>.
+    check sy-subrc is initial.
+    clear l_dmbtr.
+    <fs_over>-lbkumcurrent = l_lbkumcur.
+    <fs_over>-lbkumcommon  = l_lbkumcom.
+    if <fs_over>-lbkumcommon ne 0.
+*        l_rec1 = sy-tabix.
+        if <fs_over>-xdmshb_in ne 0.
+            l_dmbtr = <fs_over>-xdmshb_in
+                * <fs_over>-lbkumcurrent
+                / <fs_over>-lbkumcommon.
+            <fs_over>-xdmshb_in = l_dmbtr.
+        else.
+            l_dmbtr = <fs_over>-xdmshb_out
+                * <fs_over>-lbkumcurrent
+                / <fs_over>-lbkumcommon.
+            <fs_over>-xdmshb_out = l_dmbtr.
+        endif.
+    endif.
+    if not l_dmbtr is initial.
+        clear: lw_docmat.                                      "1557283
+        move-corresponding <fs_over> to lw_docmat.       "#EC ENHOK
+        insert lw_docmat into table lt_docmat_temp.            "1650775
+    endif.
+*   recording a step 'Calculating doc. revalue balance'        "1417445
+    if g_bkgrd is initial.
+        check gv_wan is initial.                               "1417445
+        perform run_scale
+            using l_prcntall l_prcntcur text-016
+            changing l_prcntshw l_prcnttmp.
+    endif.
+endloop.
+if lt_docmat_temp is not initial.                              "1650775 start
+  append lines of lt_docmat_temp to ppt_docmat.
+  refresh lt_docmat_temp.
+  sort ppt_docmat stable by xmatnr bwtar werk
+    tblsb pspnr vbeln posnr linkk lgort charg sobkz budat.
+endif.                                                         "1650775 end
+
+* free work memory
+refresh: lt_ind1_docover.                                      "1557283
+free lt_ind1_docover.
+
+* fill index table
+lt_ind2_docmat[]  = ppt_docmat[].
+
+loop at pt_overval assigning <fs_over>.
+    if <fs_over>-lost is initial.
+        read table lt_ind2_docmat transporting no fields
+        with key xbukrs = <fs_over>-xbukrs
+                 xbelnr = <fs_over>-xbelnr
+                 buzei  = <fs_over>-buzei
+                 pspnr  = <fs_over>-pspnr
+                 vbeln  = <fs_over>-vbeln
+                 posnr  = <fs_over>-posnr
+        binary search.
+    else.
+        read table lt_ind2_docmat transporting no fields
+            with key xbukrs = <fs_over>-xbukrs
+                     xbelnr = <fs_over>-xbelnr
+                     buzei  = <fs_over>-buzei
+                     xhkont = <fs_over>-xhkont.                "1650775
+    endif.
+
+    check not sy-subrc is initial.
+
+    clear: l_lgort, lv_lgort_cleared, lv_index.                "1557283 start
+* for overvalue document warehouse definition
+    read table ppt_docmat with key xmatnr = <fs_over>-xmatnr
+      bwtar = <fs_over>-bwtar werk = <fs_over>-werk
+      binary search transporting no fields.
+    lv_index = sy-tabix.
+    loop at ppt_docmat into lw_ind3_docmat
+        from lv_index
+        where xmatnr = <fs_over>-xmatnr
+          and bwtar  = <fs_over>-bwtar
+          and werk   = <fs_over>-werk                          "1557283 end
+          and lgort  = <fs_over>-lgort                         "1604108
+          and charg  = <fs_over>-charg.                        "1604108
+
+        l_lgort = <fs_over>-lgort.
+        check lw_ind3_docmat-budat <= <fs_over>-budat.
+        l_lgort = lw_ind3_docmat-lgort.
+
+        clear: lw_docmat, lw_ind2_docmat.                      "1557283
+        move-corresponding <fs_over> to lw_docmat.        "#EC ENHOK
+        move-corresponding <fs_over> to lw_ind2_docmat.  "#EC ENHOK
+        lw_docmat-lgort = l_lgort.
+        lw_ind2_docmat-lgort = l_lgort.
+        insert lw_docmat into table ppt_docmat.                "1557283
+        insert lw_ind2_docmat into table lt_ind2_docmat.
+        clear l_lgort.
+        lv_lgort_cleared = abap_true.                          "1506298
+        exit.
+    endloop.
+    if not l_lgort is initial.
+        clear: lw_docmat, lw_ind2_docmat.                      "1557283
+        move-corresponding <fs_over> to lw_docmat.        "#EC ENHOK
+        move-corresponding <fs_over> to lw_ind2_docmat.  "#EC ENHOK
+        lw_docmat-lgort = l_lgort.
+        lw_ind2_docmat-lgort = l_lgort.
+        insert lw_docmat into table ppt_docmat.                "1557283
+        insert lw_ind2_docmat into table lt_ind2_docmat.
+    elseif lv_lgort_cleared = abap_false.                      "1506298 start
+*       search for matching listmat entry
+        if lv_listmat_sorted = abap_false.
+          sort ppt_listmat by field_link.
+          lv_listmat_sorted = abap_true.
+        endif.
+        read table ppt_listmat assigning <fs_listmat>
+          with key field_link = <fs_over>-field_link
+          binary search.
+        if sy-subrc is initial.
+          l_lgort = <fs_listmat>-lgort.
+          <fs_listmat>-banner_doc = gc_true.
+          clear: lw_docmat, lw_ind2_docmat.                    "1557283
+          move-corresponding <fs_over> to lw_docmat.        "#EC ENHOK
+          move-corresponding <fs_over> to lw_ind2_docmat.  "#EC ENHOK
+          lw_docmat-lgort = l_lgort.
+          lw_ind2_docmat-lgort = l_lgort.
+          insert lw_docmat into table ppt_docmat.              "1557283
+          insert lw_ind2_docmat into table lt_ind2_docmat.
+        endif.                                                 "1506298 end
+    endif.
+endloop.
+
+refresh pt_overval.                                            "1604108
+
+endform.                    " overvalue_doc_splitting
+*&---------------------------------------------------------------------
+*&      Form  calc_quantity_date
+*&---------------------------------------------------------------------
+form calc_quantity_date
+    using pw_over         type type_overval
+          pt_ind1_listmat type tt_listmat                      "1557283
+          pt_ind7_docmat  type tt_docmat                       "1557283
+          pso_budat_high  type budat
+    changing p_lbkumcom   type type_gazprst
+             p_lbkumcur   type type_gazprst.
+types:                                                         "1650775 start
+  begin of type_buffer_listmat,
+    xmatnr like pw_over-xmatnr,
+    bwtar  like pw_over-bwtar,
+    werk   like pw_over-werk,
+    tblsb  like pw_over-tblsb,
+    pspnr  like pw_over-pspnr,
+    vbeln  like pw_over-vbeln,
+    posnr  like pw_over-posnr,
+    linkk  like pw_over-linkk,
+    lgort  like pw_over-lgort,
+    charg  like pw_over-charg,
+    sobkz  like pw_over-sobkz,
+    lbkumcom type type_gazprst,
+    lbkumcur type type_gazprst,
+  end of type_buffer_listmat,
+  begin of type_buffer_docmat,
+    xmatnr like pw_over-xmatnr,
+    bwtar  like pw_over-bwtar,
+    werk   like pw_over-werk,
+    tblsb  like pw_over-tblsb,
+    pspnr  like pw_over-pspnr,
+    vbeln  like pw_over-vbeln,
+    posnr  like pw_over-posnr,
+    linkk  like pw_over-linkk,
+    budat  like pw_over-budat,
+    lgort  like pw_over-lgort,
+    charg  like pw_over-charg,
+    sobkz  like pw_over-sobkz,
+    lbkumcom type type_gazprst,
+    lbkumcur type type_gazprst,
+  end of type_buffer_docmat.
+
+data:
+  ls_buffer_listmat type type_buffer_listmat.
+
+statics:
+  ss_buffer_docmat  type type_buffer_docmat,
+  st_buffer_listmat type hashed table of type_buffer_listmat
+    with unique key xmatnr bwtar werk tblsb pspnr vbeln posnr linkk
+                    lgort charg sobkz.
+
+if pw_over-lost is initial.
+
+* get quantity on selection end date ********************
+  read table st_buffer_listmat with table key
+    xmatnr = pw_over-xmatnr
+    bwtar  = pw_over-bwtar
+    werk   = pw_over-werk
+    tblsb  = pw_over-tblsb
+    pspnr  = pw_over-pspnr
+    vbeln  = pw_over-vbeln
+    posnr  = pw_over-posnr
+    linkk  = pw_over-linkk
+    lgort  = ''
+    charg  = ''
+    sobkz  = ''
+    into ls_buffer_listmat.
+  if sy-subrc = 0.
+*   buffered plant quantity
+    p_lbkumcom = ls_buffer_listmat-lbkumcom.
+*   get storage location quantity only
+    read table st_buffer_listmat with table key
+      xmatnr = pw_over-xmatnr
+      bwtar  = pw_over-bwtar
+      werk   = pw_over-werk
+      tblsb  = pw_over-tblsb
+      pspnr  = pw_over-pspnr
+      vbeln  = pw_over-vbeln
+      posnr  = pw_over-posnr
+      linkk  = pw_over-linkk
+      lgort  = pw_over-lgort
+      charg  = pw_over-charg
+      sobkz  = pw_over-sobkz
+      into ls_buffer_listmat.
+    if sy-subrc = 0.
+*     buffered storage location quantity
+      p_lbkumcur = ls_buffer_listmat-lbkumcur.
+    else.
+      perform calc_quantity_end_sloc
+        using pw_over
+              pt_ind1_listmat[]
+        changing
+              p_lbkumcur.
+      ls_buffer_listmat-lgort = pw_over-lgort.
+      ls_buffer_listmat-charg = pw_over-charg.
+      ls_buffer_listmat-sobkz = pw_over-sobkz.
+      ls_buffer_listmat-lbkumcur = p_lbkumcur.
+      clear ls_buffer_listmat-lbkumcom.
+      Insert ls_buffer_listmat Into Table st_buffer_listmat.
+    endif.
+  else.
+*   get plant and storage location quantity
+    perform calc_quantity_end_plantsloc
+      using pw_over
+            pt_ind1_listmat[]
+            pt_ind7_docmat[]
+            pso_budat_high
+      changing
+            p_lbkumcom
+            p_lbkumcur.
+    ls_buffer_listmat-xmatnr = pw_over-xmatnr.
+    ls_buffer_listmat-bwtar  = pw_over-bwtar.
+    ls_buffer_listmat-werk   = pw_over-werk.
+    ls_buffer_listmat-tblsb  = pw_over-tblsb.
+    ls_buffer_listmat-pspnr  = pw_over-pspnr.
+    ls_buffer_listmat-vbeln  = pw_over-vbeln.
+    ls_buffer_listmat-posnr  = pw_over-posnr.
+    ls_buffer_listmat-linkk  = pw_over-linkk.
+    ls_buffer_listmat-lbkumcom = p_lbkumcom.
+    Insert ls_buffer_listmat Into Table st_buffer_listmat.
+    ls_buffer_listmat-lgort  = pw_over-lgort.
+    ls_buffer_listmat-charg  = pw_over-charg.
+    ls_buffer_listmat-sobkz  = pw_over-sobkz.
+    ls_buffer_listmat-lbkumcur = p_lbkumcur.
+    clear ls_buffer_listmat-lbkumcom.
+    Insert ls_buffer_listmat Into Table st_buffer_listmat.
+  endif.
+
+* get quantity in the selection period ******************
+  if ss_buffer_docmat-xmatnr = pw_over-xmatnr  and
+     ss_buffer_docmat-bwtar  = pw_over-bwtar   and
+     ss_buffer_docmat-werk   = pw_over-werk    and
+     ss_buffer_docmat-tblsb  = pw_over-tblsb   and
+     ss_buffer_docmat-pspnr  = pw_over-pspnr   and
+     ss_buffer_docmat-vbeln  = pw_over-vbeln   and
+     ss_buffer_docmat-posnr  = pw_over-posnr   and
+     ss_buffer_docmat-linkk  = pw_over-linkk   and
+     ss_buffer_docmat-budat  = pw_over-budat.
+*    buffered plant quantity
+     p_lbkumcom = ss_buffer_docmat-lbkumcom.
+     if ss_buffer_docmat-lgort = pw_over-lgort  and
+        ss_buffer_docmat-charg = pw_over-charg   and
+        ss_buffer_docmat-sobkz = pw_over-sobkz.
+*       buffered storage location quantity
+        p_lbkumcur = ss_buffer_docmat-lbkumcur.
+     else.
+*      get storage location quantity
+       perform calc_quantity_date_sloc
+         using pw_over
+               pt_ind7_docmat
+               pso_budat_high
+         changing
+               p_lbkumcur.
+       ss_buffer_docmat-lgort    = pw_over-lgort.
+       ss_buffer_docmat-charg    = pw_over-charg.
+       ss_buffer_docmat-sobkz    = pw_over-sobkz.
+       ss_buffer_docmat-lbkumcur = p_lbkumcur.
+     endif.
+  else.
+*   get plant and storage location quantity
+    perform calc_quantity_date_plantsloc
+      using pw_over
+            pt_ind7_docmat
+            pso_budat_high
+      changing
+            p_lbkumcom
+            p_lbkumcur.
+    ss_buffer_docmat-xmatnr = pw_over-xmatnr.
+    ss_buffer_docmat-bwtar  = pw_over-bwtar.
+    ss_buffer_docmat-werk   = pw_over-werk.
+    ss_buffer_docmat-tblsb  = pw_over-tblsb.
+    ss_buffer_docmat-pspnr  = pw_over-pspnr.
+    ss_buffer_docmat-vbeln  = pw_over-vbeln.
+    ss_buffer_docmat-posnr  = pw_over-posnr.
+    ss_buffer_docmat-linkk  = pw_over-linkk.
+    ss_buffer_docmat-budat  = pw_over-budat.
+    ss_buffer_docmat-lgort  = pw_over-lgort.
+    ss_buffer_docmat-charg  = pw_over-charg.
+    ss_buffer_docmat-sobkz  = pw_over-sobkz.
+    ss_buffer_docmat-lbkumcom = p_lbkumcom.
+    ss_buffer_docmat-lbkumcur = p_lbkumcur.
+  endif.
+
+else.
+  perform calc_quantity_date_lost
+      using pw_over
+            pt_ind1_listmat[]
+            pt_ind7_docmat[]
+            pso_budat_high
+      changing
+            p_lbkumcom
+            p_lbkumcur.
+endif.                                                         "1650775 end
+
+endform.                    " calc_quantity_date
+
+*&---------------------------------------------------------------------*
+*&      Form  fi_way_doc_linked_getting
+*&---------------------------------------------------------------------*
+form fi_way_doc_linked_getting
+    using pt_bkpf type tt_bkpf
+          pt_bseg type tt_bseg1
+          pt_ekbe type tt_ekbe
+          pw_mseg_mkpf type type_mseg_mkpf
+          pp_listmat_ybukrs type bukrs
+          pp_listmat_xmatnr type matnr
+          pp_listmat_werk   type werks_d
+    changing pw_mseg_mkpf_1 type type_mseg_mkpf
+             p_typedoc      type type_1c.
+
+data: l_banner(1) type c,
+      l_menge     type menge_d,
+      l_awkey     type awkey,
+      lw_ekbe     type type_ekbe,
+      lw_bseg     type type_bseg,
+      lw_bkpf     type type_bkpf.
+
+l_banner = gc_true.
+clear pw_mseg_mkpf_1.                                          "1139018
+
+if pw_mseg_mkpf-awkey is initial.
+    p_typedoc = gc_item_typ_u.
+    if not pw_mseg_mkpf-ebeln is initial.
+* get from document order flow
+        loop at pt_ekbe into lw_ekbe
+            where ebeln eq pw_mseg_mkpf-ebeln
+              and ebelp eq pw_mseg_mkpf-ebelp.
+
+            check lw_ekbe-ebelp ne g_fourzero
+              and lw_ekbe-belnr ne pw_mseg_mkpf-mblnr
+              and lw_ekbe-werks ne pp_listmat_werk
+              and lw_ekbe-menge eq pw_mseg_mkpf-menge
+              and lw_ekbe-bwtar eq pw_mseg_mkpf-bwtar.
+
+            l_awkey = lw_ekbe-awkey.
+            clear l_banner.
+            exit.
+        endloop.
+    endif.
+else.
+*    perfrom get_fi_data
+    p_typedoc = gc_item_typ_f.
+    clear l_banner.
+    l_awkey = pw_mseg_mkpf-awkey.
+endif.
+
+if l_banner is initial.
+* get linking FI document
+    loop at pt_bkpf into lw_bkpf
+        where awkey = l_awkey
+          and bukrs = pp_listmat_ybukrs.
+
+* buzei belnr hkont bwkey bukrs gjahr bwtar ebelp ebeln,
+        read table pt_bseg into lw_bseg
+            with key belnr = lw_bkpf-belnr
+                     werks = pp_listmat_werk
+                     matnr = pp_listmat_xmatnr
+                     gjahr = lw_bkpf-gjahr
+                     bukrs = pp_listmat_ybukrs
+                     shkzg = pw_mseg_mkpf-shkzg
+                     menge = pw_mseg_mkpf-menge.
+        if sy-subrc is initial.
+            move: lw_bkpf-belnr to pw_mseg_mkpf_1-belnr,
+                  lw_bkpf-gjahr to pw_mseg_mkpf_1-gjahr,
+                  lw_bkpf-budat to pw_mseg_mkpf_1-budat,
+                  lw_bseg-buzei to pw_mseg_mkpf_1-buzei.
+            exit.
+        endif.
+    endloop.
+
+    if not sy-subrc is initial.
+        if not pw_mseg_mkpf-ebeln is initial.
+            loop at pt_ekbe into lw_ekbe
+                where ebeln eq pw_mseg_mkpf-ebeln
+                  and ebelp eq pw_mseg_mkpf-ebelp
+                  and belnr ne pw_mseg_mkpf-mblnr.
+                exit.
+            endloop.
+        else.
+            sy-subrc = 4.
+        endif.
+
+        if sy-subrc is initial
+            and not lw_ekbe-awkey is initial.
+            read table pt_bkpf into lw_bkpf
+                with key awkey = lw_ekbe-awkey
+                         bukrs = pp_listmat_ybukrs.
+            if sy-subrc is initial.
+                move: lw_bkpf-belnr to pw_mseg_mkpf_1-belnr,
+                      lw_bkpf-gjahr to pw_mseg_mkpf_1-gjahr,
+                      lw_bkpf-budat to pw_mseg_mkpf_1-budat.
+                read table pt_bseg into lw_bseg
+                    with key belnr = pw_mseg_mkpf_1-belnr
+                             werks = pp_listmat_werk
+                             matnr = pp_listmat_xmatnr
+                             gjahr = pw_mseg_mkpf_1-gjahr
+                             bukrs = pp_listmat_ybukrs
+                             shkzg = pw_mseg_mkpf-shkzg
+                             ebeln = lw_ekbe-ebeln
+                             ebelp = lw_ekbe-ebelp.
+                if sy-subrc is initial.
+                    move: lw_bseg-dmbtr to pw_mseg_mkpf_1-dmbtr,
+                          lw_bseg-buzei to pw_mseg_mkpf_1-buzei.
+                endif.
+            endif.
+        else.
+            move lw_ekbe-dmbtr to pw_mseg_mkpf_1-dmbtr.
+            p_typedoc = gc_item_typ_u.
+        endif.
+    endif.
+else.
+
+    if not pw_mseg_mkpf-ebeln is initial.
+
+        clear: pw_mseg_mkpf_1, l_menge.
+        loop at pt_ekbe into lw_ekbe
+            where ebeln eq pw_mseg_mkpf-ebeln
+              and ebelp eq pw_mseg_mkpf-ebelp.
+
+            check lw_ekbe-ebelp ne g_fourzero
+              and lw_ekbe-belnr ne pw_mseg_mkpf-mblnr
+              and lw_ekbe-shkzg ne pw_mseg_mkpf-shkzg
+              and lw_ekbe-werks ne pp_listmat_werk.
+
+              add lw_ekbe-dmbtr to pw_mseg_mkpf_1-dmbtr.
+              add lw_ekbe-menge to l_menge.
+        endloop.
+
+        if l_menge is initial.
+            pw_mseg_mkpf_1-dmbtr = 0.
+        else.
+            pw_mseg_mkpf_1-dmbtr = pw_mseg_mkpf_1-dmbtr
+                * pw_mseg_mkpf-menge / l_menge.
+        endif.
+*    else.
+
+    endif.
+    move: gc_doc_phantom     to pw_mseg_mkpf_1-belnr,
+          gc_str_phantom     to pw_mseg_mkpf_1-gjahr,
+          pw_mseg_mkpf-budat to pw_mseg_mkpf_1-budat.
+endif.
+
+endform.                    " fi_way_doc_linked_getting
+
+*&---------------------------------------------------------------------
+*&      Form  calc_quantity_date_lost
+*&---------------------------------------------------------------------
+form calc_quantity_date_lost                                   "1650775
+    using pw_over         type type_overval
+          pt_ind1_listmat type tt_listmat
+          pt_ind7_docmat  type tt_docmat
+          pso_budat_high  type budat
+    changing p_lbkumcom   type type_gazprst
+             p_lbkumcur   type type_gazprst.
+
+data:
+    lv_index        like sy-tabix,
+    l_dmbtr         type type_gazprst.
+
+field-symbols:
+    <fs_ind1_listmat> type type_listmat,
+    <fs_ind7_docmat>  type type_docmat.
+
+read table pt_ind1_listmat with key xmatnr = pw_over-xmatnr
+  bwtar = pw_over-bwtar werk = pw_over-werk
+  binary search transporting no fields.
+if sy-subrc = 0.
+  lv_index = sy-tabix.
+  loop at pt_ind1_listmat assigning <fs_ind1_listmat>
+    from lv_index.
+
+    if <fs_ind1_listmat>-xmatnr ne pw_over-xmatnr or
+       <fs_ind1_listmat>-bwtar  ne pw_over-bwtar  or
+       <fs_ind1_listmat>-werk   ne pw_over-werk.
+      exit.
+    endif.
+    check <fs_ind1_listmat>-xsaknr = pw_over-xhkont.
+
+    if <fs_ind1_listmat>-lgort = pw_over-lgort  and
+       <fs_ind1_listmat>-charg = pw_over-charg  and
+       <fs_ind1_listmat>-sobkz = pw_over-sobkz.
+*     calc quantity in current storage on selection end date
+      add <fs_ind1_listmat>-endremn to p_lbkumcur.
+    endif.
+*   calc quantity in current plant on selection end date
+    add <fs_ind1_listmat>-endremn to p_lbkumcom.
+  endloop.
+endif.
+
+read table pt_ind7_docmat with key xmatnr = pw_over-xmatnr
+  bwtar = pw_over-bwtar werk = pw_over-werk
+  binary search transporting no fields.
+if sy-subrc = 0.
+  lv_index = sy-tabix.
+  loop at pt_ind7_docmat assigning <fs_ind7_docmat> from lv_index.
+    if <fs_ind7_docmat>-xmatnr ne pw_over-xmatnr  or
+       <fs_ind7_docmat>-bwtar  ne pw_over-bwtar   or
+       <fs_ind7_docmat>-werk   ne pw_over-werk.
+      exit.
+    endif.
+    check <fs_ind7_docmat>-budat >  pw_over-budat
+      and <fs_ind7_docmat>-budat <= pso_budat_high
+      and <fs_ind7_docmat>-xhkont = pw_over-xhkont.
+
+*   calc quantity in storage and in plant on overvalue date
+    if <fs_ind7_docmat>-lgort eq pw_over-lgort
+        and <fs_ind7_docmat>-charg eq pw_over-charg
+        and <fs_ind7_docmat>-sobkz eq pw_over-sobkz.
+
+        if <fs_ind7_docmat>-xmensh_in is initial.
+            l_dmbtr = abs( <fs_ind7_docmat>-xmensh_out ).
+            add l_dmbtr to p_lbkumcur.
+            add l_dmbtr to p_lbkumcom.
+        else.
+            subtract <fs_ind7_docmat>-xmensh_in
+                        from p_lbkumcur.
+            subtract <fs_ind7_docmat>-xmensh_in
+                        from p_lbkumcom.
+        endif.
+    else.
+        if <fs_ind7_docmat>-xmensh_in is initial.
+            l_dmbtr = abs( <fs_ind7_docmat>-xmensh_out ).
+            add l_dmbtr to p_lbkumcom.
+        else.
+            subtract <fs_ind7_docmat>-xmensh_in
+                from p_lbkumcom.
+        endif.
+    endif.
+  endloop.
+endif.
+
+endform.                    " calc_quantity_date_lost          "1650775
+*&---------------------------------------------------------------------
+*&      Form  calc_quantity_end_plantsloc
+*&---------------------------------------------------------------------
+form calc_quantity_end_plantsloc                               "1650775
+    using pw_over         type type_overval
+          pt_ind1_listmat type tt_listmat
+          pt_ind7_docmat  type tt_docmat
+          pso_budat_high  type budat
+    changing p_lbkumcom   type type_gazprst
+             p_lbkumcur   type type_gazprst.
+
+data:
+    lv_index        like sy-tabix.
+
+field-symbols:
+    <fs_ind1_listmat> type type_listmat.
+
+  read table pt_ind1_listmat with key
+    xmatnr = pw_over-xmatnr     bwtar  = pw_over-bwtar
+    werk   = pw_over-werk       tblsb  = pw_over-tblsb
+    pspnr  = pw_over-pspnr      vbeln  = pw_over-vbeln
+    posnr  = pw_over-posnr      linkk  = pw_over-linkk
+    binary search transporting no fields.
+  check sy-subrc = 0.
+  lv_index = sy-tabix.
+
+  loop at pt_ind1_listmat assigning <fs_ind1_listmat>
+    from lv_index.
+
+    if <fs_ind1_listmat>-xmatnr ne pw_over-xmatnr or
+       <fs_ind1_listmat>-bwtar  ne pw_over-bwtar  or
+       <fs_ind1_listmat>-werk   ne pw_over-werk   or
+       <fs_ind1_listmat>-tblsb  ne pw_over-tblsb  or
+       <fs_ind1_listmat>-pspnr  ne pw_over-pspnr  or
+       <fs_ind1_listmat>-vbeln  ne pw_over-vbeln  or
+       <fs_ind1_listmat>-posnr  ne pw_over-posnr  or
+       <fs_ind1_listmat>-linkk  ne pw_over-linkk.
+      exit.
+    endif.
+
+    if <fs_ind1_listmat>-lgort = pw_over-lgort and
+       <fs_ind1_listmat>-charg = pw_over-charg and
+       <fs_ind1_listmat>-sobkz = pw_over-sobkz.
+*     calc quantity in current storage on selection end date
+      add <fs_ind1_listmat>-endremn to p_lbkumcur.
+    endif.
+*   calc quantity in current plant on selection end date
+    add <fs_ind1_listmat>-endremn to p_lbkumcom.
+  endloop.
+
+endform.                    " calc_quantity_end_plantsloc      "1650775
+*&---------------------------------------------------------------------
+*&      Form  calc_quantity_end_sloc
+*&---------------------------------------------------------------------
+form calc_quantity_end_sloc                                    "1650775
+    using pw_over         type type_overval
+          pt_ind1_listmat type tt_listmat
+    changing p_lbkumcur   type type_gazprst.
+
+data:
+    lv_index        like sy-tabix.
+
+field-symbols:
+    <fs_ind1_listmat> type type_listmat.
+
+  read table pt_ind1_listmat with key
+    xmatnr = pw_over-xmatnr     bwtar  = pw_over-bwtar
+    werk   = pw_over-werk       tblsb  = pw_over-tblsb
+    pspnr  = pw_over-pspnr      vbeln  = pw_over-vbeln
+    posnr  = pw_over-posnr      linkk  = pw_over-linkk
+    lgort  = pw_over-lgort      charg  = pw_over-charg
+    sobkz  = pw_over-sobkz
+    binary search transporting no fields.
+  check sy-subrc = 0.
+  lv_index = sy-tabix.
+
+  loop at pt_ind1_listmat assigning <fs_ind1_listmat>
+    from lv_index.
+
+    if <fs_ind1_listmat>-xmatnr ne pw_over-xmatnr or
+       <fs_ind1_listmat>-bwtar  ne pw_over-bwtar  or
+       <fs_ind1_listmat>-werk   ne pw_over-werk   or
+       <fs_ind1_listmat>-tblsb  ne pw_over-tblsb  or
+       <fs_ind1_listmat>-pspnr  ne pw_over-pspnr  or
+       <fs_ind1_listmat>-vbeln  ne pw_over-vbeln  or
+       <fs_ind1_listmat>-posnr  ne pw_over-posnr  or
+       <fs_ind1_listmat>-linkk  ne pw_over-linkk  or
+       <fs_ind1_listmat>-lgort  ne pw_over-lgort  or
+       <fs_ind1_listmat>-charg  ne pw_over-charg  or
+       <fs_ind1_listmat>-sobkz  ne pw_over-sobkz.
+      exit.
+    endif.
+*   calc quantity in current storage on selection end date
+    add <fs_ind1_listmat>-endremn to p_lbkumcur.
+  endloop.
+
+endform.                    " calc_quantity_end_sloc           "1650775
+*&---------------------------------------------------------------------
+*&      Form  calc_quantity_date_sloc
+*&---------------------------------------------------------------------
+form calc_quantity_date_sloc                                   "1650775
+    using pw_over         type type_overval
+          pt_ind7_docmat  type tt_docmat
+          pso_budat_high  type budat
+    changing p_lbkumcur   type type_gazprst.
+
+data:
+    lv_index          like sy-tabix,
+    l_dmbtr           type type_gazprst.
+
+field-symbols:
+    <fs_ind7_docmat>  type type_docmat.
+
+  read table pt_ind7_docmat with key
+    xmatnr = pw_over-xmatnr     bwtar = pw_over-bwtar
+    werk   = pw_over-werk       tblsb = pw_over-tblsb
+    pspnr  = pw_over-pspnr      vbeln = pw_over-vbeln
+    posnr  = pw_over-posnr      linkk = pw_over-linkk
+    lgort  = pw_over-lgort      charg = pw_over-charg
+    sobkz  = pw_over-sobkz
+    binary search transporting no fields.
+  check sy-subrc = 0.
+  lv_index = sy-tabix.
+
+  loop at pt_ind7_docmat assigning <fs_ind7_docmat>
+    from lv_index.
+    if <fs_ind7_docmat>-xmatnr ne pw_over-xmatnr  or
+       <fs_ind7_docmat>-bwtar  ne pw_over-bwtar   or
+       <fs_ind7_docmat>-werk   ne pw_over-werk    or
+       <fs_ind7_docmat>-tblsb  ne pw_over-tblsb   or
+       <fs_ind7_docmat>-pspnr  ne pw_over-pspnr   or
+       <fs_ind7_docmat>-vbeln  ne pw_over-vbeln   or
+       <fs_ind7_docmat>-posnr  ne pw_over-posnr   or
+       <fs_ind7_docmat>-linkk  ne pw_over-linkk   or
+       <fs_ind7_docmat>-lgort  ne pw_over-lgort   or
+       <fs_ind7_docmat>-charg  ne pw_over-charg   or
+       <fs_ind7_docmat>-sobkz  ne pw_over-sobkz.
+      exit.
+    endif.
+    check <fs_ind7_docmat>-budat >  pw_over-budat
+      and <fs_ind7_docmat>-budat <= pso_budat_high.
+
+*   calc quantity in storage on overvalue date
+    if <fs_ind7_docmat>-xmensh_in is initial.
+      l_dmbtr = abs( <fs_ind7_docmat>-xmensh_out ).
+      add l_dmbtr to p_lbkumcur.
+    else.
+      subtract <fs_ind7_docmat>-xmensh_in from p_lbkumcur.
+    endif.
+  endloop.
+
+endform.                    " calc_quantity_date_sloc          "1650775
+*&---------------------------------------------------------------------
+*&      Form  calc_quantity_date_plantsloc
+*&---------------------------------------------------------------------
+form calc_quantity_date_plantsloc                              "1650775
+    using pw_over         type type_overval
+          pt_ind7_docmat  type tt_docmat
+          pso_budat_high  type budat
+    changing p_lbkumcom   type type_gazprst
+             p_lbkumcur   type type_gazprst.
+data:
+    lv_index          like sy-tabix,
+    l_dmbtr           type type_gazprst.
+
+field-symbols:
+    <fs_ind7_docmat>  type type_docmat.
+
+  read table pt_ind7_docmat with key
+    xmatnr = pw_over-xmatnr     bwtar = pw_over-bwtar
+    werk   = pw_over-werk       tblsb = pw_over-tblsb
+    pspnr  = pw_over-pspnr      vbeln = pw_over-vbeln
+    posnr  = pw_over-posnr      linkk = pw_over-linkk
+    binary search transporting no fields.
+  check sy-subrc = 0.
+  lv_index = sy-tabix.
+
+  loop at pt_ind7_docmat assigning <fs_ind7_docmat>
+    from lv_index.
+    if <fs_ind7_docmat>-xmatnr ne pw_over-xmatnr  or
+       <fs_ind7_docmat>-bwtar  ne pw_over-bwtar   or
+       <fs_ind7_docmat>-werk   ne pw_over-werk    or
+       <fs_ind7_docmat>-tblsb  ne pw_over-tblsb   or
+       <fs_ind7_docmat>-pspnr  ne pw_over-pspnr   or
+       <fs_ind7_docmat>-vbeln  ne pw_over-vbeln   or
+       <fs_ind7_docmat>-posnr  ne pw_over-posnr   or
+       <fs_ind7_docmat>-linkk  ne pw_over-linkk.
+      exit.
+    endif.
+    check <fs_ind7_docmat>-budat >  pw_over-budat
+      and <fs_ind7_docmat>-budat <= pso_budat_high.
+
+*   calc quantity in storage and in plant on overvalue date
+    if <fs_ind7_docmat>-lgort eq pw_over-lgort
+        and <fs_ind7_docmat>-charg eq pw_over-charg
+        and <fs_ind7_docmat>-sobkz eq pw_over-sobkz.
+
+        if <fs_ind7_docmat>-xmensh_in is initial.
+            l_dmbtr = abs( <fs_ind7_docmat>-xmensh_out ).
+            add l_dmbtr to p_lbkumcur.
+            add l_dmbtr to p_lbkumcom.
+        else.
+            subtract <fs_ind7_docmat>-xmensh_in
+                        from p_lbkumcur.
+            subtract <fs_ind7_docmat>-xmensh_in
+                        from p_lbkumcom.
+        endif.
+    else.
+        if <fs_ind7_docmat>-xmensh_in is initial.
+            l_dmbtr = abs( <fs_ind7_docmat>-xmensh_out ).
+            add l_dmbtr to p_lbkumcom.
+        else.
+            subtract <fs_ind7_docmat>-xmensh_in
+                from p_lbkumcom.
+        endif.
+    endif.
+  endloop.
+
+endform.                    " calc_quantity_date_plantsloc     "1650775

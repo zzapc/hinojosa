@@ -1,0 +1,1313 @@
+************************************************************************
+* TIPO : MANTENIMIENTO
+* TITULO : Monitor WHS
+* *
+* DESCRIPCION : Monitor WHS
+*
+*
+* AUTOR: Andrés Picazo                                FECHA: 26/12/2013
+* ANALISTA: Alfredo García
+*
+* MODIFICACIONES
+*
+***********************************************************************
+REPORT zmsg_monitor.
+
+*------INCLUDES--------------------------------------------------------*
+
+*------TABLAS/ESTRUCTURAS----------------------------------------------*
+TABLES: zwhs_monitor_sel, zwhs_campos, zwhs_mensaje, afru, sscrfields,
+        makt, zwhs_mot_cest, *zwhs_monitor_sel.
+*------CONSTANTES------------------------------------------------------*
+
+*------TABLAS INTERNAS-------------------------------------------------*
+DATA: i_listado          TYPE TABLE OF zwhs_monitor,
+      i_listado_aux      TYPE TABLE OF zwhs_monitor,
+      i_listado_ini      TYPE TABLE OF zwhs_monitor,
+      i_listado_borrados TYPE TABLE OF zwhs_monitor,
+      l_listado          TYPE zwhs_monitor.
+
+TYPES: BEGIN OF t_log,
+         lights,
+         idcola  TYPE zidcola,
+         cont    TYPE zwhs_log-cont,
+         fecha   TYPE erdat,
+         hora    TYPE erzet,
+         usuario TYPE ernam,
+         tcode   TYPE tcode,
+         tipo    TYPE msgty,
+         mensaje TYPE bapi_msg,
+       END OF t_log.
+DATA i_log TYPE TABLE OF t_log.
+
+FIELD-SYMBOLS: <listado> TYPE zwhs_monitor,
+               <log>     TYPE t_log.
+
+
+*------VARIABLES-------------------------------------------------------*
+DATA: v_inicio, l_return, l_mensaje TYPE bapi_msg,
+zwhs_monitor TYPE zwhs_monitor,
+l_string     TYPE string.
+
+__data_set_vart zwhs_campos_desc.
+*----------------------------------------------------------------------*
+* CLASS lcl_alv DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_event_grid DEFINITION INHERITING FROM zcl_ap_alv_grid_eventos.
+  PUBLIC SECTION.
+    METHODS: double_click REDEFINITION,
+      data_changed REDEFINITION,
+      toolbar      REDEFINITION,
+      user_command REDEFINITION.
+ENDCLASS.                    "lcl_event_grid DEFINITION
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report DEFINITION INHERITING FROM zcl_ap_dev.
+  PUBLIC SECTION.
+    METHODS:  buscar_datos REDEFINITION,
+      verificar_datos.
+
+ENDCLASS.                    "REPORT DEFINITION
+
+DATA: o_alv   TYPE REF TO zcl_ap_alv_grid,
+      o_event TYPE REF TO lcl_event_grid,
+      o_prog  TYPE REF TO zcl_report.
+
+
+DEFINE: sel_par.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN POSITION 1.
+  PARAMETERS p_&1 LIKE t001-butxt DEFAULT &3 MODIF ID noi.
+  SELECTION-SCREEN POSITION 30.
+  SELECT-OPTIONS: s_&1 FOR  zwhs_monitor_sel-&2.
+  SELECTION-SCREEN END OF LINE.
+END-OF-DEFINITION.
+
+*------PARAMETER/SELECT-OPTIONS EN PANTALLA----------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK 001 WITH FRAME.
+PARAMETERS: p_idcli LIKE zwhs_interlocuto-idcliente OBLIGATORY MEMORY ID zidcliente.
+SELECT-OPTIONS: s_idcola FOR zwhs_monitor_sel-idcola,
+                s_idmsg  FOR zwhs_monitor_sel-idmsg MATCHCODE OBJECT zwhs_mensaje,
+                s_estado FOR zwhs_monitor_sel-estado MODIF ID sie,
+                s_objkey FOR zwhs_monitor_sel-objkey,
+                s_fechac FOR zwhs_monitor_sel-fecha_creacion DEFAULT sy-datum,
+                s_horac  FOR zwhs_monitor_sel-hora_creacion,
+                s_usuari FOR zwhs_monitor_sel-usuario,
+                s_lgort  FOR zwhs_monitor_sel-lgort MATCHCODE OBJECT ztet_equipos_almd_h,
+                s_pendi  FOR zwhs_monitor_sel-pendiente,
+                s_e_s    FOR zwhs_monitor_sel-e_s.
+sel_par: entre entrega 'Entrega',
+         pedid pedido  'Pedido ventas',
+         ebeln ebeln   'Pedido compras',
+         werks werks   'Centro',
+         matnr matnr   'Material',
+         charg charg   'Lote',
+         exidv exidv   'HU',
+         lifnr lifnr   'Proveedor',
+         tanum tanum   'Nº OT'.
+sel_par: aufnr aufnr   'Orden',
+         auart auart   'Clase de orden',
+         otros otros   'Otros',
+         belnr belnr   'Documento',
+         gjahr gjahr   'Ejercicio',
+         cpudt cpudt   'F.Doc.Contable',
+         cputm cputm   'H.Doc.Contable',
+         aufnr2 aufnr2  'Nueva orden'.
+*SELECT-OPTIONS: s_estadf   FOR zwhs_monitor_sel-estado_factura,
+*                s_factu  FOR zwhs_monitor_sel-factura.
+SELECTION-SCREEN SKIP.
+SELECT-OPTIONS: s_log FOR makt-maktx.
+SELECTION-SCREEN SKIP.
+PARAMETERS: p_incar AS CHECKBOX.
+SELECTION-SCREEN SKIP.
+PARAMETERS: p_vari LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK 001.
+SELECTION-SCREEN: FUNCTION KEY 1.
+SELECTION-SCREEN: FUNCTION KEY 2.
+SELECTION-SCREEN: FUNCTION KEY 3.
+SELECTION-SCREEN: FUNCTION KEY 4.
+SELECTION-SCREEN: FUNCTION KEY 5.
+
+
+
+
+************************************************************************
+*
+* LOGICA DEL PROGRAMA
+*
+************************************************************************
+CLASS lcl_event_grid IMPLEMENTATION.
+  METHOD double_click.
+    DATA: l_existe,
+          i_fichero   TYPE TABLE OF string,
+          l_fichero   TYPE string,
+          l_formatear,
+          l_doc(12),
+          l_mblnr     TYPE mblnr,
+          l_ebeln     TYPE ebeln,
+          l_mjahr     TYPE mjahr,
+          l_editor    TYPE string.
+
+
+    READ TABLE i_listado INTO l_listado INDEX e_row-index.
+    IF sy-subrc = 0.
+      DATA(l_extension) =  zcl_ap_ficheros=>get_extension( l_listado-fichero ).
+      TRANSLATE l_extension TO LOWER CASE.
+      CASE e_column.
+        WHEN 'FICHERO'.
+          IF l_listado-formato = 'W'.
+            IF NOT l_listado-contenido_zip IS INITIAL.
+              l_fichero = zcl_ap_documentos=>get_directorio_temporal( ).
+              l_fichero = zcl_ap_ficheros=>concat_ruta( directorio = l_fichero
+                                                   fichero    = 'mensaje.zip' ).
+              zcl_ap_ficheros=>grabar_xstring( EXPORTING fichero = l_fichero
+                                                         xstring = l_listado-contenido_zip ).
+              zcl_ap_gos=>visualizar_fichero_st( fichero = l_fichero extension = 'ZIP' ).
+            ELSEIF NOT l_listado-contenido_ficher IS INITIAL.
+              IF l_listado-contenido_ficher(1) = '{'.
+                cl_demo_output=>display_json( l_listado-contenido_ficher ).
+              ENDIF.
+            ENDIF.
+          ELSEIF l_listado-formato = 'X' OR l_listado-formato = 'J'.
+            IF l_extension = 'json' OR l_listado-formato = 'J'.
+              REPLACE ALL OCCURRENCES OF '"' IN l_listado-contenido_ficher WITH '%22'.
+              l_fichero = 'https://jsonlint.com/?json=' && l_listado-contenido_ficher.
+              CALL METHOD cl_gui_frontend_services=>execute
+                EXPORTING
+                  document               = l_fichero
+                EXCEPTIONS
+                  file_not_found         = 1
+                  path_not_found         = 1
+                  cntl_error             = 2
+                  error_no_gui           = 3
+                  bad_parameter          = 4
+                  file_extension_unknown = 5
+                  error_execute_failed   = 6
+                  synchronous_failed     = 7
+                  not_supported_by_gui   = 8
+                  OTHERS                 = 9.
+
+            ELSE.
+              zcl_ap_ws=>ver_xml( xml = l_listado-contenido_ficher ).
+            ENDIF.
+          ELSE.
+            IF NOT l_listado-fichero IS INITIAL.
+              IF zcl_ap_ficheros=>existe( l_listado-fichero ) = 'X'.
+                l_existe = 'X'.
+                zcl_ap_ficheros=>ver_fichero_texto( l_listado-fichero ).
+              ENDIF.
+            ENDIF.
+            IF l_existe IS INITIAL.
+              zcl_ap_string=>string2tabla( EXPORTING string = l_listado-contenido_ficher
+                                                     longitud = 10000
+                                           CHANGING  tabla = i_fichero ).
+
+              l_fichero = zcl_ap_documentos=>get_directorio_temporal( ).
+              l_fichero = zcl_ap_ficheros=>concat_ruta( directorio = l_fichero
+                                                   fichero    = 'mensaje.txt' ).
+              zcl_ap_ficheros=>grabar_fichero( EXPORTING fichero = l_fichero
+                                               CHANGING  tabla   = i_fichero ).
+              zcl_ap_ficheros=>ver_fichero_texto( l_fichero ).
+            ENDIF.
+          ENDIF.
+        WHEN 'MATNR' OR 'MAKTX'.
+          zcl_ap_material=>visualizar( l_listado-matnr ).
+        WHEN 'CHARG'.
+          zcl_ap_clas_lote=>ver_mat_lote( matnr = l_listado-matnr
+                                         charg = l_listado-charg ).
+        WHEN 'AUFNR' OR 'AUFNR2'.
+          IF e_column = 'AUFNR'.
+            DATA(l_aufnr) = l_listado-aufnr.
+          ELSE.
+            l_aufnr = l_listado-aufnr2.
+          ENDIF.
+          SELECT SINGLE aufnr FROM aufk
+            INTO l_doc
+           WHERE aufnr = l_aufnr.
+          IF sy-subrc = 0.
+            zcl_ap_orden_pp=>visualizar( l_aufnr ).
+          ELSE.
+            SELECT MAX( mjahr ) FROM mkpf
+              INTO l_mjahr
+             WHERE mblnr = l_listado-aufnr.
+            IF NOT l_mjahr IS INITIAL.
+              l_mblnr = l_listado-aufnr.
+              zcl_ap_docmat=>visualizar( mblnr = l_mblnr mjahr = l_mjahr ).
+            ELSE.
+              SELECT SINGLE ebeln FROM ekko
+                INTO l_doc
+               WHERE ebeln = l_listado-aufnr.
+              IF sy-subrc = 0.
+                l_ebeln = l_listado-aufnr.
+                zcl_ap_pedido_mm=>visualizar( l_ebeln ).
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        WHEN 'EXIDV'.
+          IF l_listado-exidv(3) = 'NOT'.
+            afru-rueck = l_listado-exidv+4(10).
+            afru-rmzhl = l_listado-exidv+15(4).
+            zcl_ap_string=>poner_ceros_c( CHANGING cadena = afru-rmzhl ).
+            zcl_ap_orden_pp=>ver_notificacion( rueck = afru-rueck
+                                   rmzhl = afru-rmzhl ).
+          ELSE.
+            zcl_ap_hu=>visualizar( exidv = l_listado-exidv ).
+          ENDIF.
+        WHEN 'EBELN'.
+          zcl_ap_pedido_mm=>visualizar( l_listado-ebeln ).
+        WHEN 'PEDIDO'.
+          zcl_ap_pedido_sd=>visualizar( l_listado-pedido ).
+        WHEN 'ENTREGA'.
+          SELECT SINGLE vbeln FROM likp
+            INTO l_doc
+           WHERE vbeln = l_listado-entrega.
+          IF sy-subrc = 0.
+            zcl_ap_entregas=>visualizar( l_listado-entrega ).
+          ELSE.
+            SELECT MAX( mjahr ) FROM mkpf
+              INTO l_mjahr
+             WHERE mblnr = l_listado-entrega.
+            IF NOT l_mjahr IS INITIAL.
+              zcl_ap_docmat=>visualizar( mblnr = l_listado-entrega mjahr = l_mjahr ).
+            ELSE.
+              SELECT SINGLE ebeln FROM ekko
+                INTO l_doc
+           WHERE ebeln = l_listado-entrega.
+              IF sy-subrc = 0.
+                zcl_ap_pedido_mm=>visualizar( l_listado-entrega ).
+              ENDIF.
+            ENDIF.
+          ENDIF.
+
+        WHEN 'TANUM'.
+          zcl_ap_ot=>visualizar( lgnum = l_listado-lgnum tanum = l_listado-tanum tapos = l_listado-tapos ).
+        WHEN 'MSGGUID'.
+          DATA: im_msgkey TYPE sxmsmkey,
+                pay_bytes TYPE xstring.
+          SELECT pid FROM sxmspmast
+            INTO im_msgkey-pid
+            UP TO 1 ROWS
+           WHERE msgguid = l_listado-msgguid
+           ORDER BY exetimest DESCENDING.
+          ENDSELECT.
+          IF sy-subrc = 0.
+            im_msgkey-msgid = l_listado-msgguid.
+            CALL FUNCTION 'SXMB_GET_MESSAGE_PAYLOAD'
+              EXPORTING
+                im_msgkey      = im_msgkey
+                im_archive     = ''
+                im_version     = '000'
+              IMPORTING
+                ex_msg_bytes   = pay_bytes
+              EXCEPTIONS
+                not_authorized = 1
+                no_message     = 2
+                internal_error = 3
+                no_payload     = 4
+                OTHERS         = 5.
+            IF sy-subrc <> 0.
+              MESSAGE 'Error recuperando payload' TYPE 'I'.
+              RETURN.
+            ENDIF.
+
+            TRY.
+                CALL FUNCTION 'DISPLAY_XML_STRING'
+                  EXPORTING
+                    xml_string      = pay_bytes
+*                   TITLE           =
+*                   STARTING_X      = 5
+*                   STARTING_Y      = 5
+                  EXCEPTIONS
+                    no_xml_document = 1
+                    OTHERS          = 2.
+
+              CATCH cx_root INTO DATA(o_root).              "#EC *
+                MESSAGE o_root->get_text( ) TYPE 'I'.
+            ENDTRY.
+          ENDIF.
+        WHEN OTHERS.
+          IF l_listado-formato = 'X'.
+            IF e_column = 'CONTENIDO_FICHER'.
+              l_editor = o_prog->o_par->get_atr1( campo = 'EDITOR' valor = sy-uname ).
+              IF l_editor IS INITIAL.
+                l_editor = 'NOTEPAD.EXE'.
+              ENDIF.
+
+
+              l_fichero = l_listado-contenido_ficher.
+*              IF l_listado-contenido_ficher CS cl_abap_char_utilities=>cr_lf.
+*                CLEAR l_formatear.
+*              ELSE.
+*                l_formatear = 'X'.
+*              ENDIF.
+              DATA: l_dir_temp      TYPE string,
+                    l_fichero_local TYPE string,
+                    i_fichero_aux   TYPE TABLE OF string.
+
+              l_dir_temp = zcl_ap_documentos=>get_directorio_temporal( ).
+              CONCATENATE l_dir_temp '\fichero.xml' INTO l_fichero_local.
+              zcl_ap_ficheros=>grabar_xstring( fichero = l_fichero_local
+                                               string  = l_listado-contenido_ficher ).
+
+*              zcl_ap_documentos=>ejecutar( tcode = 'PORTABLES' nombre = 'EDITOR_XML'
+*                                           parametros = l_fichero_local ).
+              CALL METHOD cl_gui_frontend_services=>execute
+                EXPORTING
+*                 document               =
+                  application            = l_editor
+                  parameter              = l_fichero_local
+*                 default_directory      =
+*                 maximized              =
+*                 minimized              =
+                  synchronous            = 'X'
+*                 operation              = 'OPEN'
+                EXCEPTIONS
+                  cntl_error             = 1
+                  error_no_gui           = 2
+                  bad_parameter          = 3
+                  file_not_found         = 4
+                  path_not_found         = 5
+                  file_extension_unknown = 6
+                  error_execute_failed   = 7
+                  synchronous_failed     = 8
+                  not_supported_by_gui   = 9
+                  OTHERS                 = 10.
+              zcl_ap_ficheros=>leer_xstring( EXPORTING fichero = l_fichero_local get_string = 'X'
+                                             IMPORTING string  = l_listado-contenido_ficher ).
+
+              IF l_fichero NE l_listado-contenido_ficher.
+                IF l_formatear = 'X'.
+                  zcl_ap_string=>quitar_caracteres_extranos( EXPORTING replacement = 32 CHANGING string = l_listado-contenido_ficher ).
+                ENDIF.
+
+                MODIFY i_listado FROM l_listado INDEX e_row-index.
+                UPDATE zwhs_cola
+                   SET contenido_ficher = l_listado-contenido_ficher
+                 WHERE idcola  = l_listado-idcola.
+
+                IF l_listado-idmsg = 'FCT'.
+                  IF zcl_ap_popup=>confirmar( texto = '¿Desea enviar el mensaje?' ) = 'X'.
+                    zwhs=>procesa_msg( EXPORTING idcola  = l_listado-idcola
+                                                 tcode   = 'ZWHS_MONITOR'
+                                                 modo_ct = 'A'
+                                                 forzar_reproceso = 'X'
+                                       IMPORTING mensaje = l_listado-mensaje ).
+
+                    zwhs=>update_cola_mem( CHANGING monitor = l_listado ).
+                    MODIFY i_listado FROM l_listado INDEX e_row-index.
+                  ENDIF.
+                ENDIF.
+
+                o_alv->refrescar_grid( ).
+              ENDIF.
+            ELSE.
+              IF l_extension = 'json'.
+*                REPLACE ALL OCCURRENCES OF '"' IN l_listado-contenido_ficher WITH '%22'.
+*                l_fichero = 'https://jsonlint.com/?json=' && l_listado-contenido_ficher.
+*                CALL METHOD cl_gui_frontend_services=>execute
+*                  EXPORTING
+*                    document               = l_fichero
+*                  EXCEPTIONS
+*                    file_not_found         = 1
+*                    path_not_found         = 1
+*                    cntl_error             = 2
+*                    error_no_gui           = 3
+*                    bad_parameter          = 4
+*                    file_extension_unknown = 5
+*                    error_execute_failed   = 6
+*                    synchronous_failed     = 7
+*                    not_supported_by_gui   = 8
+*                    OTHERS                 = 9.
+                cl_demo_output=>display_json( l_listado-contenido_ficher ).
+              ELSE.
+                zcl_ap_ws=>ver_xml( xml = l_listado-contenido_ficher ).
+              ENDIF.
+            ENDIF.
+          ELSEIF ( l_listado-formato = 'W' OR l_listado-formato = 'J' ) AND NOT l_listado-contenido_ficher IS INITIAL.
+            IF l_listado-contenido_ficher(1) = '{'.
+              cl_demo_output=>display_json( l_listado-contenido_ficher ).
+            ENDIF.
+          ELSE.
+            zwhs=>muestra_msg( idcola = l_listado-idcola editar = 'X' ).
+          ENDIF.
+
+
+      ENDCASE.
+    ENDIF.
+
+  ENDMETHOD.                    "double_click
+
+
+  METHOD toolbar.
+
+    super->toolbar( EXPORTING e_object = e_object e_interactive = e_interactive ).
+*    add_boton( e_object = e_object function = 'GRABAR' text = 'Grabar fichero SALIDA' icon = '@HK@' ).
+*    add_boton( e_object = e_object function = 'PROCESAR' text = 'Procesar cola ENTRADA' icon = '@15@' ).
+*    add_boton( e_object = e_object function = 'VISIBLE' text = '' quickinfo = 'Procesar cola ENTRADA paso a paso' icon = '@10@' ).
+*    add_boton( e_object = e_object function = 'LOG' text = 'Ver log' icon = '@KK@' ).
+
+
+
+  ENDMETHOD.                    "toolbar
+
+  METHOD user_command.
+
+    CASE e_ucomm .
+      WHEN OTHERS.
+        super->user_command( EXPORTING e_ucomm = e_ucomm ).
+    ENDCASE .
+
+  ENDMETHOD.                    "USER_COMMAND
+
+  METHOD data_changed.
+    DATA: ls_good TYPE lvc_s_modi.
+    DATA l_campo(40).
+
+    FIELD-SYMBOLS <fs> TYPE any.
+    LOOP AT er_data_changed->mt_good_cells INTO ls_good.
+      AT NEW row_id.
+        READ TABLE i_listado INTO l_listado INDEX ls_good-row_id.
+      ENDAT.
+      IF sy-subrc = 0.
+        CONCATENATE 'L_LISTADO-' ls_good-fieldname INTO l_campo.
+        ASSIGN (l_campo) TO <fs>.
+        IF sy-subrc = 0.
+          <fs> = ls_good-value.
+        ENDIF.
+      ENDIF.
+      AT END OF row_id.
+        IF l_listado-ind IS INITIAL.
+          l_listado-ind = 'U'.
+        ENDIF.
+        l_listado-mensaje = ''.
+        MODIFY i_listado FROM l_listado INDEX ls_good-row_id.
+      ENDAT.
+    ENDLOOP.
+
+    o_prog->verificar_datos( ).
+
+    o_alv->refrescar_grid( ).
+  ENDMETHOD.                    "data_changed
+ENDCLASS.                    "lcl_event_grid IMPLEMENTATION
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report IMPLEMENTATION.
+
+  METHOD buscar_datos.
+    DATA: r_log    TYPE RANGE OF bapi_msg,
+          lr_log   LIKE LINE OF r_log,
+          lr_maktx LIKE LINE OF s_log.
+
+
+    LOOP AT s_log INTO lr_maktx.
+      MOVE-CORRESPONDING lr_maktx TO lr_log.
+      COLLECT lr_log INTO r_log.
+    ENDLOOP.
+
+    sgpi_texto( 'Leyendo datos' ).
+
+    i_listado = zwhs=>select_cola( idcliente   = p_idcli
+                                   r_idcola    = s_idcola[]
+                                   r_idmsg     = s_idmsg[]
+                                   r_estado    = s_estado[]
+                                   r_objkey    = s_objkey[]
+                                   r_fechac    = s_fechac[]
+                                   r_horac     = s_horac[]
+                                   r_usuario   = s_usuari[]
+                                   r_pendiente = s_pendi[]
+                                   r_entrega   = s_entre[]
+                                   r_pedido    = s_pedid[]
+                                   r_ebeln     = s_ebeln[]
+                                   r_matnr     = s_matnr[]
+                                   r_werks     = s_werks[]
+                                   r_charg     = s_charg[]
+                                   r_exidv     = s_exidv[]
+                                   r_aufnr     = s_aufnr[]
+                                   r_aufnr2    = s_aufnr2[]
+                                   r_auart     = s_auart[]
+                                   r_e_s       = s_e_s[]
+                                   r_lgort     = s_lgort[]
+                                   r_otros     = s_otros[]
+                                   r_belnr     = s_belnr[]
+                                   r_gjahr     = s_gjahr[]
+                                   r_cpudt     = s_cpudt[]
+                                   r_cputm     = s_cputm[]
+                                   r_lifnr     = s_lifnr[]
+                                   r_tanum     = s_tanum[]
+                                   incluir_archivados = p_incar
+                                   r_log       = r_log[] ).
+
+    i_listado_ini = i_listado.
+  ENDMETHOD.                                               "seleccionar_datos
+
+  METHOD verificar_datos.
+
+  ENDMETHOD.                    "VERIFICAR_DATOS
+
+ENDCLASS.                    "REPORT IMPLEMENTATION
+
+*----------------------------------------------------------------------*
+* INITIALIZATION
+*----------------------------------------------------------------------*
+INITIALIZATION.
+
+  SET PARAMETER ID 'ZREINICIAR' FIELD ''.
+  SET PARAMETER ID 'Z_NO_VAR_DEF' FIELD ''.
+  CREATE OBJECT o_prog
+    EXPORTING
+      status = 'INICIO'
+      prog   = zwhs=>clave_param.
+
+  sscrfields-functxt_03 = '@M4@ Jobs'.
+  sscrfields-functxt_04 = '@HJ@ Leer ficheros entrada'.
+  sscrfields-functxt_05 = '@HK@ Generar ficheros salida'.
+
+  CREATE OBJECT o_event
+    EXPORTING
+      boton_refrescar = 'X'
+      boton_excel     = 'X'
+      o_prog          = o_prog.
+
+  CREATE OBJECT o_alv
+    EXPORTING
+      estructura = 'ZWHS_MONITOR'
+      o_event    = o_event.
+
+  p_vari = o_alv->get_default_layout( ).
+
+
+  o_prog->initialization( CHANGING sscrfields = sscrfields ).
+
+  IF p_idcli IS INITIAL.
+    p_idcli = 'AIC'.
+  ENDIF.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_vari.
+
+  p_vari = o_alv->get_f4_layout( ).
+
+
+
+AT SELECTION-SCREEN OUTPUT.
+  SET PARAMETER ID 'ZIDCLIENTE' FIELD p_idcli.
+
+  CLEAR o_prog->o_par.
+  CREATE OBJECT o_prog->o_par
+    EXPORTING
+      clave = p_idcli.
+
+
+  SELECT * FROM zwhs_campos_desc
+    INTO TABLE i_zwhs_campos_desc
+   WHERE idcliente = p_idcli.
+
+  DATA: l_campo(50),
+        i_group4 TYPE TABLE OF screen-group4 WITH HEADER LINE.
+  FIELD-SYMBOLS <fs>.
+  LOOP AT SCREEN.
+    IF screen-group1 = 'NOI'.
+      screen-input = '0'.
+      screen-display_3d = '0'.
+
+      LOOP AT i_zwhs_campos_desc ASSIGNING <zwhs_campos_desc> WHERE campo(5) = screen-name+2(5).
+        IF <zwhs_campos_desc>-descr_corta = 'INVISIBLE'.
+          screen-input = '0'.
+          screen-invisible = '1'.
+          COLLECT screen-group4 INTO i_group4.
+        ELSE.
+          UNASSIGN <fs>.
+          CONCATENATE 'P_' <zwhs_campos_desc>-campo INTO l_campo.
+          ASSIGN (l_campo) TO <fs>.
+          IF sy-subrc NE 0.
+            CONCATENATE 'P_' <zwhs_campos_desc>-campo(5) INTO l_campo.
+            ASSIGN (l_campo) TO <fs>.
+          ENDIF.
+          IF <fs> IS ASSIGNED.
+            IF NOT <zwhs_campos_desc>-descr_larga IS INITIAL.
+              <fs> = <zwhs_campos_desc>-descr_larga.
+            ELSE.
+              <fs> = <zwhs_campos_desc>-descr_corta.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+
+
+  LOOP AT i_zwhs_campos_desc ASSIGNING <zwhs_campos_desc> WHERE descr_corta = 'INVISIBLE'.
+    LOOP AT SCREEN.
+      IF screen-name+2(5) = <zwhs_campos_desc>-campo(5) AND screen-group1 NE 'SIE'.
+        screen-input = '0'.
+        screen-invisible = '1'.
+        COLLECT screen-group4 INTO i_group4.
+        MODIFY SCREEN.
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+
+  LOOP AT SCREEN.
+    IF screen-invisible NE '1' AND screen-group1 NE 'SIE'.
+      READ TABLE i_group4 WITH KEY table_line = screen-group4.
+      IF sy-subrc = 0.
+        screen-input = '0'.
+        screen-invisible = '1'.
+        MODIFY SCREEN.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+************************************************************************
+* AT SELECTION-SCREEN.
+************************************************************************
+AT SELECTION-SCREEN.
+
+  DATA(v_super) = zcl_usuario=>es_usuario_sistemas( ).
+  DATA(v_aut) = v_super.
+  IF v_super IS INITIAL.
+    SELECT SINGLE idcliente FROM zwhs_inter_user
+      INTO p_idcli
+     WHERE idcliente = p_idcli
+       AND bname = sy-uname.
+    IF sy-subrc = 0.
+      v_aut = 'X'.
+    ENDIF.
+  ENDIF.
+  v_aut = 'X'.
+
+  IF v_aut IS INITIAL.
+    MESSAGE |No autorizado a interlocutor { p_idcli }| TYPE 'W'.
+  ENDIF.
+
+  CASE sy-ucomm.
+    WHEN 'INTERLOCUT'.
+      zcl_ap_utils=>mantener_tabla( tabla = 'ZWHS_INTERLOCUTO' campo_filtro = 'IDCLIENTE' valor_filtro = p_idcli op_filtro = 'EQ' ).
+    WHEN 'MENSAJES'.
+      zcl_ap_utils=>mantener_cluster( tabla =  'ZWHS_MENSAJES' campo_filtro = 'IDCLIENTE' valor_filtro = p_idcli op_filtro = 'EQ' ).
+    WHEN 'MUELLES'.
+      zcl_ap_utils=>mantener_tabla( 'ZWHS_MUELLES' ).
+    WHEN 'MOTIVOS'.
+      zcl_ap_utils=>mantener_tabla( 'ZWHS_MOTIVOS' ).
+    WHEN 'DESTINOS'.
+      zcl_ap_utils=>mantener_tabla( 'ZWHS_DESTINOS' ).
+    WHEN 'EQUIPOS'.
+      zcl_ap_utils=>mantener_tabla( 'ZTET_EQUIPOS_V' ).
+    WHEN 'DESC_CAMP'.
+      zcl_ap_utils=>mantener_tabla( tabla =  'ZWHS_CAMPOS_DESC' campo_filtro = 'IDCLIENTE' valor_filtro = p_idcli op_filtro = 'EQ' ).
+    WHEN 'ZAPCMD'.
+      CALL TRANSACTION 'ZAPCMD' AND SKIP FIRST SCREEN.
+    WHEN 'USUARIOS'.
+      zcl_ap_utils=>mantener_tabla( tabla = 'ZWHS_INTER_USERV'  campo_filtro = 'IDCLIENTE' valor_filtro = p_idcli op_filtro = 'EQ' ).
+    WHEN 'MCEST'.
+      zcl_ap_utils=>mantener_tabla( 'ZWHS_MOT_CEST' ).
+    WHEN 'UPD_CAMPOS'.
+      CLEAR zwhs_campos.
+      zcl_ap_popup=>popup_usuario( EXPORTING campo1 = 'ZWHS_CAMPOS-IDMSG'
+                                             campo2 = 'ZWHS_CAMPOS-IDESTRUCTURA'
+                                             titulo = 'Informe estructura'
+                                   IMPORTING return = l_return
+                                   CHANGING  valor1 = zwhs_campos-idmsg
+                                             valor2 = zwhs_campos-idestructura ).
+      IF l_return = ''.
+        l_mensaje = zwhs=>update_campos_estructura( idmsg        = zwhs_campos-idmsg
+                                                       idestructura = zwhs_campos-idestructura ).
+        IF NOT l_mensaje IS INITIAL.
+          MESSAGE l_mensaje TYPE 'I'.
+        ELSE.
+          MESSAGE 'Se ha refrescado la definición de la estructura' TYPE 'S'.
+        ENDIF.
+      ENDIF.
+    WHEN 'FC03'.
+      SUBMIT zwhs_monitor_jobs
+         AND RETURN
+         VIA SELECTION-SCREEN
+        WITH p_client = p_idcli.
+
+    WHEN 'FC04'.
+      SUBMIT zwhs_in
+      VIA SELECTION-SCREEN
+      WITH p_client = p_idcli
+      AND RETURN.
+
+    WHEN 'FC05'.
+      SUBMIT zwhs_out
+      VIA SELECTION-SCREEN
+      WITH p_client = p_idcli
+      AND RETURN.
+
+    WHEN 'REN_DIR'.
+      DATA: l_ok,
+            i_mensajes   TYPE TABLE OF zwhs_mensaje WITH HEADER LINE,
+            l_cambios(2),
+            l_cambio.
+      CLEAR zwhs_mensaje.
+      zcl_ap_popup=>popup_usuario( EXPORTING campo1 = 'ZWHS_MENSAJE-RUTA_KO'
+                                             campo2 = 'ZWHS_MENSAJE-RUTA_OK'
+                                             titulo = 'Renombrado de rutas'
+                                   IMPORTING return = l_ok
+                                   CHANGING  valor1 = zwhs_mensaje-ruta_ko
+                                             valor2 = zwhs_mensaje-ruta_ok ).
+      IF l_ok NE 'A'. "Cancelado
+        IF zwhs_mensaje-ruta_ko IS INITIAL.
+          MESSAGE 'Informe ruta origen' TYPE 'E'.
+        ENDIF.
+        IF zwhs_mensaje-ruta_ok IS INITIAL.
+          MESSAGE 'Informe ruta destino' TYPE 'E'.
+        ENDIF.
+
+        CLEAR l_cambios.
+        SELECT * FROM zwhs_mensaje
+          INTO TABLE i_mensajes
+         WHERE idcliente = p_idcli.
+        LOOP AT i_mensajes.
+          CLEAR l_cambio.
+          IF i_mensajes-ruta_mensaje CS zwhs_mensaje-ruta_ko.
+            l_cambio = 'X'.
+            REPLACE ALL OCCURRENCES OF zwhs_mensaje-ruta_ko IN i_mensajes-ruta_mensaje WITH zwhs_mensaje-ruta_ok.
+          ENDIF.
+          IF i_mensajes-ruta_ok CS zwhs_mensaje-ruta_ko.
+            l_cambio = 'X'.
+            REPLACE ALL OCCURRENCES OF zwhs_mensaje-ruta_ko IN i_mensajes-ruta_ok WITH zwhs_mensaje-ruta_ok.
+          ENDIF.
+          IF i_mensajes-ruta_ko CS zwhs_mensaje-ruta_ko.
+            l_cambio = 'X'.
+            REPLACE ALL OCCURRENCES OF zwhs_mensaje-ruta_ko IN i_mensajes-ruta_ko WITH zwhs_mensaje-ruta_ok.
+          ENDIF.
+
+          IF l_cambio = 'X'.
+            ADD 1 TO l_cambios.
+            UPDATE zwhs_mensaje
+                SET ruta_mensaje = i_mensajes-ruta_mensaje
+                    ruta_ok = i_mensajes-ruta_ok
+                    ruta_ko = i_mensajes-ruta_ko
+                   WHERE  idmsg  = i_mensajes-idmsg.
+          ENDIF.
+        ENDLOOP.
+        IF l_cambios IS INITIAL.
+          MESSAGE 'No se ha modificado ninguna ruta' TYPE 'I'.
+        ELSE.
+          MESSAGE i398(00) WITH 'Se han modificado' l_cambios 'mensajes'.
+        ENDIF.
+      ENDIF.
+
+    WHEN OTHERS.
+      IF sy-ucomm = 'PARAM' AND p_idcli = 'TET'.
+        zcl_ap_parametros=>mantenimiento_st( 'TETRA' ).
+      ELSEIF sy-ucomm = 'PARAM' AND p_idcli = 'LAC'.
+        zcl_ap_parametros=>mantenimiento_st( 'LACTIBER' ).
+      ELSEIF sy-ucomm = 'PARAM' AND p_idcli = 'LNX'.
+        zcl_ap_parametros=>mantenimiento_st( 'LYNX' ).
+      ELSEIF sy-ucomm = 'PARAM' AND p_idcli = 'GC'.
+        zcl_ap_parametros=>mantenimiento_st( 'GC' ).
+      ELSEIF sy-ucomm = 'PARAM' AND p_idcli = 'WHS'.
+        zcl_ap_parametros=>mantenimiento_st( 'ZWHS' ).
+      ELSEIF sy-ucomm = 'PARAM'.
+        zcl_ap_parametros=>mantenimiento_st( p_idcli ).
+      ELSE.
+        o_prog->at_selection(  ).
+      ENDIF.
+  ENDCASE.
+
+
+
+*----------------------------------------------------------------------
+* START-OF-SELECTION.
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  o_prog->buscar_datos( ).
+
+  CALL SCREEN 0100.
+
+************************************************************************
+*
+* FORMS ADICIONALES
+*
+************************************************************************
+
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0100  OUTPUT
+*&---------------------------------------------------------------------*
+
+MODULE status_0100 OUTPUT.
+  SET PF-STATUS 'ST_0100'.
+  SET TITLEBAR '100'.
+
+  IF v_inicio IS INITIAL.
+    v_inicio = 'X'.
+
+    o_alv->variant-variant = p_vari.
+    o_alv->set_layout( style = 'STYLE'
+                       lights = 'LIGHTS'
+                       ancho_optimizado = 'X' ).
+
+    o_alv->set_field_noout( 'CHECK,IND,RUTA,COMPRIMIR,FECHA,HORA,OPERARIO' ).
+    o_alv->set_field_input( 'ULT_PASO,PENDIENTE' ).
+    o_alv->set_field( campo = 'CORRECCION_MAN' op = 'CHECKBOX' ).
+
+    LOOP AT i_zwhs_campos_desc ASSIGNING <zwhs_campos_desc>.
+      IF <zwhs_campos_desc>-descr_corta = 'INVISIBLE'.
+        o_alv->set_field_noout( <zwhs_campos_desc>-campo ).
+      ELSE.
+        o_alv->set_field_text( campo = <zwhs_campos_desc>-campo valor = <zwhs_campos_desc>-descr_corta valor2 = <zwhs_campos_desc>-descr_larga ).
+      ENDIF.
+    ENDLOOP.
+
+    o_alv->registrar_enter( ).
+
+    o_alv->show( CHANGING tabla = i_listado ).
+
+    o_alv->forzar_no_edicion( 'ESTADO' ).
+  ENDIF.
+
+ENDMODULE.                 " STATUS_0100  OUTPUT
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+MODULE user_command_0100 INPUT.
+  DATA: l_modo_ct,
+        l_regenerar,
+        l_regenerar2,
+        l_simular,
+        l_continuar,
+        l_cont(7),
+        l_fila TYPE i.
+
+  o_alv->comprobar_cambios( ).
+  o_alv->set_marca_filas_sel( CHANGING t_tabla = i_listado ).
+
+  CASE sy-ucomm.
+    WHEN 'BACK'.
+      o_alv->comprobar_cambios( ).
+      i_listado_aux = i_listado.
+      SORT: i_listado_ini, i_listado_aux.
+      LEAVE TO SCREEN 0.
+    WHEN 'GRABAR'.
+      o_alv->comprobar_cambios( ).
+      LOOP AT i_listado ASSIGNING <listado>.
+        READ TABLE i_listado_ini INTO l_listado WITH KEY idcola = <listado>-idcola.
+        IF sy-subrc = 0.
+*          zwhs=>update_cola_mem( CHANGING monitor = l_listado ).
+          IF <listado> NE l_listado.
+            IF l_listado-ult_paso NE <listado>-ult_paso.
+              UPDATE zwhs_cola
+                 SET ult_paso = <listado>-ult_paso
+               WHERE idcola   = <listado>-idcola.
+            ENDIF.
+
+            IF l_listado-estado NE <listado>-estado.
+              IF <listado>-estado = 'X'.
+                <listado>-correccion_man = 'X'.
+                UPDATE zwhs_cola
+                   SET correccion_man = 'X'
+                WHERE idcola   = <listado>-idcola.
+              ENDIF.
+              zwhs=>cambia_estado_cola( idcola = <listado>-idcola tcode = 'ZWHS_MONITOR' estado = <listado>-estado ).
+            ENDIF.
+
+            IF l_listado-pendiente NE <listado>-pendiente.
+              zwhs=>cambia_estado_cola( idcola = <listado>-idcola tcode = 'ZWHS_MONITOR' pendiente = <listado>-pendiente ).
+            ENDIF.
+
+            MESSAGE 'Se han grabado los cambios' TYPE 'S'.
+          ENDIF.
+        ELSE.
+
+        ENDIF.
+      ENDLOOP.
+      i_listado_ini = i_listado.
+
+*      LOOP AT i_listado_borrados ASSIGNING <listado> WHERE check = 'X'.
+*        zwhs=>borra_msg( <listado>-idcola ).
+*      ENDLOOP.
+      o_alv->refrescar_grid( ).
+
+    WHEN 'WHS_IN'.
+      SUBMIT zwhs_in
+      VIA SELECTION-SCREEN
+      WITH p_client = p_idcli
+      AND RETURN.
+      o_prog->buscar_datos( ).
+      o_alv->refrescar_grid( ).
+
+    WHEN 'WHS_OUT'.
+      SUBMIT zwhs_out
+      VIA SELECTION-SCREEN
+      WITH p_client = p_idcli
+      AND RETURN.
+      o_prog->buscar_datos( ).
+      o_alv->refrescar_grid( ).
+
+    WHEN 'PROGRAMA'.
+      LOOP AT i_listado ASSIGNING <listado> WHERE check = 'X'.
+        SELECT SINGLE * FROM zwhs_mensaje
+          WHERE idmsg = <listado>-idmsg.
+        IF zwhs_mensaje-programa IS INITIAL.
+          MESSAGE i398(00) WITH 'Mensaje' <listado>-idmsg 'no tiene asociado programa posterior'.
+        ELSE.
+          SUBMIT (zwhs_mensaje-programa)
+            AND RETURN
+           WITH p_idcola = <listado>-idcola.
+        ENDIF.
+      ENDLOOP.
+
+    WHEN 'CESTADO'.
+      DATA i_idmsg TYPE TABLE OF zidmsg.
+      CLEAR i_idmsg.
+      LOOP AT i_listado ASSIGNING <listado> WHERE check = 'X'.
+        COLLECT <listado>-idmsg INTO i_idmsg.
+      ENDLOOP.
+      IF sy-subrc NE 0.
+        MESSAGE 'Seleccione algún mensaje' TYPE 'I'.
+      ELSE.
+        DESCRIBE TABLE i_idmsg LINES sy-tfill.
+        IF sy-tfill > 1.
+          MESSAGE 'Seleccione un único tipo de mensaje' TYPE 'I'.
+        ELSE.
+          CLEAR zwhs_mot_cest.
+          IF NOT <listado>-codigo IS INITIAL.
+            SELECT SINGLE * FROM zwhs_mot_cest
+             WHERE codigo = <listado>-codigo.
+          ENDIF.
+          zwhs_monitor_sel-estado = *zwhs_monitor_sel-estado = <listado>-estado.
+          CALL SCREEN 0300 STARTING AT 3 3 ENDING AT 66 5.
+        ENDIF.
+      ENDIF.
+
+    WHEN 'NUEVO'.
+      CLEAR: zwhs_monitor_sel, l_return, l_mensaje.
+      zcl_ap_popup=>popup_usuario( EXPORTING campo1 = 'ZWHS_MONITOR_SEL-IDMSG'
+                                             campo2 = 'ZWHS_MONITOR_SEL-OBJKEY'
+                                             titulo = 'Informe clave del nuevo mensaje'
+                                   IMPORTING return = l_return
+                                   CHANGING  valor1 = zwhs_monitor_sel-idmsg
+                                             valor2 = zwhs_monitor_sel-objkey ).
+      IF l_return = ''.
+        zwhs=>genera_msg( EXPORTING idmsg   = zwhs_monitor_sel-idmsg
+                                       objkey  = zwhs_monitor_sel-objkey
+                                       tcode   = 'ZWHS_MONITOR'
+                             IMPORTING idcola  = zwhs_monitor_sel-idcola
+                                       mensaje = l_mensaje ).
+        IF NOT l_mensaje IS INITIAL.
+          MESSAGE l_mensaje TYPE 'I'.
+        ENDIF.
+
+        l_listado-idcola = zwhs_monitor_sel-idcola.
+        zwhs=>update_cola_mem( CHANGING monitor = l_listado ).
+        APPEND l_listado TO i_listado.
+      ENDIF.
+      o_alv->refrescar_grid( ).
+    WHEN 'BORRAR'.
+      l_cont = 0.
+      LOOP AT i_listado ASSIGNING <listado> WHERE check = 'X'.
+
+        ADD 1 TO l_cont.
+*          APPEND <listado> TO i_listado_borrados.
+*          DELETE i_listado_ini WHERE idcola = <listado>-idcola.
+
+        zwhs=>borra_msg( <listado>-idcola ).
+        DELETE i_listado.
+
+      ENDLOOP.
+      MESSAGE s398(00) WITH 'Se han borrado' l_cont 'registros'.
+      o_alv->refrescar_grid( ).
+    WHEN 'REPROCESAR' OR 'VISIBLE' OR 'REGENERAR' OR 'DEBUG' OR 'SALTAR_VAL'.
+
+
+      IF sy-ucomm =  'VISIBLE'.
+        l_modo_ct = 'A'.
+      ELSE.
+        l_modo_ct = 'N'.
+      ENDIF.
+      IF sy-ucomm = 'REGENERAR'.
+        l_regenerar = 'X'.
+      ELSE.
+        CLEAR l_regenerar.
+      ENDIF.
+      IF sy-ucomm = 'DEBUG'.
+        l_simular = 'D'.
+      ELSEIF sy-ucomm = 'SALTAR_VAL'.
+        l_simular = 'V'.
+      ELSE.
+        CLEAR l_simular.
+      ENDIF.
+
+      l_cont = 0.
+      IF sy-ucomm NE 'REGENERAR'.
+        LOOP AT i_listado ASSIGNING <listado> WHERE check = 'X'
+                                                 AND ( e_s = 'E'
+                                                   OR formato = 'S'        "SQL
+                                                   OR formato = 'T'  ). "Tabla
+          l_listado = <listado>.
+          zwhs=>update_cola_mem( CHANGING monitor = l_listado ).
+          IF l_listado-estado = 'X' AND <listado>-estado NE 'X'.
+            <listado> = l_listado.
+            MESSAGE 'El mensaje ha cambiado de estado durante reprocesos' TYPE 'I'.
+            CONTINUE.
+          ENDIF.
+          l_continuar = 'X'.
+          IF <listado>-estado = 'X'.
+            CLEAR l_continuar.
+
+            IF zcl_usuario=>es_usuario_sistemas( ).
+              l_continuar = zcl_ap_popup=>confirmar( opcion = 'N'
+                                     texto  = 'Mensaje ya procesado anteriormente'
+                                     texto2 = '¿Estás seguro de volver a procesarlo?' ).
+            ELSE.
+              MESSAGE 'Mensaje totalmente procesado. No es posible volver a hacerlo' TYPE 'I'.
+            ENDIF.
+          ENDIF.
+          IF l_continuar = 'X'.
+            ADD 1 TO l_cont.
+            zwhs=>procesa_msg( EXPORTING idcola  = <listado>-idcola
+                                         tcode   = 'ZWHS_MONITOR'
+                                         modo_ct = l_modo_ct
+                                         forzar_reproceso = 'X'
+                                         simular = l_simular
+                               IMPORTING mensaje = <listado>-mensaje ).
+
+
+            IF <listado>-mensaje = 'Reiniciamos por anulación SM'.
+              SET PARAMETER ID 'ZREINICIAR' FIELD 'X'.
+              LEAVE PROGRAM.
+            ENDIF.
+
+            zwhs=>update_cola_mem( CHANGING monitor = <listado> ).
+          ENDIF.
+        ENDLOOP.
+        IF l_cont > 0.
+          MESSAGE s398(00) WITH 'Se han grabado' l_cont 'registros'.
+        ENDIF.
+      ENDIF.
+
+      l_cont = 0.
+      LOOP AT i_listado ASSIGNING <listado> WHERE check = 'X' AND e_s = 'S' AND formato NE 'S' AND formato NE 'T'.
+        l_listado = <listado>.
+        zwhs=>update_cola_mem( CHANGING monitor = l_listado ).
+        IF l_listado-estado = 'X' AND <listado>-estado NE 'X'.
+          <listado> = l_listado.
+          MESSAGE 'El mensaje ha cambiado de estado durante reprocesos' TYPE 'I'.
+          CONTINUE.
+        ENDIF.
+
+        ADD 1 TO l_cont.
+
+        l_regenerar2 = l_regenerar.
+        IF l_regenerar IS INITIAL.
+          IF l_listado-contenido_ficher IS INITIAL AND l_listado-contenido_zip IS INITIAL.
+            l_regenerar2 = 'X'.
+          ENDIF.
+        ENDIF.
+        zwhs=>cola_2_fichero( EXPORTING idcola    = <listado>-idcola
+                                        regenerar = l_regenerar2
+                              IMPORTING ruta      = <listado>-fichero
+                                        mensaje   = <listado>-mensaje ).
+
+        zwhs=>update_cola_mem( CHANGING monitor = <listado> ).
+      ENDLOOP.
+      IF l_cont > 0.
+        MESSAGE s398(00) WITH 'Se han grabado' l_cont 'registros'.
+      ENDIF.
+
+      o_alv->refrescar_grid( ).
+    WHEN 'LOG'.
+      l_fila = o_alv->get_fila_activa( ).
+      READ TABLE i_listado ASSIGNING <listado> INDEX l_fila.
+      IF sy-subrc = 0.
+        SELECT * FROM zwhs_log
+          INTO CORRESPONDING FIELDS OF TABLE i_log
+         WHERE idcola = <listado>-idcola.
+        IF sy-subrc NE 0.
+          SELECT * FROM zwhs_log_bak
+            INTO CORRESPONDING FIELDS OF TABLE i_log
+           WHERE idcola = <listado>-idcola.
+        ENDIF.
+
+        IF NOT i_log[] IS INITIAL.
+          DATA o_alv_log TYPE REF TO zcl_ap_alv.
+
+          CREATE OBJECT o_alv_log
+            EXPORTING
+              tabla    = 'I_LOG'
+              lights   = 'LIGHTS'
+              optimize = ''.
+
+          LOOP AT i_log ASSIGNING <log>.
+            IF <log>-tipo = 'E'.
+              <log>-lights = zcl_ap_alv=>c_sem_rojo.
+            ELSEIF <log>-tipo = 'W'.
+              <log>-lights = zcl_ap_alv=>c_sem_ambar.
+            ELSEIF <log>-tipo = 'I' OR <log>-tipo = 'S'.
+              <log>-lights = zcl_ap_alv=>c_sem_verde.
+            ENDIF.
+          ENDLOOP.
+
+          o_alv_log->set_field_noout( 'TIPO' ).
+          o_alv_log->set_field( campo = 'IDCOLA,TCODE,USUARIO' op = 'OPT' ).
+          o_alv_log->set_orden( 'IDCOLA,FECHA,HORA' ).
+          o_alv_log->show_popup( end_column = 200 ).
+        ENDIF.
+      ENDIF.
+    WHEN 'XML'.
+      l_fila = o_alv->get_fila_activa( ).
+      READ TABLE i_listado ASSIGNING <listado> INDEX l_fila.
+      IF sy-subrc = 0.
+        SELECT SINGLE * FROM zwhs_mensaje
+         WHERE idmsg = <listado>-idmsg.
+        IF sy-subrc = 0 AND NOT zwhs_mensaje-transformacion IS INITIAL.
+          SET PARAMETER ID 'XSLTNAME' FIELD zwhs_mensaje-transformacion.
+          CALL TRANSACTION 'XSLT_TOOL' AND SKIP FIRST SCREEN.
+        ENDIF.
+      ENDIF.
+  ENDCASE.
+
+ENDMODULE.                 " USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0300  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE status_0300 OUTPUT.
+  SET PF-STATUS 'ST_0300'.
+  SET TITLEBAR '300'.
+
+
+  DATA: i_cod     TYPE TABLE OF zwhs_mot_cest WITH HEADER LINE,
+        l_men(5),
+        i_valores TYPE TABLE OF tpda_vrm_value WITH HEADER LINE.
+
+  REFRESH i_valores.
+  CONCATENATE '%' <listado>-idmsg '%' INTO l_men.
+  SELECT * FROM zwhs_mot_cest
+    INTO TABLE i_cod
+   WHERE mensajes = '*'
+     OR mensajes LIKE l_men.
+  LOOP AT i_cod.
+    i_valores-key = i_cod-codigo.
+    CONCATENATE i_cod-codigo i_cod-descripcion INTO i_valores-text SEPARATED BY space.
+    APPEND i_valores.
+  ENDLOOP.
+
+
+  zcl_ap_popup=>list_dynpro( campo   = 'ZWHS_MOT_CEST-CODIGO'
+                             valores = i_valores[] ).
+
+ENDMODULE.                 " STATUS_0300  OUTPUT
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0300  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0300 INPUT.
+
+  CASE sy-ucomm.
+    WHEN 'ACEPTAR'.
+      LOOP AT i_listado ASSIGNING <listado> WHERE check = 'X'
+                                              AND ( estado NE zwhs_monitor_sel-estado ).
+        l_string = zcl_ap_utils=>concat( p1 = 'Cambio de estado' p2 = <listado>-estado p3 = 'a' p4 = zwhs_monitor_sel-estado
+                                         p5 = 'motivo' p6 = zwhs_mot_cest-codigo
+*                                         p7 = 'por operario' p8 = ztpp004-zzoperario
+                                         p9 = sy-uname ).
+        zwhs=>inserta_log( idcola = <listado>-idcola tipo = 'W' mensaje = l_string ).
+
+        UPDATE zwhs_cola
+           SET estado = zwhs_monitor_sel-estado
+               codigo = zwhs_mot_cest-codigo
+               fecha_cest  = sy-datum
+               hora_cest   = sy-uzeit
+*               operario    = ztpp004-zzoperario
+        WHERE  idcola      = <listado>-idcola.
+
+        <listado>-estado = zwhs_monitor_sel-estado.
+        <listado>-codigo = zwhs_mot_cest-codigo.
+        <listado>-fecha_cest = sy-datum.
+        <listado>-hora_cest = sy-uzeit.
+
+        IF NOT <listado>-codigo IS INITIAL.
+          SELECT SINGLE tipo descripcion FROM zwhs_mot_cest
+            INTO (<listado>-tipo_ce, <listado>-descripcion_ce)
+           WHERE codigo = <listado>-codigo.
+
+          IF NOT <listado>-tipo_ce IS INITIAL.
+            <listado>-tipo_ce = zcl_ap_utils=>get_texto_dominio( dominio = 'ZTIPO_MOT_CEST' valor = <listado>-tipo_ce ).
+          ENDIF.
+        ENDIF.
+
+        CASE zwhs_monitor_sel-estado.
+          WHEN 'E'.
+            <listado>-lights = zcl_ap_alv=>c_sem_rojo.
+          WHEN 'X'.
+            <listado>-lights = zcl_ap_alv=>c_sem_verde.
+          WHEN OTHERS.
+            <listado>-lights = zcl_ap_alv=>c_sem_ambar.
+        ENDCASE.
+      ENDLOOP.
+      IF sy-subrc = 0.
+        COMMIT WORK AND WAIT.
+        o_alv->refrescar_grid( ).
+      ENDIF.
+      LEAVE TO SCREEN 0.
+    WHEN 'CANCEL'.
+      LEAVE TO SCREEN 0.
+  ENDCASE.
+
+ENDMODULE.                 " USER_COMMAND_0300  INPUT
+*&---------------------------------------------------------------------*
+*&      Module  VALIDAR_MOTIVO_DESV  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE validar_motivo_desv INPUT.
+
+  EXIT. "En ningún caso se pide obligatorio
+  CHECK sy-ucomm NE 'CANCEL'.
+
+  IF zwhs_mot_cest-codigo IS INITIAL.
+    MESSAGE 'Informe motivo' TYPE 'E'.
+  ELSE.
+    IF zwhs_mot_cest-codigo IS INITIAL.
+      CLEAR zwhs_mot_cest.
+    ELSE.
+      SELECT SINGLE * FROM zwhs_mot_cest
+        INTO zwhs_mot_cest
+       WHERE codigo = zwhs_mot_cest-codigo.
+    ENDIF.
+  ENDIF.
+
+ENDMODULE.                 " VALIDAR_MOTIVO_DESV  INPUT
+
+*----------------------------------------------------------------------*
+*  MODULE validar_operario INPUT
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+MODULE validar_operario INPUT.
+  EXIT. "En ningún caso se pide obligatorio
+
+  CHECK sy-ucomm NE 'CANCEL'.
+
+*  IF ztpp004-zzoperario IS INITIAL.
+*    CLEAR ztpp004-name1.
+*    IF sy-ucomm = 'ACEPTAR'.
+*      MESSAGE 'Informe operario' TYPE 'E'.
+*    ENDIF.
+*  ELSE.
+*    SELECT SINGLE name1 FROM ztpp004
+*      INTO ztpp004-name1
+*      WHERE zzoperario = ztpp004-zzoperario.
+*    IF sy-subrc NE 0.
+*      MESSAGE 'Operario incorrecto' TYPE 'E'.
+*    ENDIF.
+*  ENDIF.
+
+ENDMODULE.                 " VALIDAR_MOTIVO_DESV  INPUT

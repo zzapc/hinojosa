@@ -1,0 +1,1032 @@
+FUNCTION zz_coci_create_bobina.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(DEST_NAME) LIKE  RCTC51-CSDES
+*"  TABLES
+*"      SCOME STRUCTURE  COME
+*"      SCOMH STRUCTURE  COMH
+*"      SCOMP STRUCTURE  RCOMP
+*"----------------------------------------------------------------------
+
+
+* ======================================================================
+* Local data
+* ----------------------------------------------------------------------
+  DATA: afpo_struc LIKE afpo.
+  DATA: BEGIN OF l_mcha OCCURS 0.
+          INCLUDE STRUCTURE mcha.
+  DATA: END OF l_mcha.
+  DATA: xbncom LIKE bncom.
+  DATA: mcha_tmp LIKE mcha.
+  DATA: missing_order.
+  DATA: missing_position.
+  DATA: char_of_batch LIKE clbatch OCCURS 1 WITH HEADER LINE.
+  DATA: changed_batch LIKE mcha    OCCURS 1 WITH HEADER LINE.
+  DATA: l_batch LIKE mcha-charg.
+  DATA: l_batch_cuobj LIKE mcha-cuobj_bm.
+  DATA: dunkel_klassifizieren      VALUE '1'.
+  DATA: user_destination TYPE c.
+  DATA: wmara LIKE mara.
+  DATA: l_bkpf LIKE bkpf OCCURS 0 WITH HEADER LINE.
+* DATA definitions for format conversion
+  DATA: l_atfor TYPE cabn-atfor,
+        l_atinn TYPE cabn-atinn.
+*  DATA: l_char_val TYPE cawn-atwrt.
+*  DATA: l_char_val_float TYPE cawn-atflv.
+  DATA: l_char_val_packed(16) TYPE p DECIMALS 14.
+  DATA: l_comw TYPE comw.
+  DATA: l_api_val_i TYPE api_val_i.
+
+* Konstanten:
+  DATA:
+    create_batch   LIKE comh-mscla VALUE 'PI_BT_CR',
+    classify_batch LIKE comh-mscla VALUE 'PI_BT_CL'.
+
+* Target field names of the function
+  DATA  target_field_names LIKE rtc55ext OCCURS 0 WITH HEADER LINE.
+
+* Table for storing target field values
+  DATA  target_field_values LIKE rtc55val OCCURS 0 WITH HEADER LINE.
+
+* --- Target fields ----------------------------------------------------
+  DATA:
+    batch              LIKE afpod-charg,  "wg. Charge bewerten
+    material           LIKE afpod-matnr,
+    plant              LIKE afpod-pwerk,
+    process_order      LIKE caufvd-aufnr,
+    order_item_number  LIKE afpod-posnr,
+    batch_charac_name  LIKE cabn-atnam,
+    batch_charac_value LIKE come-atwrt,
+    event_date         LIKE coch-andat,
+    event_time         LIKE coch-anuzt.
+
+* --- Constants for target field names -----------------------
+  DATA:
+    c_batch              LIKE tc50a-dspara  VALUE 'BATCH',
+    c_material           LIKE tc50a-dspara  VALUE 'MATERIAL',
+    c_plant              LIKE tc50a-dspara  VALUE 'PLANT',
+    c_process_order      LIKE tc50a-dspara  VALUE 'PROCESS_ORDER',
+    c_order_item_number  LIKE tc50a-dspara  VALUE 'ORDER_ITEM_NUMBER',
+    c_batch_charac_name  LIKE tc50a-dspara
+                                    VALUE 'BATCH_CHARAC_NAME',
+    c_batch_charac_value LIKE tc50a-dspara
+                                    VALUE 'BATCH_CHARAC_VALUE',
+    c_event_date         LIKE tc50a-dspara  VALUE 'EVENT_DATE  ',
+    c_event_time         LIKE tc50a-dspara  VALUE 'EVENT_TIME  ',
+    c_vendor_batch       LIKE tc50a-dspara  VALUE 'VENDOR_BATCH'.
+
+  DATA: ls_scome TYPE come.
+  DATA: lv_atinn TYPE atinn.
+
+
+* Check, if there are messages to process -------------------
+  DATA number_of_entries TYPE p.
+  DESCRIBE TABLE scomh LINES number_of_entries.
+  CHECK number_of_entries > 0.
+
+* Sort message table
+  SORT scomh.
+
+* ======================================================================
+* Processing of each message
+* ----------------------------------------------------------------------
+
+  LOOP AT scomh.                       "loop over message header(s)
+
+    CLEAR l_mcha.
+    REFRESH l_mcha.
+
+    CLEAR changed_batch.
+    REFRESH changed_batch.
+
+    IF scomh-mscla NE create_batch AND scomh-mscla NE classify_batch.
+      user_destination = 'X'.
+    ENDIF.
+
+* --- Fill table TARGET_FIELD_NAMES ------------------------
+    REFRESH target_field_names.
+* Charge
+    CLEAR target_field_names.
+    MOVE c_batch TO target_field_names-dspara.
+    IF scomh-mscla = classify_batch.
+      target_field_names-chk_obli = raise_error.
+      target_field_names-chk_init = raise_error.
+    ENDIF.
+    APPEND target_field_names.
+* Material
+* in jedem Fall obligatorisch
+    CLEAR target_field_names.
+    MOVE c_material TO target_field_names-dspara.
+    target_field_names-chk_obli = raise_error.
+    target_field_names-chk_init = raise_error.
+    APPEND target_field_names.
+* Werk
+    CLEAR target_field_names.
+    MOVE c_plant TO  target_field_names-dspara.
+    APPEND target_field_names.
+* Prozeßauftrag
+    CLEAR target_field_names.
+    MOVE c_process_order  TO target_field_names-dspara.
+    APPEND target_field_names.
+* Nummer der Auftragsposition
+    CLEAR target_field_names.
+    MOVE  c_order_item_number  TO target_field_names-dspara.
+    APPEND target_field_names.
+* Merkmalname
+* obligatorisch bei Chargenbewertung
+    CLEAR target_field_names.
+    MOVE  c_batch_charac_name     TO target_field_names-dspara.
+    IF scomh-mscla = classify_batch.
+      target_field_names-chk_obli = raise_error.
+      target_field_names-chk_init = raise_error.
+    ENDIF.
+    APPEND target_field_names.
+* Merkmalwert
+* obligatorisch bei Chargenbewertung
+    CLEAR target_field_names.
+    MOVE  c_batch_charac_value    TO target_field_names-dspara.
+    IF scomh-mscla = classify_batch.
+      target_field_names-chk_obli = raise_error.
+      target_field_names-chk_init = raise_error.
+    ENDIF.
+    APPEND target_field_names.
+* EVENT DATE
+    CLEAR target_field_names.
+    MOVE  c_event_date TO target_field_names-dspara.
+    target_field_names-chk_obli = raise_error.
+    target_field_names-chk_init = raise_error.
+    APPEND target_field_names.
+* EVENT TIME
+    CLEAR target_field_names.
+    MOVE  c_event_time TO target_field_names-dspara.
+    target_field_names-chk_obli = raise_error.
+    target_field_names-chk_init = off.
+    APPEND target_field_names.
+
+* VENDOR BATCH
+    CLEAR target_field_names.
+    MOVE c_vendor_batch TO target_field_names-dspara.
+*    IF SCOMH-MSCLA = CLASSIFY_BATCH.
+*      TARGET_FIELD_NAMES-CHK_OBLI = RAISE_ERROR.
+*      TARGET_FIELD_NAMES-CHK_INIT = RAISE_ERROR.
+*    ENDIF.
+    APPEND target_field_names.
+
+*   Delete table entries for each message
+    REFRESH target_field_values.
+
+*   Determine values of target fields by reading message characteristics
+    CALL FUNCTION 'COCM_MESS_CHARS_TO_DEST_FIELDS'
+      EXPORTING
+        destination             = dest_name
+      TABLES
+        message_characteristics = scome  "exporting
+        target_fields           = target_field_names  "exporting
+        target_field_values     = target_field_values  "importing
+        log_entries             = scomp  "importing
+      CHANGING
+        message_header          = scomh
+      EXCEPTIONS
+        OTHERS                  = 1.
+
+*   Update message header (save changed ERRKZ)
+    MODIFY scomh.
+    CHECK scomh-errkz <> ekz_dest_error.         "exit, if error occured
+
+*   Copy target field values to local target fields
+    INCLUDE icocmf01.
+
+    IF NOT batch_charac_name IS INITIAL.
+*   Convert char.values to format required for classif.
+      CLEAR sy-msgid.
+*     Get format of message characteristic
+      READ TABLE target_field_values
+                   WITH KEY dspara = c_batch_charac_value.
+*     Get format of batch characteristic
+      CALL FUNCTION 'CTUT_FEATURE_CHECK'
+        EXPORTING
+          feature_neutral_name = batch_charac_name
+        IMPORTING
+          format               = l_atfor
+          feature_id           = l_atinn
+        EXCEPTIONS
+*         INVALID_CLASS_TYPE   = 1
+*         MISSING_FEATURE_INFORMATION       = 2
+          no_feature_found     = 3
+          no_feature_valid     = 4
+*         NO_LANGUAGE          = 5
+          OTHERS               = 6.
+      IF sy-subrc <> 0.
+        scomp-msgid = sy-msgid.
+        scomp-msgno = sy-msgno.
+        scomp-msgv1 = sy-msgv1.
+        scomp-msgv2 = sy-msgv2.
+        scomp-msgv3 = sy-msgv3.
+        scomp-msgv4 = sy-msgv4.
+        scomp-msgty = sy-msgty.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+*     error during batch creation --> destination error
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+      ENDIF.
+      CHECK scomh-errkz <> ekz_dest_error.
+*   Convert char.values <> CHAR where batch char. is of same format
+      IF l_atfor <> for_char
+      AND l_atfor = target_field_values-atfor.
+*     fill and call API of characteristics
+        l_comw-atinn = l_atinn.
+        l_comw-atwrt = batch_charac_value.
+        IF batch_charac_value CA 'E'.
+*       no conversion for EXP
+          l_comw-atflv  = batch_charac_value.
+        ELSE.
+*       conversion into packed format type
+          CATCH SYSTEM-EXCEPTIONS conversion_errors = 1.
+            l_char_val_packed     = batch_charac_value.
+            l_comw-atflv = l_char_val_packed.
+          ENDCATCH.
+          IF sy-subrc NE 0.
+            IF 1 = 0.
+*           statement for where-used list
+              MESSAGE e400(cb).
+            ENDIF.
+*           error during characteristic value assignment
+            scomp-msgty = 'E'.
+            scomp-msgid = 'CB'.
+            scomp-msgno = '400'.
+            scomp-msgv1 = batch_charac_value.
+            scomp-msgv2 = dest_name.
+            scomp-msgv3 = space.
+            scomp-msgv4 = space.
+            scomp-detlevel = '1'.
+            scomp-probclass = '1'.
+            scomp-msid = scomh-msid.
+            APPEND scomp.
+            scomh-errkz = ekz_dest_error.
+            MODIFY scomh.
+          ENDIF.
+        ENDIF.
+        CHECK scomh-errkz <> ekz_dest_error.
+        CLEAR sy-msgid.
+*     initialisation for format <> CHAR to perform conversion
+        CALL FUNCTION 'CHARACTERISTIC_INITIALIZE'
+          EXPORTING
+            atinn_imp   = l_atinn
+            display_imp = ''
+          EXCEPTIONS
+            not_found   = 1
+            OTHERS      = 2.
+        IF sy-subrc <> 0.
+          IF NOT sy-msgid IS INITIAL.
+            scomp-msgid = sy-msgid.
+            scomp-msgno = sy-msgno.
+            scomp-msgv1 = sy-msgv1.
+            scomp-msgv2 = sy-msgv2.
+            scomp-msgv3 = sy-msgv3.
+            scomp-msgv4 = sy-msgv4.
+            scomp-msgty = sy-msgty.
+            scomp-detlevel = '1'.
+            scomp-probclass = '1'.
+            scomp-msid = scomh-msid.
+            APPEND scomp.
+*         error during batch creation --> destination error
+            scomh-errkz = ekz_dest_error.
+            MODIFY scomh.
+          ELSE.
+            IF 1 = 0.
+*           statement for where-used list
+              MESSAGE e400(cb).
+*           error during characteristic value asssignment
+              scomp-msgty = 'E'.
+              scomp-msgid = 'CB'.
+              scomp-msgno = '400'.
+              scomp-msgv1 = batch_charac_value.
+              scomp-msgv2 = dest_name.
+              scomp-msgv3 = space.
+              scomp-msgv4 = space.
+              scomp-detlevel = '1'.
+              scomp-probclass = '1'.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+        CHECK scomh-errkz <> ekz_dest_error.
+        CLEAR sy-msgid.
+*     perform conversion for format <> CHAR
+        CALL FUNCTION 'CHAR_VALUE_PREPARE'
+          EXPORTING
+            char_imp  = l_comw
+          IMPORTING
+            value_exp = l_api_val_i
+          EXCEPTIONS
+            no_value  = 1
+            OTHERS    = 2.
+        IF sy-subrc <> 0.
+          IF NOT sy-msgid IS INITIAL.
+            scomp-msgid = sy-msgid.
+            scomp-msgno = sy-msgno.
+            scomp-msgv1 = sy-msgv1.
+            scomp-msgv2 = sy-msgv2.
+            scomp-msgv3 = sy-msgv3.
+            scomp-msgv4 = sy-msgv4.
+            scomp-msgty = sy-msgty.
+            scomp-detlevel = '1'.
+            scomp-probclass = '1'.
+            scomp-msid = scomh-msid.
+            APPEND scomp.
+*         error during batch creation --> destination error
+            scomh-errkz = ekz_dest_error.
+            MODIFY scomh.
+          ELSE.
+            IF 1 = 0.
+*           statement for where-used list
+              MESSAGE e400(cb).
+*           error during characteristic value asssignment
+              scomp-msgty = 'E'.
+              scomp-msgid = 'CB'.
+              scomp-msgno = '400'.
+              scomp-msgv1 = batch_charac_value.
+              scomp-msgv2 = dest_name.
+              scomp-msgv3 = space.
+              scomp-msgv4 = space.
+              scomp-detlevel = '1'.
+              scomp-probclass = '1'.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+        CHECK scomh-errkz <> ekz_dest_error.
+*     conversion completed for format <> CHAR
+        batch_charac_value = l_api_val_i-atwtb.
+      ELSE.
+*   No conversion for format CHAR
+      ENDIF.
+    ENDIF.
+*******************************************
+* Charge anlegen:
+*******************************************
+    IF scomh-mscla = create_batch.
+
+      IF NOT process_order IS INITIAL AND
+         NOT order_item_number IS INITIAL.
+* Struktur bncom füllen wegen user-exits bei der Nummernvergabe
+        PERFORM bncom_fuellen USING      process_order
+                                         order_item_number
+                              CHANGING   xbncom
+                                         afpo_struc
+                                         missing_order
+                                         missing_position.
+        IF NOT missing_order IS INITIAL.
+          IF 1 = 0.
+* Statement für Verwendungsnachweis
+            MESSAGE e062(co) WITH process_order.
+* Auftrag & ist nicht vorhanden
+          ENDIF.
+          scomp-msgty = 'E'.
+          scomp-msgid = 'CO'.
+          scomp-msgno = '062'.
+          scomp-msgv1 = process_order.
+          scomp-msgv2 = dest_name.
+          scomp-msgv3 = space.
+          scomp-msgv4 = space.
+          scomp-detlevel = '1'.
+          scomp-probclass = '1'.
+          scomp-msid = scomh-msid.
+          APPEND scomp.
+          scomh-errkz = ekz_dest_error.
+          MODIFY scomh.
+        ENDIF.
+
+        CHECK scomh-errkz <> ekz_dest_error.
+
+        IF NOT missing_position IS INITIAL.
+          IF 1 = 0.
+* Statement für Verwendungsnachweis
+            MESSAGE e098(40) WITH order_item_number process_order.
+* Die Auftragsposition & des Prozeßauftrags & ist nicht vorhanden
+          ENDIF.
+          scomp-msgty = 'E'.
+          scomp-msgid = '40'.
+          scomp-msgno = '098'.
+          scomp-msgv1 = order_item_number.
+          scomp-msgv2 = process_order.
+          scomp-msgv3 = dest_name.
+          scomp-msgv4 = space.
+          scomp-detlevel = '1'.
+          scomp-probclass = '1'.
+          scomp-msid = scomh-msid.
+          APPEND scomp.
+          scomh-errkz = ekz_dest_error.
+          MODIFY scomh.
+        ENDIF.
+        CHECK scomh-errkz <> ekz_dest_error.
+
+        MOVE afpo_struc-matnr  TO mcha_tmp-matnr.  "Matnr. der Position
+        MOVE afpo_struc-charg  TO mcha_tmp-charg.  "Charge
+        MOVE afpo_struc-pwerk  TO mcha_tmp-werks.  "Planungswerk
+      ENDIF.
+* Die Werte aus der Position mit den expliziten Werten überschreiben:
+      IF NOT material IS INITIAL.
+        MOVE material TO mcha_tmp-matnr.                 "Materialnummer
+      ENDIF.
+      IF NOT batch IS INITIAL.
+        MOVE batch TO mcha_tmp-charg.  "Charge
+      ENDIF.
+      IF NOT plant IS INITIAL.
+        MOVE plant TO mcha_tmp-werks.  "Planungswerk
+      ENDIF.
+
+      CALL FUNCTION 'VB_CREATE_BATCH'
+        EXPORTING
+          ymcha                        = mcha_tmp
+          new_lgort                    = afpo_struc-lgort
+          bypass_lock                  = space
+          x_bncom                      = xbncom
+          kzcla                        = dunkel_klassifizieren
+          no_change_of_bwtar           = 'X'
+        IMPORTING
+          ymcha                        = mcha_tmp
+        TABLES
+          new_batch                    = l_mcha
+        EXCEPTIONS
+          no_material                  = 1
+          no_batch                     = 2
+          no_plant                     = 3
+          material_not_found           = 4
+          plant_not_found              = 5
+          stoloc_not_found             = 6
+          lock_on_material             = 7
+          lock_on_plant                = 8
+          lock_on_batch                = 9
+          lock_system_error            = 10
+          no_authority                 = 11
+          batch_exist                  = 12
+          stoloc_exist                 = 13
+          illegal_batch_number         = 14
+          no_batch_handling            = 15
+          no_valuation_area            = 16
+          valuation_type_not_found     = 17
+          no_valuation_found           = 18
+          error_automatic_batch_number = 19
+          cancelled                    = 20
+          wrong_status                 = 21
+          interval_not_found           = 22
+          number_range_not_extern      = 23
+          object_not_found             = 24
+          error_check_batch_number     = 25
+          no_external_number           = 26
+          no_customer_number           = 27
+          OTHERS                       = 28.
+
+* Fehler bei der Chargenanlage:
+      IF NOT sy-subrc IS INITIAL.
+        scomp-msgid = sy-msgid.
+        scomp-msgno = sy-msgno.
+        scomp-msgv1 = sy-msgv1.
+        scomp-msgv2 = sy-msgv2.
+        scomp-msgv3 = sy-msgv3.
+        scomp-msgv4 = sy-msgv4.
+        scomp-msgty = sy-msgty.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+*       Fehler bei Erzeugen der Charge       --> Destinationerror
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+
+      ENDIF.
+    ENDIF.
+
+****************************************
+* Charge klassifizieren:
+****************************************
+    IF scomh-mscla = classify_batch.
+      IF NOT process_order IS INITIAL AND
+         NOT order_item_number IS INITIAL.
+* Struktur bncom füllen wegen user-exits bei der Nummernvergabe
+        PERFORM bncom_fuellen USING      process_order
+                                         order_item_number
+                              CHANGING   xbncom
+                                         afpo_struc
+                                         missing_order
+                                         missing_position.
+
+        IF NOT missing_order IS INITIAL.
+          IF 1 = 0.
+* Statement für Verwendungsnachweis
+            MESSAGE e062(co) WITH process_order.
+* Auftrag & ist nicht vorhanden
+          ENDIF.
+          scomp-msgty = 'E'.
+          scomp-msgid = 'CO'.
+          scomp-msgno = '062'.
+          scomp-msgv1 = process_order.
+          scomp-msgv2 = dest_name.
+          scomp-msgv3 = space.
+          scomp-msgv4 = space.
+          scomp-detlevel = '1'.
+          scomp-probclass = '1'.
+          scomp-msid = scomh-msid.
+          APPEND scomp.
+          scomh-errkz = ekz_dest_error.
+          MODIFY scomh.
+        ENDIF.
+
+        CHECK scomh-errkz <> ekz_dest_error.
+
+        IF NOT missing_position IS INITIAL.
+          IF 1 = 0.
+* Statement für Verwendungsnachweis
+            MESSAGE e098(40) WITH order_item_number process_order.
+* Die Auftragsposition & des Prozeßauftrags & ist nicht vorhanden
+          ENDIF.
+          scomp-msgty = 'E'.
+          scomp-msgid = '40'.
+          scomp-msgno = '098'.
+          scomp-msgv1 = order_item_number.
+          scomp-msgv2 = process_order.
+          scomp-msgv3 = dest_name.
+          scomp-msgv4 = space.
+          scomp-detlevel = '1'.
+          scomp-probclass = '1'.
+          scomp-msid = scomh-msid.
+          APPEND scomp.
+          scomh-errkz = ekz_dest_error.
+          MODIFY scomh.
+        ENDIF.
+        CHECK scomh-errkz <> ekz_dest_error.
+
+        MOVE afpo_struc-matnr  TO mcha_tmp-matnr.  "Matnr. der Position
+        MOVE afpo_struc-charg  TO mcha_tmp-charg.  "Charge
+        MOVE afpo_struc-pwerk  TO mcha_tmp-werks.  "Planungswerk
+      ENDIF.
+* Die Werte aus der Position mit den expliziten Werten überschreiben:
+      IF NOT material IS INITIAL.
+        MOVE material TO mcha_tmp-matnr.                 "Materialnummer
+      ENDIF.
+      IF NOT batch IS INITIAL.
+        MOVE batch TO mcha_tmp-charg.  "Charge
+      ENDIF.
+      IF NOT plant IS INITIAL.
+        MOVE plant TO mcha_tmp-werks.  "Planungswerk
+      ENDIF.
+      char_of_batch-atnam = batch_charac_name.
+      char_of_batch-atwtb = batch_charac_value.
+      APPEND char_of_batch.
+
+      CALL FUNCTION 'VB_CHANGE_BATCH'
+        EXPORTING
+          ymcha                   = mcha_tmp
+          bypass_lock             = ' '
+          x_bncom                 = xbncom
+          kzcla                   = dunkel_klassifizieren
+        IMPORTING
+          ymcha                   = mcha_tmp
+        TABLES
+          char_of_batch           = char_of_batch
+          changed_batch           = changed_batch
+        EXCEPTIONS
+          no_material             = 1
+          no_batch                = 2
+          no_plant                = 3
+          material_not_found      = 4
+          plant_not_found         = 5
+          lock_on_material        = 6
+          lock_on_plant           = 7
+          lock_on_batch           = 8
+          lock_system_error       = 9
+          no_authority            = 10
+          batch_not_exist         = 11
+          no_class                = 12
+          error_in_classification = 13
+          OTHERS                  = 14.
+
+* Fehler bei der Chargenklassifizierung:
+      IF NOT sy-subrc IS INITIAL.
+        scomp-msgid = sy-msgid.
+        scomp-msgno = sy-msgno.
+        scomp-msgv1 = sy-msgv1.
+        scomp-msgv2 = sy-msgv2.
+        scomp-msgv3 = sy-msgv3.
+        scomp-msgv4 = sy-msgv4.
+        scomp-msgty = sy-msgty.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+*       Fehler bei der Klassifizierung der Charge --> Destinationerror
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+
+      ENDIF.
+    ENDIF.
+
+    IF user_destination = 'X'.
+      IF ( batch IS INITIAL ) OR       "create batch
+         ( batch_charac_name IS INITIAL ).
+
+        IF NOT process_order IS INITIAL AND
+           NOT order_item_number IS INITIAL.
+* Struktur bncom füllen wegen user-exits bei der Nummernvergabe
+          PERFORM bncom_fuellen USING      process_order
+                                           order_item_number
+                                CHANGING   xbncom
+                                           afpo_struc
+                                           missing_order
+                                           missing_position.
+          IF NOT missing_order IS INITIAL.
+            IF 1 = 0.
+* Statement für Verwendungsnachweis
+              MESSAGE e062(co) WITH process_order.
+* Auftrag & ist nicht vorhanden
+            ENDIF.
+            scomp-msgty = 'E'.
+            scomp-msgid = 'CO'.
+            scomp-msgno = '062'.
+            scomp-msgv1 = process_order.
+            scomp-msgv2 = dest_name.
+            scomp-msgv3 = space.
+            scomp-msgv4 = space.
+            scomp-detlevel = '1'.
+            scomp-probclass = '1'.
+            scomp-msid = scomh-msid.
+            APPEND scomp.
+            scomh-errkz = ekz_dest_error.
+            MODIFY scomh.
+          ENDIF.
+
+          CHECK scomh-errkz <> ekz_dest_error.
+
+          IF NOT missing_position IS INITIAL.
+            IF 1 = 0.
+* Statement für Verwendungsnachweis
+              MESSAGE e098(40) WITH order_item_number process_order.
+* Die Auftragsposition & des Prozeßauftrags & ist nicht vorhanden
+            ENDIF.
+            scomp-msgty = 'E'.
+            scomp-msgid = '40'.
+            scomp-msgno = '098'.
+            scomp-msgv1 = order_item_number.
+            scomp-msgv2 = process_order.
+            scomp-msgv3 = dest_name.
+            scomp-msgv4 = space.
+            scomp-detlevel = '1'.
+            scomp-probclass = '1'.
+            scomp-msid = scomh-msid.
+            APPEND scomp.
+            scomh-errkz = ekz_dest_error.
+            MODIFY scomh.
+          ENDIF.
+          CHECK scomh-errkz <> ekz_dest_error.
+
+          MOVE afpo_struc-matnr  TO mcha_tmp-matnr.  "Matnr. der Position
+          MOVE afpo_struc-charg  TO mcha_tmp-charg.  "Charge
+          MOVE afpo_struc-pwerk  TO mcha_tmp-werks.  "Planungswerk
+        ENDIF.
+* Die Werte aus der Position mit den expliziten Werten überschreiben:
+        IF NOT material IS INITIAL.
+          MOVE material TO mcha_tmp-matnr.                 "Materialnummer
+        ENDIF.
+        IF NOT batch IS INITIAL.
+          MOVE batch TO mcha_tmp-charg."Charge
+        ENDIF.
+        IF NOT plant IS INITIAL.
+          MOVE plant TO mcha_tmp-werks."Planungswerk
+        ENDIF.
+*HFC
+        CLEAR lv_atinn.
+        CALL FUNCTION 'CONVERSION_EXIT_ATINN_INPUT'
+          EXPORTING
+            input  = 'Z_LOTE_PROVEEDOR'
+          IMPORTING
+            output = lv_atinn.
+
+        CLEAR ls_scome.
+        READ TABLE scome INTO ls_scome
+        WITH KEY atinn = lv_atinn.
+        IF sy-subrc = 0 .
+          mcha_tmp-licha = ls_scome-atwrt.
+        ENDIF.
+
+        CALL FUNCTION 'VB_CREATE_BATCH'
+          EXPORTING
+            ymcha                        = mcha_tmp
+            new_lgort                    = afpo_struc-lgort
+            bypass_lock                  = space
+            x_bncom                      = xbncom
+            kzcla                        = dunkel_klassifizieren
+            no_change_of_bwtar           = 'X'
+          IMPORTING
+            ymcha                        = mcha_tmp
+          TABLES
+            new_batch                    = l_mcha
+          EXCEPTIONS
+            no_material                  = 1
+            no_batch                     = 2
+            no_plant                     = 3
+            material_not_found           = 4
+            plant_not_found              = 5
+            stoloc_not_found             = 6
+            lock_on_material             = 7
+            lock_on_plant                = 8
+            lock_on_batch                = 9
+            lock_system_error            = 10
+            no_authority                 = 11
+            batch_exist                  = 12
+            stoloc_exist                 = 13
+            illegal_batch_number         = 14
+            no_batch_handling            = 15
+            no_valuation_area            = 16
+            valuation_type_not_found     = 17
+            no_valuation_found           = 18
+            error_automatic_batch_number = 19
+            cancelled                    = 20
+            wrong_status                 = 21
+            interval_not_found           = 22
+            number_range_not_extern      = 23
+            object_not_found             = 24
+            error_check_batch_number     = 25
+            no_external_number           = 26
+            no_customer_number           = 27
+            OTHERS                       = 28.
+
+* Fehler bei der Chargenanlage:
+        IF NOT sy-subrc IS INITIAL.
+          scomp-msgid = sy-msgid.
+          scomp-msgno = sy-msgno.
+          scomp-msgv1 = sy-msgv1.
+          scomp-msgv2 = sy-msgv2.
+          scomp-msgv3 = sy-msgv3.
+          scomp-msgv4 = sy-msgv4.
+          scomp-msgty = sy-msgty.
+          scomp-detlevel = '1'.
+          scomp-probclass = '1'.
+          scomp-msid = scomh-msid.
+          APPEND scomp.
+*       Fehler bei Erzeugen der Charge       --> Destinationerror
+          scomh-errkz = ekz_dest_error.
+          MODIFY scomh.
+*        ELSE.
+*          scomp-msgid = sy-msgid.
+*          scomp-msgno = sy-msgno.
+*          scomp-msgv1 = sy-msgv1.
+*          scomp-msgv2 = sy-msgv2.
+*          scomp-msgv3 = sy-msgv3.
+*          scomp-msgv4 = sy-msgv4.
+*          scomp-msgty = sy-msgty.
+*          scomp-detlevel = '1'.
+*          scomp-probclass = '2'.
+*          scomp-msid = scomh-msid.
+*          APPEND scomp.
+        ENDIF.
+
+      ELSEIF
+          NOT batch IS INITIAL AND
+          NOT batch_charac_name IS INITIAL.              "classify batch
+
+        IF NOT process_order IS INITIAL AND
+           NOT order_item_number IS INITIAL.
+* Struktur bncom füllen wegen user-exits bei der Nummernvergabe
+          PERFORM bncom_fuellen USING      process_order
+                                           order_item_number
+                                CHANGING   xbncom
+                                           afpo_struc
+                                           missing_order
+                                           missing_position.
+          IF NOT missing_order IS INITIAL.
+            IF 1 = 0.
+* Statement für Verwendungsnachweis
+              MESSAGE e062(co) WITH process_order.
+* Auftrag & ist nicht vorhanden
+            ENDIF.
+            scomp-msgty = 'E'.
+            scomp-msgid = 'CO'.
+            scomp-msgno = '062'.
+            scomp-msgv1 = process_order.
+            scomp-msgv2 = dest_name.
+            scomp-msgv3 = space.
+            scomp-msgv4 = space.
+            scomp-detlevel = '1'.
+            scomp-probclass = '1'.
+            scomp-msid = scomh-msid.
+            APPEND scomp.
+            scomh-errkz = ekz_dest_error.
+            MODIFY scomh.
+          ENDIF.
+
+          CHECK scomh-errkz <> ekz_dest_error.
+
+          IF NOT missing_position IS INITIAL.
+            IF 1 = 0.
+* Statement für Verwendungsnachweis
+              MESSAGE e098(40) WITH order_item_number process_order.
+* Die Auftragsposition & des Prozeßauftrags & ist nicht vorhanden
+            ENDIF.
+            scomp-msgty = 'E'.
+            scomp-msgid = '40'.
+            scomp-msgno = '098'.
+            scomp-msgv1 = order_item_number.
+            scomp-msgv2 = process_order.
+            scomp-msgv3 = dest_name.
+            scomp-msgv4 = space.
+            scomp-detlevel = '1'.
+            scomp-probclass = '1'.
+            scomp-msid = scomh-msid.
+            APPEND scomp.
+            scomh-errkz = ekz_dest_error.
+            MODIFY scomh.
+          ENDIF.
+          CHECK scomh-errkz <> ekz_dest_error.
+
+          MOVE afpo_struc-matnr  TO mcha_tmp-matnr.  "Matnr. der Position
+          MOVE afpo_struc-charg  TO mcha_tmp-charg.  "Charge
+          MOVE afpo_struc-pwerk  TO mcha_tmp-werks.  "Planungswerk
+        ENDIF.
+* Die Werte aus der Position mit den expliziten Werten überschreiben:
+        IF NOT material IS INITIAL.
+          MOVE material TO mcha_tmp-matnr.                 "Materialnummer
+        ENDIF.
+        IF NOT batch IS INITIAL.
+          MOVE batch TO mcha_tmp-charg."Charge
+        ENDIF.
+        IF NOT plant IS INITIAL.
+          MOVE plant TO mcha_tmp-werks."Planungswerk
+        ENDIF.
+
+        char_of_batch-atnam = batch_charac_name.
+        char_of_batch-atwtb = batch_charac_value.
+        APPEND char_of_batch.
+
+        CALL FUNCTION 'VB_CHANGE_BATCH'
+          EXPORTING
+            ymcha                   = mcha_tmp
+            bypass_lock             = ' '
+            x_bncom                 = xbncom
+            kzcla                   = dunkel_klassifizieren
+          IMPORTING
+            ymcha                   = mcha_tmp
+          TABLES
+            char_of_batch           = char_of_batch
+            changed_batch           = changed_batch
+          EXCEPTIONS
+            no_material             = 1
+            no_batch                = 2
+            no_plant                = 3
+            material_not_found      = 4
+            plant_not_found         = 5
+            lock_on_material        = 6
+            lock_on_plant           = 7
+            lock_on_batch           = 8
+            lock_system_error       = 9
+            no_authority            = 10
+            batch_not_exist         = 11
+            no_class                = 12
+            error_in_classification = 13
+            OTHERS                  = 14.
+
+* Fehler bei der Chargenklassifizierung:
+        IF NOT sy-subrc IS INITIAL.
+          scomp-msgid = sy-msgid.
+          scomp-msgno = sy-msgno.
+          scomp-msgv1 = sy-msgv1.
+          scomp-msgv2 = sy-msgv2.
+          scomp-msgv3 = sy-msgv3.
+          scomp-msgv4 = sy-msgv4.
+          scomp-msgty = sy-msgty.
+          scomp-detlevel = '1'.
+          scomp-probclass = '1'.
+          scomp-msid = scomh-msid.
+          APPEND scomp.
+*       Fehler bei der Klassifizierung der Charge --> Destinationerror
+          scomh-errkz = ekz_dest_error.
+          MODIFY scomh.
+
+        ENDIF.
+
+      ENDIF.
+    ENDIF.
+
+    CHECK scomh-errkz NE ekz_dest_error.
+    CHECK NOT ( l_mcha IS INITIAL AND changed_batch IS INITIAL ).
+
+    CALL FUNCTION 'MARA_SINGLE_READ'
+      EXPORTING
+        matnr     = mcha_tmp-matnr
+      IMPORTING
+        wmara     = wmara
+      EXCEPTIONS
+*       LOCK_ON_MATERIAL        = 1
+*       LOCK_SYSTEM_ERROR       = 2
+*       WRONG_CALL              = 3
+        not_found = 4.
+*           OTHERS                  = 5.
+
+    IF sy-subrc = 04.
+*       Destination error
+      scomh-errkz = ekz_dest_error.
+      MODIFY scomh.
+*       Protokollsatz
+      IF 1 = 0.
+*         Statement für Verwendungsnachweis
+        MESSAGE i503 WITH material dest_name.
+*   Material & ist nicht vorhanden
+*   Material & does not exist
+      ENDIF.
+      scomp-msgty = 'E'.
+      scomp-msgid = 'CB'.
+      scomp-msgno = '503'.
+      scomp-msgv1 = material.
+      scomp-msgv2 = dest_name.
+      scomp-msgv3 = space.
+      scomp-msgv4 = space.
+      scomp-detlevel = '1'.
+      scomp-probclass = '1'.
+      scomp-msid = scomh-msid.
+      APPEND scomp.
+    ENDIF.
+    CHECK scomh-errkz <> ekz_dest_error.
+
+    IF NOT wmara-kzwsm IS INITIAL.
+* Material has proportion/product unit of measure
+      IF NOT l_mcha IS INITIAL.
+* Batch was created
+        READ TABLE l_mcha INDEX 1.
+        l_batch_cuobj = l_mcha-cuobj_bm.
+        l_batch = l_mcha-charg.
+      ELSEIF NOT changed_batch IS INITIAL.
+* Batch was changed
+        READ TABLE changed_batch INDEX 1.
+        l_batch_cuobj = changed_batch-cuobj_bm.
+        l_batch = changed_batch-charg.
+      ENDIF.
+
+      CALL FUNCTION 'VBWS_BATCH_VALUATION_SET'
+        EXPORTING
+          i_matnr               = mcha_tmp-matnr
+          i_werks               = mcha_tmp-werks
+          i_charg               = l_batch
+          i_charg_cuobj         = l_batch_cuobj
+        TABLES
+          e_bkpf                = l_bkpf
+        EXCEPTIONS
+          no_material           = 1
+          no_plant              = 2
+          no_batch              = 3
+          no_valuation_area     = 4
+          no_variable_valuation = 5
+          error_fi_posting      = 6
+          OTHERS                = 7.
+
+      IF NOT sy-subrc IS INITIAL.
+        scomp-msgid = sy-msgid.
+        scomp-msgno = sy-msgno.
+        scomp-msgv1 = sy-msgv1.
+        scomp-msgv2 = sy-msgv2.
+        scomp-msgv3 = sy-msgv3.
+        scomp-msgv4 = sy-msgv4.
+        scomp-msgty = sy-msgty.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+*      Error during valuation of batch - Destination error
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+      ENDIF.
+
+      READ TABLE l_bkpf INDEX 1 TRANSPORTING NO FIELDS.
+      IF sy-subrc IS INITIAL.
+        LOOP AT l_bkpf.
+          scomp-msgid = 'LB'.
+          scomp-msgno = '094'.
+          scomp-msgv1 = l_bkpf-belnr.
+          scomp-msgv2 = l_bkpf-bukrs.
+          scomp-msgv3 = space.
+          scomp-msgv4 = space.
+          scomp-msgty = 'I'.
+          scomp-detlevel = '1'.
+          scomp-probclass = '4'.
+          scomp-msid = scomh-msid.
+          APPEND scomp.
+          IF 1 = 0.
+            MESSAGE i094(lb) WITH l_bkpf-belnr l_bkpf-bukrs.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.                             "at SCOMH
+
+
+ENDFUNCTION.

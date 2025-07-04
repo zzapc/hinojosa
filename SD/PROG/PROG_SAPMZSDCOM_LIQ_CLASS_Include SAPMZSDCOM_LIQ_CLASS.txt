@@ -1,0 +1,347 @@
+*&---------------------------------------------------------------------*
+*&  Include           SAPMZSDCOM_LIQ_CLASS
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&       Class lcl_application
+*&---------------------------------------------------------------------*
+*        Text
+*----------------------------------------------------------------------*
+CLASS lcl_application DEFINITION.
+
+  PUBLIC SECTION.
+    METHODS: handle_hotspot_click FOR EVENT hotspot_click
+                                  OF cl_gui_alv_grid
+                                  IMPORTING e_row_id
+                                            e_column_id
+                                            es_row_no
+                                            sender.
+
+*   Evento para actualizar los datos antes de que se modifique la tabla
+    METHODS: handle_data_changed  FOR EVENT data_changed
+                                  OF cl_gui_alv_grid
+                                  IMPORTING er_data_changed
+                                            e_onf4
+                                            e_onf4_before
+                                            e_onf4_after
+                                            e_ucomm
+                                            sender.
+
+*   Evento para actualizar los datos después de modificar la tabla
+    METHODS: handle_data_changed_finished
+                                  FOR EVENT data_changed_finished
+                                  OF cl_gui_alv_grid
+                                  IMPORTING e_modified
+                                            et_good_cells
+                                            sender.
+
+*   Evento para añadir botones propios en la barra de herramientas
+    METHODS: handle_toolbar       FOR EVENT toolbar
+                                  OF cl_gui_alv_grid
+                                  IMPORTING e_object
+                                            e_interactive
+                                            sender.
+
+*   Evento para manejar los pulsadores propios en la barra de herramientas
+    METHODS: handle_user_command  FOR EVENT user_command
+                                  OF cl_gui_alv_grid
+                                  IMPORTING e_ucomm
+                                            sender.
+
+
+  PRIVATE SECTION.
+
+*   Variable de control de errores
+    DATA: error_in_data TYPE c.
+
+*   Método para chequear el importe a liquidar
+    METHODS: check_importe_a_liquidar IMPORTING ps_good_importe TYPE lvc_s_modi
+                                                pr_data_changed TYPE REF TO cl_alv_changed_data_protocol.
+
+
+ENDCLASS.                    "LCL_APPLICATION DEFINITION
+
+
+*&---------------------------------------------------------------------*
+*&       Class (Implementation)  lcl_application
+*&---------------------------------------------------------------------*
+*        Text
+*----------------------------------------------------------------------*
+CLASS lcl_application IMPLEMENTATION.
+
+* -------------------------------------------------------------------- *
+* HOTSPOT_CLICK                                                        *
+* -------------------------------------------------------------------- *
+  METHOD  handle_hotspot_click.
+
+    DATA: ls_comis    TYPE zssdcomliq001_grid,
+          ls_fact     TYPE zssdcomliq002_grid,
+          ls_variant  TYPE disvariant.
+
+*   Recuperamos la variante para saber en que ALV estamos
+    CALL METHOD sender->get_variant
+      IMPORTING
+        es_variant = ls_variant.
+
+*   Dependiendo del ALV navegamos a un sitio u otro
+    CASE ls_variant-handle.
+
+*     ALV de Comisionistas
+*     -----------------------------------------------------------------
+      WHEN 'COMI'.
+*       Sacamos los datos de la línea pulsada
+        READ TABLE gti_comis INTO ls_comis INDEX es_row_no-row_id.
+        CHECK sy-subrc = 0.
+*       Dependiendo del campo pulsado navegamos a un sitio u otro
+        CASE e_column_id.
+*         Proveedor -> Navegamos a la dynpro de facturas por comisionista
+          WHEN 'LIFNR'.
+            PERFORM mostrar_facturas_comis USING ls_comis.
+*         Documento financiero -> Navegamos
+          WHEN 'BELNR_LIQ'.
+            IF ls_comis-belnr_liq IS NOT INITIAL.
+              SET PARAMETER ID 'BLN' FIELD ls_comis-belnr_liq.
+              SET PARAMETER ID 'BUK' FIELD ls_comis-bukrs.
+              SET PARAMETER ID 'GJR' FIELD ls_comis-gjahr_liq.
+              CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN.
+            ENDIF.
+        ENDCASE.
+
+*     ALV de detalle de facturas
+*     -----------------------------------------------------------------
+      WHEN 'FACT'.
+*       Sacamos los datos de la línea pulsada
+        READ TABLE gti_facts_com INTO ls_fact INDEX es_row_no-row_id.
+        CHECK sy-subrc = 0.
+*       Dependiendo del campo pulsado navegamos a un sitio u otro
+        CASE e_column_id.
+*         Factura de ventas -> Navegamos
+          WHEN 'VBELN'.
+            CALL FUNCTION 'RV_CALL_DISPLAY_TRANSACTION'
+              EXPORTING
+                vbeln = ls_fact-vbeln.
+
+*         Documento financiero -> Navegamos
+          WHEN 'BELNR'.
+            IF ls_fact-belnr IS NOT INITIAL.
+              SET PARAMETER ID 'BLN' FIELD ls_fact-belnr.
+              SET PARAMETER ID 'BUK' FIELD ls_fact-bukrs.
+              SET PARAMETER ID 'GJR' FIELD ls_fact-gjahr.
+              CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN.
+            ENDIF.
+        ENDCASE.
+
+    ENDCASE.
+
+  ENDMETHOD.                    "HANDLE_HOTSPOT_CLICK
+
+
+* -------------------------------------------------------------------- *
+* HANDLE_DATA_CHANGED
+* Para los cambios (antes de que se modifique la tabla del ALV)
+* -------------------------------------------------------------------- *
+  METHOD handle_data_changed.
+
+    DATA: ls_fact     TYPE zssdcomliq002_grid,
+          ls_fact_aux TYPE zssdcomliq002_grid,
+          ls_variant  TYPE disvariant,
+          ls_good     TYPE lvc_s_modi.
+
+    DATA: lv_ind      TYPE i.
+
+*   Recuperamos la variante para saber en que ALV estamos
+    CALL METHOD sender->get_variant
+      IMPORTING
+        es_variant = ls_variant.
+
+*   Chequeamos que estamos modificando el ALV de facturas
+    CHECK ls_variant-handle = 'FACT'.
+
+*   Recorremos las modificaciones
+    LOOP AT er_data_changed->mt_good_cells INTO ls_good.
+*     Hacemos un chequeo u otro dependiendo del campo
+      CASE ls_good-fieldname.
+*       Importe a liquidar: chequeamos que no sea mayor al pendiente de liquidar
+        WHEN 'ZIMP_LIQ'.
+          CALL METHOD check_importe_a_liquidar
+            EXPORTING
+              ps_good_importe = ls_good
+              pr_data_changed = er_data_changed.
+      ENDCASE.
+    ENDLOOP.
+
+*   Mostramos el error
+    IF error_in_data EQ 'X'.
+      CALL METHOD er_data_changed->display_protocol.
+    ENDIF.
+
+  ENDMETHOD.                    "handle_data_changed
+
+
+* -------------------------------------------------------------------- *
+* HANDLE_DATA_CHANGED_FINISHED
+* Para los cambios (después de que se modifique la tabla del ALV)
+* -------------------------------------------------------------------- *
+  METHOD handle_data_changed_finished.
+
+    DATA: ls_fact     TYPE zssdcomliq002_grid,
+          ls_fact_aux TYPE zssdcomliq002_grid,
+          ls_variant  TYPE disvariant,
+          ls_mod      TYPE lvc_s_modi.
+    DATA: lv_ind      TYPE i.
+
+*   Recuperamos la variante para saber en que ALV estamos
+    CALL METHOD sender->get_variant
+      IMPORTING
+        es_variant = ls_variant.
+
+*   Chequeamos que estamos modificando el ALV de facturas
+    CHECK ls_variant-handle = 'FACT'.
+
+*   Sacamos la línea modificada
+    READ TABLE et_good_cells INTO ls_mod INDEX 1.
+    CHECK sy-subrc = 0.
+    READ TABLE gti_facts_com INTO ls_fact INDEX ls_mod-row_id.
+    CHECK sy-subrc = 0.
+
+*   Cargamos el icono
+    IF ls_fact-checkbox = 'X'.
+      ls_fact-icono = icon_led_green.
+    ELSE.
+      ls_fact-icono = icon_led_yellow.
+    ENDIF.
+    MODIFY gti_facts_com FROM ls_fact INDEX ls_mod-row_id.
+
+*   Actualizamos la tabla global de facturas
+    READ TABLE gti_facts INTO ls_fact_aux WITH KEY bukrs = ls_fact-bukrs
+                                                   lifnr = ls_fact-lifnr
+                                                   vbeln = ls_fact-vbeln
+                                                   kschl = ls_fact-kschl
+                                                   gsber = ls_fact-gsber.
+    IF sy-subrc = 0.
+      lv_ind = sy-tabix.
+      MODIFY gti_facts FROM ls_fact INDEX lv_ind.
+    ENDIF.
+
+*   Actualizamos el ALV
+    PERFORM refrescar_alv_fac.
+
+  ENDMETHOD.                    "handle_data_changed_finished
+
+
+* -------------------------------------------------------------------- *
+* HANDLE_TOOLBAR
+* Para añadir pulsadores propios en la barra de herramientas
+* -------------------------------------------------------------------- *
+  METHOD handle_toolbar.
+
+    DATA: ls_variant  TYPE disvariant,
+          ls_toolbar  TYPE stb_button.
+
+*   Recuperamos la variante para saber en que ALV estamos
+    CALL METHOD sender->get_variant
+      IMPORTING
+        es_variant = ls_variant.
+
+*   Chequeamos que estamos en el ALV de facturas
+    CHECK ls_variant-handle = 'FACT'.
+
+*   Añadimos un separador
+    CLEAR ls_toolbar.
+    MOVE 3 TO ls_toolbar-butn_type.
+    APPEND ls_toolbar TO e_object->mt_toolbar.
+*   Añadimos un botón para seleccionar todo
+    CLEAR ls_toolbar.
+    MOVE 'SEL_ALL' TO ls_toolbar-function.
+    MOVE icon_select_all TO ls_toolbar-icon.
+    MOVE 'Seleccionar todo'(804) TO ls_toolbar-quickinfo.
+    MOVE 'Seleccionar todo'(804) TO ls_toolbar-text.
+    MOVE ' ' TO ls_toolbar-disabled.
+    APPEND ls_toolbar TO e_object->mt_toolbar.
+*   Añadimos un botón para desseleccionar todo
+    CLEAR ls_toolbar.
+    MOVE 'UNSEL_ALL'             TO ls_toolbar-function.
+    MOVE icon_deselect_all       TO ls_toolbar-icon.
+    MOVE 'Borrar selección'(805) TO ls_toolbar-quickinfo.
+    MOVE 'Borrar selección'(805) TO ls_toolbar-text.
+    MOVE ' ' TO ls_toolbar-disabled.
+    APPEND ls_toolbar TO e_object->mt_toolbar.
+
+  ENDMETHOD.                    "handle_toolbar
+
+
+* -------------------------------------------------------------------- *
+* HANDLE_USER_COMMAND
+* Para manejar los pulsadores propios del ALV
+* -------------------------------------------------------------------- *
+  METHOD handle_user_command.
+
+    DATA: ls_variant  TYPE disvariant.
+
+*   Recuperamos la variante para saber en que ALV estamos
+    CALL METHOD sender->get_variant
+      IMPORTING
+        es_variant = ls_variant.
+
+*   Chequeamos que estamos en el ALV de facturas
+    CHECK ls_variant-handle = 'FACT'.
+
+*   Dependiendo del código de función hacemos una cosa u otra
+    CASE e_ucomm.
+*     Marcar todo
+      WHEN 'SEL_ALL'.
+        PERFORM marcar_facturas USING 'X'.
+
+*     Desmarcar todo
+      WHEN 'UNSEL_ALL'.
+        PERFORM marcar_facturas USING ' '.
+    ENDCASE.
+
+  ENDMETHOD.                    "handle_user_command
+
+
+* -------------------------------------------------------------------- *
+* CHECK_IMPORTE_A_LIQUIDAR
+* Chequeamos el importe modificado a liquidar
+* -------------------------------------------------------------------- *
+  METHOD check_importe_a_liquidar.
+
+    DATA: ls_fact       TYPE zssdcomliq002_grid.
+    DATA: lv_imp_liq    TYPE zsdcom_imp_liq,
+          lv_total      TYPE zsdcom_imp_liq,
+          lv_total_str  TYPE char15.
+
+*   Inicializamos el control de errores
+    CLEAR error_in_data.
+
+*   Sacamos el valor del importe que han modificado
+    CALL METHOD pr_data_changed->get_cell_value
+      EXPORTING
+        i_row_id    = ps_good_importe-row_id
+        i_fieldname = ps_good_importe-fieldname
+      IMPORTING
+        e_value     = lv_imp_liq.
+
+*   Sacamos el importe total pendiente de la comisión
+    READ TABLE gti_facts_com INTO ls_fact INDEX ps_good_importe-row_id.
+    CHECK sy-subrc = 0.
+    lv_total = ls_fact-ztot_com - ls_fact-zliq_par.
+
+*   Si el importe que quieren poner es > que el pendiente -> ERROR
+    IF lv_imp_liq > lv_total.
+      WRITE lv_total TO lv_total_str CURRENCY ls_fact-waerk.
+      CONDENSE lv_total_str.
+      CALL METHOD pr_data_changed->add_protocol_entry
+        EXPORTING
+          i_msgid     = 'ZSDCOM'
+          i_msgno     = '022'
+          i_msgty     = 'E'
+          i_msgv1     = lv_total_str
+          i_fieldname = ps_good_importe-fieldname
+          i_row_id    = ps_good_importe-row_id.
+      error_in_data = 'X'.
+    ENDIF.
+
+  ENDMETHOD.                    "check_importe_a_liquidar
+
+ENDCLASS.                    "LCL_APPLICATION IMPLEMENTATION

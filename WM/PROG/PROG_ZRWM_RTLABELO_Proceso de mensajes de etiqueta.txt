@@ -1,0 +1,979 @@
+*&---------------------------------------------------------------------*
+*& Report  RTLABELO                                                    *
+*&---------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+* Nachricht: Etiketten verarbeiten                                     *
+*----------------------------------------------------------------------*
+
+REPORT zrwm_rtlabelo  MESSAGE-ID wj.
+
+
+*----------------------------------------------------------------------*
+* Typen
+*----------------------------------------------------------------------*
+
+TYPE-POOLS: label.
+
+DATA:   bdcdata LIKE bdcdata    OCCURS 0 WITH HEADER LINE.
+*----------------------------------------------------------------------*
+* Daten
+*----------------------------------------------------------------------*
+
+* Schnittstelle
+TABLES: nast.                          " Nachricht
+
+* Felder/Strukturen/Tabellen
+DATA: fcat TYPE label_f_cat,           " Etikettentyp
+      fscr TYPE c,                     " Bildschirmanzeige
+      frco LIKE sy-subrc,              " Verarbeitungscode
+      slab TYPE label_s_com,           " Etiketten
+      tlab TYPE label_t_com.
+
+TYPES: BEGIN OF tipo_matlote,
+         matnr TYPE matnr,
+         charg TYPE charg_d,
+         werks TYPE werks_d.
+TYPES: END OF tipo_matlote.
+TYPES: tty_matlote TYPE TABLE OF tipo_matlote.
+
+DATA: gs_tab_omp        TYPE zmt_omp_mat_move_out_sap_to_om,
+      gs_tab_omp_2_pacs TYPE zmt_mat_move_new_format,
+      gs_tab_omp_2_sc   TYPE zmt_mat_move_new_format.
+
+
+*----------------------------------------------------------------------*
+* Einsprungsroutinen
+*----------------------------------------------------------------------*
+
+* Artikeletikett
+FORM product_label USING return_code screen_flag.
+
+  fcat = '01'.
+  fscr = screen_flag.
+
+  PERFORM main.
+  IF frco <> 0.
+    return_code = 1.
+  ELSE.
+    return_code = 0.
+  ENDIF.
+
+ENDFORM.
+
+
+* Regaletikett
+FORM shelf_label USING return_code screen_flag.
+
+  fcat = '02'.
+  fscr = screen_flag.
+
+  PERFORM main.
+  IF frco <> 0.
+    return_code = 1.
+  ELSE.
+    return_code = 0.
+  ENDIF.
+
+ENDFORM.
+
+
+*----------------------------------------------------------------------*
+* Hauptroutine
+*----------------------------------------------------------------------*
+
+FORM main.
+
+  frco = 0.
+  CLEAR slab.
+  REFRESH tlab.
+
+  PERFORM labels_determine.
+  CHECK frco = 0.
+*
+*  PERFORM material_read.
+*  CHECK frco = 0.
+  PERFORM data_output.
+  CHECK frco = 0.
+
+ENDFORM.
+
+
+*----------------------------------------------------------------------*
+* Hilfsroutine
+*----------------------------------------------------------------------*
+
+* Zum Übertragen von Fehlern (Exceptions) aus Funktionsbausteinen
+* in das Nast-Protokoll.
+
+FORM protocol_update.
+
+  CHECK fscr = space.
+
+  CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+    EXPORTING
+      msg_arbgb = syst-msgid
+      msg_nr    = syst-msgno
+      msg_ty    = syst-msgty
+      msg_v1    = syst-msgv1
+      msg_v2    = syst-msgv2
+      msg_v3    = syst-msgv3
+      msg_v4    = syst-msgv4
+    EXCEPTIONS
+      OTHERS    = 1.
+
+ENDFORM.
+
+
+*----------------------------------------------------------------------*
+* Steuerung
+*----------------------------------------------------------------------*
+
+FORM labels_determine.
+
+* Aus dem Objektschlüssel der Nachricht die Belegdaten lesen;
+* dabei wird auch der Aufteiler berücksichtigt.
+  CALL FUNCTION 'LABELING_OBJECT_EXTRACT'
+    EXPORTING
+      s_output = nast
+    IMPORTING
+      t_labcom = tlab
+    EXCEPTIONS
+      OTHERS   = 1.
+  IF sy-subrc <> 0.
+    frco = 1.
+    PERFORM protocol_update.
+    EXIT.
+  ENDIF.
+
+* Der Etikettentyp ist über die Einsprungroutine
+* eindeutig festgelegt und wird hier übergeben.
+  LOOP AT tlab INTO slab.
+    slab-etityp = fcat.
+    MODIFY tlab FROM slab.
+  ENDLOOP.
+
+** Ermitteln der zu generierenden Etikettenarten aus der
+** Etikettenzuordnung. Dabei werden Aktionen berücksichtigt.
+*  CALL FUNCTION 'LABELING_TYPES_DETERMINE'
+*    CHANGING
+*      t_labcom = tlab
+*    EXCEPTIONS
+*      OTHERS   = 1.
+*  IF sy-subrc <> 0.
+*    frco = 1.
+*    PERFORM protocol_update.
+*    EXIT.
+*  ENDIF.
+
+** Bei Sonderanforderungen ist die Sprache in NAST noch nicht gefüllt.
+*  IF nast-kappl = 'WE' AND nast-spras IS INITIAL.
+*    READ TABLE tlab INTO slab INDEX 1.
+*    nast-spras = slab-spras.
+*  ENDIF.
+
+ENDFORM.
+
+
+*---------------------------------------------------------------------*
+* Material
+*---------------------------------------------------------------------*
+FORM material_read.
+
+  CALL FUNCTION 'LABELING_UNIT_DETERMINE'
+    CHANGING
+      t_labcom = tlab
+    EXCEPTIONS
+      OTHERS   = 1.
+  IF sy-subrc <> 0.
+    frco = 2.
+    PERFORM protocol_update.
+    EXIT.
+  ENDIF.
+
+  CALL FUNCTION 'LABELING_TEXT_READ'
+    CHANGING
+      t_labcom = tlab
+    EXCEPTIONS
+      OTHERS   = 1.
+  IF sy-subrc <> 0.
+    frco = 2.
+    PERFORM protocol_update.
+    EXIT.
+  ENDIF.
+
+  CALL FUNCTION 'LABELING_PRICE_READ'
+    CHANGING
+      t_labcom = tlab
+    EXCEPTIONS
+      OTHERS   = 1.
+  IF sy-subrc <> 0.
+    frco = 2.
+    PERFORM protocol_update.
+    EXIT.
+  ENDIF.
+
+ENDFORM.
+
+
+*----------------------------------------------------------------------*
+* Ausgabe
+*----------------------------------------------------------------------*
+
+FORM data_output.
+
+  CASE nast-nacha.
+
+
+    WHEN '8'.
+
+      READ TABLE tlab INTO DATA(ls_lab) INDEX 1.
+      SELECT SINGLE lgnum INTO @DATA(lv_lgnum) FROM t320 WHERE werks = @ls_lab-werks.
+
+*      SUBMIT zrwm_intf_omp_new            WITH p_werks = ls_lab-werks
+*                                          WITH p_matnr = ls_lab-matnr
+*                                          WITH p_lgnum = lv_lgnum.
+*      PERFORM call_transaction USING
+*         ls_lab-werks
+*         ls_lab-matnr
+*         lv_lgnum.
+
+
+      PERFORM call_transaction_new USING ls_lab-werks
+*                                         ls_lab-matnr
+                                         lv_lgnum.
+
+
+
+  ENDCASE.
+
+ENDFORM.
+
+FORM call_transaction USING p_werks p_matnr p_lgnum.
+  DATA:
+    gs_tab_omp        TYPE zmt_omp_mat_move_out_sap_to_om,
+    gs_tab_omp_2_pacs TYPE zmt_mat_move_new_format,
+    gs_tab_omp_2_sc   TYPE zmt_mat_move_new_format.
+*  DATA: ls_params  TYPE pri_params,
+*        l_jobcount TYPE tbtcjob-jobcount,
+*        l_jobname  TYPE tbtcjob-jobname.
+
+**Llenamos la tabla
+*  REFRESH bdcdata.
+*
+*  PERFORM bdc_dynpro      USING 'ZRWM_INTF_OMP_NEW' '1000'.
+*  PERFORM bdc_field       USING 'P_WERKS' p_werks.
+*  PERFORM bdc_field       USING 'P_LGNUM' p_lgnum.
+*  PERFORM bdc_field       USING 'P_MATNR' p_matnr.
+*  PERFORM bdc_field       USING 'P_SEND'  ''.
+*  PERFORM bdc_field       USING 'BDC_OKCODE' '=ONLI'.
+
+*Open Job
+
+*  l_jobname = 'ZRWM_RTLABELO'.
+*  CALL FUNCTION 'JOB_OPEN'
+*    EXPORTING
+*      jobname  = l_jobname
+*    IMPORTING
+*      jobcount = l_jobcount.
+*
+*  SUBMIT zrwm_intf_omp_new USER sy-uname
+*  VIA JOB l_jobname NUMBER l_jobcount
+*                                      WITH p_werks = p_werks
+*                                      WITH p_matnr = p_matnr
+*                                      WITH p_lgnum = p_lgnum
+*                                      WITH p_send = ''
+*                                      AND RETURN.
+*
+*
+*  CALL FUNCTION 'JOB_CLOSE'
+*    EXPORTING
+*      jobcount  = l_jobcount
+*      jobname   = l_jobname
+*      strtimmed = 'X'.
+*
+**  CALL TRANSACTION ' ZWM_INTF_OMP_NEW' USING  bdcdata
+**      MODE 'E'
+**      UPDATE 'S'.
+*  DATA a.
+*  WHILE a IS INITIAL.
+*  ENDWHILE.
+*  IF p_werks = '2001' OR "PACS
+*      p_werks = '2070'.   "SAN CAYETANO
+*    PERFORM f_get_data_2  IN PROGRAM zrwm_intf_omp_new using  'ZRWM_INTF_OMP_NEW' changing gs_tab_omp_2_sc.
+
+  SELECT SINGLE mtart FROM mara INTO @DATA(lv_mtart) WHERE matnr = @p_matnr.
+
+  SELECT SINGLE valor1 FROM ztwm001
+    INTO @DATA(lv_tpmat)
+    WHERE cprog = 'ZRWM_RTLABELO' AND
+          param1 = 'PAP_MTART' AND
+          param2 = '01' AND
+          param3 = @lv_mtart.
+
+  IF p_werks = '2000'.
+    PERFORM f_get_data_3 IN PROGRAM zrwm_intf_omp_new USING  'ZRWM_INTF_OMP_NEW' p_matnr p_werks p_lgnum lv_tpmat
+                                                      CHANGING gs_tab_omp_2_pacs.
+
+    PERFORM f_send_to_omp  IN PROGRAM zrwm_intf_omp_new USING abap_true 'ZRWM_INTF_OMP_NEW'
+                                                p_werks
+                                                gs_tab_omp gs_tab_omp_2_pacs ''.
+
+*      PERFORM f_graba_ultima_ejec IN PROGRAM zrwm_intf_omp_new .
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CALL_TRANSACTION_NEW
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_LAB_WERKS  text
+*      -->P_LS_LAB_MATNR  text
+*      -->P_LV_LGNUM  text
+*----------------------------------------------------------------------*
+FORM call_transaction_new  USING p_werks
+*                                 p_matnr
+                                 p_lgnum.
+  DATA:
+    gs_tab_omp      TYPE zmt_omp_mat_move_out_sap_to_om,
+    gs_tab_omp_2_sc TYPE zmt_mat_move_new_format.
+
+
+  DATA: t_matlote TYPE tty_matlote.
+
+
+  SELECT * FROM ztwm001
+    INTO TABLE @DATA(lt_ztwm001)
+    WHERE cprog	= 'ZRWM_RTLABELO'.
+
+
+* recuperamos los materiales/lote del documento de material generado
+  SELECT matnr charg werks FROM mseg
+       INTO TABLE t_matlote
+       WHERE mblnr = nast-objky(10) AND
+             mjahr = nast-objky+10(4) AND
+             bwart = '101'.
+
+* dejamos en la tabla interna solo los que pertenecen a centro 2000
+  LOOP AT  t_matlote INTO DATA(wa_matlote).
+    DATA(lv_tabix) = sy-tabix.
+    READ TABLE lt_ztwm001 INTO DATA(ls_ztwm001) WITH KEY param1 = 'SUPPLIER_NAME'  param3 = wa_matlote-werks.
+    IF sy-subrc <> 0.
+*    IF wa_matlote-werks <> '2000'.
+      DELETE t_matlote INDEX lv_tabix.
+    ELSE.
+* Dejamos solo los materiales 'ZPAP' o 'ZCOM'.
+      SELECT SINGLE mtart INTO @DATA(lv_mtart) FROM mara WHERE matnr = @wa_matlote-matnr.
+*      SELECT SINGLE valor1 FROM ztwm001
+*        INTO @DATA(lv_tipo)
+*        WHERE cprog  = 'ZRWM_RTLABELO' AND
+*        param1 = 'PAP_MTART' AND
+*        param3 = @lv_mtart.
+*      IF lv_tipo <> 'PAP' AND lv_tipo <> 'COM'.
+      READ TABLE lt_ztwm001 INTO ls_ztwm001 WITH KEY param1 = 'PAP_MTART'  param3 = lv_mtart.
+      IF sy-subrc <> 0.
+        DELETE t_matlote INDEX lv_tabix.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+
+  IF t_matlote[] IS NOT INITIAL.
+
+*    p_werks = '2000'.
+    p_werks = wa_matlote-werks.
+
+    PERFORM f_get_data  USING  'ZRWM_RTLABELO'
+                                p_werks
+                                p_lgnum
+                        CHANGING gs_tab_omp_2_pacs
+                                 t_matlote.
+
+    PERFORM f_send_to_omp IN PROGRAM zrwm_intf_omp_new
+                          USING abap_true
+                                'ZRWM_RTLABELO'
+                                p_werks
+                                gs_tab_omp
+                                gs_tab_omp_2_pacs
+                                ''.
+
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_DATA_3
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_0465   text
+*      -->P_P_MATNR  text
+*      -->P_P_WERKS  text
+*      -->P_P_LGNUM  text
+*      -->P_LV_TPMAT  text
+*      <--P_GS_TAB_OMP_2_PACS  text
+*      <--P_T_MATLOTE  text
+*----------------------------------------------------------------------*
+FORM f_get_data USING p_repid p_werks p_lgnum "p_tpmat
+                  CHANGING gs_tab_omp_2_pacs
+                           t_matlote TYPE tty_matlote.
+  TYPES: BEGIN OF tr_data_3,
+           matnr               TYPE matnr,
+           charg               TYPE charg_d,
+           lgnum               TYPE lgnum,
+           name                TYPE char30,
+           stockcommandid      TYPE char30,
+           stockgroupid        TYPE char30,
+           materialtype        TYPE char30,
+           operation           TYPE char30,
+           productid           TYPE char30,
+           paperid             TYPE char30,
+           unitid              TYPE char30,
+           width               TYPE char30,
+           width_unit          TYPE char30,
+           standardlength      TYPE char30,
+           standardlength_unit TYPE char30,
+           grammage_txt        TYPE char30,
+           grammage_unit       TYPE char30,
+           cost_txt            TYPE char30,
+           cost_unit           TYPE char30,
+           leadtime            TYPE char30,
+           preprint            TYPE char30,
+           comments            TYPE char30,
+           quantity_txt        TYPE char30,
+           quantity_unit       TYPE char30,
+           fromwhid            TYPE char30,
+           towhid              TYPE char30,
+           eventdate           TYPE char30,
+           movementtype        TYPE char30,
+         END OF tr_data_3,
+         tt_data_3 TYPE STANDARD TABLE OF tr_data_3.
+
+
+  DATA: ls_data                      TYPE zmt_omp_mat_move_out_sap_to_om,
+
+        ls_data_pc                   TYPE zmt_mat_move_new_format,
+        ls_action_pc                 TYPE zdt_mat_move_new_format,
+        ls_choice_pc                 TYPE zdt_mat_move_new_format_action,
+        ls_ccstockcommand_pc         TYPE zdt_mat_move_new_format_ccsto1,
+        ls_ccstockcommanddata_pc     TYPE zdt_mat_move_new_format_ccstoc,
+        ls_ccproduct_pc              TYPE zdt_mat_move_new_format_ccpro1,
+        ls_ccproductdata_pc          TYPE zdt_mat_move_new_format_ccprod,
+        ls_ccmaterialmovement_pc     TYPE zdt_mat_move_new_format_ccmat1,
+        ls_ccmaterialmovementdata_pc TYPE zdt_mat_move_new_format_ccmate,
+        ls_cc_lot_command_pc         TYPE  zdt_mat_move_new_format_cc_lot, "JJR
+        ls_cclot_pc                  TYPE zdt_mat_move_new_format_cclot,  "JJR
+
+        wl_lqua                      TYPE lqua,
+        ls_mara                      TYPE mara,
+        lt_hard                      TYPE STANDARD TABLE OF ztwm001,
+        tl_lqua                      TYPE STANDARD TABLE OF lqua,
+        lv_aux                       TYPE lein_mgewi,
+
+        lv_ancho                     TYPE lein_mgewi,
+        lv_str                       TYPE string,
+        lv_str2                      TYPE string,
+        lv_aux_grama                 TYPE lqua_gesme,
+        LV_0DEC TYPE P DECIMALS 0,
+        lv_aux_cost                  TYPE netwr,
+        lv_aux_in                    TYPE bstmg,
+        lv_unit_in                   TYPE gewei,
+        lv_unit_out                  TYPE gewei,
+        lv_lenum                     TYPE lenum,
+        lv_qunit                     TYPE gewei,
+        lv_datatype                  TYPE datatype_d.
+
+  TYPES: BEGIN OF mat,
+           matnr TYPE matnr,
+         END OF mat.
+  TYPES: tty_mat TYPE TABLE OF mat.
+  DATA: t_mat  TYPE tty_mat,
+        wa_mat TYPE LINE OF tty_mat.
+
+  TYPES: BEGIN OF lot,
+           matnr TYPE matnr,
+           charg TYPE charg_d,
+           lifnr TYPE mch1-lifnr,
+           name1 TYPE lfa1-name1,
+         END OF lot.
+
+  DATA: t_lot TYPE SORTED TABLE OF lot WITH UNIQUE KEY matnr charg.
+
+  DATA: gt_lqua TYPE STANDARD TABLE OF lqua.
+
+  TYPES: BEGIN OF mtart,
+           mtart TYPE mtart,
+         END OF mtart.
+  TYPES: tty_mtart TYPE TABLE OF mtart.
+  DATA: t_mtart  TYPE tty_mtart,
+        wa_mtart TYPE LINE OF tty_mtart.
+
+
+  TYPES: BEGIN OF mat_centro,
+           matnr TYPE matnr,
+           werks TYPE werks_d,
+           lgort TYPE lgort_d,
+         END OF mat_centro.
+  TYPES: tty_mat_centro TYPE TABLE OF mat_centro.
+  DATA: t_mat_centro  TYPE tty_mat_centro,
+        wa_mat_centro TYPE LINE OF tty_mat_centro.
+
+
+*  DATA a.
+*  WHILE a IS INITIAL.
+*  ENDWHILE.
+
+
+  SELECT * FROM ztwm001
+    INTO TABLE lt_hard
+    WHERE cprog = p_repid AND
+          param2 = '01'.
+
+
+  IF t_matlote[] IS NOT INITIAL.
+    LOOP AT t_matlote INTO DATA(wa_matlote).
+      SELECT SINGLE * FROM lqua
+            INTO @DATA(wa_lqua)
+           WHERE lgnum = @p_lgnum AND
+                 werks = @wa_matlote-werks AND
+                 verme GT 0 AND
+                 matnr = @wa_matlote-matnr AND
+                 charg = @wa_matlote-charg.
+      IF sy-subrc = 0.
+        APPEND wa_lqua TO gt_lqua.
+      ENDIF.
+    ENDLOOP.
+
+    IF gt_lqua[] IS NOT INITIAL.
+      SELECT matnr INTO TABLE @DATA(tl_mara)
+        FROM mara FOR ALL ENTRIES IN @gt_lqua
+       WHERE matnr  = @gt_lqua-matnr.
+      IF sy-subrc IS NOT INITIAL.
+        CLEAR: tl_mara, tl_mara[].
+      ELSE.
+        SORT tl_mara BY matnr.
+        DELETE ADJACENT DUPLICATES FROM tl_mara COMPARING matnr.
+      ENDIF.
+    ENDIF.
+
+    "recuperamos el tipo de material para poder hacer la distinción entre 'PAP' y 'COM'
+    "valores que encontraremos en la tabla de parámetros
+    SELECT matnr, mtart FROM mara
+      INTO TABLE @DATA(t_tipomat)
+      FOR ALL ENTRIES IN @t_matlote
+      WHERE matnr = @t_matlote-matnr.
+  ELSE.
+    EXIT.
+  ENDIF.
+
+  LOOP AT gt_lqua ASSIGNING FIELD-SYMBOL(<fs_lqua>).
+    READ TABLE tl_mara INTO DATA(wl_mara) WITH KEY matnr = <fs_lqua>-matnr.
+    IF sy-subrc IS NOT INITIAL.
+      CLEAR: <fs_lqua>-mandt, <fs_lqua>-lgnum, <fs_lqua>-lqnum.
+    ENDIF.
+  ENDLOOP.
+
+  DELETE gt_lqua WHERE lqnum IS INITIAL.
+
+
+  CLEAR: tl_lqua, tl_lqua[].
+
+  LOOP AT gt_lqua ASSIGNING <fs_lqua>.
+    CLEAR: wl_lqua.
+    wl_lqua-lgnum = <fs_lqua>-lgnum.
+    wl_lqua-matnr = <fs_lqua>-matnr.
+    wl_lqua-werks = <fs_lqua>-werks.
+    wl_lqua-verme = <fs_lqua>-verme.
+    wl_lqua-gewei = <fs_lqua>-gewei.
+    wl_lqua-lenum = <fs_lqua>-lenum. "JJR 31.07.2023
+    wl_lqua-mgewi = <fs_lqua>-mgewi. "JJR 31.07.2023
+    wl_lqua-lgort = <fs_lqua>-lgort.
+    wl_lqua-charg = <fs_lqua>-charg. "JJR 31.07.2023
+    wl_lqua-wenum = <fs_lqua>-wenum. "JJR 31.07.2023
+    wl_lqua-wdatu = <fs_lqua>-wdatu. "JJR 31.07.2023
+
+    " cvivo - 62813 - Verificar si es compatible
+    CALL METHOD zcl_wm_compatibles=>get_compatibles
+      EXPORTING
+        iv_werks    = wl_lqua-werks
+        iv_matnr    = wl_lqua-matnr
+      IMPORTING
+        e_principal = DATA(l_principal)
+      RECEIVING
+        et_compat   = DATA(t_compat).
+
+    IF t_compat IS NOT INITIAL AND l_principal IS INITIAL. " hay compatibles y éste no es el principal
+      wl_lqua-matnr = t_compat[ principal = abap_true ]-matnr. " sustituyo por el principal
+    ELSE.
+      CLEAR: l_principal, t_compat, t_compat[].
+    ENDIF.
+
+    COLLECT wl_lqua INTO tl_lqua.
+
+    "inserto en la tabla de tipos de material aquelos materiales compatibles
+    READ TABLE t_tipomat INTO DATA(wa_tipomat) WITH KEY matnr = wl_lqua-matnr.
+    IF sy-subrc <> 0.
+      SELECT SINGLE matnr mtart FROM mara
+       INTO wa_tipomat
+        WHERE matnr = wl_lqua-matnr.
+
+      IF sy-subrc = 0.
+        APPEND wa_tipomat TO t_tipomat.
+      ENDIF.
+    ENDIF.
+
+    wa_mat-matnr = wl_lqua-matnr.
+    APPEND wa_mat TO t_mat.
+  ENDLOOP.
+
+  SORT t_mat BY matnr ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM t_mat.
+
+  gt_lqua[] = tl_lqua[].
+
+
+  CLEAR: ls_data_pc, ls_action_pc, ls_choice_pc.
+
+* nos quedamos con los tipos de material de los materiales del documento de material.
+  LOOP AT t_tipomat INTO wa_tipomat.
+    wa_mtart-mtart = wa_tipomat-mtart.
+    APPEND wa_mtart TO t_mtart.
+  ENDLOOP.
+  SORT t_mtart BY mtart ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM t_mtart.
+
+
+* nos quedamos con los distinso materiales/centros del documento de material
+  LOOP AT gt_lqua INTO DATA(wa_lqua_1).
+    wa_mat_centro-matnr = wa_lqua_1-matnr.
+    wa_mat_centro-werks = wa_lqua_1-werks.
+    wa_mat_centro-lgort = wa_lqua_1-lgort.
+    APPEND wa_mat_centro TO t_mat_centro.
+  ENDLOOP.
+
+  SORT t_mat_centro BY matnr werks lgort ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM t_mat_centro.
+
+
+  LOOP AT t_mtart INTO wa_mtart.
+    CLEAR: ls_choice_pc.
+
+*   SEGMENTO CABECERA - un unico segmento
+    SELECT SINGLE valor1 FROM ztwm001
+          INTO @DATA(lv_tpmat)
+          WHERE cprog = 'ZRWM_RTLABELO' AND
+                param1 = 'PAP_MTART' AND
+                param2 = '01' AND
+                param3 = @wa_mtart-mtart.
+
+
+    CLEAR: ls_ccstockcommanddata_pc.
+
+    ls_ccstockcommanddata_pc-materialtype = lv_tpmat.
+
+    IF lv_tpmat = 'PAP'.
+      READ TABLE lt_hard ASSIGNING FIELD-SYMBOL(<h>) WITH KEY param1 = 'PAP_PARAMS'
+                                                              param3 = p_werks.
+      IF sy-subrc EQ 0.
+        ls_ccstockcommanddata_pc-stockcommandid = <h>-valor2.
+        ls_ccstockcommanddata_pc-stockgroupid   = <h>-valor1.
+      ENDIF.
+    ELSEIF lv_tpmat = 'COM'.
+      READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'COM_PARAMS'
+                                                param3 = p_werks.
+      IF sy-subrc EQ 0.
+        ls_ccstockcommanddata_pc-stockcommandid = <h>-valor2.
+        ls_ccstockcommanddata_pc-stockgroupid   = <h>-valor1.
+      ENDIF.
+    ENDIF.
+
+    READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'OPERATION_STCKCMD'.
+    IF sy-subrc EQ 0.
+      ls_ccstockcommanddata_pc-operation = <h>-valor1.
+    ENDIF.
+
+*      PERFORM f_dame_fecha_hora IN PROGRAM zrwm_intf_omp_new CHANGING lv_str.
+*    ls_ccstockcommanddata_pc-eventdateforzerolevel = ''. "lv_str.
+
+
+    ls_ccstockcommand_pc-ccstockcommanddata = ls_ccstockcommanddata_pc.
+    ls_choice_pc-ccstockcommand = ls_ccstockcommand_pc.
+
+
+    "SEGMENTO CCLOTCOMMANDATA - 1 UNICO SEGMENTO
+    ls_cc_lot_command_pc-cclotcommanddata-lotcommandid = 1.
+    ls_cc_lot_command_pc-cclotcommanddata-operation = 'Update'.
+
+    IF lv_tpmat = 'PAP'.
+      ls_cc_lot_command_pc-cclotcommanddata-stockgroupid = 'PaperGroup'.
+    ELSEIF lv_tpmat = 'COM'.
+      ls_cc_lot_command_pc-cclotcommanddata-stockgroupid = 'StockCom'.
+    ENDIF.
+
+    APPEND ls_cc_lot_command_pc TO ls_choice_pc-cc_lot_command.
+
+
+    LOOP AT t_tipomat INTO wa_tipomat WHERE mtart = wa_mtart-mtart.
+      LOOP AT t_mat INTO wa_mat WHERE matnr = wa_tipomat-matnr.
+        "SEGMENTO DATOS DE MATERIAL - un segmento por material
+        CLEAR: ls_ccproductdata_pc.
+
+        SELECT SINGLE * FROM mara
+          INTO ls_mara
+          WHERE matnr = wa_mat-matnr.
+
+        SELECT SINGLE mbew~matnr, mbew~bwkey, mbew~bwtar, mbew~verpr, mbew~peinh, t001~waers
+                    INTO @DATA(ls_mbew)
+                    FROM t001w INNER JOIN mbew  ON t001w~bwkey = mbew~bwkey
+                          LEFT OUTER JOIN t001k ON mbew~bwkey  = t001k~bwkey
+                          LEFT OUTER JOIN t001  ON t001k~bukrs = t001~bukrs
+                    WHERE t001w~werks = @p_werks
+                      AND mbew~matnr  = @wa_mat_centro-matnr
+                      AND mbew~lvorm  = ''.
+        IF sy-subrc IS NOT INITIAL.
+          CLEAR: ls_mbew.
+        ENDIF.
+
+        CONCATENATE ls_mara-matkl ls_mara-zzgramaje '/' ls_mara-zzancho INTO ls_ccproductdata_pc-productid.
+        CONCATENATE ls_mara-matkl ls_mara-zzgramaje INTO ls_ccproductdata_pc-paperid.
+
+
+        IF ls_ccstockcommanddata_pc-materialtype NE 'PAP'.
+          CLEAR: ls_ccproductdata_pc-paperid.
+        ENDIF.
+
+        READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'MATERIALMANAGEMENT'.
+        IF sy-subrc EQ 0.
+          ls_ccproductdata_pc-materialmanagement = <h>-valor1.
+        ENDIF.
+
+        ls_ccproductdata_pc-materialtype = ls_ccstockcommanddata_pc-materialtype.
+
+        READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'UNITID'.
+        IF sy-subrc EQ 0.
+          ls_ccproductdata_pc-unitid = <h>-valor1.
+        ENDIF.
+
+
+        LV_0DEC = ls_mara-zzancho * 1.
+        ls_ccproductdata_pc-materialwidth-content = LV_0DEC.
+        CONDENSE ls_ccproductdata_pc-materialwidth-content NO-GAPS.
+
+        READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'WIDTH_UNIT'.
+        IF sy-subrc EQ 0.
+          ls_ccproductdata_pc-materialwidth-unit = <h>-valor1.
+        ENDIF.
+
+
+        lv_aux = ls_mara-zzlargo * 1.
+        ls_ccproductdata_pc-materiallength-content = ls_mara-zzlargo * 1.
+        CONDENSE ls_ccproductdata_pc-materiallength-content NO-GAPS.
+
+        READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'LENGTH_UNIT'.
+        IF sy-subrc EQ 0.
+          ls_ccproductdata_pc-materiallength-unit = <h>-valor1.
+        ENDIF.
+
+        CLEAR lv_aux_grama.
+        IF ls_mara-zzgramaje IS NOT INITIAL.
+          lv_aux_grama = ls_mara-zzgramaje * 1.
+          LV_0DEC  = ls_mara-zzgramaje * 1.
+          ls_ccproductdata_pc-grammage-content = LV_0DEC.
+          CONDENSE ls_ccproductdata_pc-grammage-content .
+        ENDIF.
+
+        READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'GRAMMAGE_UNIT'.
+        IF sy-subrc EQ 0.
+          ls_ccproductdata_pc-grammage-unit = <h>-valor1.
+        ENDIF.
+
+        "Cálculo del Coste - De KG -> a M2 (para cálculo de Coste)
+        lv_aux_in   = 1.
+        lv_unit_in  = 'KG'.
+        lv_unit_out = 'M2'.
+
+
+        IF ( ls_mbew-matnr IS NOT INITIAL ) AND ( ls_mbew-peinh NE 0 ) .
+          lv_aux_grama = ls_mara-zzgramaje / 1000.
+
+          ls_ccproductdata_pc-cost-content = ( ls_mbew-verpr * lv_aux_grama ) / ( ls_mbew-peinh ) .
+
+          CONDENSE ls_ccproductdata_pc-cost-content NO-GAPS.
+        ELSE.
+          ls_ccproductdata_pc-cost-content = '0'.
+        ENDIF.
+
+        CONCATENATE ls_mbew-waers '/m2' INTO ls_ccproductdata_pc-cost-unit.
+
+        READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'LEADTIME'.
+        IF sy-subrc EQ 0.
+          ls_ccproductdata_pc-leadtime = <h>-valor1.
+        ENDIF.
+
+        IF ls_mara-mtart EQ 'ZPIM' OR ls_mara-mtart EQ 'ZPAH'.
+          ls_ccproductdata_pc-preprint = 'YES'.
+        ELSE.
+          ls_ccproductdata_pc-preprint = 'NO'.
+        ENDIF.
+
+        ls_ccproductdata_pc-comments = ''.
+
+        ls_ccproduct_pc-ccproductdata = ls_ccproductdata_pc.
+*        ls_ccproduct_pc-operation = ls_ccstockcommanddata_pc-operation.
+        ls_ccproduct_pc-operation = 'Replace'.
+        APPEND ls_ccproduct_pc TO ls_choice_pc-ccproduct.
+
+        LOOP AT t_mat_centro INTO wa_mat_centro WHERE matnr = wa_tipomat-matnr.
+
+          "SEGMENTO MOVIMIENTOS DE MATERIAL
+          LOOP AT gt_lqua INTO DATA(ls_lqua) WHERE matnr = wa_mat_centro-matnr AND
+                                                   werks = wa_mat_centro-werks AND
+                                                   lgort = wa_mat_centro-lgort.
+
+            CLEAR: ls_cclot_pc, ls_ccmaterialmovementdata_pc.
+
+            "SEGMEMENTO MOVIMIENTOS DE MATERIAL - 1 POR LOTE
+            ls_ccmaterialmovementdata_pc-stockcommandid = ls_ccstockcommanddata_pc-stockcommandid.
+            ls_ccmaterialmovementdata_pc-productid = ls_ccproductdata_pc-productid.
+
+            READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'QUANTITY_UNIT'.
+            IF sy-subrc EQ 0.
+              ls_ccmaterialmovementdata_pc-quantity-unit = <h>-valor1.
+            ENDIF.
+
+            lv_qunit = ls_ccmaterialmovementdata_pc-quantity-unit.
+            CALL FUNCTION 'CONVERSION_EXIT_CUNIT_INPUT'
+              EXPORTING
+                input          = lv_qunit
+              IMPORTING
+                output         = lv_qunit
+              EXCEPTIONS
+                unit_not_found = 1
+                OTHERS         = 2.
+
+            "De KG -> a M
+            PERFORM f_cambia_unidad IN PROGRAM zrwm_intf_omp_new USING ls_mara-matnr
+                                                                       ls_lqua-verme
+                                                                       ls_lqua-gewei
+                                                                       lv_qunit
+                                                                       ls_mara-zzancho
+                                                                  CHANGING lv_aux.
+            ls_ccmaterialmovementdata_pc-quantity-content = lv_aux * 1.
+            CONDENSE ls_ccmaterialmovementdata_pc-quantity-content NO-GAPS.
+
+            READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'FROMWHID'.
+            IF sy-subrc EQ 0.
+              ls_ccmaterialmovementdata_pc-fromwhid = <h>-valor1.
+            ENDIF.
+
+            READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'TOWHID'
+                                                      param3 = p_werks.
+            IF sy-subrc EQ 0.
+              ls_ccmaterialmovementdata_pc-towhid  = <h>-valor1.
+            ENDIF.
+
+            PERFORM f_dame_fecha_hora IN PROGRAM zrwm_intf_omp_new CHANGING lv_str.
+            ls_ccmaterialmovementdata_pc-eventdate = lv_str.
+
+            READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'MOVEMENTTYPE'.
+            IF sy-subrc EQ 0.
+              ls_ccmaterialmovementdata_pc-movementtype = <h>-valor1.
+            ENDIF.
+
+            ls_ccmaterialmovement_pc-ccmaterialmovementdata = ls_ccmaterialmovementdata_pc.
+            APPEND ls_ccmaterialmovement_pc TO ls_choice_pc-ccmaterialmovement.
+
+
+            "SEGMENTO CCLOTDATA - 1 POR LOTE
+**            ls_cclot_pc-cclotdata-lotid = ls_lqua-lenum. "ls_lqua-charg. "Numero de lote
+
+*--> INI FCARDONA 19.11.2024 LOTID = UA y no a CHARG
+
+*            ls_cclot_pc-cclotdata-lotid = ls_lqua-charg. "Numero de lote
+            ls_cclot_pc-cclotdata-lotid = ls_lqua-lenum.
+
+*<-- INI FCARDONA 19.11.2024 LOTID = UA y no a CHARG
+
+            ls_cclot_pc-cclotdata-erpreference = ls_lqua-lenum. "Numero de UA del lote
+
+            lv_unit_in  = 'KG'.
+            lv_unit_out = 'M2'.
+            DATA lv_aux_out TYPE ekpo-menge.
+            lv_aux_in = ls_lqua-verme.
+            CLEAR: lv_aux_out.
+            CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+              EXPORTING
+                i_matnr              = ls_lqua-matnr
+                i_in_me              = lv_unit_in
+                i_out_me             = lv_unit_out
+                i_menge              = lv_aux_in
+              IMPORTING
+                e_menge              = lv_aux_out
+              EXCEPTIONS
+                error_in_application = 1
+                error                = 2
+                OTHERS               = 3.
+
+            ls_cclot_pc-cclotdata-leafquantity-content  = lv_aux_out.
+
+            TRANSLATE lv_unit_out TO LOWER CASE.
+            ls_cclot_pc-cclotdata-leafquantity-unit = lv_unit_out. "M2
+
+            ls_cclot_pc-cclotdata-length-content = ls_mara-zzlargo.
+            ls_cclot_pc-cclotdata-length-unit = 'mm'.
+            ls_cclot_pc-cclotdata-lotcommandid = 1.
+            ls_cclot_pc-cclotdata-productid = ls_ccproductdata_pc-productid."Número de material
+
+            IF lv_tpmat = 'PAP'.
+              ls_cclot_pc-cclotdata-stock_group_id = 'PaperGroup'.
+            ELSEIF lv_tpmat = 'COM'.
+              ls_cclot_pc-cclotdata-stock_group_id = 'StockCom'.
+            ENDIF.
+
+            SELECT SINGLE licha
+              FROM mch1
+              INTO ls_cclot_pc-cclotdata-supplierlotid "Número de lote proveedor
+              WHERE matnr = ls_lqua-matnr AND
+                    charg = ls_lqua-charg.
+
+            SELECT ebeln, xblnr_mkpf, mblnr, mjahr UP TO 1 ROWS  FROM mseg INTO @DATA(ls_mseg)
+                   WHERE bwart = '101' AND matnr = @ls_lqua-matnr AND charg = @ls_lqua-charg ORDER BY mjahr DESCENDING, mblnr DESCENDING. "Numero de pedido de compras
+              EXIT.
+            ENDSELECT.
+            ls_cclot_pc-cclotdata-supplierorderlineid = ls_mseg-ebeln.
+
+            ls_cclot_pc-cclotdata-delivery_note = ls_mseg-xblnr_mkpf."Nota de entrega de la EM
+            ls_cclot_pc-cclotdata-weight-content = ls_lqua-mgewi."Peso en Kg del lote
+            ls_cclot_pc-cclotdata-weight-unit = ls_lqua-gewei.
+            TRANSLATE ls_cclot_pc-cclotdata-weight-unit TO LOWER CASE. "cgijon - 22.08.23 - 7000055471, TICKET 78613
+
+            READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'TOWHID'
+                                                      param3 = p_werks.
+            IF sy-subrc = 0.
+              ls_cclot_pc-cclotdata-wh_id = <h>-valor1.
+            ENDIF.
+
+            ls_cclot_pc-cclotdata-width-content = ls_mara-zzancho * 1."ancho del material ZZANCHO/MARA
+            ls_cclot_pc-cclotdata-width-unit = 'mm'.
+
+            ls_cclot_pc-operation = 'Update'.
+            APPEND ls_cclot_pc TO ls_choice_pc-cclot.
+
+          ENDLOOP.
+        ENDLOOP.
+      ENDLOOP.
+    ENDLOOP.
+  ENDLOOP.
+
+  IF ls_choice_pc-ccproduct[] IS NOT INITIAL.
+    CLEAR: ls_action_pc, ls_data_pc.
+    ls_action_pc-action = ls_choice_pc.
+    ls_action_pc-centro = p_werks.
+    READ TABLE lt_hard ASSIGNING <h> WITH KEY param1 = 'NAME'.
+    IF sy-subrc EQ 0.
+      ls_action_pc-name =  <h>-valor1.
+    ENDIF.
+    ls_data_pc-mt_mat_move_new_format = ls_action_pc.
+    gs_tab_omp_2_pacs = ls_data_pc.
+  ENDIF.
+
+
+ENDFORM.

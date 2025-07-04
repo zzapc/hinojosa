@@ -1,0 +1,1125 @@
+***********************************************************************
+* TIPO : LISTADO
+* TITULO : Bloqueo de productos obsoletos
+* DESCRIPCION : Bloqueo de productos obsoletos
+*
+* AUTOR: Andrés Picazo                                FECHA: 06/11/2024
+* ANALISTA: Juan Vicente Martínez
+*
+***********************************************************************
+REPORT zrmm0034.
+
+INCLUDE rsdbc1xx.
+
+CLASS lcl_alv DEFINITION INHERITING FROM zcl_ap_alv_check FINAL.
+  PUBLIC SECTION.
+    METHODS handle_user_command REDEFINITION.
+    METHODS visualizar_objeto   REDEFINITION.
+ENDCLASS.
+
+
+CLASS zcl_report DEFINITION INHERITING FROM zcl_dev FINAL.
+  PUBLIC SECTION.
+    TYPES: BEGIN OF t_listado,
+             check         TYPE xfeld,
+             lights        TYPE zico_estado_mensaje,
+             matnr         TYPE matnr,
+             maktx         TYPE maktx,
+             mtart         TYPE mtart,
+             mstae         TYPE mara-mstae,
+             mstav         TYPE mara-mstav,
+             mstdv         TYPE mara-mstdv,
+             werks         TYPE marc-werks,
+             mmsta         TYPE marc-mmsta,
+             cuobj         TYPE marc-cuobj,
+             vkorg         TYPE mvke-vkorg,
+             vtweg         TYPE mvke-vtweg,
+             vmsta         TYPE mvke-vmsta,
+             vmstd         TYPE mvke-vmstd,
+             stock_centro  TYPE mard-labst,
+             otros_centros TYPE string,
+             kunag         TYPE kunnr,
+             name1         TYPE kna1-name1,
+             brsch         TYPE kna1-brsch,
+             brtxt         TYPE t016t-brtxt,
+             kdmat         TYPE knmt-kdmat,
+             comercial     TYPE lifnr,
+             comercial_t   TYPE lfa1-name1,
+             catalogo      TYPE abap_bool,
+             prtyp         TYPE yhp_idx_td130-prtyp,
+             descr         TYPE zvcxi_pxs_tc120t-descr,
+             prton         TYPE yhp_idx_td130-prton,
+             dcutt         TYPE yhp_idx_td100-dcutt,
+             pts           TYPE string,
+             charg         TYPE mcha-charg,
+             hsdat         TYPE mcha-hsdat,
+             lwedt         TYPE mcha-lwedt,
+             fecha_101     TYPE mcha-hsdat,
+             ersda         TYPE mcha-ersda,
+             ersda_mat     TYPE mara-ersda,
+             fcalculo      TYPE mcha-hsdat,
+             meses         TYPE pea_scrmm,
+             vbeln         TYPE vbeln_vl,
+             wadat_ist     TYPE likp-wadat_ist,
+             message       TYPE bapi_msg,
+             error         TYPE abap_bool,
+             proc          TYPE abap_bool,
+           END OF t_listado,
+           tt_listado TYPE STANDARD TABLE OF t_listado WITH KEY matnr werks.
+
+    DATA: i_listado TYPE tt_listado,
+          o_alv     TYPE REF TO lcl_alv ##NEEDED.
+
+    METHODS  main.
+
+    METHODS: listado,
+      seleccionar_datos.
+
+  PRIVATE SECTION.
+    METHODS get_listado IMPORTING matnr         TYPE matnr OPTIONAL
+                        RETURNING VALUE(i_list) TYPE tt_listado.
+
+    METHODS preparar_listado CHANGING i_listado TYPE tt_listado
+                                      i_mat     TYPE tt_listado.
+
+ENDCLASS.
+
+*------VARIABLES-------------------------------------------------------*
+DATA o_prog TYPE REF TO zcl_report.
+
+DATA: marc          TYPE marc,
+      yhp_idx_td130 TYPE yhp_idx_td130,
+      kna1          TYPE kna1,
+      mara          TYPE mara,
+      mvke          TYPE mvke.
+
+
+*------PARAMETER/SELECT-OPTIONS EN PANTALLA----------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-sel.
+SELECT-OPTIONS: s_werks FOR marc-werks,
+                s_prtyp FOR yhp_idx_td130-prtyp,
+                s_brsch FOR kna1-brsch,
+                s_kunnr FOR kna1-kunnr,
+                s_matnr FOR marc-matnr,
+                s_mtart FOR mara-mtart,
+                s_mstae FOR mara-mstae,
+                s_mmsta FOR marc-mmsta,
+                s_vmsta FOR mvke-vmsta.
+PARAMETERS p_meses TYPE int2.
+SELECTION-SCREEN SKIP 1.
+PARAMETERS p_vari LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK b01.
+__botones_plantilla.
+
+
+************************************************************************
+*
+* LOGICA DEL PROGRAMA
+*
+************************************************************************
+
+*----------------------------------------------------------------------*
+* CLASS lcl_alv IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv IMPLEMENTATION.
+  METHOD visualizar_objeto.
+    DATA: l_list  TYPE o_prog->t_listado,
+          kotg933 TYPE kotg933.
+
+    DATA o_bi TYPE REF TO zcl_ap_batch_input.
+
+    l_list = list.
+
+
+    CASE column.
+      WHEN 'CUOBJ' OR 'PRTYP' OR 'DESCR'.
+        zhcl_ai_core=>visualizar_cuobj( l_list-cuobj ).
+
+
+      WHEN 'MATNR' OR 'PRTON' OR 'DCUTT' OR 'PTS'.
+        CASE column.
+          WHEN 'PRTON'. l_list-matnr = l_list-prton.
+          WHEN 'DCUTT'. l_list-matnr = l_list-dcutt.
+          WHEN 'PTS'.
+            IF l_list-pts CS '.'.
+              RETURN.
+            ELSE.
+              l_list-matnr = l_list-pts.
+            ENDIF.
+        ENDCASE.
+        IF NOT l_list-matnr IS INITIAL.
+          SET PARAMETER ID 'MAT' FIELD l_list-matnr.
+          SET PARAMETER ID 'WRK' FIELD l_list-werks.
+        ENDIF.
+        CALL TRANSACTION 'MM03' AND SKIP FIRST SCREEN.
+
+      WHEN 'STOCK_CENTRO'.
+        zcl_ap_material=>ver_stocks( matnr = l_list-matnr
+                                     werks = l_list-werks ).
+      WHEN 'CATALOGO'.
+        SELECT kotg933~*
+          FROM kotg933
+          WHERE kappl = 'V'
+            AND kschl = 'ZA01'
+            AND matnr = @l_list-matnr
+            AND vkorg = @l_list-vkorg
+            AND vtweg = @l_list-vtweg
+            AND datbi >= @sy-datum
+            AND datab <= @sy-datum
+          ORDER BY kotg933~vkorg, kotg933~kunnr
+          INTO CORRESPONDING FIELDS OF @kotg933
+          UP TO 1 ROWS.
+        ENDSELECT.
+        IF sy-subrc = 0.
+          o_bi = NEW #( ).
+
+          o_bi->inicio( ).
+
+*
+          o_bi->dynpro( program = 'SAPMV13G' dynpro = '0100' okcode = '=ANTA' ).
+          o_bi->campos( campo = 'G000-KSCHL' valor = 'ZA01' ). " Clase de lista/exclusión de materiales
+
+          o_bi->dynpro( program = 'SAPLV14A' dynpro = '0100' okcode = '=WEIT' ).
+
+          o_bi->dynpro( program = 'RV13G934' dynpro = '1000' okcode = '=ONLI' ).
+          o_bi->campos( campo = 'F001' valor = kotg933-vkorg ).
+          o_bi->campos( campo = 'F002' valor = kotg933-vtweg ).
+          o_bi->campos( campo = 'F003' valor = kotg933-spart ).
+          o_bi->campos( campo = 'F004' valor = kotg933-kunnr ).
+          o_bi->campos( campo = 'F005-LOW' valor = kotg933-matnr ).
+
+          o_bi->llamar_transaccion( tcode = 'VB03' modo = 'E' ).
+        ENDIF.
+      WHEN OTHERS. message = 'No implementado'.
+    ENDCASE.
+  ENDMETHOD. " handle_double_click
+
+  METHOD handle_user_command.
+    DATA l_ayer TYPE dats.
+
+    l_ayer = sy-datum - 1.
+
+    check_ucomm_sel = 'EJEC,DESBLOQUEAR'.
+
+    super->handle_user_command( e_salv_function ).
+
+    CASE ucomm.
+      WHEN 'EJEC'.
+        IF line_exists( o_prog->i_listado[ check = 'X' error = 'X' ] ).
+          MESSAGE 'No seleccione líneas con errores' TYPE 'I'.
+          RETURN.
+        ENDIF.
+        CLEAR o_prog->o_log->i_log.
+        DATA(o_mat) = NEW zcl_ap_material( ).
+        LOOP AT o_prog->i_listado ASSIGNING FIELD-SYMBOL(<listado>) WHERE check = 'X'.
+
+          DATA(l_mod_ok) = ''.
+          DATA(l_bloqueo_mat) = ''.
+* ¿Es el ultimo centro asociado a la unidad organizativa
+          DATA(l_ultimo_centro_unorg) = 'X'.
+          IF NOT <listado>-vkorg IS INITIAL.
+            SELECT marc~werks FROM marc JOIN tvkwz ON tvkwz~werks = marc~werks
+              INTO @DATA(l_centro)
+              UP TO 1 ROWS
+             WHERE matnr = @<listado>-matnr
+               AND marc~werks NE @<listado>-werks
+               AND vkorg = @<listado>-vkorg
+               AND vtweg = @<listado>-vtweg
+               AND mmsta = ''
+             ORDER BY marc~werks.
+            ENDSELECT.
+            IF sy-subrc = 0.
+              CLEAR l_ultimo_centro_unorg.
+            ENDIF.
+          ENDIF.
+          DATA(l_mod) = ''.
+          o_mat->ini_update( matnr = <listado>-matnr ).
+*          IF <listado>-mstae <> '99' OR <listado>-mstav <> 'ZZ'.
+*            SELECT SINGLE * FROM mara
+*            INTO @DATA(l_mara)
+*            WHERE matnr = @<listado>-matnr.
+*            l_mara-mstae = '99'.
+*            IF l_mara-mstav <> 'ZZ'.
+*              l_mara-mstav = 'ZZ'.
+*              l_mara-mstdv = sy-datum.
+*            ENDIF.
+*            o_mat->add_datos_basicos( mara = l_mara ).
+*          ENDIF.
+          IF <listado>-mmsta <> '99'.
+            SELECT SINGLE * FROM marc
+            INTO @DATA(l_marc)
+            WHERE matnr = @<listado>-matnr
+              AND werks = @<listado>-werks.
+            IF l_marc-mmsta <> '99'.
+              l_marc-mmsta = '99'.
+              l_marc-mmstd = sy-datum.
+              <listado>-mmsta = '99'.
+              o_mat->add_datos_centro( marc = l_marc compras = 'X' ).
+              l_mod = 'X'.
+            ENDIF.
+          ENDIF.
+
+* Si el resto de centro, está bloquedo, bloquemos también el material
+          IF <listado>-mstae <> '99'.
+            SELECT SINGLE matnr FROM marc
+            INTO <listado>-matnr
+            WHERE matnr = <listado>-matnr
+              AND werks NE <listado>-werks
+              AND mmsta NE '99'.
+            IF sy-subrc NE 0.
+              SELECT SINGLE * FROM mara
+             INTO @DATA(l_mara)
+             WHERE matnr = @<listado>-matnr.
+              IF l_mara-mstae <> '99'.
+                l_bloqueo_mat = 'X'.
+                l_mara-mstae = '99'.
+                l_mara-mstde = sy-datum.
+                l_mod = 'X'.
+                o_mat->add_datos_basicos( mara = l_mara ).
+              ENDIF.
+            ENDIF.
+          ENDIF.
+
+
+          IF NOT <listado>-vkorg IS INITIAL.
+            SELECT * FROM mvke                     "#EC CI_NO_TRANSFORM
+              INTO TABLE @DATA(i_mvke)
+             WHERE matnr  = @<listado>-matnr
+               AND vkorg  = @<listado>-vkorg
+               AND vtweg  = @<listado>-vtweg
+               AND lvorm  = ''
+               AND vmsta <> 'ZZ'.
+            IF l_ultimo_centro_unorg = 'X'.
+              LOOP AT i_mvke ASSIGNING FIELD-SYMBOL(<mvke>).
+                <mvke>-lvorm = 'X'.
+                <mvke>-vmsta = 'ZZ'.
+                <mvke>-vmstd = sy-datum.
+                o_mat->add_datos_ventas( mvke = <mvke>  ).
+                l_mod = 'X'.
+              ENDLOOP.
+            ELSE.
+              <listado>-message = o_prog->message( p1 = 'No se bloquea la vista de ventas del material' p2 = <listado>-matnr p3 = <listado>-vkorg p4 = <listado>-vtweg p5 = 'por estar también en el centro' p6 = l_centro postponer = 'X' type = 'W' ).
+            ENDIF.
+          ENDIF.
+          IF l_mod IS INITIAL.
+            <listado>-message = o_prog->message( p1 = 'No eran necesarias modificaciones para el material' p2 = <listado>-matnr p3 = 'en centro' p4 = <listado>-werks postponer = 'X' type = 'I' ).
+            <listado>-lights  = zcl_ap_alv=>set_icono( icono = icon_okay mensaje = <listado>-message ).
+          ELSE.
+            o_mat->update( ).
+            ASSIGN o_mat->messages[ type = 'E' ] TO FIELD-SYMBOL(<mess>).
+            IF sy-subrc = 0.
+              o_prog->message( p1 = |Error bloqueando material { <mess>-message }| postponer = 'X' ).
+              CONTINUE.
+            ELSE.
+              <listado>-message = o_prog->message( p1 = 'Se ha bloqueado material' p2 = <listado>-matnr p3 = 'en centro' p4 = <listado>-werks postponer = 'X' type = 'S' ).
+              LOOP AT i_mvke ASSIGNING <mvke>.
+                o_prog->message( p1 = 'Se ha bloqueado material' p2 = <listado>-matnr p3 = 'en área de ventas' p4 = <mvke>-vkorg p5 = <mvke>-vtweg postponer = 'X' type = 'S' ).
+              ENDLOOP.
+              IF l_bloqueo_mat = 'X'.
+                o_prog->message( p1 = 'Se ha bloqueado material' p2 = <listado>-matnr p3 = 'a nivel general con bloqueo 99' postponer = 'X' type = 'S' ).
+              ENDIF.
+              l_mod_ok = 'X'.
+              COMMIT WORK AND WAIT.
+              CLEAR l_mod.
+            ENDIF.
+          ENDIF.
+
+          IF NOT <listado>-vkorg IS INITIAL AND l_ultimo_centro_unorg = 'X'.
+            SELECT kotg933~* FROM kotg933
+              INTO TABLE @DATA(i_cond)
+            WHERE kappl  = 'V'
+              AND kschl  = 'ZA01'
+              AND matnr  = @<listado>-matnr
+              AND vkorg  = @<listado>-vkorg
+              AND vtweg  = @<listado>-vtweg
+              AND datbi >= @sy-datum
+              AND datab <= @sy-datum.
+            IF sy-subrc = 0.
+              LOOP AT i_cond ASSIGNING FIELD-SYMBOL(<cond>).
+                UPDATE kotg933
+                   SET datbi = l_ayer
+                       WHERE kappl = <cond>-kappl
+                         AND kschl = <cond>-kschl
+                         AND vkorg = <cond>-vkorg
+                         AND vtweg = <cond>-vtweg
+                         AND spart = <cond>-spart
+                         AND kunnr = <cond>-kunnr
+                         AND matnr = <cond>-matnr
+                         AND datbi = <cond>-datbi.
+                l_mod = 'X'.
+*                IF l_mod_ok IS INITIAL.
+                <listado>-message = o_prog->message( p1 = 'Se ha limitado catálogo ' p2 = <listado>-matnr p3 = 'en área de ventas' p4 = <cond>-vkorg p5 = <cond>-vtweg p6 = 'para cliente' p7 = <listado>-kunag postponer = 'X' type = 'S' ).
+*                ENDIF.
+              ENDLOOP.
+            ENDIF.
+
+            SELECT kotg934~* FROM kotg934
+              INTO TABLE @DATA(i_cond_934)
+            WHERE kappl  = 'V'
+              AND kschl  = 'ZA01'
+              AND matnr  = @<listado>-matnr
+              AND vkorg  = @<listado>-vkorg
+              AND vtweg  = @<listado>-vtweg
+              AND datbi >= @sy-datum
+              AND datab <= @sy-datum.
+            IF sy-subrc = 0.
+              LOOP AT i_cond_934 ASSIGNING FIELD-SYMBOL(<cond_934>).
+                UPDATE kotg934
+                   SET datbi = l_ayer
+                       WHERE kappl = <cond_934>-kappl
+                         AND kschl = <cond_934>-kschl
+                         AND vkorg = <cond_934>-vkorg
+                         AND vtweg = <cond_934>-vtweg
+                         AND spart = <cond_934>-spart
+                         AND kunwe = <cond_934>-kunwe
+                         AND matnr = <cond_934>-matnr
+                         AND datbi = <cond_934>-datbi.
+                l_mod = 'X'.
+*                IF l_mod_ok IS INITIAL.
+                <listado>-message = o_prog->message( p1 = 'Se ha limitado catálogo ' p2 = <listado>-matnr p3 = 'en área de ventas' p4 = <cond_934>-vkorg p5 = <cond_934>-vtweg p6 = 'para destinatario' p7 = <cond_934>-kunwe postponer = 'X' type = 'S' ).
+*                ENDIF.
+              ENDLOOP.
+            ENDIF.
+
+            SELECT kotg903~* FROM kotg903
+              INTO TABLE @DATA(i_cond_903)
+            WHERE kappl  = 'V'
+              AND kschl  = 'ZA01'
+              AND matnr  = @<listado>-matnr
+              AND vkorg  = @<listado>-vkorg
+              AND datbi >= @sy-datum
+              AND datab <= @sy-datum.
+            IF sy-subrc = 0.
+              LOOP AT i_cond_903 ASSIGNING FIELD-SYMBOL(<cond_903>).
+                UPDATE kotg903
+                   SET datbi = l_ayer
+                       WHERE kappl = <cond_903>-kappl
+                         AND kschl = <cond_903>-kschl
+                         AND vkorg = <cond_903>-vkorg
+                         AND matnr = <cond_903>-matnr
+                         AND datbi = <cond_903>-datbi.
+                l_mod = 'X'.
+*                IF l_mod_ok IS INITIAL.
+                <listado>-message = o_prog->message( p1 = 'Se ha limitado catálogo ' p2 = <listado>-matnr p3 = 'en org. ventas' p4 = <cond_903>-vkorg   postponer = 'X' type = 'S' ).
+*                ENDIF.
+              ENDLOOP.
+            ENDIF.
+
+
+            SELECT knmt~vkorg, knmt~vtweg, knmt~kunnr, knmt~kdmat FROM  knmt
+              INTO TABLE @DATA(i_knmt)
+             WHERE matnr = @<listado>-matnr
+               AND vkorg = @<listado>-vkorg
+               AND vtweg = @<listado>-vtweg
+               AND NOT kdmat LIKE '%_OBS'.
+            LOOP AT i_knmt ASSIGNING FIELD-SYMBOL(<knmt>).
+              <knmt>-kdmat = <knmt>-kdmat && '_OBS'.
+              UPDATE knmt
+                 SET kdmat = <knmt>-kdmat
+               WHERE vkorg  = <knmt>-vkorg
+                 AND vtweg  = <knmt>-vtweg
+                 AND kunnr  = <knmt>-kunnr
+                 AND matnr  = <listado>-matnr.
+              l_mod = 'X'.
+*              IF l_mod_ok IS INITIAL.
+              <listado>-message = o_prog->message( p1 = 'Se ha cambiado el material ' p2 = <listado>-matnr p3 = 'de cliente a a' p4 = <knmt>-kdmat postponer = 'X' type = 'S' ).
+*              ENDIF.
+            ENDLOOP.
+          ENDIF.
+          IF l_mod = 'X'.
+            <listado>-lights = zcl_ap_alv=>set_icono( icono = icon_okay mensaje = <listado>-message ).
+          ENDIF.
+
+        ENDLOOP.
+        IF sy-subrc = 0.
+          o_prog->o_log->show_log( ).
+          refresh( ).
+        ENDIF.
+
+
+      WHEN 'DESBLOQUEAR'.
+        IF line_exists( o_prog->i_listado[ check = 'X' error = 'X' ] ).
+          MESSAGE 'No seleccione líneas con errores' TYPE 'I'.
+          RETURN.
+        ENDIF.
+        CLEAR o_prog->o_log->i_log.
+        o_mat = NEW zcl_ap_material( ).
+        DATA: l_desbloqueo_compras,
+              l_desbloqueo_general,
+              l_desbloqueo_ventas,
+              l_bloqueado.
+        LOOP AT o_prog->i_listado ASSIGNING <listado> WHERE check = 'X'.
+          CLEAR: l_mod_ok, l_mod, l_desbloqueo_compras, l_desbloqueo_compras, l_desbloqueo_ventas.
+
+          o_mat->ini_update( matnr = <listado>-matnr ).
+          SELECT SINGLE * FROM marc
+          INTO @l_marc
+          WHERE matnr = @<listado>-matnr
+            AND werks = @<listado>-werks.
+          IF NOT l_marc-mmsta IS INITIAL.
+            l_bloqueado = 'X'.
+            CLEAR: l_marc-mmsta, l_marc-mmstd.
+            o_mat->add_datos_centro( marc = l_marc compras = 'X' ).
+            l_mod = 'X'.
+            l_desbloqueo_compras = 'X'.
+          ENDIF.
+
+          SELECT SINGLE * FROM mara
+           INTO @l_mara
+           WHERE matnr = @<listado>-matnr.
+          IF NOT l_mara-mstae IS INITIAL.
+            l_bloqueado = 'X'.
+            l_desbloqueo_general = 'X'.
+            CLEAR: l_mara-mstae, l_mara-mstde.
+            l_mod = 'X'.
+            o_mat->add_datos_basicos( mara = l_mara ).
+          ENDIF.
+
+
+          IF NOT <listado>-vkorg IS INITIAL.
+            SELECT * FROM mvke                     "#EC CI_NO_TRANSFORM
+              INTO TABLE @i_mvke
+             WHERE matnr  = @<listado>-matnr
+               AND vkorg  = @<listado>-vkorg
+               AND vtweg  = @<listado>-vtweg
+               AND vmsta NE ''.
+            LOOP AT i_mvke ASSIGNING <mvke>.
+              l_bloqueado = 'X'.
+              CLEAR: <mvke>-lvorm, <mvke>-vmsta, <mvke>-vmstd.
+              o_mat->add_datos_ventas( mvke = <mvke>  ).
+              l_mod = 'X'.
+              l_desbloqueo_ventas = 'X'.
+            ENDLOOP.
+          ENDIF.
+
+          IF l_mod IS INITIAL.
+            <listado>-message = o_prog->message( p1 = 'No eran necesarias modificaciones para el material' p2 = <listado>-matnr p3 = 'en centro' p4 = <listado>-werks postponer = 'X' type = 'I' ).
+            <listado>-lights  = zcl_ap_alv=>set_icono( icono = icon_okay mensaje = <listado>-message ).
+          ELSE.
+            o_mat->update( ).
+            ASSIGN o_mat->messages[ type = 'E' ] TO <mess>.
+            IF sy-subrc = 0.
+              o_prog->message( p1 = |Error desbloqueando material { <mess>-message }| postponer = 'X' ).
+              CONTINUE.
+            ELSE.
+              <listado>-message = |Se ha desbloqueado material|.
+              CLEAR: <listado>-mstae, <listado>-mmsta, <listado>-vmsta.
+
+              IF l_desbloqueo_general = 'X'.
+                o_prog->message( p1 = 'Se ha desbloqueado material' p2 = <listado>-matnr p3 = 'a nivel general' postponer = 'X' type = 'S' ).
+              ENDIF.
+              IF l_desbloqueo_compras = 'X'.
+                o_prog->message( p1 = 'Se ha desbloqueado material' p2 = <listado>-matnr p3 = 'en centro' p4 = <listado>-werks postponer = 'X' type = 'S' ).
+              ENDIF.
+              LOOP AT i_mvke ASSIGNING <mvke>.
+                o_prog->message( p1 = 'Se ha desbloqueado material' p2 = <listado>-matnr p3 = 'en área de ventas' p4 = <mvke>-vkorg p5 = <mvke>-vtweg postponer = 'X' type = 'S' ).
+              ENDLOOP.
+              l_mod_ok = 'X'.
+              COMMIT WORK AND WAIT.
+              CLEAR l_mod.
+            ENDIF.
+          ENDIF.
+
+          IF NOT <listado>-vkorg IS INITIAL.
+            SELECT kotg933~* FROM kotg933
+              INTO TABLE @i_cond
+            WHERE kappl  = 'V'
+              AND kschl  = 'ZA01'
+              AND matnr  = @<listado>-matnr
+              AND vkorg  = @<listado>-vkorg
+              AND vtweg  = @<listado>-vtweg
+             ORDER BY vkorg ASCENDING, vtweg ASCENDING, spart ASCENDING, kunnr ASCENDING, matnr ASCENDING, datbi DESCENDING.
+            IF sy-subrc = 0.
+              DELETE ADJACENT DUPLICATES FROM i_cond COMPARING vkorg vtweg spart kunnr matnr.
+              LOOP AT i_cond ASSIGNING <cond> WHERE datbi < sy-datum.
+                UPDATE kotg933
+                   SET datbi = '99991231'
+                WHERE kappl = <cond>-kappl
+                  AND kschl = <cond>-kschl
+                  AND vkorg = <cond>-vkorg
+                  AND vtweg = <cond>-vtweg
+                  AND spart = <cond>-spart
+                  AND kunnr = <cond>-kunnr
+                  AND matnr = <cond>-matnr
+                  AND datbi = <cond>-datbi.
+                l_mod = 'X'.
+*                IF l_mod_ok IS INITIAL.
+                <listado>-message = o_prog->message( p1 = 'Se ha ampliado catálogo a 31.12.9999 para ' p2 = <listado>-matnr p3 = 'en área de ventas'
+                                                     p4 = <cond>-vkorg p5 = <cond>-vtweg p6 = 'para cliente' p7 = <listado>-kunag
+                                                     postponer = 'X' type = 'S' ).
+*                ENDIF.
+              ENDLOOP.
+            ENDIF.
+
+            SELECT kotg934~* FROM kotg934
+              INTO TABLE @i_cond_934
+            WHERE kappl  = 'V'
+              AND kschl  = 'ZA01'
+              AND matnr  = @<listado>-matnr
+              AND vkorg  = @<listado>-vkorg
+              AND vtweg  = @<listado>-vtweg
+            ORDER BY vkorg ASCENDING, vtweg ASCENDING, spart ASCENDING, kunwe ASCENDING, matnr ASCENDING, datbi DESCENDING.
+            IF sy-subrc = 0.
+              DELETE ADJACENT DUPLICATES FROM i_cond_934 COMPARING vkorg vtweg spart kunwe matnr.
+              LOOP AT i_cond_934 ASSIGNING <cond_934> WHERE datbi < sy-datum.
+                UPDATE kotg934
+                   SET datbi = '99991231'
+                       WHERE kappl = <cond_934>-kappl
+                         AND kschl = <cond_934>-kschl
+                         AND vkorg = <cond_934>-vkorg
+                         AND vtweg = <cond_934>-vtweg
+                         AND spart = <cond_934>-spart
+                         AND kunwe = <cond_934>-kunwe
+                         AND matnr = <cond_934>-matnr
+                         AND datbi = <cond_934>-datbi.
+                l_mod = 'X'.
+*                IF l_mod_ok IS INITIAL.
+                <listado>-message = o_prog->message( p1 = 'Se ha ampliado catálogo a 31.12.9999 para ' p2 = <listado>-matnr p3 = 'en área de ventas'
+                                                     p4 = <cond_934>-vkorg p5 = <cond_934>-vtweg p6 = 'para destinatario' p7 = <cond_934>-kunwe
+                                                     postponer = 'X' type = 'S' ).
+*                ENDIF.
+              ENDLOOP.
+            ENDIF.
+
+            SELECT kotg903~* FROM kotg903
+              INTO TABLE @i_cond_903
+            WHERE kappl  = 'V'
+              AND kschl  = 'ZA01'
+              AND matnr  = @<listado>-matnr
+              AND vkorg  = @<listado>-vkorg
+              ORDER BY vkorg ASCENDING, matnr ASCENDING, datbi DESCENDING.
+            IF sy-subrc = 0.
+              DELETE ADJACENT DUPLICATES FROM i_cond_903 COMPARING vkorg matnr.
+              LOOP AT i_cond_903 ASSIGNING <cond_903> WHERE datbi < sy-datum.
+                UPDATE kotg903
+                   SET datbi = '99991231'
+                       WHERE kappl = <cond_903>-kappl
+                         AND kschl = <cond_903>-kschl
+                         AND vkorg = <cond_903>-vkorg
+                         AND matnr = <cond_903>-matnr
+                         AND datbi = <cond_903>-datbi.
+                l_mod = 'X'.
+*                IF l_mod_ok IS INITIAL.
+                <listado>-message = o_prog->message( p1 = 'Se ha ampliado catálogo a 31.12.9999 para ' p2 = <listado>-matnr p3 = 'en org. ventas' p4 = <cond_903>-vkorg
+                                                     postponer = 'X' type = 'S' ).
+*                ENDIF.
+              ENDLOOP.
+            ENDIF.
+
+
+            SELECT knmt~vkorg, knmt~vtweg, knmt~kunnr, knmt~kdmat FROM  knmt
+              INTO TABLE @i_knmt
+             WHERE matnr = @<listado>-matnr
+               AND vkorg = @<listado>-vkorg
+               AND vtweg = @<listado>-vtweg
+               AND kdmat LIKE '%_OBS'.
+            LOOP AT i_knmt ASSIGNING <knmt>.
+              SPLIT <knmt>-kdmat AT '_OBS' INTO <knmt>-kdmat DATA(l_aux).
+              UPDATE knmt
+                 SET kdmat = <knmt>-kdmat
+               WHERE vkorg  = <knmt>-vkorg
+                 AND vtweg  = <knmt>-vtweg
+                 AND kunnr  = <knmt>-kunnr
+                 AND matnr  = <listado>-matnr.
+              l_mod = 'X'.
+*              IF l_mod_ok IS INITIAL.
+              <listado>-message = o_prog->message( p1 = 'Se ha cambiado el material ' p2 = <listado>-matnr p3 = 'de cliente a a' p4 = <knmt>-kdmat postponer = 'X' type = 'S' ).
+*              ENDIF.
+            ENDLOOP.
+          ENDIF.
+          IF l_mod = 'X' or l_bloqueado is initial or l_mod_ok = 'X'.
+            <listado>-lights = zcl_ap_alv=>set_icono( icono = icon_okay mensaje = <listado>-message ).
+          ENDIF.
+        ENDLOOP.
+        IF sy-subrc = 0.
+          o_prog->o_log->show_log( ).
+          refresh( ).
+        ENDIF.
+      WHEN OTHERS.
+    ENDCASE.
+  ENDMETHOD.
+ENDCLASS.
+
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report IMPLEMENTATION.
+  METHOD main.
+    seleccionar_datos( ).
+    listado( ).
+  ENDMETHOD.                    " REPORT
+
+  METHOD seleccionar_datos.
+    DATA: i_mat      TYPE tt_listado,
+          i_mch1     TYPE tt_charge,
+          i_list_aux TYPE tt_listado.
+    DATA i_mat_cuobj TYPE zhcl_mm_core=>tt_mat_cuobj.
+
+    sgpi_texto( 'Seleccionando datos'(sda) ).
+
+    i_listado = get_listado( ).
+
+    o_prog->o_sgpi->get_filas_tabla( i_listado[] ).
+
+    preparar_listado( CHANGING i_listado = i_listado
+                               i_mat = i_mat ).
+
+    IF NOT i_mat IS INITIAL.
+      SELECT matnr, werks FROM marc
+        INTO TABLE @DATA(i_marc)
+       FOR ALL ENTRIES IN @i_mat
+      WHERE matnr = @i_mat-matnr.
+*        AND NOT werks IN @s_werks.
+      SORT i_mat BY matnr werks.
+
+      SELECT matnr, werks, mvke~vkorg, mvke~vtweg FROM mvke JOIN tvkwz ON  mvke~vkorg = tvkwz~vkorg "#EC CI_BUFFJOIN.
+                                                                       AND mvke~vtweg = tvkwz~vtweg
+        INTO TABLE @DATA(i_mvke)
+       FOR ALL ENTRIES IN @i_mat
+      WHERE matnr  = @i_mat-matnr
+        AND werks  = @i_mat-werks
+        AND lvorm  = ''
+        AND vmsta <> 'ZZ'.
+
+      SELECT matnr, werks, kunnr, kotg933~vkorg, kotg933~vtweg FROM kotg933 JOIN tvkwz ON  kotg933~vkorg = tvkwz~vkorg "#EC CI_BUFFJOIN.
+                                                                                       AND kotg933~vtweg = tvkwz~vtweg
+        INTO TABLE @DATA(i_catalogo)
+       FOR ALL ENTRIES IN @i_mat
+      WHERE kappl  = 'V'
+        AND kschl  = 'ZA01'
+        AND matnr  = @i_mat-matnr
+        AND werks  = @i_mat-werks
+        AND datbi >= @sy-datum
+        AND datab <= @sy-datum.
+
+      SELECT matnr, werks, kunwe AS kunnr, kotg934~vkorg, kotg934~vtweg FROM kotg934 JOIN tvkwz ON  kotg934~vkorg = tvkwz~vkorg "#EC CI_BUFFJOIN.
+                                                                                       AND kotg934~vtweg = tvkwz~vtweg
+        APPENDING CORRESPONDING FIELDS OF TABLE @i_catalogo
+       FOR ALL ENTRIES IN @i_mat
+      WHERE kappl  = 'V'
+        AND kschl  = 'ZA01'
+        AND matnr  = @i_mat-matnr
+        AND werks  = @i_mat-werks
+        AND datbi >= @sy-datum
+        AND datab <= @sy-datum.
+
+      SELECT matnr, werks, kotg903~vkorg FROM kotg903 JOIN tvkwz ON  kotg903~vkorg = tvkwz~vkorg "#EC CI_BUFFJOIN.
+        APPENDING CORRESPONDING FIELDS OF TABLE @i_catalogo
+       FOR ALL ENTRIES IN @i_mat
+      WHERE kappl  = 'V'
+        AND kschl  = 'ZA01'
+        AND matnr  = @i_mat-matnr
+        AND werks  = @i_mat-werks
+        AND datbi >= @sy-datum
+        AND datab <= @sy-datum.
+    ENDIF.
+
+* Verificamos si no el material no está en otros centros
+    LOOP AT i_listado ASSIGNING FIELD-SYMBOL(<listado>).
+      LOOP AT i_marc ASSIGNING FIELD-SYMBOL(<marc>) WHERE     matnr  = <listado>-matnr
+                                                          AND werks <> <listado>-werks.
+        __add_lista <listado>-otros_centros <marc>-werks.
+        IF <listado>-message IS INITIAL.
+          <listado>-lights = zcl_ap_alv=>set_icono( icono = icon_warning mensaje = 'Material creado en otros centros' ).
+        ENDIF.
+      ENDLOOP.
+*      IF sy-subrc = 0.
+*        DATA(i_list) = get_listado( <listado>-matnr ).
+*        IF NOT i_list IS INITIAL.
+*          LOOP AT i_list ASSIGNING FIELD-SYMBOL(<list>) where not werks in s_werks.
+*            <list>-message = 'Material recuperado de otro centro'.
+*          ENDLOOP.
+*        ENDIF.
+*      ENDIF.
+
+
+      LOOP AT i_catalogo ASSIGNING FIELD-SYMBOL(<catalogo>) WHERE     matnr = <listado>-matnr
+                                                                  AND werks = <listado>-werks.
+*                                                                  AND kunnr = <listado>-kunag.
+        <listado>-catalogo = 'X'.
+      ENDLOOP.
+    ENDLOOP.
+*    APPEND LINES OF i_list_aux TO i_listado.
+*    SORT i_listado BY matnr werks.
+*    preparar_listado( CHANGING i_listado = i_listado
+*                           i_mat = i_mat
+*                           i_mch1 = i_mch1 ).
+
+* Buscamos PTs asociados a los semis
+    MOVE-CORRESPONDING i_listado TO i_mat_cuobj.
+    NEW zhcl_mm_core( )->get_semis_pt( EXPORTING i_mat = i_mat_cuobj
+                                    IMPORTING pts = DATA(pts) ).
+    LOOP AT i_listado ASSIGNING <listado> WHERE mtart = 'ZPSE'.
+      LOOP AT pts ASSIGNING FIELD-SYMBOL(<pts>) WHERE matnr = <listado>-matnr.
+        __add_lista_no0 <listado>-pts <pts>-matnr_pt.
+      ENDLOOP.
+    ENDLOOP.
+
+    SORT i_listado BY matnr werks.
+  ENDMETHOD.
+
+  METHOD get_listado.
+    IF matnr IS INITIAL.
+      DATA(r_matnr) = s_matnr[].
+      DATA(r_werks) = s_werks[].
+    ELSE.
+      r_matnr = VALUE #( (  option = 'EQ' sign = 'I' low = matnr ) ).
+    ENDIF.
+
+    CLEAR i_list.
+    SELECT mara~matnr, mara~mtart, mara~mstae, mara~mstav, mara~mstdv, mara~ersda AS ersda_mat,
+           makt~maktx,
+           marc~werks, marc~mmsta, marc~cuobj,
+           yhp_idx_td130~prtyp, yhp_idx_td130~prton,
+           zvcxi_pxs_tc120t~descr,
+           yhp_idx_td010~kunag,
+           kna1~brsch, kna1~name1,
+           t016t~brtxt,
+           yhp_idx_td100~dcutt,
+           mvke~vkorg, mvke~vtweg, mvke~vmsta, mvke~vmstd
+      FROM marc JOIN mara ON mara~matnr = marc~matnr
+     LEFT OUTER JOIN tvkwz ON tvkwz~werks = marc~werks
+     LEFT OUTER JOIN mvke ON mvke~matnr = marc~matnr
+                         AND mvke~vkorg = tvkwz~vkorg
+                         AND mvke~vtweg = tvkwz~vtweg
+     LEFT OUTER JOIN mch1 ON mch1~matnr = marc~matnr
+     LEFT OUTER JOIN makt ON  makt~matnr = marc~matnr
+                          AND makt~spras = @sy-langu
+     LEFT OUTER JOIN yhp_idx_td130 ON yhp_idx_td130~cuobj = marc~cuobj
+     LEFT OUTER JOIN zvcxi_pxs_tc120t ON  zvcxi_pxs_tc120t~tprin = yhp_idx_td130~prtyp
+                                      AND zvcxi_pxs_tc120t~langu = @sy-langu
+     LEFT OUTER JOIN yhp_idx_td010 ON yhp_idx_td010~cuobj = marc~cuobj
+     LEFT OUTER JOIN yhp_idx_td100 ON yhp_idx_td100~cuobj = marc~cuobj
+     LEFT OUTER JOIN kna1 ON kna1~kunnr = yhp_idx_td010~kunag
+     LEFT OUTER JOIN t016t ON  t016t~brsch = kna1~brsch "#EC CI_BUFFJOIN.
+                           AND t016t~spras = @sy-langu
+     INTO CORRESPONDING FIELDS OF TABLE @i_list
+   WHERE marc~matnr          IN @r_matnr
+     AND mara~mtart          IN @s_mtart
+     AND mara~mstae          IN @s_mstae
+     AND marc~werks          IN @r_werks
+     AND marc~mmsta          IN @s_mmsta
+     AND marc~xchpf           = 'X'
+     AND yhp_idx_td130~prtyp IN @s_prtyp
+     AND yhp_idx_td010~kunag IN @s_kunnr
+     AND mvke~vmsta          IN @s_vmsta
+  ORDER BY mara~matnr, marc~werks.
+
+* Si hay registros con área de ventas, borramos los que no
+    LOOP AT i_list ASSIGNING FIELD-SYMBOL(<list>) WHERE vkorg(1) = '2'.
+      DELETE i_list WHERE matnr = <list>-matnr AND werks = <list>-werks AND vkorg(1) NE '2'.
+    ENDLOOP.
+
+* Algunas tablas indexadas hacen que un mismo material aparezca dos veces
+    DELETE ADJACENT DUPLICATES FROM i_list COMPARING matnr werks.
+  ENDMETHOD.
+
+  METHOD preparar_listado.
+    DATA l_icono TYPE icon_d.
+
+    DATA: r_werks_sel TYPE RANGE OF werks_d,
+          r_matnr_sel TYPE RANGE OF matnr,
+          lr_werks    LIKE LINE OF r_werks_sel,
+          lr_matnr    LIKE LINE OF r_matnr_sel.
+
+    lr_werks-option = 'EQ'.
+    lr_matnr-option = lr_werks-option.
+    lr_werks-sign = 'I'.
+    lr_matnr-sign = lr_werks-sign.
+    LOOP AT i_listado ASSIGNING FIELD-SYMBOL(<listado>) WHERE proc IS INITIAL.
+      lr_matnr-low = <listado>-matnr.
+      COLLECT lr_matnr INTO r_matnr_sel.
+      lr_werks-low = <listado>-werks.
+      COLLECT lr_werks INTO r_werks_sel.
+    ENDLOOP.
+
+    NEW zhcl_mm_core( )->get_zstocks( EXPORTING r_matnr = r_matnr_sel
+                                                r_werks = r_werks_sel
+                                                stock_mm = 'X'
+                                                stock_cliente = 'X'
+                                                stock_especial = 'X'
+                                                bloqueado = 'X'
+                                                calidad = 'X'
+                                      IMPORTING i_zstocks = DATA(i_zstocks_anonimo) ).
+
+    CLEAR i_mat.
+    LOOP AT i_listado ASSIGNING <listado> WHERE proc IS INITIAL.
+      CLEAR l_icono.
+      <listado>-proc = 'X'.
+
+* Damos detalle del último lote
+      SELECT charg hsdat lwedt ersda FROM mcha
+         INTO CORRESPONDING FIELDS OF <listado>
+        UP TO 1 ROWS
+       WHERE matnr  = <listado>-matnr
+         AND werks  = <listado>-werks
+         AND hsdat <> '00000000'
+       ORDER BY hsdat DESCENDING.
+      ENDSELECT.
+      IF sy-subrc <> 0.
+        SELECT charg hsdat lwedt ersda  FROM mcha
+           INTO CORRESPONDING FIELDS OF <listado>
+          UP TO 1 ROWS
+         WHERE matnr = <listado>-matnr
+           AND werks = <listado>-werks
+         ORDER BY lwedt DESCENDING ersda DESCENDING.
+        ENDSELECT.
+      ENDIF.
+      IF NOT <listado>-charg IS INITIAL AND <listado>-hsdat IS INITIAL.
+        IF <listado>-hsdat IS INITIAL.
+          SELECT SINGLE hsdat FROM mch1
+             INTO CORRESPONDING FIELDS OF <listado>
+           WHERE matnr = <listado>-matnr
+             AND charg = <listado>-charg.
+        ENDIF.
+        IF <listado>-hsdat IS INITIAL.
+          SELECT SINGLE lwedt FROM mch1
+             INTO CORRESPONDING FIELDS OF <listado>
+           WHERE matnr = <listado>-matnr
+             AND charg = <listado>-charg.
+
+          SELECT budat_mkpf FROM mseg
+            INTO <listado>-fecha_101
+            UP TO 1 ROWS
+           WHERE matnr = <listado>-matnr
+             AND werks = <listado>-werks
+             AND charg = <listado>-charg
+             AND bwart = '101'
+           ORDER BY budat_mkpf DESCENDING.
+          ENDSELECT.
+        ENDIF.
+      ENDIF.
+
+* Si la fecha de último movimiento es inferior a la ultima EM (debido a las cargas, cogemos esta)
+      IF <listado>-hsdat IS INITIAL.
+        IF NOT <listado>-lwedt IS INITIAL OR NOT <listado>-fecha_101 IS INITIAL.
+          IF NOT <listado>-lwedt IS INITIAL AND <listado>-lwedt < <listado>-fecha_101.
+            <listado>-fcalculo = <listado>-lwedt.
+          ELSE.
+            <listado>-fcalculo = <listado>-fecha_101.
+          ENDIF.
+        ELSEIF NOT <listado>-ersda IS INITIAL.
+          <listado>-fcalculo = <listado>-ersda.
+        ELSE.
+          <listado>-fcalculo = <listado>-ersda_mat.
+        ENDIF.
+      ELSE.
+        <listado>-fcalculo = <listado>-hsdat.
+      ENDIF.
+
+      IF NOT <listado>-fcalculo IS INITIAL.
+        zcl_ap_fechas=>periodos_resta_fechas( EXPORTING fecha1 = sy-datum
+                                                      fecha2 = <listado>-fcalculo
+                                                      output_format = '04'
+                                            IMPORTING meses = DATA(l_meses) ).
+        <listado>-meses = l_meses.
+      ENDIF.
+
+      IF p_meses > 0.
+        IF <listado>-meses < p_meses.
+          DELETE i_listado.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+
+      IF <listado>-mtart = 'ZPSE' AND NOT <listado>-pts IS INITIAL.
+        DATA(l_matnr) = <listado>-pts.
+      ELSE.
+        l_matnr = <listado>-matnr.
+      ENDIF.
+
+      SELECT likp~vbeln wadat_ist FROM lips JOIN likp ON lips~vbeln = likp~vbeln
+        INTO CORRESPONDING FIELDS OF <listado>
+        UP TO 1 ROWS
+       WHERE vbtyp = 'J'
+         AND matnr = l_matnr
+         AND wadat_ist NE '00000000'
+       ORDER BY wadat_ist DESCENDING likp~vbeln DESCENDING.
+      ENDSELECT.
+
+      IF <listado>-mmsta = '99'.
+        l_icono = icon_locked.
+        <listado>-message = 'Material bloqueado'.
+      ELSE.
+        APPEND VALUE #( matnr = <listado>-matnr
+                        werks = <listado>-werks ) TO i_mat.
+      ENDIF.
+
+
+      IF NOT <listado>-kunag IS INITIAL.
+        SELECT kdmat FROM  knmt JOIN tvkwz ON knmt~vkorg = tvkwz~vkorg "#EC CI_BUFFJOIN.
+                                          AND knmt~vtweg = tvkwz~vtweg
+          INTO <listado>-kdmat
+          UP TO 1 ROWS
+         WHERE kunnr = <listado>-kunag
+           AND matnr = <listado>-matnr
+           AND tvkwz~werks = <listado>-werks.
+        ENDSELECT.
+
+        SELECT lifnr FROM knvp JOIN tvkwz ON knvp~vkorg = tvkwz~vkorg "#EC CI_BUFFJOIN.
+                                         AND knvp~vtweg = tvkwz~vtweg
+          INTO @<listado>-comercial
+          UP TO 1 ROWS
+        WHERE kunnr  = @<listado>-kunag
+          AND werks  = @<listado>-werks
+          AND parvw = 'Y0'
+          ORDER BY kunnr.
+        ENDSELECT.
+        <listado>-comercial_t = get( tabla = 'LFA1' clave = <listado>-comercial ).
+
+* El mercado lo queremos el que hay a nivel de area de ventas
+        DATA(l_brsch) = <listado>-brsch.
+        SELECT zzbrsch FROM knvv JOIN tvkwz ON knvv~vkorg = tvkwz~vkorg "#EC CI_BUFFJOIN.
+                                           AND knvv~vtweg = tvkwz~vtweg
+          INTO @<listado>-brsch
+          UP TO 1 ROWS
+        WHERE kunnr  = @<listado>-kunag
+          AND werks  = @<listado>-werks
+          AND zzbrsch NE ''
+          ORDER BY kunnr.
+        ENDSELECT.
+        IF NOT <listado>-brsch IN s_brsch.
+          DELETE i_listado.
+          CONTINUE.
+        ENDIF.
+        IF <listado>-brsch NE l_brsch.
+          SELECT SINGLE brtxt FROM  t016t
+            INTO <listado>-brtxt
+           WHERE spras  = sy-langu
+             AND brsch  = <listado>-brsch.
+        ENDIF.
+      ENDIF.
+
+
+*      <listado>-stock_centro = zcl_ap_material=>get_stock( matnr = <listado>-matnr
+*                                                    werks = <listado>-werks
+*                                                    libre = 'X'
+*                                                    bloqueado = 'X'
+*                                                    calidad = 'X'
+*                                                    sobkz = '' ).
+
+      LOOP AT i_zstocks_anonimo ASSIGNING FIELD-SYMBOL(<zstocks>) WHERE matnr = <listado>-matnr
+                                                                   AND werks = <listado>-werks.
+        <listado>-stock_centro = <listado>-stock_centro  + <zstocks>-stock_mm + <zstocks>-stock_cliente + <zstocks>-stock_cli_esp.
+      ENDLOOP.
+
+
+      set_status_list( EXPORTING message = <listado>-message icono = l_icono CHANGING list = <listado> ).
+    ENDLOOP.
+  ENDMETHOD.
+
+  METHOD listado.
+    sgpi_texto( 'Generando informe'(gin) ).
+
+    o_alv->add_button( button = 'F01' text = 'Bloquear material'  icon = icon_execute_object ucomm = 'EJEC' ).
+    o_alv->add_button( button = 'F02' text = 'Desbloquear material'  icon = icon_system_undo ucomm = 'DESBLOQUEAR' ).
+
+    o_alv->set_layout( p_vari ).
+
+    o_alv->set_top_of_page( ).
+
+    o_alv->set_field_hotspot( campo = 'MATNR,CHARG,CUOBJ,KUNAG,PRTYP,VBELN' auto = 'X' ).
+    o_alv->set_field_hotspot( campo = 'PRTON,DCUTT,PTS' valor = 'MM03' ).
+    o_alv->set_field_noout( 'CUOBJ,MSTAV,MSTDV' ).
+
+    o_alv->set_field( campo = 'LIGHTS,MATNR' op = 'KEY' ).
+    o_alv->set_field_quitar( 'CHECK,ERROR,PROC' ).
+    o_alv->set_field_text( campo = 'MESES' valor = 'MesesSinUso' valor2 = 'Meses sin uso' ).
+    o_alv->set_field_text( 'OTROS_CENTROS,CATALOGO' ).
+    o_alv->set_field_text( campo = 'PTS' valor = 'Util.en PT' valor2 = 'Utilizado en producto terminado' ).
+    o_alv->set_field_text( campo = 'FECHA_101' valor = 'F.Alta' valor2 = 'Fecha del primer 101 del lote' ).
+    o_alv->set_field_text( campo = 'FCALCULO' valor = 'F.Cálculo' valor2 = 'Fecha que se usará en los cálculos' ).
+    o_alv->set_field_text( campo = 'ERSDA' valor = 'FCr.Lote' valor2 = 'Fecha creación lote' ).
+    o_alv->set_field_text( campo = 'ERSDA_MAT' valor = 'FCre.Mat.' valor2 = 'Fecha creación material' ).
+
+    o_alv->set_field_text( campo = 'STOCK_CENTRO' valor = 'Stock' valor2 = 'Stock centro' ).
+    o_alv->set_field_text( campo = 'COMERCIAL' valor = 'Com.' valor2 = 'Comercial' ).
+    o_alv->set_field_text( campo = 'COMERCIAL_T' valor = 'Nombre comercial').
+
+    o_alv->set_field_text( campo = 'MSTAE' valor = 'BlqMat' valor2 = 'Bloqueo material' ).
+    o_alv->set_field_text( campo = 'MMSTA' valor = 'BlqCen' valor2 = 'Bloqueo centro' ).
+    o_alv->set_field_text( campo = 'VMSTA' valor = 'BlqVen' valor2 = 'Bloqueo ventas' ).
+
+    o_alv->set_field_text( campo = 'WADAT_IST' valor = 'FUltSM' valor2 = 'Fecha última entrega de salida' ).
+
+    o_alv->set_orden( 'MATNR,MAKTX,WERKS' ).
+    o_alv->get_datos_layout( EXPORTING reordenar_tabla = 'X' tabla_ref = 'X' CHANGING t_tabla = i_listado ).
+    o_alv->set_seleccion( CHANGING t_tabla = i_listado ).
+
+    o_alv->show( ).
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* INITIALIZATION
+*----------------------------------------------------------------------*
+INITIALIZATION.
+  o_prog = NEW #( status       = 'INICIO_DYN'
+                  status_prog  = 'ZAP_STATUS'
+                  no_param     = 'X'
+                  guardar_logz = 'X' ).
+
+  PERFORM add_button IN PROGRAM zap_status USING 'M01' 'Log'(log) '' ''.
+  IF zcl_usuario=>es_usuario_sistemas( ).
+    PERFORM add_button IN PROGRAM zap_status
+            USING 'M02' 'Parámetros' '' ''.
+  ENDIF.
+
+  o_prog->o_alv = NEW #( status             = 'STANDARD_ALV_DYN'
+                         status_prog        = 'ZAP_STATUS'
+                         top_of_page_auto   = 'X'
+                         top_of_page_titulo = 'X'
+                         o_dev              = o_prog ).
+
+  o_prog->initialization_i( CHANGING sscrfields = sscrfields ).
+  IF o_prog->variante_forzada IS INITIAL.
+    p_vari = o_prog->o_alv->get_default_layout( ).
+
+    s_mtart[] = VALUE #( option = 'EQ'
+                         sign = 'I'
+                         ( low = 'ZPTO' )
+                         ( low = 'ZPSE' ) ).
+
+    s_mstae[] = VALUE #( option = 'EQ'
+                         sign = 'E'
+                         ( low = '99' )
+                         ( low = 'ZZ' ) ).
+
+    s_mmsta[] = VALUE #( ( option = 'EQ'
+                           sign = 'E'
+                           low = '99' ) ).
+    o_prog->parametros_por_defecto( CHANGING r_werks = s_werks[] ).
+  ENDIF.
+
+
+AT SELECTION-SCREEN OUTPUT.
+  o_prog->selection_screen_output( CHANGING current_scr = current_scr ).
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_vari.
+  p_vari = o_prog->o_alv->get_f4_layout( ).
+
+************************************************************************
+* AT SELECTION-SCREEN.
+************************************************************************
+AT SELECTION-SCREEN.
+  CASE sy-ucomm.
+    WHEN 'ONLI'.
+      o_prog->validar_seleccion_obligatoria( campos_or = '*' msgty = 'W' ).
+      o_prog->validar_centro( r_werks = s_werks[] obligatorio = 'X' ).
+    WHEN OTHERS.
+      o_prog->at_selection( ).
+  ENDCASE.
+
+AT SELECTION-SCREEN ON EXIT-COMMAND.
+  o_prog->at_selection( ).
+
+*----------------------------------------------------------------------
+* START-OF-SELECTION.
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+  o_prog->main( ).

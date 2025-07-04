@@ -1,0 +1,352 @@
+***********************************************************************
+* TIPO : LISTADO
+* TITULO : Listado de rutas por material
+* DESCRIPCION : Listado de rutas por material
+*
+* AUTOR: Andrés Picazo                                FECHA: 20/12/2024
+* ANALISTA: Jose Vicente Martínez Urios
+*
+***********************************************************************
+REPORT zrmm0037.
+
+*------TABLAS/ESTRUCTURAS----------------------------------------------*
+TABLES: marc, mara, yhp_idx_td010.
+
+INCLUDE rsdbc1xx.
+*------TABLAS INTERNAS-------------------------------------------------*
+*----------------------------------------------------------------------*
+* CLASS lcl_alv DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv DEFINITION INHERITING FROM zcl_ap_alv FINAL.
+  PUBLIC SECTION.
+    METHODS visualizar_objeto   REDEFINITION.
+ENDCLASS.
+
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report DEFINITION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report DEFINITION INHERITING FROM zcl_dev FINAL.
+  PUBLIC SECTION.
+    TYPES: BEGIN OF t_listado,
+*             check             TYPE xfeld,
+*             lights            TYPE zico_estado_mensaje,
+             werks             TYPE marc-werks,
+             mmsta             TYPE marc-mmsta,
+             bismt             TYPE mara-bismt,
+             matnr             TYPE marc-matnr,
+             maktx             TYPE maktx,
+             cuobj             TYPE cuobj,
+             ersda             TYPE mara-ersda,
+             kunag             TYPE yhp_idx_td010-kunag,
+             redeterminacion   TYPE string,
+             ruta_seleccionada TYPE string,
+             ruta_1            TYPE string,
+             ruta_2            TYPE string,
+             ruta_3            TYPE string,
+             ruta_4            TYPE string,
+             ruta_5            TYPE string,
+*             message           TYPE bapi_msg,
+           END OF t_listado,
+           tt_listado TYPE STANDARD TABLE OF t_listado.
+
+    DATA: i_listado TYPE tt_listado,
+          o_alv     TYPE REF TO lcl_alv ##NEEDED.
+
+    METHODS  main.
+
+    METHODS: listado,
+      seleccionar_datos.
+
+ENDCLASS.
+
+*------VARIABLES-------------------------------------------------------*
+DATA o_prog TYPE REF TO zcl_report.
+
+
+*------PARAMETER/SELECT-OPTIONS EN PANTALLA----------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-sel.
+SELECT-OPTIONS: s_werks FOR marc-werks,
+                s_matnr FOR marc-matnr,
+                s_bismt FOR mara-bismt,
+                s_mtart FOR mara-mtart,
+                s_mmsta FOR marc-mmsta,
+                s_ersda FOR mara-ersda,
+                s_kunag FOR yhp_idx_td010-kunag.
+
+SELECTION-SCREEN SKIP 1.
+PARAMETERS: p_mail  AS CHECKBOX USER-COMMAND mai,
+            p_email TYPE text255 MODIF ID mai.
+SELECTION-SCREEN SKIP 1.
+PARAMETERS p_vari LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK b01.
+__botones_plantilla.
+
+
+************************************************************************
+*
+* LOGICA DEL PROGRAMA
+*
+************************************************************************
+
+*----------------------------------------------------------------------*
+* CLASS lcl_alv IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv IMPLEMENTATION.
+  METHOD visualizar_objeto.
+    DATA l_list TYPE o_prog->t_listado.
+
+    l_list = list.
+    CASE column.
+*      WHEN 'BUKRS'.
+*        MESSAGE l_list-bukrs TYPE 'I'.
+      WHEN OTHERS. message = 'No implementado'.
+    ENDCASE.
+  ENDMETHOD. " handle_double_click
+
+
+ENDCLASS.
+
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report IMPLEMENTATION.
+  METHOD main.
+    seleccionar_datos( ).
+
+    listado( ).
+
+    IF p_mail = 'X'.
+      zcl_ap_envio_mail=>mail( EXPORTING direccion = p_email
+                                         subject = 'Rutas'
+                                         o_alv_origen = o_alv
+                                         conversion_sap = 'Y'
+                                         nombre_fichero_tabla = 'rutas.xlsx'
+                               IMPORTING message = DATA(l_msg)
+                                 CHANGING i_tabla = i_listado ).
+    ENDIF.
+
+  ENDMETHOD.                    " REPORT
+
+  METHOD seleccionar_datos.
+    DATA: i_td310  TYPE  yhp_omp_tt_td310,
+          i_rte    TYPE  yhp_omp_tt_rte,
+          message  TYPE bapi_msg,
+          traza    TYPE table_of_strings,
+          l_rtespv TYPE REF TO zcl_vcxi_xcsr_ea_rtespv.
+    DATA: lv_size  TYPE abap_msize,
+          lv_size2 TYPE abap_msize.
+
+    sgpi_texto( 'Seleccionando datos'(sda) ).
+    SELECT mara~matnr, mara~bismt, mara~ersda,
+           marc~werks, marc~cuobj,
+           makt~maktx,
+           yhp_idx_td010~kunag
+      FROM marc JOIN mara ON marc~matnr = mara~matnr
+     LEFT OUTER JOIN makt ON makt~matnr = marc~matnr
+                                AND makt~spras = @sy-langu
+     LEFT OUTER JOIN yhp_idx_td010  ON yhp_idx_td010~cuobj = marc~cuobj
+      INTO CORRESPONDING FIELDS OF TABLE @i_listado
+     WHERE marc~matnr IN @s_matnr
+       AND marc~werks IN @s_werks
+       AND mmsta IN @s_mmsta
+       AND bismt IN @s_bismt
+       AND mtart IN @s_mtart
+       AND mara~ersda IN @s_ersda
+       AND kunag IN @s_kunag.
+
+    o_prog->o_sgpi->get_filas_tabla( i_listado[] ).
+    LOOP AT i_listado ASSIGNING FIELD-SYMBOL(<listado>).
+      sgpi_texto( texto1 = 'Procesando datos'(pda) cant_porc = 100 ).
+      IF NOT <listado>-cuobj IS INITIAL.
+
+        cl_abap_memory_utilities=>get_total_used_size( IMPORTING size = lv_size ).
+        CLEAR traza.
+        DATA(element) = NEW zhcl_ai_core( )->find_by_cuobj_id( EXPORTING cuobj = <listado>-cuobj
+                                                                         id = 'RTESPV'
+                                                                         navegar_a_hijos = 'SOV,COMP_P*'
+                                                               IMPORTING message = message
+                                                                         CHANGING traza = traza ).
+        IF NOT element IS INITIAL.
+          TRY.
+              l_rtespv ?= element->get_clsea( ).
+              <listado>-redeterminacion = l_rtespv->get_rterd( ).
+            CATCH cx_sy_move_cast_error.
+              CLEAR l_rtespv.
+          ENDTRY.
+        ENDIF.
+
+        CLEAR: i_td310, i_rte.
+
+* Cambiamos llamada indirecta por programa porque la funció no va bien si la llamas varias veces
+*        CALL FUNCTION 'YHP_OMP_INTERFACE'
+*          EXPORTING
+*            if_cuobj = <listado>-cuobj
+*          IMPORTING
+*            et_td310 = i_td310
+*            et_rte   = i_rte.
+
+
+
+        SUBMIT zrmm0037f
+          AND RETURN
+          WITH p_cuobj = <listado>-cuobj.
+        IMPORT i_td310 TO i_td310 i_rte TO i_rte FROM MEMORY ID 'ZRMM0037F'.
+        FREE MEMORY ID 'ZRMM0037F'.
+
+        cl_abap_memory_utilities=>get_total_used_size( IMPORTING size = lv_size2 ).
+        IF sy-batch = 'X'.
+          lv_size = lv_size / 1048576.
+          lv_size2 = lv_size2 / 1048576.
+          DATA(l_dif) = lv_size2 - lv_size.
+          IF l_dif > 1.
+            MESSAGE |{ <listado>-matnr } Total memoria antes de llamar a la función { lv_size } Mb después { lv_size2 }| TYPE 'S'.
+          ENDIF.
+        ENDIF.
+
+        cl_abap_memory_utilities=>do_garbage_collection( ).
+        IF l_dif > 2.
+          cl_abap_memory_utilities=>get_total_used_size( IMPORTING size = lv_size2 ).
+          lv_size2 = lv_size2 / 1048576.
+          MESSAGE |Tras liberar memoria { lv_size2 }| TYPE 'S'.
+        ENDIF.
+
+
+
+        SORT i_td310 BY coper.
+        LOOP AT i_td310 ASSIGNING FIELD-SYMBOL(<td310>) WHERE arbpl CS '_'.
+          SPLIT <td310>-arbpl AT '_' INTO aux1 aux2.
+          IF <listado>-ruta_seleccionada IS INITIAL.
+            <listado>-ruta_seleccionada = aux2.
+          ELSE.
+            CONCATENATE <listado>-ruta_seleccionada aux2 INTO <listado>-ruta_seleccionada SEPARATED BY '/'.
+          ENDIF.
+        ENDLOOP.
+        IF NOT i_rte IS INITIAL.
+          DATA l_r TYPE numc1.
+          SORT i_rte BY route vornr.
+          CLEAR l_r.
+          LOOP AT i_rte ASSIGNING FIELD-SYMBOL(<rte>).
+            AT NEW route.
+              ADD 1 TO l_r.
+            ENDAT.
+            IF <rte>-arbpl CS '_'.
+              DATA(l_campo) = 'RUTA_' && l_r.
+              ASSIGN COMPONENT l_campo OF STRUCTURE <listado> TO FIELD-SYMBOL(<ruta>).
+              IF sy-subrc = 0.
+                SPLIT <rte>-arbpl AT '_' INTO aux1 aux2.
+                IF <ruta> IS INITIAL.
+                  <ruta> = aux2.
+                ELSE.
+                  CONCATENATE <ruta> aux2 INTO <ruta> SEPARATED BY '/'.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+          ENDLOOP.
+        ENDIF.
+
+        COMMIT WORK AND WAIT.
+      ENDIF.
+    ENDLOOP.
+
+    SORT i_listado.
+  ENDMETHOD.
+
+  METHOD listado.
+    sgpi_texto( 'Generando informe'(gin) ).
+
+*    o_alv->add_button( button = 'F01' text = 'Ejecutar'(eje)  icon = icon_execute_object ucomm = 'EJEC' ).
+
+    o_alv->set_layout( p_vari ).
+
+    o_alv->set_top_of_page( ).
+
+    o_alv->set_field_hotspot( campo = 'MATNR' auto = 'X' ).
+
+    o_alv->set_field_noout( 'CUOBJ' ).
+    o_alv->set_field_text( 'RUTA_1,RUTA_2,RUTA_3,RUTA_4,RUTA_5' ).
+    o_alv->set_field_text( campo = 'RUTA_SELECCIONADA' valor = 'Ruta sel.' valor2 = 'Ruta seleccionada' ).
+    o_alv->set_field_text( campo = 'REDETERMINACION' valor = 'Redeterminación' valor2 = 'Redeterminación' ).
+
+*    o_alv->set_orden( '' ).
+    o_alv->get_datos_layout( EXPORTING reordenar_tabla = 'X' tabla_ref = 'X' CHANGING t_tabla = i_listado ).
+    o_alv->set_seleccion( CHANGING t_tabla = i_listado ).
+
+    o_alv->show( ).
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* INITIALIZATION
+*----------------------------------------------------------------------*
+INITIALIZATION.
+  o_prog = NEW #( status       = 'INICIO_DYN'
+                  status_prog  = 'ZAP_STATUS'
+                  no_param     = 'X'
+                  guardar_logz = '' ).
+
+  IF zcl_usuario=>es_usuario_sistemas( ).
+    PERFORM add_button IN PROGRAM zap_status
+            USING 'M01' 'Parámetros' '' ''.
+  ENDIF.
+
+  PERFORM add_button IN PROGRAM zap_status USING 'M02' 'Log'(log) '' ''.
+
+  o_prog->o_alv = NEW #( status             = 'STANDARD_ALV_DYN'
+                         status_prog        = 'ZAP_STATUS'
+                         top_of_page_auto   = 'X'
+                         top_of_page_titulo = 'X'
+                         o_dev              = o_prog ).
+
+  s_mtart[] = VALUE #( option = 'EQ' sign = 'I'
+                        ( low = 'ZPTO' )
+                        ( low = 'ZPSE' ) ).
+  p_email = zcl_ap_usuario=>get_email( ).
+  o_prog->initialization_i( CHANGING sscrfields = sscrfields ).
+  IF o_prog->variante_forzada IS INITIAL.
+    p_vari = o_prog->o_alv->get_default_layout( ).
+    o_prog->parametros_por_defecto( CHANGING r_werks = s_werks[] ).
+  ENDIF.
+
+
+AT SELECTION-SCREEN OUTPUT.
+  o_prog->selection_screen_output( CHANGING current_scr = current_scr ).
+  zcl_ap_dynpro=>screen_visible( group1 = 'MAI' variable = p_mail ).
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_vari.
+  p_vari = o_prog->o_alv->get_f4_layout( ).
+
+************************************************************************
+* AT SELECTION-SCREEN.
+************************************************************************
+AT SELECTION-SCREEN.
+  CASE sy-ucomm.
+    WHEN 'ONLI'.
+      o_prog->validar_seleccion_obligatoria( campos_or = '*' msgty = 'W' ).
+      o_prog->validar_centro( r_werks = s_werks[] obligatorio = 'X' ).
+      IF p_mail = 'X' AND p_email IS INITIAL.
+        MESSAGE 'Informe mail destino' TYPE 'E'.
+      ENDIF.
+    WHEN OTHERS.
+      o_prog->at_selection( ).
+  ENDCASE.
+
+
+AT SELECTION-SCREEN ON EXIT-COMMAND.
+  o_prog->at_selection( ).
+
+*----------------------------------------------------------------------
+* START-OF-SELECTION.
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+  o_prog->main( ).

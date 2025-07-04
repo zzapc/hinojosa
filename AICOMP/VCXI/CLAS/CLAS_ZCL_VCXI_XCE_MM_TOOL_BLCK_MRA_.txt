@@ -1,0 +1,204 @@
+
+class ZCL_VCXI_XCE_MM_TOOL_BLCK_MRA definition
+  public
+  final
+  create public .
+
+public section.
+
+  types:
+    begin of YS_MCHB,
+        MATNR type MATNR,
+        WERKS type WERKS_D,
+        CHARG type CHARG_D,
+        LGORT type LGORT_D,
+        SPEME type SPEME,
+      end of YS_MCHB .
+  types:
+    YT_MCHB type standard table of YS_MCHB with default key .
+
+  methods FINISHED
+    importing
+      !IS_MRAFINISHED type ZVCXI_XCE_MM_S_MRAFINISHED
+    returning
+      value(RR_MSG) type ref to /VCXI/CL_CKXM_MESSAGE
+    raising
+      /VCXI/CX_CKX .
+protected section.
+private section.
+
+  methods GET_TOOL_STOCK
+    importing
+      !IS_MRAFINISHED type ZVCXI_XCE_MM_S_MRAFINISHED
+    returning
+      value(RT_MRAFINISHED) type ZVCXI_XCE_MM_TT_MRAFINISHED
+    raising
+      /VCXI/CX_CKX .
+  methods GET_LGORT_RELEASED
+    importing
+      !IF_WERKS type WERKS_D
+    returning
+      value(RF_LGORT) type LGORT_D
+    raising
+      /VCXI/CX_CKX .
+  methods POST_GOODSMVT
+    importing
+      !IS_MRAFINISHED type ZVCXI_XCE_MM_S_MRAFINISHED
+    changing
+      value(CR_MSG) type ref to /VCXI/CL_CKXM_MESSAGE
+    raising
+      /VCXI/CX_CKX .
+  methods UPDATE_BATCH
+    importing
+      !IS_MRAFINISHED type ZVCXI_XCE_MM_S_MRAFINISHED
+    changing
+      value(CR_MSG) type ref to /VCXI/CL_CKXM_MESSAGE
+    raising
+      /VCXI/CX_CKX .
+endclass. "ZCL_VCXI_XCE_MM_TOOL_BLCK_MRA definition
+class ZCL_VCXI_XCE_MM_TOOL_BLCK_MRA implementation.
+  method FINISHED.
+
+    RR_MSG = new #( ).
+
+*** Update Batch Classification
+    ME->UPDATE_BATCH( exporting IS_MRAFINISHED = IS_MRAFINISHED
+                      changing  CR_MSG         = RR_MSG ).
+
+*** Post transfer movements to mark repair/amendment as finished
+    ME->POST_GOODSMVT( exporting IS_MRAFINISHED = IS_MRAFINISHED
+                       changing  CR_MSG         = RR_MSG ).
+
+  endmethod.
+  method GET_LGORT_RELEASED.
+
+*** Get Storage Location from Database Table
+    select single LGORT into @RF_LGORT
+           from ZVCXI_XCE_TC310
+          where TSLOC eq 'RELEASED'
+            and WERKS eq @IF_WERKS.
+    if SY-SUBRC ne 0.
+      select single LGORT into @RF_LGORT
+             from ZVCXI_XCE_TC310
+            where TSLOC eq 'RELEASED'.
+    endif.
+
+    if SY-SUBRC ne 0.
+***   No Storage Location found
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                            IF_MSGID = 'ZVCXI_XCE_MM'
+                                            IF_MSGNO = '017' ).
+    endif.
+
+  endmethod.
+  method GET_TOOL_STOCK.
+
+*** Get Tool Stock with Blocked Stock
+    select MATNR, WERKS, CHARG, LGORT,
+           sum( CSPEM ) as SPEME
+           into corresponding fields of table @RT_MRAFINISHED
+           from MCHB
+          where MATNR eq @IS_MRAFINISHED-MATNR
+           and  WERKS eq @IS_MRAFINISHED-WERKS
+           and  CHARG eq @IS_MRAFINISHED-CHARG
+           and  CSPEM ne 0
+          group by MATNR, WERKS, CHARG, LGORT.
+
+    if SY-SUBRC ne 0.
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                            IF_MSGID = 'ZVCXI_XCE_MM'
+                                            IF_MSGNO = '018' ).
+    endif.
+
+  endmethod.
+  method POST_GOODSMVT.
+
+    data: LT_GMITEM   type table of BAPI2017_GM_ITEM_CREATE.
+
+
+*** Get Tool Stock
+    data(LT_MRAFINISHED) = ME->GET_TOOL_STOCK( IS_MRAFINISHED = IS_MRAFINISHED ).
+
+*** Collect Items
+    loop at LT_MRAFINISHED into data(LS_MRAFINISHED).
+      data(LF_UMLGO) = ME->GET_LGORT_RELEASED( IF_WERKS = LS_MRAFINISHED-WERKS ).
+      append lines of ZCL_VCXI_XCI_BOB_GOODSMVT=>PREPARE_GMITEM_UNRESTR( IF_MATNR  = LS_MRAFINISHED-MATNR
+                                                                         IF_WERKS  = LS_MRAFINISHED-WERKS
+                                                                         IF_CHARG  = LS_MRAFINISHED-CHARG
+                                                                         IF_LGORT  = LS_MRAFINISHED-LGORT
+                                                                         IF_UMLGO  = LF_UMLGO
+                                                                         IF_ERFMG  = LS_MRAFINISHED-SPEME ) to LT_GMITEM.
+    endloop.
+
+*** Create Goods Movements
+    data(LF_TESTRUN) = ABAP_FALSE.
+    ZCL_VCXI_XCI_BOB_GOODSMVT=>CREATE( exporting IF_BKTXT   = 'Repair/Amendment finished'(001)
+                                                 IF_GMCODE  = ZCL_VCXI_XCI_BOB_GOODSMVT=>C_GMCODE_TRANSFER   "Transfer posting
+                                                 IT_GMITEM  = LT_GMITEM
+                                                 IF_TESTRUN = LF_TESTRUN
+                                       changing  CR_MSG     = CR_MSG ).
+  endmethod.
+  method UPDATE_BATCH.
+
+    field-symbols: <S_MAPVC> type /VCXI/CKXC_S_MAPVC,
+                   <S_MAPVN> type /VCXI/CKXC_S_MAPVN.
+
+
+*** Load Business Object of Material Batch
+    data(LR_BOB_BATCH) = new ZCL_VCXI_XCI_BOB_BATCH( ).
+    LR_BOB_BATCH->INIT_FROM_DB( IF_MATNR = IS_MRAFINISHED-MATNR
+                                IF_CHARG = IS_MRAFINISHED-CHARG
+                                IF_WERKS = IS_MRAFINISHED-WERKS ).
+    if LR_BOB_BATCH->F_MATNR is initial.
+***   Couldn't find batch &1 for Material &2 - Please check if batch is correct
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                            IF_MSGID = 'ZVCXI_XCE_MM'
+                                            IF_MSGNO = '023'
+                                            IF_MSGV1 = IS_MRAFINISHED-CHARG
+                                            IF_MSGV2 = IS_MRAFINISHED-MATNR ).
+    endif.
+
+*** Get current Classification
+    data(LT_SETVA) = LR_BOB_BATCH->GET_CLASSI( IF_SETID = 'ZVCXI_XCE_PP_TOOL_BATCH' ).
+
+***--------------------------------------------------------------------------------------
+*** Update Classification
+    loop at LT_SETVA assigning field-symbol(<S_SETVA>).
+      case <S_SETVA>-MAPID.
+***     Tool Lifetime
+        when 'LIFETIME'.
+          check IS_MRAFINISHED-TLTIM_X eq ABAP_TRUE.
+          if <S_SETVA>-T_MAPVN is initial.
+            append initial line to <S_SETVA>-T_MAPVN.
+          endif.
+          loop at <S_SETVA>-T_MAPVN assigning <S_MAPVN>.
+            <S_MAPVN>-ATFLV = conv STRING( IS_MRAFINISHED-TLTIM ).
+          endloop.
+
+***     Storage Information
+        when 'STORAGE_INFO'.
+          check IS_MRAFINISHED-STINF_X eq ABAP_TRUE.
+          if <S_SETVA>-T_MAPVC is initial.
+            append initial line to <S_SETVA>-T_MAPVC.
+          endif.
+          loop at <S_SETVA>-T_MAPVC assigning <S_MAPVC>.
+            clear: <S_MAPVC>-ATWTB, <S_MAPVC>-VAMAP.  "Only provide Original Value
+            <S_MAPVC>-VAORG = conv STRING( IS_MRAFINISHED-STINF ).
+          endloop.
+
+      endcase.
+    endloop.
+
+***--------------------------------------------------------------------------------------
+*** Set new Classification
+    LR_BOB_BATCH->CHANGE_CLASSI( exporting IF_SETID    = 'ZVCXI_XCE_PP_TOOL_BATCH'
+                                           IT_SETVA    = LT_SETVA
+                                           IF_COMMIT   = ABAP_TRUE
+                                 importing ET_BAPIRET2 = data(LT_BAPIRET2) ).
+
+*** Return Messages
+    loop at LT_BAPIRET2 into data(LS_BAPIRET2).
+      CR_MSG->ADD_MESSAGE_BY_BAPIRET2( IS_BAPIRET2 = LS_BAPIRET2 ).
+    endloop.
+
+  endmethod.

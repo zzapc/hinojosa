@@ -1,0 +1,123 @@
+
+class ZCL_VCXI_XCM_MBQ_STP_S405 definition
+  public
+  inheriting from ZCL_VCXI_XCM_MBQ_STP_S000
+  create public .
+
+public section.
+
+  methods EXECUTE
+    redefinition .
+protected section.
+
+  methods CREATE_CSPLIT
+    importing
+      !IS_ACTDAT_CSPL type ZVCXI_XCM_MBQ_S_ACTDAT_CSPL
+      !IS_MATLI type ZVCXI_XCM_MBQ_S_MATLI
+      !IF_STLAN type STLAN default '5'
+    raising
+      /VCXI/CX_CKX .
+private section.
+endclass. "ZCL_VCXI_XCM_MBQ_STP_S405 definition
+class ZCL_VCXI_XCM_MBQ_STP_S405 implementation.
+  method CREATE_CSPLIT.
+
+    data: LS_MATDAT_MAKV type ZVCXI_XCM_MBQ_S_MATDAT_MAKV,
+          LS_MATDAT_MAKZ type ZVCXI_XCM_MBQ_S_MATDAT_MAKZ,
+          LS_MAKV        type MAKV.
+    data: LT_MAKG type CKT_MAKG,
+          LT_MAKZ type CKF_MAKZ_TABKZ.
+    data: LR_BOB_MAT type ref to ZCL_VCXI_XCI_BOB_MAT.
+    field-symbols: <S_MAKZ> type MAKZ.
+
+
+***--------------------------------------------------------------------------------------
+*** Get Business Object for Material
+    LR_BOB_MAT = new #( ).
+    LR_BOB_MAT->INIT_FROM_DB( exporting IF_MATNR = IS_MATLI-MATNR
+                                        IF_WERKS = IS_ACTDAT_CSPL-WERKS ).
+
+*** Set Cost Co-Product Flag
+    LR_BOB_MAT->S_PLANTDATA-CO_PRODUCT = ABAP_TRUE.
+    LR_BOB_MAT->SAVE( ).
+
+***--------------------------------------------------------------------------------------
+    loop at IS_ACTDAT_CSPL-T_MATDAT_MAKV into LS_MATDAT_MAKV.
+      clear: LS_MAKV, LT_MAKG, LT_MAKZ.
+
+***   Prepare Cost Apportionment to Co-Products
+      LS_MAKV-MANDT = SY-MANDT.
+      LS_MAKV-MATNR = IS_MATLI-MATNR.
+      LS_MAKV-WERKS = IS_ACTDAT_CSPL-WERKS.
+      LS_MAKV = corresponding #( base ( LS_MAKV ) LS_MATDAT_MAKV ).
+      LT_MAKG = value #( for LS_MATDAT_MAKG in IS_ACTDAT_CSPL-T_MATDAT_MAKG
+                             where ( CSPLIT = LS_MATDAT_MAKV-CSPLIT )
+                             ( corresponding #( base ( LS_MAKV ) LS_MATDAT_MAKG ) ) ).
+      loop at IS_ACTDAT_CSPL-T_MATDAT_MAKZ into LS_MATDAT_MAKZ where CSPLIT = LS_MATDAT_MAKV-CSPLIT.
+        append corresponding #( base ( LS_MAKV ) LS_MATDAT_MAKZ ) to LT_MAKZ assigning <S_MAKZ>.
+
+***     Get Material Number via SmartVC LEVEL
+        if <S_MAKZ>-KUPPL is initial.
+          <S_MAKZ>-KUPPL = value #( ME->R_DCO_INPUT->T_MATLI[ LEVEL_SOURCE = LS_MATDAT_MAKZ-LEVEL_SOURCE ]-MATNR optional ).
+        endif.
+      endloop.
+
+***   Save Cost Apportionment to Co-Products
+      LR_BOB_MAT->SAVE_CSPL( IS_MAKV = LS_MAKV
+                             IT_MAKG = LT_MAKG
+                             IT_MAKZ = LT_MAKZ ).
+    endloop.
+
+  endmethod.
+  method EXECUTE.
+
+    data: LS_MATLI   type ZVCXI_XCM_MBQ_S_MATLI.
+    data: LR_ACTDAT  type ref to DATA.
+    field-symbols: <S_ACTDAT_CSPL> type ZVCXI_XCM_MBQ_S_ACTDAT_CSPL.
+
+
+    try.
+***     Get Material List Entry of active Material List Entry
+        LS_MATLI = ME->R_DCO_INPUT->T_MATLI[ MLCNT = ME->R_DCO_INPUT->F_MLCNT ].
+
+***     Check Activity - Create Cost Apportionment to Co-Products
+        if not LINE_EXISTS( LS_MATLI-T_ACTCON[ ACTID = ZCL_VCXI_XCM_MBQ_CUST=>C_ACTID_CSPL ] ).
+***       Set Status to CANCELED
+          ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_CANCELED ).
+          return.
+        endif.
+
+***     Load Activity Control Data
+        LR_ACTDAT = LS_MATLI-T_ACTCON[ ACTID = ZCL_VCXI_XCM_MBQ_CUST=>C_ACTID_CSPL ]-R_ACTDAT.
+        assign LR_ACTDAT->* to <S_ACTDAT_CSPL>.
+
+
+***--------------------------------------------------------------------------------------
+***     Create Cost Apportionment to Co-Products
+        ME->CREATE_CSPLIT( IS_ACTDAT_CSPL = <S_ACTDAT_CSPL>
+                           IS_MATLI       = LS_MATLI ).
+
+***     Perform Save and Commit
+        ME->R_RPSEG->SAVE_AND_COMMIT( ).
+
+***     Inform Co-Products about Save of Main-Co
+        ZCL_VCXI_XCE_MM_MMEXT=>TRIGGER_COPRODUCT( IF_MATNR = LS_MATLI-MATNR
+                                                  IF_WERKS = <S_ACTDAT_CSPL>-WERKS ).
+
+***     Set Status to Complete
+        ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_COMPLETED ).
+
+***--------------------------------------------------------------------------------------
+      catch /VCXI/CX_CKX into data(LR_CX_CKX).
+***     Set Status to Error
+        ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_ERROR ).
+
+***     Add Message to Message Log
+        ME->R_RPSEG->R_MSG->ADD_MESSAGE_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+    endtry.
+
+*** Perform Save and Commit
+    ME->R_RPSEG->SAVE_AND_COMMIT( ).
+
+  endmethod.
+endclass. "ZCL_VCXI_XCM_MBQ_STP_S405 implementation

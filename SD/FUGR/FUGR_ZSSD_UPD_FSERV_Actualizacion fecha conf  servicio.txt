@@ -1,0 +1,251 @@
+FUNCTION zssd_upd_fserv.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_FCONFS) TYPE  ZSSD_FCONFS OPTIONAL
+*"     VALUE(I_VBELN) TYPE  VBELN_VA OPTIONAL
+*"     VALUE(I_POSNR) TYPE  POSNR OPTIONAL
+*"     VALUE(LLAMADA_DESDE_USER) TYPE  XFELD OPTIONAL
+*"     REFERENCE(XVBEP) TYPE  EHS_VBEPVB_T OPTIONAL
+*"  CHANGING
+*"     REFERENCE(XVBAP) TYPE  EHS_VBAPVB_T OPTIONAL
+*"----------------------------------------------------------------------
+  DATA lv_ok TYPE xfeld.
+  CLEAR lv_ok.
+  PERFORM chequear_tabla_z USING xvbap i_vbeln CHANGING lv_ok.
+
+  IF lv_ok NE abap_true.
+    RETURN.
+  ENDIF.
+
+  DATA lv_fecha TYPE datum.
+  lv_fecha = i_fconfs.
+  IF llamada_desde_user IS INITIAL.
+    SELECT SINGLE werks INTO @DATA(lv_werks) FROM vbap WHERE vbeln = @i_vbeln AND posnr = @i_posnr.
+
+    DO.
+*          Calendario de festivos asociado a calendario de fábrica: TFACD-HOCID
+      SELECT SINGLE hocid INTO @DATA(lv_hocid) FROM t001w AS t1 INNER JOIN tfacd AS t2
+        ON t1~fabkl EQ t2~ident
+        WHERE werks EQ @lv_werks.
+
+      DATA holiday_found TYPE cind.
+      CLEAR holiday_found.
+*      date = lv_fecha.
+      CALL FUNCTION 'HOLIDAY_CHECK_AND_GET_INFO'
+        EXPORTING
+          date                         = lv_fecha
+          holiday_calendar_id          = lv_hocid "'Z1'
+*         WITH_HOLIDAY_ATTRIBUTES      = ' '
+        IMPORTING
+          holiday_found                = holiday_found
+*         TABLES
+*         HOLIDAY_ATTRIBUTES           =
+        EXCEPTIONS
+          calendar_buffer_not_loadable = 1
+          date_after_range             = 2
+          date_before_range            = 3
+          date_invalid                 = 4
+          holiday_calendar_id_missing  = 5
+          holiday_calendar_not_found   = 6
+          OTHERS                       = 7.
+      IF sy-subrc <> 0.
+* Implement suitable error handling here
+      ENDIF.
+      IF holiday_found EQ space.
+
+        DATA ld_day TYPE cind.
+        CLEAR ld_day.
+        "Comprobamos de nuevo que no caiga en sábado
+        CALL FUNCTION 'DATE_COMPUTE_DAY'
+          EXPORTING
+            date = lv_fecha
+          IMPORTING
+            day  = ld_day.
+        IF ld_day EQ '6' OR ld_day EQ '7'.
+          "lo pasamos a lunes
+          lv_fecha = lv_fecha + 1.
+          CONTINUE.
+        ENDIF.
+
+        EXIT.
+      ELSE.
+        "Si es vacacional vamos desplazando un día hasta
+        "encontrar un día no vacacional
+        lv_fecha = lv_fecha + 1.
+
+*        DATA ld_day TYPE cind.
+        CLEAR ld_day.
+
+        "Comprobamos de nuevo que no caiga en sábado
+        CALL FUNCTION 'DATE_COMPUTE_DAY'
+          EXPORTING
+            date = lv_fecha
+          IMPORTING
+            day  = ld_day.
+        IF ld_day EQ '6' OR ld_day = '7'.
+          "lo pasamos a lunes
+          lv_fecha = lv_fecha + 1.
+        ENDIF.
+
+      ENDIF.
+    ENDDO.
+  ENDIF.
+
+  IF llamada_desde_user IS NOT INITIAL.
+*#  Reparto confirmado por programa de Verificación disponibilidad.
+*#  Actualización campo Z Confirmación de servicio # Vía EXIT SAVE_DOCUMENT_PREPARE.
+*•  Revisión de estructura XVEP, Si la suma de cantidad confirmada XVBEP-BMENG de todos los repartos
+*ETENR de la posición POSNR, si la suma es IGUAL a XVBEP-WMENG # Se indicará en
+*el campo Z Confirmación de servicio la Fecha confirmada más temprana XVBEP-EDATU.
+*•  Al actualizar el campo Z de Confirmación de servicio, SI NO se dispone del mensaje ZBA3 confirmación
+*de pedido en status PENDIENTE, se asignaría un nuevo mensaje ZBA3 con status PENDIENTE.
+*•  Este nuevo mensaje se procesaría nocturnamente.
+
+
+    DATA lt_vbep TYPE ehs_vbepvb_t.
+
+    lt_vbep[] = xvbep[].
+    DATA lv_menge TYPE menge_d.
+    DATA lv_menge2 TYPE menge_d.
+
+    SORT lt_vbep BY vbeln posnr edatu ASCENDING.
+
+    DATA lv_cta TYPE i.
+
+
+
+    LOOP AT lt_vbep ASSIGNING FIELD-SYMBOL(<fs_vbep>) WHERE updkz <> 'D' GROUP BY ( vbeln = <fs_vbep>-vbeln posnr = <fs_vbep>-posnr ) .
+      CLEAR: lv_cta, lv_menge, lv_menge2.
+      LOOP AT GROUP <fs_vbep> ASSIGNING FIELD-SYMBOL(<fs_g>).
+        lv_cta = 1.
+        lv_menge = lv_menge + <fs_g>-bmeng.
+        lv_menge2 = lv_menge2 + <fs_g>-wmeng.
+*        IF lv_cta = 1.
+*          SELECT SINGLE zzfconfs INTO @DATA(lv_fecha) FROM vbap WHERE vbeln = @<fs_g>-vbeln AND posnr = @<fs_g>-posnr..
+*          IF sy-subrc = 0 AND lv_fecha IS INITIAL.
+*            UPDATE vbap SET zzfconfs = <fs_g>-edatu WHERE vbeln = <fs_g>-vbeln AND posnr = <fs_g>-posnr.
+
+*          ENDIF.
+*          CLEAR lv_fecha.
+*        ENDIF.
+      ENDLOOP.
+      IF lv_cta = 1 AND lv_menge = lv_menge2.
+        READ TABLE xvbap ASSIGNING FIELD-SYMBOL(<xvbap>) WITH KEY posnr = <fs_vbep>-posnr.
+        IF sy-subrc = 0 AND <xvbap>-zzfconfs IS INITIAL.
+
+          SELECT SINGLE bedae, knttp
+            FROM t459k AS t1 INNER JOIN t459a AS t2
+            ON t1~bedar EQ t2~bedar
+            WHERE bedae = @<xvbap>-bedae
+            INTO ( @DATA(lv_clase_neces), @DATA(tipo_imputacion) ).
+          IF lv_clase_neces EQ 'KSV'.
+            CONTINUE.
+          ENDIF.
+          IF tipo_imputacion = 'M'. "Si es make to order, pasamos, la actualización vendrá desde el FB_PLN
+            CONTINUE.
+          ENDIF.
+          LOOP AT GROUP <fs_vbep> ASSIGNING <fs_g>.
+            EXIT.
+          ENDLOOP.
+          <xvbap>-zzfconfs = <fs_g>-edatu.
+          IF <xvbap>-updkz = ''.
+            <xvbap>-updkz = 'U'.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+  ELSE.
+
+    SELECT SINGLE zzfconfs, bedae FROM vbap WHERE vbeln = @i_vbeln AND posnr = @i_posnr INTO ( @DATA(lv_dat), @DATA(clase_neces) ).
+    CHECK sy-subrc = 0.
+    CHECK lv_dat IS INITIAL.
+    CHECK clase_neces <> 'KSV'.
+    SELECT SINGLE knttp
+           FROM t459k AS t1 INNER JOIN t459a AS t2
+           ON t1~bedar EQ t2~bedar
+           WHERE bedae = @clase_neces
+           INTO @DATA(tipo_imputacion2).
+    CHECK tipo_imputacion2 = 'M'. "Si es make to order, pasamos, la actualización vendrá desde el FB_PLN
+
+    "Si la fecha de confirmación de servicio es anterior a la fecha solicitada
+    "por el cliente, hay que poner la fecha solicitada por el cliente.
+    "De esta forma, NO se le confirmaría al cliente una fecha ANTERIOR a la ya enviada.
+    SELECT SINGLE edatu
+      FROM vbep
+      INTO @DATA(lv_data_edatu)
+      WHERE vbeln = @i_vbeln
+      AND posnr = @i_posnr
+      AND edatu <> '00000000'.
+
+    IF i_fconfs < lv_data_edatu.
+*      RETURN.
+      lv_fecha = lv_data_edatu.
+    ENDIF.
+
+    DATA: order_header_in  TYPE bapisdh1,
+          order_header_inx TYPE bapisdh1x,
+          order_item_in    TYPE STANDARD TABLE OF bapisditm,
+          order_item_inx   TYPE STANDARD TABLE OF bapisditmx,
+          lt_return        TYPE TABLE OF bapiret2,
+          extensionin      TYPE STANDARD TABLE OF bapiparex,
+          extensionex      TYPE STANDARD TABLE OF bapiparex,
+          bape_vbap        TYPE bape_vbap,
+          bape_vbapx       TYPE bape_vbapx.
+
+    "ADD JVM - 12/12/2024 la generación del ZBA3 no tiene la fecha actualizada la 1º vez que se genera
+    SELECT SINGLE * FROM vbap WHERE vbeln = @i_vbeln AND posnr = @i_posnr INTO @DATA(wa_vbap).
+    IF sy-subrc = 0.
+*        wa_vbap-zzfconfs = lv_fecha.
+      UPDATE vbap SET zzfconfs = lv_fecha WHERE vbeln = i_vbeln AND posnr = i_posnr.
+      COMMIT WORK AND WAIT.
+    ENDIF.
+    "FADD JVM - 12/12/2024
+    order_header_inx-updateflag = 'U'.
+    APPEND INITIAL LINE TO order_item_in ASSIGNING FIELD-SYMBOL(<f>).
+    APPEND INITIAL LINE TO order_item_inx ASSIGNING FIELD-SYMBOL(<fx>).
+    <f>-itm_number = <fx>-itm_number = i_posnr.
+    <fx>-updateflag = 'U'.
+
+    APPEND INITIAL LINE TO extensionin ASSIGNING FIELD-SYMBOL(<fs>).
+    MOVE 'BAPE_VBAP' TO <fs>-structure.
+    bape_vbap-vbeln = i_vbeln.
+    bape_vbap-posnr = i_posnr.
+    bape_vbap-zzfconfs = lv_fecha.
+
+    FIELD-SYMBOLS: <wa_item> TYPE any.
+    ASSIGN <fs>-valuepart1 TO <wa_item> CASTING TYPE bape_vbap.
+    IF sy-subrc EQ 0.
+      <wa_item> = bape_vbap.
+      UNASSIGN <wa_item>.
+    ENDIF.
+
+    APPEND INITIAL LINE TO extensionin ASSIGNING <fs>.
+    MOVE 'BAPE_VBAPX' TO <fs>-structure.
+    bape_vbapx-vbeln = i_vbeln.
+    bape_vbapx-posnr = i_posnr.
+    bape_vbapx-zzfconfs = abap_true.
+
+    ASSIGN <fs>-valuepart1 TO <wa_item> CASTING TYPE bape_vbapx.
+    IF sy-subrc EQ 0.
+      <wa_item> = bape_vbapx.
+      UNASSIGN <wa_item>.
+    ENDIF.
+
+    CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+      EXPORTING
+        salesdocument    = i_vbeln
+        order_header_in  = order_header_in
+        order_header_inx = order_header_inx
+      TABLES
+        return           = lt_return
+        order_item_in    = order_item_in
+        order_item_inx   = order_item_inx
+        extensionin      = extensionin.
+
+    COMMIT WORK AND WAIT.
+
+  ENDIF.
+
+ENDFUNCTION.

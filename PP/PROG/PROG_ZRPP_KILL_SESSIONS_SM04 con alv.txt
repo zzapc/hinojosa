@@ -1,0 +1,3805 @@
+************************************************************************
+* Change history of ALV Development
+* Program description: RSM04000_ALV
+* Author: Edgar Lott - original version
+*         M Harish Reddy (C5056145) - ALV adaption
+* Date : 25/05/2004
+* Short description of the program: Displays the list of the user sessions.
+*---------------------------------------------------------------------*
+
+REPORT zrpp_kill_sessions MESSAGE-ID 14 NO STANDARD PAGE HEADING.
+
+*TYPE-POOLS: slis. " obsolete
+
+TABLES:
+  sm04dic,
+  usr41,
+  usertrace,
+  usr05.
+
+INCLUDE <color>.
+INCLUDE tskhincl.
+INCLUDE dp_th_defs.
+INCLUDE rsusrcom.
+INCLUDE rsblkcom.
+
+" Selection screen to display a specific session
+SELECTION-SCREEN BEGIN OF BLOCK b4 WITH FRAME TITLE text-003.
+
+*SELECTION-SCREEN BEGIN OF SCREEN 001.
+PARAMETERS: seskey  TYPE ssi_session_key NO-DISPLAY,  " for single session display
+            sw_list TYPE c DEFAULT ' ' NO-DISPLAY,    " for usage via AL08
+*            p_apl   TYPE ssi_application,
+            p_user  TYPE uname.
+*            p_ip    TYPE string.
+
+*SELECTION-SCREEN END OF SCREEN 001.
+SELECTION-SCREEN END OF BLOCK b4.
+
+*
+* internal table of user
+*
+* el 4May 2007 - add appl_info.
+*
+* As long as structure usrinfo must not be extended we fill in the
+* application info into the local structure urs_tabl_alv.
+*
+TYPES: BEGIN OF t_session_alv_line.
+TYPES: session_type        TYPE ssi_session_type,
+       ext_stype(20),
+       ext_state(10),
+       ext_time(19),
+       ext_trace(5),
+       line_col(3),
+       ipaddr(30),
+       selected(1),
+       total_mem_kb        TYPE i,
+       total_mem_brutto_kb TYPE i,
+       total_mem_heap_kb   TYPE i,
+       total_mem_hyper_kb  TYPE i,
+       total_mem_abap_kb   TYPE i,
+       appl_info           TYPE ssi_application_info,
+       act_program         TYPE ssi_program,
+       security_context    TYPE string,
+       logon_hdl           TYPE ssi_logon_hdl,
+       logon_id            TYPE ssi_logon_id,
+       session_hdl         TYPE ssi_session_hdl,
+       session_key         TYPE ssi_session_key,
+       tenant              TYPE ssi_tenant_id,
+       user_name           TYPE uname,
+       application         TYPE ssi_application,
+       location_info       TYPE ssi_logon_location_info,
+       sessions            TYPE i,
+       rfc_hdl             TYPE string,
+       rfc_type_long(20),
+       server_name         TYPE ssi_servername_disp,
+       trace               TYPE ssi_trace_level,
+       logon_privilege(20),
+       priority(10),
+       open_tasks          TYPE i,
+       websocket_handle    TYPE string.
+TYPES: END OF t_session_alv_line.
+TYPES: t_session_alv_table TYPE TABLE OF t_session_alv_line.
+DATA: session_alv_table TYPE t_session_alv_table.
+DATA: lt_tx_zpprf_menu  TYPE t_session_alv_table.
+DATA: lt_all     TYPE t_session_alv_table.
+*DATA: lt_tx_zpick       TYPE t_session_alv_table.
+FIELD-SYMBOLS: <current_session> TYPE t_session_alv_line.
+
+*
+* internal table of all sessions of all servers
+*
+DATA: sw_session_tabl_alv TYPE t_session_alv_table.
+*
+* internal table of memory
+*
+DATA: BEGIN OF usr_blksd_tabl OCCURS 10.
+        INCLUDE STRUCTURE ublksd.
+      DATA: END OF usr_blksd_tabl.
+
+DATA: BEGIN OF mem_tabl_alv OCCURS 10.
+        INCLUDE STRUCTURE ublks.
+        DATA:   selected(1).
+DATA: memsum2(16) TYPE p DECIMALS 0.
+DATA: roll2(16) TYPE p DECIMALS 0.
+DATA: page2(16) TYPE p DECIMALS 0.
+DATA: privsum2(16) TYPE p DECIMALS 0.
+DATA: total_mem_kb TYPE i.
+DATA: order TYPE i.
+DATA: END OF mem_tabl_alv.
+
+DATA: BEGIN OF selected_usr_gen OCCURS 10.
+DATA:   tid TYPE i.
+DATA: END OF selected_usr_gen.
+
+DATA: BEGIN OF selected_usr_tec OCCURS 10.
+DATA: tid TYPE i,
+      uid TYPE i.
+DATA: END OF selected_usr_tec.
+
+DATA: BEGIN OF selected_usr OCCURS 10.
+DATA:   tid TYPE i.
+DATA: END OF selected_usr.
+
+DATA: BEGIN OF selected_modes OCCURS 10.
+DATA:   tid TYPE i.
+DATA:   extmode LIKE ublksd-extmode.
+DATA: END OF selected_modes.
+
+DATA: mem64_multiplier TYPE abap_msize VALUE 1.
+
+DATA: BEGIN OF detailed_mem_tabl_alv OCCURS 10.
+        INCLUDE STRUCTURE ublksd.
+        DATA:   selected(1).
+DATA:   order TYPE i.
+DATA: END OF detailed_mem_tabl_alv.
+
+DATA: BEGIN OF idetailed_mem_tabl_alv OCCURS 10.
+        INCLUDE STRUCTURE ublksd.
+        DATA:   intmode LIKE ublksd-extmode.
+DATA:   selected(1).
+DATA: END OF idetailed_mem_tabl_alv.
+
+DATA: semaphore(1),
+      with_appl_info        TYPE ssi_bool,
+      show_all_session      TYPE ssi_bool,
+      show_logon_privileges TYPE ssi_bool,
+      task_name(4)          TYPE n VALUE '0001',
+      myname                LIKE msxxlist-name,
+      mysystem(64),
+      block_status          LIKE sy-index VALUE 0,
+      block_opened_index    LIKE sy-tabix VALUE 0.
+
+DATA: f.
+
+DATA: fieldcat              TYPE slis_t_fieldcat_alv,
+      layout                TYPE slis_layout_alv,
+      events                TYPE slis_t_event,
+      sw_session_events     TYPE slis_t_event,
+      sw_session_fieldcat   TYPE slis_t_fieldcat_alv,
+      sw_session_layout     TYPE slis_layout_alv,
+      mem_fieldcat          TYPE slis_t_fieldcat_alv,
+      mem_layout            TYPE slis_layout_alv,
+      mem_details_fieldcat  TYPE slis_t_fieldcat_alv,
+      mem_details_layout    TYPE slis_layout_alv,
+      mem_idetails_fieldcat TYPE slis_t_fieldcat_alv,
+      mem_idetails_layout   TYPE slis_layout_alv,
+      usr_info_fieldcat     TYPE slis_t_fieldcat_alv,
+      usr_info_layout       TYPE slis_layout_alv,
+      is_variant            LIKE disvariant,
+      act_session_key       TYPE ssi_session_key.
+
+*
+* internal table of user detailed info
+*
+DATA: BEGIN OF usr_info OCCURS 10.
+DATA: field(40),
+      VALUE(80).
+DATA: END OF usr_info.
+
+*
+* okcode for dynpros 2000, ...
+*
+DATA: okcode(7).
+
+*
+* for ngsso
+*
+DATA: security_context_reference TYPE security_context_ref,
+      is_sec_cont_ref_set        TYPE char1.
+
+*
+* content separation
+*
+DATA: is_system_client TYPE sap_bool.
+
+DATA: sm04_configuration(20).
+
+*
+* report starts here
+*
+
+PERFORM start.
+
+FORM start.
+*
+* don't change field-delimiters
+* CPS: 25.06.2004
+*
+*
+*
+*field-symbols: <fs> type x.
+*assign f to <fs> type 'X'.
+*<fs> = 04.
+*call function 'LIST_ALLOW_SEQUENCE_OF_HYPHENS'
+*     exporting
+*          character = f
+*     exceptions
+*          others    = 0.
+
+*<fs> = 05.
+*sy-vline = f.
+
+  DATA: l_value TYPE string.
+
+  WRITE :/ |Inicio ZRPP_KILL_SESSIONS|.
+  " TODO: this is not needed in CGAP. Just use the normal authority checks
+  "is_system_client = cl_system_client_check=>is_system_client( ).
+  is_system_client = 'X'.
+
+  myname = cl_abap_syst=>get_instance_name( ).
+
+  cl_spfl_profile_parameter=>get_value(
+    EXPORTING
+      name = 'SAPSYSTEMNAME'
+    IMPORTING
+      value = l_value ).
+  mysystem = l_value.
+
+
+  is_variant-report = 'RSM04000_ALV_NEW'.
+
+  GET PARAMETER ID 'SM04_CONFIGURATION' FIELD sm04_configuration.
+  IF sy-subrc = 4.
+    with_appl_info = 1.
+    show_all_session = 0.
+    show_logon_privileges = 1.
+    sm04_configuration = 'X X'.
+    SET PARAMETER ID 'SM04_CONFIGURATION' FIELD sm04_configuration.
+  ELSE.
+    IF sm04_configuration(1) = 'X'.
+      with_appl_info = 1.
+    ELSE.
+      with_appl_info = 0.
+    ENDIF.
+    IF sm04_configuration+1(1) = 'X'.
+      show_all_session = 1.
+    ELSE.
+      show_all_session = 0.
+    ENDIF.
+    IF sm04_configuration+2(1) = 'X'.
+      show_logon_privileges = 1.
+    ELSE.
+      show_logon_privileges = 0.
+    ENDIF.
+  ENDIF.
+
+  IF sw_list = 'X'.
+    PERFORM systemwide_user_list.
+    RETURN.
+  ENDIF.
+
+  " Single session display only works if show_all_session = 1. TODO: check why
+  IF seskey IS NOT INITIAL.
+    show_all_session = 1.
+  ENDIF.
+
+  " inform about reduced function set for non system clients
+  IF is_system_client <> 'X'.
+    MESSAGE s168.
+  ENDIF.
+
+  PERFORM build_list.
+*  PERFORM build_fieldcat USING fieldcat[].
+*  PERFORM build_layout USING layout.
+*  PERFORM build_event  USING events[].
+*
+  is_variant-handle = 'USRL'.
+* Start of ALV Migration changes - C5056145
+*call function 'REUSE_ALV_LIST_DISPLAY'
+* End of ALV Migration changes - C5056145
+*  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+*    EXPORTING
+*      i_structure_name         = 'SESSION_ALV_TABLE'
+*      i_callback_program       = sy-repid
+*      i_callback_pf_status_set = 'SM04_SET_STATUS'
+*      i_callback_user_command  = 'SM04_USER_CMD'
+*      i_save                   = 'A'
+*      it_fieldcat              = fieldcat[]
+*      it_events                = events[]
+*      is_layout                = layout
+*      is_variant               = is_variant
+*    TABLES
+*      t_outtab                 = session_alv_table.
+
+
+*****************************************************************************
+* 67826 - 28/09/2021 - CMS - Cerrar transacciones antiguas
+* Nuevo código añadido para obtener el PID de sesión a la copia del report:
+* para tener la trazabilidad de usuario / ip / aplicación
+******************************************************************************
+* DTM
+  WRITE:/ |Inicio tratamiento|.
+  WRITE:/ ' '.
+* DTM
+
+  TYPES: ty_apl   TYPE RANGE OF  ssi_application.
+
+  DATA: lt_apl TYPE ty_apl.
+  DATA: lt_list_users TYPE STANDARD TABLE OF uinfo.
+*  DATA: l_ip       TYPE string.
+*  DATA: resto       TYPE string.
+*  DATA: l_terminal TYPE xuterminal.
+  DATA: l_zeit TYPE char08.
+  DATA: l_tid  TYPE syst_index.
+
+* Asignar valores de las aplicaciones a tratar.
+  lt_apl = VALUE #(  sign = 'I'
+                     option = 'EQ'
+                      ( low = 'ZPPRF_MENU' ) " Dejará la sesión mas reciente viva, la que ha lanzado esta ejecución
+                      ( low = 'ZSD0007' )    " Matará todas las sesiones
+                      ( low = 'ZPICK' )      " Matará todas las sesiones
+                   ).
+
+
+*  WRITE :/ |Detall dels registres/sessions trobats(SM04): { lines( session_alv_table ) } |.
+
+*  LOOP AT session_alv_table INTO DATA(ls_se) WHERE user_name     = p_user.
+*    WRITE :/ |session type:{ ls_se-session_type } usr:{ ls_se-user_name } IP:{ ls_se-location_info } application: { ls_se-application }|.
+*  ENDLOOP.
+
+  TYPES: BEGIN OF ls_ips,
+           ip TYPE ssi_logon_location_info,
+         END OF ls_ips.
+  DATA: lt_ips TYPE STANDARD TABLE OF ls_ips.
+
+
+*  DELETE TABLE session_alv_table WHERE session_type  = 'HTTP'  AND
+*                                      user_name     = p_user  AND
+*                                      location_info = ls_ip   AND
+*                                      application  IN lt_apl.
+
+* Obtener lt_ips con la lista de ips.
+  LOOP AT session_alv_table INTO DATA(ls_ses) WHERE session_type  = 'HTTP' AND
+                                                        user_name     = p_user AND
+                                                        application  IN lt_apl.
+    IF not line_exists( lt_ips[ ip = ls_ses-location_info ] ).
+      APPEND INITIAL LINE TO lt_ips ASSIGNING FIELD-SYMBOL(<fs_ip>).
+      <fs_ip>-ip =  ls_ses-location_info .
+    ENDIF.
+  ENDLOOP.
+
+* Tratamiento de ips, 1 a 1.
+  LOOP AT lt_ips INTO DATA(ls_ip).
+
+* DTM
+    WRITE : / .
+    WRITE : / |*******Tratamiento IP: { ls_ip-ip } ***********|.
+* DTM
+
+    CLEAR: lt_tx_zpprf_menu , lt_all.
+
+    LOOP AT session_alv_table INTO DATA(ls_session) WHERE session_type  = 'HTTP' AND
+                                                          user_name     = p_user AND
+                                                          location_info = ls_ip-ip   AND
+                                                          application  IN lt_apl.
+* Insertar en esta tabla para luego borrar el 1er reg., la sesión más actual.
+      IF ls_session-application = 'ZPPRF_MENU'.
+        APPEND INITIAL LINE TO lt_tx_zpprf_menu ASSIGNING FIELD-SYMBOL(<fs_zpprf_menu>).
+        <fs_zpprf_menu> = CORRESPONDING #( ls_session ).
+      ENDIF.
+
+      APPEND INITIAL LINE TO lt_all ASSIGNING FIELD-SYMBOL(<fs_all>).
+      <fs_all> = CORRESPONDING #( ls_session ).
+
+    ENDLOOP.
+
+
+    CHECK   lt_tx_zpprf_menu[] IS NOT INITIAL AND
+            lt_all[]           IS NOT INITIAL.
+
+* Ordenar y obtener el reg. mas actual, que no queremos eliminar
+    SORT   lt_tx_zpprf_menu BY ext_time DESCENDING.
+    DATA(ls_1er_reg) = lt_tx_zpprf_menu[ 1 ].
+
+* Borrar el 1er reg. para no eliminar la sesión.
+    DELETE lt_all WHERE user_name      = ls_1er_reg-user_name     AND
+                        location_info  = ls_1er_reg-location_info AND
+                        application    = ls_1er_reg-application   AND
+                        ext_time       = ls_1er_reg-ext_time      AND
+                        session_key    = ls_1er_reg-session_key.
+
+* DTM
+    WRITE :/ |Nº sesiones a eliminar: { lines( lt_all ) }|.
+    WRITE :/ .
+* DTM
+
+
+    CALL FUNCTION 'TH_USER_LIST'
+      TABLES
+        list          = lt_list_users
+      EXCEPTIONS
+        auth_misssing = 1
+        OTHERS        = 2.
+    IF sy-subrc <> 0.
+      WRITE |Error BAPI TH_USER_LIST|.
+* Implement suitable error handling here
+      EXIT.
+    ENDIF.
+
+    LOOP AT lt_all INTO DATA(ls_session_alv). " WHERE session_type = 'HTTP'.
+
+      l_zeit(2)   = ls_session_alv-ext_time+11(2).
+      l_zeit+2(2) = ls_session_alv-ext_time+14(2).
+      l_zeit+4(2) = ls_session_alv-ext_time+17(2).
+*    l_zeit+4(2) = ls_session_alv-.
+
+* DTM
+      WRITE :/ |Usuario: { p_user }|.
+      WRITE :/ |Aplicación: { ls_session_alv-application }|.
+*      WRITE :/ |IP: { p_ip }|.
+      WRITE :/ |Hora sesión: { l_zeit }|.
+      WRITE :/.
+* DTM
+
+      TRY .
+          l_tid = lt_list_users[ bname = p_user
+                                 tcode = ls_session_alv-application " p_apl
+                                 zeit  = l_zeit
+                                 term  = ls_ip-ip ]-tid.
+
+          CALL FUNCTION 'TH_DELETE_USER'
+            EXPORTING
+              user            = p_user
+              client          = '100'
+              tid             = l_tid
+            EXCEPTIONS
+              authority_error = 1
+              OTHERS          = 2.
+          IF sy-subrc <> 0.
+            WRITE |Error BAPI TH_DELETE_USER, usuario { p_user }, id:{ l_tid }|.
+          ENDIF.
+
+        CATCH cx_root.
+          WRITE :/ |Ultimo registro no encontrado.|.
+      ENDTRY.
+    ENDLOOP.
+
+
+  ENDLOOP.
+
+
+ENDFORM. " start
+
+*
+* build list of sm04 for alv
+*
+FORM build_list.
+  DATA: session_list TYPE ssi_session_list,
+        server_info  TYPE REF TO cl_server_info.
+
+  TRY.
+      CREATE OBJECT server_info.
+
+      IF is_system_client = 'X'.
+        session_list = server_info->get_session_list( with_application_info = with_appl_info ).
+      ELSE.
+        session_list = server_info->get_session_list( tenant = sy-mandt with_application_info = with_appl_info ).
+      ENDIF.
+    CATCH cx_ssi_no_auth.
+      MESSAGE e150 WITH text-100.
+  ENDTRY.
+
+  SORT session_list BY tenant user_name.
+
+  PERFORM map_session_list USING session_list
+                           CHANGING session_alv_table.
+
+ENDFORM.                    "build_list
+
+FORM build_session_key USING session_info TYPE ssi_session_info
+                       CHANGING session_key TYPE ssi_session_key.
+  DATA: tostr(64),
+        tmp TYPE string.
+
+  tmp = 'T%_U%_M%'.
+  tostr = session_info-logon_hdl.
+  REPLACE '%' IN tmp WITH tostr.
+  tostr = session_info-logon_id.
+  REPLACE '%' IN tmp WITH tostr.
+  tostr = session_info-session_hdl.
+  REPLACE '%' IN tmp WITH tostr.
+  CONDENSE tmp NO-GAPS.
+  session_key = tmp.
+ENDFORM.
+
+FORM build_logon_key USING tid TYPE i uid TYPE i
+                       CHANGING logon_key TYPE ssi_session_key.
+  DATA: tostr(64),
+        tmp TYPE string.
+
+  tmp = 'T%_U%'.
+  tostr = tid.
+  REPLACE '%' IN tmp WITH tostr.
+  tostr = uid.
+  REPLACE '%' IN tmp WITH tostr.
+  CONDENSE tmp NO-GAPS.
+  logon_key = tmp.
+ENDFORM.
+
+FORM map_session_list USING session_list TYPE ssi_session_list
+                      CHANGING session_alv_table TYPE t_session_alv_table.
+
+  DATA: session_info      TYPE ssi_session_info,
+        sum_memory        TYPE float,
+        sum_memory_brutto TYPE float,
+        sum_memory_heap   TYPE float,
+        sum_memory_abap   TYPE float,
+        sum_open_tasks    TYPE i,
+        memory_hyper      TYPE ssi_memsize_hyper,
+        current_appl      TYPE ssi_application,
+        current_appl_info TYPE ssi_application_info,
+        current_req_time  TYPE ssi_timestamp,
+        current_program   TYPE ssi_program,
+        session_counter   TYPE i,
+        is_first_session  TYPE i,
+        is_last_session   TYPE i,
+        time_t            TYPE i,
+        time_t_bias       TYPE p VALUE '19700101000000',
+        tstmp             TYPE p,
+        timestamp(32),
+        plugin_name(10),
+        set_stype         TYPE i,
+        session_alv_line  TYPE t_session_alv_line,
+        is_admin          TYPE ssi_bool,
+        session_key       TYPE ssi_session_key.
+
+  " data: t1 type i,
+  "       t2 type i,
+  "       t3 type i.
+
+  REFRESH session_alv_table. " clear table
+
+  " GET RUN TIME FIELD T1.
+
+  LOOP AT session_list INTO session_info.
+    IF seskey IS NOT INITIAL.
+      PERFORM build_session_key USING session_info CHANGING session_key.
+      IF session_key <> seskey.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    CLEAR session_alv_line. " initialize head line
+    set_stype = 0.
+    is_first_session = 0.
+    is_last_session = 0.
+    memory_hyper = session_info-memory_hyper.
+
+    AT NEW logon_hdl.
+      is_first_session = 1.
+    ENDAT.
+
+    AT END OF logon_hdl.
+      is_last_session = 1.
+    ENDAT.
+
+    " show hpyer memory just once
+    IF ( show_all_session = 1 AND is_first_session = 1 ) OR
+       ( show_all_session = 0 AND is_last_session = 1 ).
+      session_alv_line-total_mem_hyper_kb = memory_hyper / 1024.
+    ENDIF.
+
+    IF show_all_session = 1.
+      is_first_session = 1.
+      is_last_session = 1.
+    ENDIF.
+
+    IF is_first_session = 1.
+      current_req_time = session_info-request_time.
+      current_appl = session_info-application.
+      current_appl_info = session_info-application_info.
+      current_program = session_info-act_program.
+      sum_memory = 0.
+      sum_memory_brutto = 0.
+      sum_memory_heap = 0.
+      sum_memory_abap = 0.
+      sum_open_tasks = 0.
+      session_counter = 0.
+
+      IF show_logon_privileges = 1.
+        PERFORM get_privileges_info USING session_info-user_name
+                                          session_info-tenant
+                                    CHANGING is_admin.
+      ELSE.
+        is_admin = ssitg_false.
+      ENDIF.
+    ENDIF.
+
+    sum_memory = sum_memory + session_info-memory.
+    sum_memory_brutto = sum_memory_brutto + session_info-memory_brutto.
+    sum_memory_heap = sum_memory_heap + session_info-memory_heap.
+    sum_memory_abap = sum_memory_abap + session_info-memory_abap.
+    sum_open_tasks = sum_open_tasks + session_info-open_tasks.
+    session_counter = session_counter + 1.
+    IF current_req_time < session_info-request_time.
+      current_req_time = session_info-request_time.
+      current_appl = session_info-application.
+      current_appl_info = session_info-application_info.
+      current_program = session_info-act_program.
+    ENDIF.
+
+    IF is_last_session = 1.
+      DATA: tzone TYPE tznzone.
+
+      session_alv_line-logon_hdl = session_info-logon_hdl.
+      session_alv_line-logon_id = session_info-logon_id.
+      session_alv_line-session_hdl = session_info-session_hdl.
+      IF seskey IS INITIAL.
+        PERFORM build_session_key USING session_info CHANGING session_key.
+      ENDIF.
+      session_alv_line-session_key = session_key.
+      session_alv_line-tenant = session_info-tenant.
+      session_alv_line-user_name = session_info-user_name.
+      session_alv_line-application = current_appl.
+      session_alv_line-location_info = session_info-location_info.
+      session_alv_line-appl_info = current_appl_info.
+      session_alv_line-act_program = current_program.
+      " TODO: what time zone should be used?
+      tzone = sy-zonlo. " seems to be the user time zone
+      cl_abap_tstmp=>add(
+        EXPORTING
+          tstmp                      =     time_t_bias " UTC Time Stamp
+          secs                       =     current_req_time " Time Interval in Seconds
+        RECEIVING
+          r_tstmp                    =     tstmp " UTC Time Stamp
+      ).
+
+      WRITE tstmp TIME ZONE tzone TO timestamp.
+      session_alv_line-ext_time = timestamp(19).
+      session_alv_line-sessions = session_counter.
+      session_alv_line-server_name = session_info-server_name.
+      session_alv_line-trace = session_info-trace.
+
+      IF session_alv_line-trace <> 0.
+        session_alv_line-line_col = 'C30'.
+        session_alv_line-ext_trace = text-028.
+      ELSE.
+        session_alv_line-ext_trace = text-027.
+      ENDIF.
+
+      CASE session_info-logon_type.
+        WHEN dp_logon_type_undef.
+          session_alv_line-session_type = text-058.
+
+        WHEN dp_logon_internal.
+          session_alv_line-session_type = text-052.
+          CASE session_info-logon_sub_type.
+            WHEN dp_logon_batch. session_alv_line-session_type = text-068.
+          ENDCASE.
+          set_stype = 1.
+
+        WHEN dp_logon_gui.
+          session_alv_line-session_type = text-035.
+
+        WHEN dp_logon_rfc.
+          IF  session_info-logon_sub_type = dp_logon_bgrfc_scheduler.
+            session_alv_line-session_type = text-083.
+          ELSEIF session_info-logon_sub_type = dp_logon_bgrfc_unit.
+            session_alv_line-session_type = text-084.
+          ELSE.
+            session_alv_line-session_type = text-036.
+          ENDIF.
+          set_stype = 1.
+
+        WHEN dp_logon_plugin.
+          CALL FUNCTION 'TH_GET_PLUGIN_INFO'
+            EXPORTING
+              logon_hdl = session_alv_line-logon_hdl
+            IMPORTING
+              name      = plugin_name
+            EXCEPTIONS
+              OTHERS    = 1.
+
+          IF sy-subrc = 0 AND strlen( plugin_name ) > 0.
+            session_alv_line-session_type = plugin_name.
+          ELSE.
+            session_alv_line-session_type = text-039.
+          ENDIF.
+
+          set_stype = 1.
+
+        WHEN dp_logon_apc.
+          session_alv_line-session_type = text-086.
+          set_stype = 1.
+
+        WHEN OTHERS.
+* DTM
+          WRITE session_info-logon_type TO
+                session_alv_line-session_type LEFT-JUSTIFIED.
+* DTM
+      ENDCASE.
+
+      IF set_stype = 1.
+        CASE session_info-logon_sub_type.
+          WHEN dp_logon_sub_type_undef.
+          WHEN dp_logon_sync_rfc.        session_alv_line-ext_stype = text-063.
+          WHEN dp_logon_async_rfc.       session_alv_line-ext_stype = text-064.
+          WHEN dp_logon_rfc_ui.          session_alv_line-ext_stype = text-065.
+          WHEN dp_logon_http_normal.     session_alv_line-ext_stype = text-066.
+          WHEN dp_logon_http_ui.         session_alv_line-ext_stype = text-067.
+          WHEN dp_logon_http_its.        session_alv_line-ext_stype = text-088.
+          WHEN dp_logon_batch.           session_alv_line-ext_stype = text-068.
+          WHEN dp_logon_smtp.            session_alv_line-ext_stype = text-069.
+          WHEN dp_logon_bgrfc_scheduler. session_alv_line-ext_stype = text-083.
+          WHEN dp_logon_bgrfc_unit.      session_alv_line-ext_stype = text-084.
+          WHEN dp_logon_apc_normal.      session_alv_line-ext_stype = text-086.
+          WHEN dp_logon_apc_ui.          session_alv_line-ext_stype = text-087.
+          WHEN dp_logon_amc_streaming.   session_alv_line-ext_stype = text-089.
+          WHEN dp_logon_server_startup.  session_alv_line-ext_stype = text-090.
+        ENDCASE.
+      ENDIF.
+      session_alv_line-total_mem_kb = sum_memory / 1024.
+      session_alv_line-total_mem_heap_kb = sum_memory_heap / 1024.
+      session_alv_line-total_mem_abap_kb = sum_memory_abap / 1024.
+      session_alv_line-open_tasks = sum_open_tasks.
+
+      " The brutto value is already in kb
+      session_alv_line-total_mem_brutto_kb = sum_memory_brutto.
+
+      CALL FUNCTION 'TH_GET_SECURITY_CONTEXT_REF'
+        EXPORTING
+          tid                        = session_alv_line-logon_hdl
+        IMPORTING
+          security_context_reference = security_context_reference
+          is_set                     = is_sec_cont_ref_set
+        EXCEPTIONS
+          internal_error             = 1
+          OTHERS                     = 2.
+      IF is_sec_cont_ref_set = 'X'.
+        TRY.
+            CALL METHOD cl_http_security_session_admin=>get_displayname_for_contextref
+              EXPORTING
+                context_ref  = security_context_reference
+              RECEIVING
+                display_name = session_alv_line-security_context.
+          CATCH cx_http_security_session .
+        ENDTRY.
+      ENDIF.
+
+      CASE session_info-rfc_type.
+        WHEN dp_internal_rfc. session_alv_line-rfc_type_long = text-061.
+        WHEN dp_external_rfc. session_alv_line-rfc_type_long = text-062.
+      ENDCASE.
+
+      session_alv_line-rfc_hdl = session_info-rfc_hdl.
+      session_alv_line-websocket_handle = session_info-websocket_handle.
+
+      IF is_admin = ssitg_true.
+        session_alv_line-logon_privilege = text-073.
+      ENDIF.
+
+      " Translate priority into string
+      "
+      " As priorities are only relevant for "non system" sessions, we don't show priorities for
+      " system session.
+      IF session_info-logon_type <> dp_logon_internal.
+        CASE session_info-priority.
+          WHEN rq_q_prio_high. session_alv_line-priority = text-075.
+          WHEN rq_q_prio_normal. session_alv_line-priority = text-076.
+          WHEN rq_q_prio_low. session_alv_line-priority = text-077.
+        ENDCASE.
+      ELSE.
+        CLEAR session_alv_line-priority.
+      ENDIF.
+
+      APPEND session_alv_line TO session_alv_table.
+    ENDIF. " is_last_session
+  ENDLOOP.
+
+  " GET RUN TIME FIELD T2.
+  " t3 = t2 - t1.
+ENDFORM.                    "map_session_list
+
+" Read privilege info for gui reader from db.
+FORM get_privileges_info USING user_name TYPE ssi_user_name
+                               tenant TYPE ssi_tenant_id
+                    CHANGING is_admin TYPE ssi_bool.
+  CONSTANTS: has_tenant_priv TYPE x VALUE 6.
+  DATA: result TYPE abap_bool.
+
+  is_admin = ssitg_false.
+  CALL 'LOGIN_INFO' ID 'OPCODE' FIELD has_tenant_priv
+                    ID 'CLIENT' FIELD tenant
+                    ID 'USERID' FIELD user_name
+                    ID 'RESULT' FIELD result.
+  IF sy-subrc = 0 AND result = abap_true.
+    is_admin = ssitg_true.
+  ENDIF.
+ENDFORM.
+
+*
+* build alv field catalog for sm04
+*
+FORM build_fieldcat USING fieldcat TYPE slis_t_fieldcat_alv.
+  DATA: ls_fieldcat TYPE slis_fieldcat_alv.
+
+  REFRESH fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SESSION_KEY'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-082.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-rollname = 'SSI_SESSION_KEY'.
+  APPEND ls_fieldcat TO fieldcat.
+
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'LOGON_HDL'.
+*  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+*  ls_fieldcat-datatype = 'INT4'.
+*  ls_fieldcat-reptext_ddic = text-020.
+*  ls_fieldcat-no_out = 'X'.
+*  ls_fieldcat-outputlen = 10.
+*  ls_fieldcat-rollname = 'SSI_LOGON_HDL'.
+*  APPEND ls_fieldcat TO fieldcat.
+*
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'LOGON_ID'.
+*  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+*  ls_fieldcat-datatype = 'INT4'.
+*  ls_fieldcat-reptext_ddic = text-021.
+*  ls_fieldcat-no_out = 'X'.
+*  ls_fieldcat-outputlen = 10.
+*  ls_fieldcat-rollname = 'SSI_LOGON_ID'.
+*  APPEND ls_fieldcat TO fieldcat.
+*
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'SESSION_HDL'.
+*  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+*  ls_fieldcat-datatype = 'INT4'.
+*  ls_fieldcat-reptext_ddic = text-031.
+*  ls_fieldcat-no_out = 'X'.
+*  ls_fieldcat-outputlen = 10.
+*  ls_fieldcat-rollname = 'SSI_SESSION_HDL'.
+*  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TENANT'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  ls_fieldcat-key = 'X'.
+  " ls_fieldcat-reptext_ddic = text-001.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_TENANT_ID'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'USER_NAME'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  ls_fieldcat-key = 'X'.
+  " ls_fieldcat-reptext_ddic = text-002.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-rollname = 'SSI_USER_NAME'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'LOCATION_INFO'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-003.
+  ls_fieldcat-outputlen = 15.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_LOGON_LOCATION_INFO'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'APPLICATION'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-004.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-rollname = 'SSI_APPLICATION'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EXT_TIME'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-005.
+  ls_fieldcat-outputlen = 19.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'UDTIME'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SESSION_TYPE'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-033.
+  ls_fieldcat-outputlen = 15.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_SESSION_TYPE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EXT_STYPE'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_LOGON_SUB_TYPE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  IF show_all_session = 0.
+    CLEAR ls_fieldcat.
+    ls_fieldcat-fieldname = 'SESSIONS'.
+    ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+    " ls_fieldcat-reptext_ddic = text-006.
+    ls_fieldcat-outputlen = 5.
+    ls_fieldcat-lowercase = 'X'.
+    ls_fieldcat-rollname = 'SSI_SESSIONS'.
+    APPEND ls_fieldcat TO fieldcat.
+  ENDIF.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'PRIORITY'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-012.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_PRIORITY'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EXT_TRACE'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-026.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'UEXT_TRACE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_MEM_KB'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-051.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_MEMSIZE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_MEM_BRUTTO_KB'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-078.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_MEMSIZE_BRUTTO'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_MEM_HEAP_KB'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-080.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_MEMSIZE_HEAP'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_MEM_HYPER_KB'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-081.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_MEMSIZE_HYPER'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_MEM_ABAP_KB'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-079.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_MEMSIZE_ABAP'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RFC_HDL'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_RFC_HDL'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RFC_TYPE_LONG'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-041.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'URFC_TYPE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'APPL_INFO'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-057.
+  IF with_appl_info = 0.
+    ls_fieldcat-no_out = 'X'.
+  ENDIF.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_APPLICATION_INFO'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ACT_PROGRAM'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-085.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-rollname = 'SSI_MAIN_PROGRAM'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SECURITY_CONTEXT'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-059.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SECURITY_CONTEXT_REF'.
+  " ls_fieldcat-ref_tabname = 'RSM04000_TYPES'.
+  " ls_fieldcat-ref_fieldname = 'SECURITY_CONTEXT'.
+  APPEND ls_fieldcat TO fieldcat.
+
+
+
+*  " *** Note: This NGAP feature not implemented in CGAP ***
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'LOGON_PRIVILEGE'.
+*  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+*  ls_fieldcat-reptext_ddic = text-074.
+*  ls_fieldcat-no_out = 'X'.
+*  ls_fieldcat-outputlen = 20.
+*  ls_fieldcat-lowercase = 'X'.
+*  " when implemented, please set rollname to the data element
+*  ls_fieldcat-ref_tabname = 'RSM04000_TYPES'.
+*  ls_fieldcat-ref_fieldname = 'LOGON_PRIVILEGE'.
+*  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'OPEN_TASKS'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_OPEN_TASKS'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'WEBSOCKET_HANDLE'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_WEBSOCKET_HANDLE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  " Note / TODO:
+  " Check whether there are are remaining components in the
+  " structures/tables 'STSK_DOCU', 'RSM04000_TYPES'.
+  " They should be no longer used for documentation purposes
+  " by this report, because it is more concise to refer to
+  " data elements directly.
+
+ENDFORM.                    "build_fieldcat
+
+*
+* build alv layout for sm04
+*
+FORM build_layout USING layout TYPE slis_layout_alv.
+  layout-info_fieldname = 'LINE_COL'.
+  layout-box_fieldname = 'SELECTED'.
+  layout-f2code = 'PMOD'.
+  layout-allow_switch_to_list = 'X'.
+ENDFORM.                    "build_layout
+
+*
+* build alv event for server list
+*
+FORM build_event USING c_event TYPE slis_t_event.
+  DATA: ls_event TYPE slis_alv_event.
+  CLEAR ls_event.
+
+  ls_event-name = 'END_OF_LIST'.
+  ls_event-form = 'SM04_IST_END'.
+  APPEND ls_event TO c_event.
+ENDFORM.                    "build_event
+
+*
+* build alv event for server list
+*
+FORM build_sw_session_event USING c_event TYPE slis_t_event.
+  DATA: ls_event TYPE slis_alv_event.
+  CLEAR ls_event.
+
+  ls_event-name = 'END_OF_LIST'.
+  ls_event-form = 'SW_SESSION_END'.
+  APPEND ls_event TO c_event.
+ENDFORM.                    "build_event
+
+
+*
+* set alv status for sm04
+*
+FORM sm04_set_status USING rt_extab TYPE slis_t_extab.
+  IF seskey IS NOT INITIAL.
+    SET TITLEBAR '015' WITH seskey myname.
+  ELSEIF show_all_session = 0.
+    SET TITLEBAR '000' WITH myname.
+  ELSE.
+    SET TITLEBAR '017' WITH myname.
+  ENDIF.
+* Start of ALV Migration changes - C5056145
+  SET PF-STATUS 'STANDARD' EXCLUDING rt_extab.
+* End of ALV Migration changes - C5056145
+ENDFORM.                    "sm04_set_status
+
+*
+* Anzahl Logons ausgeben
+*
+FORM sm04_ist_end.
+  DATA: sum_logons       TYPE i VALUE 0,
+        sum_sessions     TYPE i VALUE 0,
+        nolines          TYPE i,
+        last_line(80),
+        no_logons(10),
+        no_sessions(10),
+        session_alv_line TYPE t_session_alv_line.
+
+  DESCRIBE TABLE session_alv_table LINES nolines.
+
+  IF nolines > 0.
+    LOOP AT session_alv_table INTO session_alv_line.
+      sum_logons = sum_logons + 1.
+      sum_sessions = sum_sessions + session_alv_line-sessions.
+    ENDLOOP.
+    IF show_all_session = 0.
+      last_line = text-022.
+      no_logons = sum_logons.
+      no_sessions = sum_sessions.
+      REPLACE '&' WITH no_logons INTO last_line.
+      REPLACE '&' WITH no_sessions INTO last_line.
+    ELSE.
+      last_line = text-032.
+      no_sessions = sum_logons.
+      REPLACE '&' WITH no_sessions INTO last_line.
+    ENDIF.
+
+    CONDENSE last_line.
+* Start of ALV Migration changes - C5056145
+*    write: /  last_line.
+* for end of list...
+    PERFORM create_footer USING last_line.
+* End of ALV Migration changes - C5056145
+  ENDIF.
+ENDFORM.                    "sm04_ist_end
+
+*
+* Anzahl Logons ausgeben
+*
+FORM sw_session_end.
+  DATA: sum_logons       TYPE i VALUE 0,
+        sum_sessions     TYPE i VALUE 0,
+        nolines          TYPE i,
+        last_line(80),
+        no_logons(10),
+        no_sessions(10),
+        session_alv_line TYPE t_session_alv_line.
+
+  DESCRIBE TABLE sw_session_tabl_alv LINES nolines.
+
+  IF nolines > 0.
+    LOOP AT sw_session_tabl_alv INTO session_alv_line.
+      sum_logons = sum_logons + 1.
+      sum_sessions = sum_sessions + session_alv_line-sessions.
+    ENDLOOP.
+    IF show_all_session = 0.
+      last_line = text-022.
+      no_logons = sum_logons.
+      no_sessions = sum_sessions.
+      REPLACE '&' WITH no_logons INTO last_line.
+      REPLACE '&' WITH no_sessions INTO last_line.
+    ELSE.
+      last_line = text-032.
+      no_sessions = sum_logons.
+      REPLACE '&' WITH no_sessions INTO last_line.
+    ENDIF.
+    CONDENSE last_line.
+* Start of ALV Migration changes - C5056145
+*    write: /  last_line.
+* for end of list...
+    PERFORM create_footer USING last_line.
+* End of ALV Migration changes - C5056145
+  ENDIF.
+ENDFORM.                    "sw_session_end
+*
+* handle user commands of sm04
+*
+FORM sm04_user_cmd USING r_ucomm LIKE sy-ucomm
+                         rs_selfield TYPE slis_selfield.
+  DATA: act_index        LIKE sy-tabix,
+        refresh          LIKE th_bool,
+        fieldname        LIKE rs_selfield-fieldname,
+        count            TYPE i,
+        session_alv_line TYPE t_session_alv_line.
+
+  refresh = th_true.
+  act_index = rs_selfield-tabindex.
+  CLEAR session_alv_line.
+  CLEAR session_alv_line-logon_hdl.
+
+  IF act_index > 0.
+    READ TABLE session_alv_table INDEX rs_selfield-tabindex ASSIGNING <current_session>.
+    session_alv_line = <current_session>.
+    session_alv_line-selected = 'X'.
+  ELSE.
+    UNASSIGN <current_session>.
+  ENDIF.
+
+  CASE r_ucomm.
+* DTM
+    WHEN 'PMOD'.
+      PERFORM session_list USING session_alv_line-selected
+                                session_alv_line-tenant
+                                session_alv_line-user_name
+                                session_alv_line-logon_hdl
+                                session_alv_line-logon_id.
+* DTM
+    WHEN 'USER'.
+      PERFORM user_info USING session_alv_line-selected
+                              session_alv_line-tenant
+                              session_alv_line-user_name.
+
+    WHEN 'UDELLN'.
+      PERFORM call_delete_user USING th_false.
+
+*    WHEN 'UDELLP'.
+*      PERFORM reset_session_pool USING selected th_false.
+
+    WHEN 'UDELGN'.
+      PERFORM call_delete_user USING th_true.
+
+*    WHEN 'UDELGP'.
+*      PERFORM reset_session_pool USING selected th_true.
+
+    WHEN 'TRON'.
+      PERFORM switch_user_trace USING 2.
+
+    WHEN 'TROND'.
+      PERFORM switch_user_trace USING 3.
+
+    WHEN 'TROF'.
+      PERFORM switch_user_trace USING 0.
+
+    WHEN 'TRDI'.
+      PERFORM show_user_trace USING session_alv_line.
+
+    WHEN 'TRRSALL'.
+      PERFORM wp_reset_trace IN PROGRAM (sm50_report) USING th_true.
+
+    WHEN 'TRRSWP'.
+      PERFORM wp_reset_trace IN PROGRAM (sm50_report) USING th_false.
+
+    WHEN 'GUSR'.
+      PERFORM systemwide_user_list.
+
+      " TODO: remove this user command (already removed from ui)
+    WHEN 'BLKL'.
+      REFRESH selected_usr_gen.
+      LOOP AT session_alv_table INTO session_alv_line.
+        IF session_alv_line-selected = 'X'.
+          selected_usr_gen-tid = session_alv_line-logon_hdl.
+          APPEND selected_usr_gen.
+        ENDIF.
+      ENDLOOP.
+      PERFORM show_memory.
+
+    WHEN 'MBLOCK'.
+      IF block_status = 1.
+        PERFORM mark_usr_tabl_block USING act_index block_opened_index.
+        refresh = th_false.
+      ELSE.
+        block_status = 2.
+        block_opened_index = act_index.
+        refresh = th_false.
+      ENDIF.
+
+    WHEN 'DINFO'.
+      REFRESH selected_usr_tec.
+      LOOP AT session_alv_table INTO session_alv_line.
+        IF session_alv_line-selected = 'X'.
+          selected_usr_tec-tid = session_alv_line-logon_hdl.
+          selected_usr_tec-uid = session_alv_line-logon_id.
+          APPEND selected_usr_tec.
+        ENDIF.
+      ENDLOOP.
+      PERFORM show_detailed_usr_infos USING session_alv_line-selected.
+
+    WHEN 'HELP'.
+
+* if column header selected, rs_selfield-value contains the field name.
+      CLEAR fieldname.
+      CONDENSE rs_selfield-value.
+      CASE rs_selfield-value.
+        WHEN text-001. fieldname = 'MANDT'.
+        WHEN text-002. fieldname = 'BNAME'.
+        WHEN text-003. fieldname = 'TERM'.
+        WHEN text-004. fieldname = 'TCODE'.
+        WHEN text-005. fieldname = 'EXT_TIME'.
+        WHEN text-006. fieldname = 'SESSIONS'.
+        WHEN text-007. fieldname = 'EXTMODE'.
+        WHEN text-020. fieldname = 'TID'.
+        WHEN text-026. fieldname = 'EXT_TRACE'.
+        WHEN text-029. fieldname = 'PROTOCOL'.
+        WHEN text-030. fieldname = 'GUIVERSION'.
+        WHEN text-033. fieldname = 'SESSION_TYPE'.
+        WHEN text-034. fieldname = 'EXT_STATE'.
+        WHEN text-041. fieldname = 'RFC_TYPE'.
+        WHEN text-048. fieldname = 'IPADDR'.
+        WHEN text-051. fieldname = 'TOTAL_MEM_KB'.
+      ENDCASE.
+
+* if data selected, rs_selfield-fieldname contains the field name.
+      IF fieldname = space.
+        fieldname = rs_selfield-fieldname.
+      ENDIF.
+
+      PERFORM show_help_info USING fieldname rs_selfield.
+
+    WHEN 'LOGONS'.
+      show_all_session = 0.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'SESSIONS'.
+      show_all_session = 1.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'WITH_APPL'.
+      with_appl_info = 1.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'NO_APPL'.
+      with_appl_info = 0.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'WITH_PRIV'.
+      show_logon_privileges = 1.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'NO_PRIV'.
+      show_logon_privileges = 0.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'INFO'.
+      CALL FUNCTION 'IWB_HTML_HELP_OBJECT_SHOW'
+        EXPORTING
+          tcode  = 'SM04'
+        EXCEPTIONS
+          OTHERS = 0.
+
+  ENDCASE.
+
+  IF block_status > 0.
+    block_status = block_status - 1.
+  ENDIF.
+
+  IF refresh = th_true.
+
+* EL 18Nov2005 - clear set of selected users
+    REFRESH selected_usr_gen.
+
+    PERFORM build_list.
+  ENDIF.
+  rs_selfield-refresh = 'X'.
+  rs_selfield-col_stable = 'X'.
+  rs_selfield-row_stable = 'X'.
+
+ENDFORM.                    "sm04_user_cmd
+
+" Persist user specific SM04 configuration
+FORM set_sm04_configuration.
+  CLEAR sm04_configuration.
+  IF with_appl_info = 1.
+    sm04_configuration = 'X'.
+  ENDIF.
+  IF show_all_session = 1.
+    sm04_configuration+1 = 'X'.
+  ENDIF.
+  IF show_logon_privileges = 1.
+    sm04_configuration+2 = 'X'.
+  ENDIF.
+  SET PARAMETER ID 'SM04_CONFIGURATION' FIELD sm04_configuration.
+  UPDATE usr05 SET parva = sm04_configuration
+    WHERE bname = sy-uname AND
+          parid = 'SM04_CONFIGURATION'.
+  IF sy-subrc = 4.
+    usr05-mandt = sy-mandt.
+    usr05-bname = sy-uname.
+    usr05-parid = 'SM04_CONFIGURATION'.
+    usr05-parva = sm04_configuration.
+    INSERT INTO usr05 VALUES usr05.
+  ENDIF.
+  COMMIT WORK.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  session_list
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->SELECTED   text
+*      -->MANDT      text
+*      -->BNAME      text
+*      -->TID        text
+*----------------------------------------------------------------------*
+FORM session_list USING selected TYPE t_session_alv_line-selected
+                       mandt TYPE t_session_alv_line-tenant
+                       bname TYPE t_session_alv_line-user_name
+                       tid   TYPE t_session_alv_line-logon_hdl
+                       logon_id  TYPE i.
+
+  DATA: str_tid(10),
+        str_logon_id(10),
+        modes LIKE sy-index.
+
+  IF selected <> 'X'.
+    MESSAGE s101.
+    EXIT.
+  ENDIF.
+
+  AUTHORITY-CHECK OBJECT 'S_ADMI_FCD'
+    ID 'S_ADMI_FCD' FIELD 'PADM'.
+  IF sy-subrc NE 0.
+    MESSAGE s104.
+    EXIT.
+  ENDIF.
+
+  WRITE tid TO str_tid LEFT-JUSTIFIED NO-GROUPING.
+  SET PARAMETER ID 'TID' FIELD str_tid.
+  WRITE logon_id TO str_logon_id LEFT-JUSTIFIED NO-GROUPING.
+  SET PARAMETER ID 'LOGON_ID' FIELD str_logon_id.
+
+  CALL 'ThUsrInfo' ID 'OPCODE' FIELD opcode_mode_count
+    ID 'TID' FIELD tid
+    ID 'MODES' FIELD modes.
+  IF sy-subrc <> 0.
+    MESSAGE s106.
+    EXIT.
+  ENDIF.
+
+  IF modes = 0.
+    MESSAGE s106.
+    EXIT.
+  ENDIF.
+
+  modes = modes + 7.
+  CALL SCREEN 2000 STARTING AT 4 4 ENDING AT 62 modes.
+
+ENDFORM.                    "session_list
+
+*
+* call user info function module
+*
+FORM user_info USING selected TYPE t_session_alv_line-selected
+                     mandt TYPE t_session_alv_line-tenant
+                     bname TYPE t_session_alv_line-user_name.
+  IF selected <> 'X'.
+    MESSAGE s101.
+    EXIT.
+  ENDIF.
+
+  CALL FUNCTION 'SUSR_SHOW_USER_DETAILS'
+    EXPORTING
+      mandt = mandt
+      bname = bname.
+ENDFORM.                    "user_info
+
+* el 5Aug2010 - show user info in system wide session info
+FORM sw_user_info USING selected_session_info TYPE t_session_alv_line.
+  CALL FUNCTION 'SUSR_SHOW_USER_DETAILS'
+    EXPORTING
+      mandt = selected_session_info-tenant
+      bname = selected_session_info-user_name.
+ENDFORM.                    "user_info
+
+*
+* delete selected user
+*
+FORM call_delete_user USING global LIKE th_bool.
+  DATA: count            TYPE i,
+        session_alv_line TYPE t_session_alv_line.
+
+  AUTHORITY-CHECK OBJECT 'S_ADMI_FCD'
+    ID 'S_ADMI_FCD' FIELD 'PADM'.
+  IF sy-subrc NE 0.
+    MESSAGE s432.
+    EXIT.
+  ENDIF.
+
+  count = 0.
+  LOOP AT session_alv_table INTO session_alv_line.
+    IF session_alv_line-selected = 'X'.
+      count = count + 1.
+      PERFORM delete_user USING session_alv_line-tenant
+                                session_alv_line-user_name
+                                session_alv_line-logon_hdl
+                                session_alv_line-logon_id
+                                global.
+    ENDIF.
+  ENDLOOP.
+
+  IF count = 0.
+    MESSAGE s101.
+  ENDIF.
+
+ENDFORM.                    "call_delete_user
+
+*
+* reset session pool
+*
+*FORM reset_session_pool USING selected type t_session_alv_line-selected
+*                              global LIKE th_bool.
+*
+*  AUTHORITY-CHECK OBJECT 'S_ADMI_FCD'
+*    ID 'S_ADMI_FCD' FIELD 'PADM'.
+*  IF sy-subrc NE 0.
+*    MESSAGE s432.
+*    EXIT.
+*  ENDIF.
+*
+*  IF selected <> 'X'.
+*    MESSAGE s101.
+*    EXIT.
+*  ENDIF.
+*
+*  IF global = th_false.
+*    LOOP AT session_alv_table.
+*      IF session_alv_table-stat = usr_stat_pooled.
+*        PERFORM delete_user USING '*'
+*                                  '*'
+*                                  session_alv_table-tid
+*                                  session_alv_table-stat
+*                                  th_true
+*                                  th_false.
+*      ENDIF.
+*    ENDLOOP.
+*  ELSE.
+*    PERFORM delete_user USING '*'
+*                              '*'
+*                              session_alv_table-tid
+*                              session_alv_table-stat
+*                              th_true
+*                              th_true.
+*
+*  ENDIF.
+*
+*ENDFORM.                    "reset_session_pool
+
+*&---------------------------------------------------------------------*
+*&      Form  delete_user
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->CLIENT     text
+*      -->USER       text
+*      -->TID        text
+*      -->STAT       text
+*      -->POOLED     text
+*      -->GLOBAL     text
+*----------------------------------------------------------------------*
+FORM delete_user USING client    TYPE t_session_alv_line-tenant
+                       user      TYPE t_session_alv_line-user_name
+                       logon_hdl TYPE t_session_alv_line-logon_hdl
+                       logon_id  TYPE t_session_alv_line-logon_id
+                       global    LIKE th_bool.
+
+  DATA: myname    LIKE msxxlist-name,
+        no_server TYPE i,
+        prozent   TYPE i,
+        msg(512).
+  DATA : BEGIN OF srvlist OCCURS 0.
+           INCLUDE STRUCTURE msxxlist.
+         DATA:  END OF srvlist.
+  DATA: answer(1)     TYPE c,
+        question(128) TYPE c.
+
+
+  question = text-056.
+  REPLACE SUBSTRING '&' IN question WITH user.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar      = text-055
+      text_question = question
+    IMPORTING
+      answer        = answer
+    EXCEPTIONS
+      OTHERS        = 0.
+
+  IF answer <> 'X' AND answer <> '1' .
+    EXIT.
+  ENDIF.
+
+* nur lokale Benutzer loeschen ==> tid mitgeben
+  IF global = th_false.
+    IF logon_hdl <> -1.
+      CALL FUNCTION 'TH_DELETE_USER'
+        EXPORTING
+          client           = client
+          user             = user
+          tid              = logon_hdl
+          logon_id         = logon_id
+          only_pooled_user = ' '
+        EXCEPTIONS
+          OTHERS           = 1.
+    ENDIF.
+    EXIT.
+  ENDIF.
+
+* systemweite Benutzer loeschen
+  myname = cl_abap_syst=>get_instance_name( ).
+
+  IF global = th_true.
+    CALL FUNCTION 'TH_SERVER_LIST'
+      TABLES
+        list           = srvlist
+      EXCEPTIONS
+        no_server_list = 1
+        OTHERS         = 2.
+
+    IF sy-subrc = 0.
+      DESCRIBE TABLE srvlist LINES no_server.
+    ELSE.
+*  KEINE SERVER-LISTE ERHALTEN
+      MESSAGE e117.
+    ENDIF.
+  ENDIF.
+
+  LOOP AT srvlist.
+    CLEAR semaphore.
+
+
+    msg = text-040.
+    REPLACE '&' WITH srvlist-name        INTO msg.
+    msg+400 = '...'.
+    CONDENSE msg.
+    prozent = sy-index * 100 / no_server.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = prozent
+        text       = msg.
+
+    IF srvlist-name = myname.
+      CALL FUNCTION 'TH_DELETE_USER'
+        EXPORTING
+          client           = client
+          user             = user
+          only_pooled_user = ' '.
+    ELSE.
+      task_name = task_name + 1.
+      CALL FUNCTION 'TH_DELETE_USER' DESTINATION srvlist-name
+        STARTING NEW TASK task_name
+        PERFORMING receive_results ON END OF TASK
+        EXPORTING
+          client           = client
+          user             = user
+          only_pooled_user = ' '
+                             EXCEPTIONS
+                             communication_failure
+                             comm_message
+                             system_failure.
+
+      WAIT UNTIL semaphore = 'X' UP TO '10' SECONDS.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    "delete_user
+
+*&---------------------------------------------------------------------*
+*&      Form  receive_results
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->TASK_NAME  text
+*----------------------------------------------------------------------*
+FORM receive_results USING task_name.
+  RECEIVE RESULTS FROM FUNCTION 'TH_DELETE_USER'
+    EXCEPTIONS      communication_failure
+                    system_failure.
+
+  semaphore = 'X'.
+ENDFORM.                    "receive_results
+
+*
+* handle user trace
+*
+FORM switch_user_trace USING trace_level TYPE i.
+  DATA: immediately      TYPE x,
+        count            TYPE i,
+        session_alv_line TYPE t_session_alv_line.
+
+  AUTHORITY-CHECK OBJECT 'S_ADMI_FCD'
+    ID 'S_ADMI_FCD' FIELD 'PADM'.
+  IF sy-subrc NE 0.
+    MESSAGE s432.
+    EXIT.
+  ENDIF.
+
+  immediately = 1.
+  count = 0.
+  LOOP AT session_alv_table INTO session_alv_line.
+    IF session_alv_line-selected = 'X'.
+      count = count + 1.
+      IF trace_level > 0.
+        CALL FUNCTION 'TH_ACTIVATE_USER_TRACE'
+          EXPORTING
+            tid             = session_alv_line-logon_hdl
+            immediately     = immediately
+            level           = trace_level
+          EXCEPTIONS
+            authority_error = 1
+            OTHERS          = 2.
+
+        IF sy-subrc = 1.
+          MESSAGE s432.
+          EXIT.
+        ELSEIF sy-subrc = 2.
+          MESSAGE s107.
+        ENDIF.
+      ELSE.
+        CALL FUNCTION 'TH_DEACTIVATE_USER_TRACE'
+          EXPORTING
+            tid             = session_alv_line-logon_hdl
+            immediately     = immediately
+          EXCEPTIONS
+            authority_error = 1
+            OTHERS          = 2.
+        IF sy-subrc = 1.
+          MESSAGE s432.
+          EXIT.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  IF count = 0.
+    MESSAGE s101.
+  ENDIF.
+ENDFORM.                    "switch_user_trace
+
+*&---------------------------------------------------------------------*
+*&      Form  show_user_trace
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->SELECTED   text
+*----------------------------------------------------------------------*
+FORM show_user_trace USING session_alv_line TYPE t_session_alv_line.
+  AUTHORITY-CHECK OBJECT 'S_ADMI_FCD'
+    ID 'S_ADMI_FCD' FIELD 'PADM'.
+  IF sy-subrc NE 0.
+    MESSAGE s104.
+    EXIT.
+  ENDIF.
+
+  IF session_alv_line-selected = ' '.
+    MESSAGE s101.
+    EXIT.
+  ENDIF.
+
+  usertrace-user = session_alv_line-user_name.
+
+  CALL FUNCTION 'STRC_SELECT_USER_TRACE'
+    EXPORTING
+      user             = usertrace-user
+      rfc_hdl          = session_alv_line-rfc_hdl
+      websocket_handle = session_alv_line-websocket_handle
+      displaymask      = 'All'
+    EXCEPTIONS
+      OTHERS           = 3.
+  IF sy-subrc NE 0.
+    MESSAGE ID sy-msgid TYPE 'I' NUMBER sy-msgno WITH sy-msgv1.
+  ENDIF.
+ENDFORM.                    "show_user_trace
+
+*
+* show terminal list
+*
+FORM systemwide_user_list.
+  PERFORM build_sw_session_list.
+  PERFORM build_sw_session_fieldcat USING sw_session_fieldcat[].
+  PERFORM build_sw_session_layout USING sw_session_layout.
+  PERFORM build_sw_session_event  USING sw_session_events[].
+
+  is_variant-handle = 'TERM'.
+* Start of ALV Migration changes - C5056145
+*call function 'REUSE_ALV_LIST_DISPLAY'
+* End of ALV Migration changes - C5056145
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_structure_name         = 'SW_SESSION_TABL_ALV'
+      i_callback_program       = sy-repid
+      i_callback_pf_status_set = 'SM04_SW_SESSION_SET_STATUS'
+      i_callback_user_command  = 'SM04_SW_SESSION_USER_CMD'
+      i_save                   = 'A'
+      it_fieldcat              = sw_session_fieldcat[]
+      it_events                = sw_session_events[]
+      is_layout                = sw_session_layout
+      is_variant               = is_variant
+    TABLES
+      t_outtab                 = sw_session_tabl_alv.
+ENDFORM.                    "systemwide_user_list
+
+* el 5Aug2010 - system wide session list
+*
+* This list is a collection of all session lists of all servers of the
+* system.
+FORM build_sw_session_list.
+  DATA: server_list         TYPE ssi_server_list,
+        server_info_line    TYPE ssi_server_info,
+        server_info         TYPE REF TO cl_server_info,
+        server_session_list TYPE ssi_session_list,
+        session_list        TYPE ssi_session_list,
+        session_info        TYPE ssi_session_info,
+        msg(80).
+
+* Get session list of all servers and collect them in session_list.
+  server_list = cl_system_info=>get_server_list( only_active_server = 0 ).
+  LOOP AT server_list INTO server_info_line.
+
+    " skip server in strange states
+    IF server_info_line-server_name <> myname AND
+       server_info_line-state <> if_server_states=>running.
+      CONTINUE.
+    ENDIF.
+
+    " TODO should we still display the communication
+    "msg = text-072.
+    "REPLACE '&' IN msg WITH server_info_line-server_name.
+    "CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    "    EXPORTING
+    "      text   = msg
+    "    EXCEPTIONS
+    "      OTHERS = 0.
+
+    TRY.
+        server_info = cl_system_info=>get_server_info( server_name = server_info_line-server_name ).
+
+        IF is_system_client = 'X'.
+          server_session_list =
+              server_info->get_session_list( with_application_info = with_appl_info ).
+        ELSE.
+          server_session_list =
+              server_info->get_session_list( with_application_info = with_appl_info
+                                             tenant = sy-mandt ).
+        ENDIF.
+      CATCH cx_ssi_no_auth.
+        MESSAGE e150 WITH text-100.
+        "MESSAGE ID 14 TYPE 'E' NUMBER 150 WITH text-100.
+    ENDTRY.
+    LOOP AT server_session_list INTO session_info.
+      APPEND session_info TO session_list.
+    ENDLOOP.
+  ENDLOOP.
+
+*   data: session_list type ssi_session_list.
+*
+*   session_list = cl_system_info=>get_session_list( ).
+  PERFORM map_session_list USING session_list
+                           CHANGING sw_session_tabl_alv.
+ENDFORM.                    "build_sw_session_list
+
+* el 5Aug2010: fieldcat for the system wide session list
+*
+* Note: fieldcat is identical to the server wide session list
+FORM build_sw_session_fieldcat USING fieldcat TYPE slis_t_fieldcat_alv.
+  DATA: ls_fieldcat TYPE slis_fieldcat_alv.
+
+  REFRESH fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SERVER_NAME'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  ls_fieldcat-key = 'X'.
+  " ls_fieldcat-reptext_ddic = text-019.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-rollname = 'SSI_SERVERNAME_DISP'.
+  ls_fieldcat-lowercase = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SESSION_KEY'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-082.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-rollname = 'SSI_SESSION_KEY'.
+  APPEND ls_fieldcat TO fieldcat.
+
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'LOGON_HDL'.
+*  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+*  ls_fieldcat-datatype = 'INT4'.
+*  ls_fieldcat-reptext_ddic = text-020.
+*  ls_fieldcat-no_out = 'X'.
+*  ls_fieldcat-outputlen = 10.
+*  ls_fieldcat-rollname = 'SSI_LOGON_HDL'.
+*  APPEND ls_fieldcat TO fieldcat.
+*
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'LOGON_ID'.
+*  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+*  ls_fieldcat-datatype = 'INT4'.
+*  ls_fieldcat-reptext_ddic = text-021.
+*  ls_fieldcat-no_out = 'X'.
+*  ls_fieldcat-outputlen = 10.
+*  ls_fieldcat-rollname = 'SSI_LOGON_ID'.
+*  APPEND ls_fieldcat TO fieldcat.
+*
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'SESSION_HDL'.
+*  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+*  ls_fieldcat-datatype = 'INT4'.
+*  ls_fieldcat-reptext_ddic = text-031.
+*  ls_fieldcat-no_out = 'X'.
+*  ls_fieldcat-outputlen = 10.
+*  ls_fieldcat-rollname = 'SSI_SESSION_HDL'.
+*  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TENANT'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  ls_fieldcat-key = 'X'.
+  " ls_fieldcat-reptext_ddic = text-001.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_TENANT_ID'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'USER_NAME'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  ls_fieldcat-key = 'X'.
+  " ls_fieldcat-reptext_ddic = text-002.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-rollname = 'SSI_USER_NAME'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'LOCATION_INFO'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-003.
+  ls_fieldcat-outputlen = 15.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_LOGON_LOCATION_INFO'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'APPLICATION'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-004.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-rollname = 'SSI_APPLICATION'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ACT_PROGRAM'.
+  ls_fieldcat-tabname = 'SESSION_ALV_TABLE'.
+  " ls_fieldcat-reptext_ddic = text-085.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-rollname = 'SSI_MAIN_PROGRAM'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EXT_TIME'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-005.
+  ls_fieldcat-outputlen = 19.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'UDTIME'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  IF show_all_session = 0.
+    CLEAR ls_fieldcat.
+    ls_fieldcat-fieldname = 'SESSIONS'.
+    ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+    " ls_fieldcat-reptext_ddic = text-006.
+    ls_fieldcat-outputlen = 5.
+    ls_fieldcat-lowercase = 'X'.
+    ls_fieldcat-rollname = 'SSI_SESSIONS'.
+    APPEND ls_fieldcat TO fieldcat.
+  ENDIF.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'PRIORITY'.
+  ls_fieldcat-tabname = 'sw_session_alv_table'.
+  " ls_fieldcat-reptext_ddic = text-012.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_PRIORITY'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SESSION_TYPE'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-033.
+  ls_fieldcat-outputlen = 15.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_SESSION_TYPE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EXT_TRACE'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-026.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'UEXT_TRACE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_MEM_KB'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-051.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_MEMSIZE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_MEM_BRUTTO_KB'.
+  ls_fieldcat-tabname = 'sw_session_alv_table'.
+  " ls_fieldcat-reptext_ddic = text-078.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_MEMSIZE_BRUTTO'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_MEM_HEAP_KB'.
+  ls_fieldcat-tabname = 'sw_session_alv_table'.
+  " ls_fieldcat-reptext_ddic = text-080.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_MEMSIZE_HEAP'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_MEM_HYPER_KB'.
+  ls_fieldcat-tabname = 'sw_session_alv_table'.
+  " ls_fieldcat-reptext_ddic = text-081.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_MEMSIZE_HYPER'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_MEM_ABAP_KB'.
+  ls_fieldcat-tabname = 'sw_session_alv_table'.
+  " ls_fieldcat-reptext_ddic = text-079.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_MEMSIZE_ABAP'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RFC_HDL'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_RFC_HDL'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RFC_TYPE_LONG'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-041.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'URFC_TYPE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'APPL_INFO'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-057.
+  IF with_appl_info = 0.
+    ls_fieldcat-no_out = 'X'.
+  ENDIF.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_APPLICATION_INFO'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SECURITY_CONTEXT'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-059.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SECURITY_CONTEXT_REF'.
+  " ls_fieldcat-ref_tabname = 'RSM04000_TYPES'.
+  " ls_fieldcat-ref_fieldname = 'SECURITY_CONTEXT'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EXT_STYPE'.
+  ls_fieldcat-tabname = 'SW_SESSION_TABL_ALV'.
+  " ls_fieldcat-reptext_ddic = text-070.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-lowercase = 'X'.
+  ls_fieldcat-rollname = 'SSI_LOGON_SUB_TYPE'.
+  APPEND ls_fieldcat TO fieldcat.
+
+*  " *** Note: This NGAP feature not implemented in CGAP ***
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'LOGON_PRIVILEGE'.
+*  ls_fieldcat-tabname = 'sw_session_alv_table'.
+*  ls_fieldcat-reptext_ddic = text-074.
+*  ls_fieldcat-no_out = 'X'.
+*  ls_fieldcat-outputlen = 20.
+*  ls_fieldcat-lowercase = 'X'.
+*  " when implemented, please set rollname to the data element
+*  ls_fieldcat-ref_tabname = 'RSM04000_TYPES'.
+*  ls_fieldcat-ref_fieldname = 'LOGON_PRIVILEGE'.
+*  APPEND ls_fieldcat TO fieldcat.
+
+  " Note / TODO:
+  " Check whether there are are remaining components in the
+  " structures/tables 'STSK_DOCU', 'RSM04000_TYPES'.
+  " They should be no longer used for documentation purposes
+  " by this report, because it is more concise to refer to
+  " data elements directly.
+
+ENDFORM.                    "build_sw_session_fieldcat
+
+*
+* build alv layout for terminal list
+*
+FORM build_sw_session_layout USING layout TYPE slis_layout_alv.
+  layout-box_fieldname = 'SELECTED'.
+  layout-f2code = 'REMS'.
+  layout-allow_switch_to_list = 'X'.
+ENDFORM.                    "build_sw_session_layout
+
+*
+* set alv status for terminal list
+*
+FORM sm04_sw_session_set_status USING rt_extab TYPE slis_t_extab.
+  IF show_all_session = 0.
+    SET TITLEBAR '008' WITH mysystem.
+  ELSE.
+    SET TITLEBAR '014' WITH mysystem.
+  ENDIF.
+  SET PF-STATUS 'GUSRL' EXCLUDING rt_extab.
+ENDFORM.                    "SM04_SW_SESSION_SET_STATUS
+
+*
+* handle user commands of terminal list
+*
+FORM sm04_sw_session_user_cmd USING r_ucomm LIKE sy-ucomm
+                         rs_selfield TYPE slis_selfield.
+  DATA: act_index        LIKE sy-tabix,
+        refresh          LIKE th_bool,
+        server           LIKE msxxlist-name,
+        fieldname        LIKE rs_selfield-fieldname,
+        session_alv_line TYPE t_session_alv_line.
+
+  refresh = th_true.
+  act_index = rs_selfield-tabindex.
+  CLEAR session_alv_line.
+
+  IF act_index > 0.
+    READ TABLE sw_session_tabl_alv INDEX rs_selfield-tabindex INTO
+      session_alv_line.
+  ENDIF.
+
+  CASE r_ucomm.
+    WHEN 'USER'.
+      PERFORM sw_user_info USING session_alv_line.
+
+    WHEN 'REMS'.
+      PERFORM remote_transaction USING session_alv_line.
+
+    WHEN 'HELP'.
+* if column header selected, rs_selfield-value contains the field name.
+      CLEAR fieldname.
+      CONDENSE rs_selfield-value.
+      CASE rs_selfield-value.
+        WHEN text-001. fieldname = 'MANDT'.
+        WHEN text-002. fieldname = 'BNAME'.
+        WHEN text-003. fieldname = 'TERM'.
+        WHEN text-019. fieldname = 'SERVER'.
+        WHEN text-020. fieldname = 'TID'.
+        WHEN text-042. fieldname = 'SPRACHE'.
+        WHEN text-043. fieldname = 'LOGON_DATE'.
+        WHEN text-044. fieldname = 'LOGON_TIME'.
+        WHEN text-048. fieldname = 'IPADDR'.
+      ENDCASE.
+
+* if data selected, rs_selfield-fieldname contains the field name.
+      IF fieldname = space.
+        fieldname = rs_selfield-fieldname.
+
+* some special mappings
+        IF fieldname = 'TERMID'.
+          fieldname = 'TID'.
+        ELSEIF fieldname = 'TERMINAL'.
+          fieldname = 'IPADDR'.
+        ENDIF.
+      ENDIF.
+
+      PERFORM show_help_info USING fieldname rs_selfield.
+
+    WHEN 'LOGONS'.
+      show_all_session = 0.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'SESSIONS'.
+      show_all_session = 1.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'WITH_APPL'.
+      with_appl_info = 1.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'NO_APPL'.
+      with_appl_info = 0.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'WITH_PRIV'.
+      show_logon_privileges = 1.
+      PERFORM set_sm04_configuration.
+
+    WHEN 'NO_PRIV'.
+      show_logon_privileges = 0.
+      PERFORM set_sm04_configuration.
+
+  ENDCASE.
+
+  IF refresh = th_true.
+    PERFORM build_sw_session_list.
+  ENDIF.
+  rs_selfield-refresh = 'X'.
+  rs_selfield-col_stable = 'X'.
+  rs_selfield-row_stable = 'X'.
+ENDFORM.                    "sm04_sw_session_user_cmd
+
+*
+* call sm04 on remote server
+*
+FORM remote_transaction USING session_alv_line TYPE t_session_alv_line.
+  DATA: comm_message(256),
+        syst_message(256) ##NEEDED ,                        "#EC NEEDED
+        dest TYPE msname2.
+
+  dest = session_alv_line-server_name.
+  IF dest = myname.
+    CALL TRANSACTION 'SM04'.
+  ELSE.
+    CALL FUNCTION 'TH_REMOTE_TRANSACTION'
+      EXPORTING
+        dest         = dest
+        tcode        = 'SM04'
+      IMPORTING
+        comm_message = comm_message
+        syst_message = syst_message.
+    IF comm_message <> space.
+      MESSAGE e102 WITH dest comm_message.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "remote_transaction
+
+*
+* show memory information
+*
+FORM show_memory.
+  PERFORM build_mem_list.
+  PERFORM build_mem_fieldcat USING mem_fieldcat[].
+  PERFORM build_mem_layout USING mem_layout.
+
+  is_variant-handle = 'MEML'.
+* Start of ALV Migration changes - C5056145
+*call function 'REUSE_ALV_LIST_DISPLAY'
+* End of ALV Migration changes - C5056145
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_structure_name         = 'MEM_TABL_ALV'
+      i_callback_program       = sy-repid
+      i_callback_pf_status_set = 'SM04_MEM_SET_STATUS'
+      i_callback_user_command  = 'SM04_MEM_USER_CMD'
+      i_save                   = 'A'
+      it_fieldcat              = mem_fieldcat[]
+      is_layout                = mem_layout
+      is_variant               = is_variant
+    TABLES
+      t_outtab                 = mem_tabl_alv.
+ENDFORM.                    "show_memory
+
+*
+* show detailed memory information (for all selected users)
+*
+FORM show_detailed_memory.
+  PERFORM build_mem_details_list.
+  PERFORM build_mem_details_fieldcat USING mem_details_fieldcat[].
+  PERFORM build_mem_details_layout USING mem_details_layout.
+
+  is_variant-handle = 'MEML'.
+* Start of ALV Migration changes - C5056145
+*call function 'REUSE_ALV_LIST_DISPLAY'
+* End of ALV Migration changes - C5056145
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_structure_name         = 'DETAILED_MEM_TABL_ALV'
+      i_callback_program       = sy-repid
+      i_callback_pf_status_set = 'SM04_DETAILED_MEM_SET_STATUS'
+      i_callback_user_command  = 'SM04_DETAILED_MEM_USER_CMD'
+      i_save                   = 'A'
+      it_fieldcat              = mem_details_fieldcat[]
+      is_layout                = mem_details_layout
+      is_variant               = is_variant
+    TABLES
+      t_outtab                 = detailed_mem_tabl_alv.
+ENDFORM.                    "show_detailed_memory
+
+*
+* show detailed memory information (for all selected users)
+*
+FORM show_idetailed_memory.
+  PERFORM build_mem_idetails_list.
+  PERFORM build_mem_idetails_fieldcat USING mem_idetails_fieldcat[].
+  PERFORM build_mem_idetails_layout USING mem_idetails_layout.
+
+  is_variant-handle = 'MEML'.
+* Start of ALV Migration changes - C5056145
+*call function 'REUSE_ALV_LIST_DISPLAY'
+* End of ALV Migration changes - C5056145
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_structure_name         = 'IDETAILED_MEM_TABL_ALV'
+      i_callback_program       = sy-repid
+      i_callback_pf_status_set = 'SM04_IDETAILED_MEM_SET_STATUS'
+      i_callback_user_command  = 'SM04_IDETAILED_MEM_USER_CMD'
+      i_save                   = 'A'
+      it_fieldcat              = mem_idetails_fieldcat[]
+      is_layout                = mem_idetails_layout
+      is_variant               = is_variant
+    TABLES
+      t_outtab                 = idetailed_mem_tabl_alv.
+ENDFORM.                    "show_idetailed_memory
+
+*&---------------------------------------------------------------------*
+*&      Form  sm04_detailed_mem_set_status
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->RT_EXTAB   text
+*----------------------------------------------------------------------*
+FORM sm04_detailed_mem_set_status USING rt_extab TYPE slis_t_extab.
+  SET TITLEBAR '012'.
+  SET PF-STATUS 'DETAILED_MEM_LIST' EXCLUDING rt_extab.
+ENDFORM.                    "sm04_detailed_mem_set_status
+
+*&---------------------------------------------------------------------*
+*&      Form  sm04_Idetailed_mem_set_status
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->RT_EXTAB   text
+*----------------------------------------------------------------------*
+FORM sm04_idetailed_mem_set_status USING rt_extab TYPE slis_t_extab.
+  SET TITLEBAR '013'.
+  SET PF-STATUS 'IDETAILED_MEM_LIST' EXCLUDING rt_extab.
+ENDFORM.                    "sm04_Idetailed_mem_set_status
+
+*&---------------------------------------------------------------------*
+*&      Form  sm04_detailed_mem_user_cmd
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->R_UCOMM      text
+*      -->RS_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM sm04_detailed_mem_user_cmd USING r_ucomm LIKE sy-ucomm
+                             rs_selfield TYPE slis_selfield.
+  DATA: act_index LIKE sy-tabix,
+        refresh   LIKE th_bool,
+        fieldname LIKE rs_selfield-fieldname,
+        count     TYPE i,
+        selected  LIKE idetailed_mem_tabl_alv-selected.
+
+
+  refresh = th_true.
+  act_index = rs_selfield-tabindex.
+  CLEAR detailed_mem_tabl_alv.
+  selected = ' '.
+
+  IF act_index > 0.
+    READ TABLE detailed_mem_tabl_alv INDEX rs_selfield-tabindex.
+    selected = 'X'.
+  ENDIF.
+
+  CASE r_ucomm.
+* DTM
+    WHEN 'PMOD'.
+      PERFORM session_list USING selected
+                                detailed_mem_tabl_alv-mandt
+                                detailed_mem_tabl_alv-bname
+                                detailed_mem_tabl_alv-tid
+                                detailed_mem_tabl_alv-key.
+* DTM
+
+    WHEN 'USER'.
+      PERFORM user_info USING selected
+                              detailed_mem_tabl_alv-mandt
+                              detailed_mem_tabl_alv-bname.
+
+    WHEN 'DINFO'.
+      REFRESH selected_usr_tec.
+      LOOP AT detailed_mem_tabl_alv.
+        IF detailed_mem_tabl_alv-selected = 'X'.
+          selected_usr_tec-tid = detailed_mem_tabl_alv-tid.
+          APPEND selected_usr_tec.
+        ENDIF.
+      ENDLOOP.
+      PERFORM show_detailed_usr_infos USING selected.
+
+    WHEN 'BLKSDI'.
+      REFRESH selected_modes.
+      count = 0.
+      LOOP AT detailed_mem_tabl_alv.
+        IF detailed_mem_tabl_alv-selected = 'X'.
+          count = count + 1.
+          selected_modes-tid = detailed_mem_tabl_alv-tid.
+          selected_modes-extmode = detailed_mem_tabl_alv-extmode.
+          APPEND selected_modes.
+        ENDIF.
+      ENDLOOP.
+      IF count > 0.
+        PERFORM show_idetailed_memory.
+      ELSE.
+        MESSAGE s101.
+      ENDIF.
+
+    WHEN 'MBLOCK'.
+      IF block_status = 1.
+        PERFORM mark_detailed_mem_tabl_block USING act_index block_opened_index.
+        refresh = th_false.
+      ELSE.
+        block_status = 2.
+        block_opened_index = act_index.
+        refresh = th_false.
+      ENDIF.
+
+    WHEN 'HELP'.
+* if column header selected, rs_selfield-value contains the field name.
+      CLEAR fieldname.
+      CONDENSE rs_selfield-value.
+      CASE rs_selfield-value.
+        WHEN text-001. fieldname = 'MANDT'.
+        WHEN text-002. fieldname = 'BNAME'.
+        WHEN text-004. fieldname = 'TCODE'.
+        WHEN text-007. fieldname = 'EXTMODE'.
+        WHEN text-009. fieldname = 'ROLL'.
+        WHEN text-010. fieldname = 'PAGE'.
+        WHEN text-023. fieldname = 'MEMSUM'.
+        WHEN text-024. fieldname = 'PRIVSUM'.
+        WHEN text-008. fieldname = 'KEY'.
+        WHEN text-020. fieldname = 'TID'.
+      ENDCASE.
+
+* if data selected, rs_selfield-fieldname contains the field name.
+      IF fieldname = space.
+        fieldname = rs_selfield-fieldname.
+
+* some special mappings due to günters changes
+        IF fieldname = 'ROLL2'.
+          fieldname = 'ROLL'.
+        ELSEIF fieldname = 'PAGE2'.
+          fieldname = 'PAGE'.
+        ELSEIF fieldname = 'MEMSUM2'.
+          fieldname = 'MEMSUM'.
+        ELSEIF fieldname = 'PRIVSUM2'.
+          fieldname = 'PRIVSUM'.
+        ENDIF.
+      ENDIF.
+
+      PERFORM show_help_info USING fieldname rs_selfield.
+  ENDCASE.
+
+  IF block_status > 0.
+    block_status = block_status - 1.
+  ENDIF.
+
+  IF refresh = th_true.
+    PERFORM build_mem_details_list.
+  ENDIF.
+  rs_selfield-refresh = 'X'.
+  rs_selfield-col_stable = 'X'.
+  rs_selfield-row_stable = 'X'.
+ENDFORM.                    "sm04_detailed_mem_user_cmd
+
+*&---------------------------------------------------------------------*
+*&      Form  sm04_idetailed_mem_user_cmd
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->R_UCOMM      text
+*      -->RS_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM sm04_idetailed_mem_user_cmd USING r_ucomm LIKE sy-ucomm
+                             rs_selfield TYPE slis_selfield.
+  DATA: act_index LIKE sy-tabix,
+        refresh   LIKE th_bool,
+        fieldname LIKE rs_selfield-fieldname,
+        selected  LIKE idetailed_mem_tabl_alv-selected.
+
+
+  refresh = th_true.
+  act_index = rs_selfield-tabindex.
+  CLEAR idetailed_mem_tabl_alv.
+  selected = ' '.
+
+  IF act_index > 0.
+    READ TABLE idetailed_mem_tabl_alv INDEX rs_selfield-tabindex.
+    selected = 'X'.
+  ENDIF.
+
+  CASE r_ucomm.
+* DTM
+    WHEN 'PMOD'.
+      PERFORM session_list USING selected
+                                idetailed_mem_tabl_alv-mandt
+                                idetailed_mem_tabl_alv-bname
+                                idetailed_mem_tabl_alv-tid
+                                idetailed_mem_tabl_alv-key.
+* DTM
+
+    WHEN 'USER'.
+      PERFORM user_info USING selected
+                              idetailed_mem_tabl_alv-mandt
+                              idetailed_mem_tabl_alv-bname.
+
+    WHEN 'DINFO'.
+      REFRESH selected_usr_tec.
+      LOOP AT idetailed_mem_tabl_alv.
+        IF idetailed_mem_tabl_alv-selected = 'X'.
+          selected_usr_tec-tid = idetailed_mem_tabl_alv-tid.
+          APPEND selected_usr_tec.
+        ENDIF.
+      ENDLOOP.
+      PERFORM show_detailed_usr_infos USING selected.
+
+    WHEN 'HELP'.
+* if column header selected, rs_selfield-value contains the field name.
+      CLEAR fieldname.
+      CONDENSE rs_selfield-value.
+      CASE rs_selfield-value.
+        WHEN text-001. fieldname = 'MANDT'.
+        WHEN text-002. fieldname = 'BNAME'.
+        WHEN text-004. fieldname = 'TCODE'.
+        WHEN text-007. fieldname = 'EXTMODE'.
+        WHEN text-011. fieldname = 'INTMODE'.
+        WHEN text-009. fieldname = 'ROLL'.
+        WHEN text-010. fieldname = 'PAGE'.
+        WHEN text-025. fieldname = 'IMODE_MEM'.
+        WHEN text-008. fieldname = 'KEY'.
+        WHEN text-020. fieldname = 'TID'.
+      ENDCASE.
+
+* if data selected, rs_selfield-fieldname contains the field name.
+      IF fieldname = space.
+        fieldname = rs_selfield-fieldname.
+
+* some special mappings due to günters changes
+        IF fieldname = 'ROLL2'.
+          fieldname = 'ROLL'.
+        ELSEIF fieldname = 'PAGE2'.
+          fieldname = 'PAGE'.
+        ELSEIF fieldname = 'MEMSUM2'.
+          fieldname = 'MEMSUM'.
+        ELSEIF fieldname = 'PRIVSUM2'.
+          fieldname = 'PRIVSUM'.
+        ENDIF.
+      ENDIF.
+
+      PERFORM show_help_info USING fieldname rs_selfield.
+  ENDCASE.
+
+  IF refresh = th_true.
+    PERFORM build_mem_idetails_list.
+  ENDIF.
+
+  rs_selfield-refresh = 'X'.
+  rs_selfield-col_stable = 'X'.
+  rs_selfield-row_stable = 'X'.
+ENDFORM.                    "sm04_idetailed_mem_user_cmd
+
+*
+* build memory list
+*
+FORM build_mem_list.
+  DATA: mem64_valid TYPE i VALUE 0.
+  DATA: BEGIN OF mem64 OCCURS 0,
+          roll    TYPE abap_msize,
+          page    TYPE abap_msize,
+          memsum  TYPE abap_msize,
+          privsum TYPE abap_msize,
+        END OF mem64.
+
+  DATA: total(16)    TYPE p,
+        order        TYPE i,
+        selected_usr TYPE i,
+        read_idx     TYPE i,
+        found        TYPE i.
+
+  DATA: BEGIN OF mem_tabl_alv_all OCCURS 10.
+          INCLUDE STRUCTURE ublks.
+          DATA:   selected(1).
+  DATA: memsum2(16) TYPE p DECIMALS 0.
+  DATA: roll2(16) TYPE p DECIMALS 0.
+  DATA: page2(16) TYPE p DECIMALS 0.
+  DATA: privsum2(16) TYPE p DECIMALS 0.
+  DATA: total_mem_mb TYPE i.
+  DATA: order TYPE i.
+  DATA: END OF mem_tabl_alv_all.
+
+
+
+  REFRESH usr_btabl.
+  REFRESH mem64.
+  REFRESH mem_tabl_alv.
+  REFRESH mem_tabl_alv_all.
+
+  IF is_system_client = 'X'.
+    CALL 'ThUsrInfo' ID 'OPCODE' FIELD opcode_long_blk_info
+         ID 'TAB' FIELD usr_btabl[]
+         ID 'MEM64' FIELD mem64[]
+         ID 'MEM64_VALID' FIELD mem64_valid.
+  ELSE.
+    CALL 'ThUsrInfo' ID 'OPCODE' FIELD opcode_long_blk_info
+         ID 'TAB' FIELD usr_btabl[]
+         ID 'MEM64' FIELD mem64[]
+         ID 'MEM64_VALID' FIELD mem64_valid
+         ID 'MANDT' FIELD sy-mandt.
+  ENDIF.
+
+* EL 18Nov2005 - bugfix
+*
+* do not sort here. the tables usr_btabl and mem64 comes
+* with the same order from the table. It must not be destroyed
+* as long as mem_tabl_alv_all has not been created.
+*
+* sort usr_btabl by mandt bname.
+
+  order = 0.
+  LOOP AT usr_btabl.
+    CLEAR mem_tabl_alv_all.
+    MOVE-CORRESPONDING usr_btabl TO mem_tabl_alv_all.
+    IF mem64_valid = 1.
+      READ TABLE mem64 INDEX sy-tabix.
+
+      mem_tabl_alv_all-memsum2  = mem64-memsum * mem64_multiplier.
+      mem_tabl_alv_all-roll2    = mem64-roll * mem64_multiplier.
+      mem_tabl_alv_all-page2    = mem64-page * mem64_multiplier.
+      mem_tabl_alv_all-privsum2 = mem64-privsum * mem64_multiplier.
+    ELSE.
+      mem_tabl_alv_all-memsum2  = mem_tabl_alv-memsum * mem64_multiplier.
+      mem_tabl_alv_all-roll2    = mem_tabl_alv-roll * mem64_multiplier.
+      mem_tabl_alv_all-page2    = mem_tabl_alv-page * mem64_multiplier.
+      mem_tabl_alv_all-privsum2 = mem_tabl_alv-privsum * mem64_multiplier.
+    ENDIF.
+
+    total = mem_tabl_alv_all-memsum2 +
+            mem_tabl_alv_all-roll2 +
+            mem_tabl_alv_all-page2 +
+            mem_tabl_alv_all-privsum2.
+
+    mem_tabl_alv_all-total_mem_mb = total / 1024 / 1024.
+
+    mem_tabl_alv_all-order = order.
+    order = order + 1.
+    APPEND mem_tabl_alv_all.
+  ENDLOOP.
+
+* EL 18Nov2005 - now we can sort without problems
+  SORT usr_btabl BY mandt bname.
+
+  DESCRIBE TABLE selected_usr_gen LINES selected_usr.
+
+  IF selected_usr > 0.
+    SORT selected_usr_gen BY tid DESCENDING.
+    SORT mem_tabl_alv_all BY tid DESCENDING.
+
+    read_idx = 1.
+    LOOP AT selected_usr_gen.
+      found = 0.
+
+      WHILE found = 0.
+        READ TABLE mem_tabl_alv_all INDEX read_idx.
+
+        IF sy-subrc = 4.
+          found = -4.
+
+        ELSEIF mem_tabl_alv_all-tid = selected_usr_gen-tid.
+          found = 1.
+
+        ELSEIF mem_tabl_alv_all-tid < selected_usr_gen-tid.
+          found = -1.
+
+        ELSE.
+          read_idx = read_idx + 1.
+        ENDIF.
+
+      ENDWHILE.
+
+      IF found = -4.
+        EXIT.
+      ENDIF.
+
+      IF mem_tabl_alv_all-tid = selected_usr_gen-tid.
+        MOVE-CORRESPONDING mem_tabl_alv_all TO mem_tabl_alv.
+        APPEND mem_tabl_alv.
+      ENDIF.
+    ENDLOOP.
+
+    SORT mem_tabl_alv BY order.
+  ELSE.
+    LOOP AT mem_tabl_alv_all.
+      MOVE-CORRESPONDING mem_tabl_alv_all TO mem_tabl_alv.
+      APPEND mem_tabl_alv.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "build_mem_list
+
+*&---------------------------------------------------------------------*
+*&      Form  build_mem_details_list
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM build_mem_details_list.
+  DATA: read_idx TYPE i,
+        found    TYPE i.
+  DATA: BEGIN OF usr_blksd_tabl_sorted OCCURS 10.
+          INCLUDE STRUCTURE ublksd.
+          DATA:   order TYPE i.
+  DATA: END OF usr_blksd_tabl_sorted.
+  DATA: order TYPE i.
+
+
+  REFRESH usr_blksd_tabl.
+  REFRESH usr_blksd_tabl_sorted.
+  REFRESH detailed_mem_tabl_alv.
+
+  CALL 'ThUsrInfo' ID 'OPCODE' FIELD opcode_detailed_blk_info
+       ID 'TAB' FIELD usr_blksd_tabl[].
+
+  order = 0.
+  LOOP AT usr_blksd_tabl.
+*    clear usr_blksd_tabl_sorted.
+    MOVE-CORRESPONDING usr_blksd_tabl TO usr_blksd_tabl_sorted.
+    usr_blksd_tabl_sorted-order = order.
+    order = order + 1.
+    APPEND usr_blksd_tabl_sorted.
+  ENDLOOP.
+
+  SORT usr_blksd_tabl_sorted BY tid DESCENDING.
+  SORT selected_usr BY tid DESCENDING.
+
+  read_idx = 1.
+  LOOP AT selected_usr.
+    found = 0.
+
+    WHILE found = 0.
+      READ TABLE usr_blksd_tabl_sorted INDEX read_idx.
+
+      IF sy-subrc = 4.
+        found = -4.
+
+      ELSEIF usr_blksd_tabl_sorted-tid = selected_usr-tid.
+        found = 1.
+
+      ELSEIF usr_blksd_tabl_sorted-tid < selected_usr-tid.
+        found = -1.
+
+      ELSE.
+        read_idx = read_idx + 1.
+      ENDIF.
+
+    ENDWHILE.
+
+    IF found = -4.
+      EXIT.
+    ENDIF.
+
+    IF usr_blksd_tabl_sorted-tid = selected_usr-tid.
+      CLEAR detailed_mem_tabl_alv.
+      MOVE-CORRESPONDING usr_blksd_tabl_sorted TO detailed_mem_tabl_alv.
+
+      APPEND detailed_mem_tabl_alv.
+    ENDIF.
+
+* search for entries with same tid and append them.
+    read_idx = read_idx + 1.
+    found = 1.
+
+    WHILE found = 1.
+      READ TABLE usr_blksd_tabl_sorted INDEX read_idx.
+
+      IF sy-subrc = 4.
+        found = -4.
+
+      ELSEIF usr_blksd_tabl_sorted-tid = selected_usr-tid.
+        CLEAR detailed_mem_tabl_alv.
+        MOVE-CORRESPONDING usr_blksd_tabl_sorted TO detailed_mem_tabl_alv.
+
+        APPEND detailed_mem_tabl_alv.
+        found = 1.
+        read_idx = read_idx + 1.
+
+      ELSE.
+        found = -1.
+      ENDIF.
+    ENDWHILE.
+
+    IF found = -4.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+  SORT detailed_mem_tabl_alv BY order.
+
+ENDFORM.                    "build_mem_details_list
+
+*&---------------------------------------------------------------------*
+*&      Form  build_mem_Idetails_list
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM build_mem_idetails_list.
+
+  REFRESH idetailed_mem_tabl_alv.
+
+  LOOP AT selected_modes.
+
+    REFRESH usr_blksd_tabl.
+
+    CALL 'ThUsrInfo' ID 'OPCODE' FIELD opcode_detailed_blk_info_imode
+         ID 'TAB' FIELD usr_blksd_tabl[]
+         ID 'TID' FIELD selected_modes-tid
+         ID 'MODE' FIELD selected_modes-extmode.
+
+    LOOP AT usr_blksd_tabl.
+      CLEAR idetailed_mem_tabl_alv.
+      MOVE-CORRESPONDING usr_blksd_tabl TO idetailed_mem_tabl_alv.
+
+*     at the moment the kernel gives us the internal mode number in
+*     field extmode (see function ThDetailedUsrBlksImode in modul thxxab.c).
+*     so we have to move it to the correct field.
+      idetailed_mem_tabl_alv-intmode = usr_blksd_tabl-extmode.
+      idetailed_mem_tabl_alv-extmode = selected_modes-extmode.
+
+      APPEND idetailed_mem_tabl_alv.
+    ENDLOOP.
+  ENDLOOP.
+
+ENDFORM.                    "build_mem_Idetails_list
+
+
+*
+* build alv field catalog of memory list
+*
+FORM build_mem_fieldcat USING fieldcat TYPE slis_t_fieldcat_alv.
+  DATA: ls_fieldcat TYPE slis_fieldcat_alv.
+
+  REFRESH fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MANDT'.
+  ls_fieldcat-tabname = 'MEM_TABL_ALV'.
+  ls_fieldcat-key = 'X'.
+  ls_fieldcat-reptext_ddic = text-001.
+  ls_fieldcat-outputlen = 4.
+  ls_fieldcat-ref_tabname = 'USRINFO'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'BNAME'.
+  ls_fieldcat-tabname = 'MEM_TABL_ALV'.
+  ls_fieldcat-key = 'X'.
+  ls_fieldcat-reptext_ddic = text-002.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-ref_tabname = 'USRINFO'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TCODE'.
+  ls_fieldcat-tabname = 'MEM_TABL_ALV'.
+  ls_fieldcat-reptext_ddic = text-004.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-ref_tabname = 'USRINFO'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MEMSUM2'.
+  ls_fieldcat-tabname = 'MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'DEC'.
+  ls_fieldcat-reptext_ddic = text-023.
+  ls_fieldcat-outputlen = 16.
+  ls_fieldcat-seltext_s = text-023.
+  ls_fieldcat-seltext_m = text-023.
+  ls_fieldcat-seltext_l = text-023.
+  ls_fieldcat-ref_fieldname = 'MEMSUM'.
+  ls_fieldcat-ref_tabname = 'UBLKSD'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'PRIVSUM2'.
+  ls_fieldcat-tabname = 'MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'DEC'.
+  ls_fieldcat-reptext_ddic = text-024.
+  ls_fieldcat-outputlen = 16.
+  ls_fieldcat-seltext_s = text-024.
+  ls_fieldcat-seltext_m = text-024.
+  ls_fieldcat-seltext_l = text-024.
+  ls_fieldcat-ref_fieldname = 'PRIVSUM'.
+  ls_fieldcat-ref_tabname = 'UBLKS'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KEY'.
+  ls_fieldcat-tabname = 'MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'INT4'.
+  ls_fieldcat-reptext_ddic = text-008.
+  ls_fieldcat-outputlen = 7.
+  ls_fieldcat-no_out = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TID'.
+  ls_fieldcat-tabname = 'MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'INT4'.
+  ls_fieldcat-reptext_ddic = text-020.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-no_out = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+ENDFORM.                    "build_mem_fieldcat
+
+*
+* build alv layout for memory list
+*
+FORM build_mem_layout USING layout TYPE slis_layout_alv.
+* Start of ALV Migration changes - C5056145
+*  layout-no_vline = 'X'.
+* End of ALV Migration changes - C5056145
+  layout-info_fieldname = 'LINE_COL'.
+  layout-f2code = 'PMOD'.
+  layout-box_fieldname = 'SELECTED'.
+  layout-allow_switch_to_list = 'X'.
+ENDFORM.                    "build_mem_layout
+
+
+*
+* set alv status for memory list
+*
+FORM sm04_mem_set_status USING rt_extab TYPE slis_t_extab.
+  SET TITLEBAR '002'.
+  SET PF-STATUS 'MEM_LIST' EXCLUDING rt_extab.
+ENDFORM.                    "sm04_mem_set_status
+
+*
+* handle user commands of memory list
+*
+FORM sm04_mem_user_cmd USING r_ucomm LIKE sy-ucomm
+                             rs_selfield TYPE slis_selfield.
+  DATA: act_index LIKE sy-tabix,
+        refresh   LIKE th_bool,
+        fieldname LIKE rs_selfield-fieldname,
+        count     TYPE i,
+        selected  LIKE idetailed_mem_tabl_alv-selected.
+
+
+  refresh = th_true.
+  act_index = rs_selfield-tabindex.
+  CLEAR mem_tabl_alv.
+  selected = ' '.
+
+  IF act_index > 0.
+    READ TABLE mem_tabl_alv INDEX rs_selfield-tabindex.
+    selected = 'X'.
+  ENDIF.
+
+  CASE r_ucomm.
+* DTM
+    WHEN 'PMOD'.
+      PERFORM session_list USING selected
+                                mem_tabl_alv-mandt
+                                mem_tabl_alv-bname
+                                mem_tabl_alv-tid
+                                mem_tabl_alv-key.
+* DTM
+
+    WHEN 'USER'.
+      PERFORM user_info USING selected
+                              mem_tabl_alv-mandt
+                              mem_tabl_alv-bname.
+
+    WHEN 'DINFO'.
+      REFRESH selected_usr_tec.
+      LOOP AT mem_tabl_alv.
+        IF mem_tabl_alv-selected = 'X'.
+          selected_usr_tec-tid = mem_tabl_alv-tid.
+          APPEND selected_usr_tec.
+        ENDIF.
+      ENDLOOP.
+      PERFORM show_detailed_usr_infos USING selected.
+
+    WHEN 'BLKSDU'.
+      REFRESH selected_usr.
+      count = 0.
+      LOOP AT mem_tabl_alv.
+        IF mem_tabl_alv-selected = 'X'.
+          count = count + 1.
+          selected_usr-tid = mem_tabl_alv-tid.
+          APPEND selected_usr.
+        ENDIF.
+      ENDLOOP.
+      IF count > 0.
+        PERFORM show_detailed_memory.
+      ELSE.
+        MESSAGE s101.
+      ENDIF.
+
+    WHEN 'MBLOCK'.
+      IF block_status = 1.
+        PERFORM mark_mem_tabl_block USING act_index block_opened_index.
+        refresh = th_false.
+      ELSE.
+        block_status = 2.
+        block_opened_index = act_index.
+        refresh = th_false.
+      ENDIF.
+
+    WHEN 'HELP'.
+* if column header selected, rs_selfield-value contains the field name.
+      CLEAR fieldname.
+      CONDENSE rs_selfield-value.
+      CASE rs_selfield-value.
+        WHEN text-001. fieldname = 'MANDT'.
+        WHEN text-002. fieldname = 'BNAME'.
+        WHEN text-004. fieldname = 'TCODE'.
+        WHEN text-009. fieldname = 'ROLL'.
+        WHEN text-010. fieldname = 'PAGE'.
+        WHEN text-023. fieldname = 'MEMSUM'.
+        WHEN text-024. fieldname = 'PRIVSUM'.
+        WHEN text-008. fieldname = 'KEY'.
+        WHEN text-020. fieldname = 'TID'.
+      ENDCASE.
+
+* if data selected, rs_selfield-fieldname contains the field name.
+      IF fieldname = space.
+        fieldname = rs_selfield-fieldname.
+
+* some special mappings due to günters changes
+        IF fieldname = 'ROLL2'.
+          fieldname = 'ROLL'.
+        ELSEIF fieldname = 'PAGE2'.
+          fieldname = 'PAGE'.
+        ELSEIF fieldname = 'MEMSUM2'.
+          fieldname = 'MEMSUM'.
+        ELSEIF fieldname = 'PRIVSUM2'.
+          fieldname = 'PRIVSUM'.
+        ENDIF.
+      ENDIF.
+
+      PERFORM show_help_info USING fieldname rs_selfield.
+  ENDCASE.
+
+  IF block_status > 0.
+    block_status = block_status - 1.
+  ENDIF.
+
+  IF refresh = th_true.
+    PERFORM build_mem_list.
+  ENDIF.
+  rs_selfield-refresh = 'X'.
+  rs_selfield-col_stable = 'X'.
+  rs_selfield-row_stable = 'X'.
+ENDFORM.                    "sm04_mem_user_cmd
+
+*&---------------------------------------------------------------------*
+*&      Form  show_help_info
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->HELP_FIELDNAME  text
+*      -->RS_SELFIELD     text
+*----------------------------------------------------------------------*
+FORM show_help_info USING help_fieldname
+                          rs_selfield TYPE slis_selfield.
+  DATA: doku       LIKE dokhl,
+        answer     LIKE rsnewleng-fcode,
+        docu_class LIKE dokil-id.
+
+  DATA: BEGIN OF loc_spar OCCURS 0.
+          INCLUDE STRUCTURE spar.
+        DATA: END OF loc_spar.
+
+  CLEAR loc_spar.
+
+  docu_class = 'DE'.
+  CASE help_fieldname.
+    WHEN 'MANDT'.   doku-object = 'MANDT'.
+    WHEN 'BNAME'.   doku-object = 'UBNAME'.
+    WHEN 'TERM'.    doku-object = 'UTERM'.
+    WHEN 'TCODE'.   doku-object = 'UTCODE'.
+    WHEN 'EXT_TIME'. doku-object = 'UDTIME'.
+    WHEN 'SESSIONS'.  doku-object = 'UMODE'.
+    WHEN 'SESSION_TYPE'. doku-object = 'SESSION_TYPE'. docu_class = 'DT'.
+    WHEN 'TID'.      doku-object = 'UTID'. docu_class = 'DT'.
+    WHEN 'EXT_STATE'.doku-object = 'SESSION_STATE'. docu_class = 'DT'.
+    WHEN 'EXT_TRACE'.doku-object = 'USER_TRACE'.
+    WHEN 'EXT_TERMINAL'.doku-object = 'UTERM'.
+    WHEN 'SERVER'.   doku-object = 'SESSION_SERVER'. docu_class = 'DT'.
+    WHEN 'ROLL'.     doku-object = 'SESSION_ROLL'. docu_class = 'DT'.
+    WHEN 'PAGE'.     doku-object = 'SESSION_PAGE'. docu_class = 'DT'.
+    WHEN 'MEMSUM'.   doku-object = 'UMEMSUMCNT'.
+    WHEN 'PRIVSUM'.  doku-object = 'UMEMPRICNT'.
+    WHEN 'KEY'.      doku-object = 'UKEY'.
+    WHEN 'PROTOCOL'. doku-object = 'PROTOCOL'. docu_class = 'DT'.
+    WHEN 'GUIVERSION'. doku-object = 'GUIVERSION'. docu_class = 'DT'.
+    WHEN 'RFC_TYPE'. doku-object = 'RFC_TYPE'. docu_class = 'DT'.
+    WHEN 'TOTAL_MEM_MB'. doku-object = 'TOTAL_MEM_MB'. docu_class = 'DT'.
+    WHEN 'EXTMODE'. doku-object = 'EXTMODE'. docu_class = 'DT'.
+    WHEN 'INTMODE'. doku-object = 'INTMODE'. docu_class = 'DT'.
+    WHEN 'IPADDR'. doku-object = 'IPADDR'. docu_class = 'DT'.
+    WHEN 'SPRACHE'. doku-object = 'SPRACHE'. docu_class = 'DT'.
+    WHEN 'LOGON_DATE'. doku-object = 'LOGON_DATE'. docu_class = 'DT'.
+    WHEN 'LOGON_TIME'. doku-object = 'LOGON_TIME'. docu_class = 'DT'.
+    WHEN 'IMODE_MEM'. doku-object = 'IMODE_MEM'. docu_class = 'DT'.
+    WHEN 'RFC_HDL'. doku-object = 'SSI_RFC_HDL'. docu_class = 'DE'.
+
+  ENDCASE.
+
+  CALL FUNCTION 'POPUP_DISPLAY_TEXT_USER_BUTTON'
+    EXPORTING
+      popup_title = help_fieldname
+      text_object = doku-object
+      docu_class  = docu_class
+    IMPORTING
+      answer      = answer
+    TABLES
+      parameter   = loc_spar
+    EXCEPTIONS
+      OTHERS      = 0.
+ENDFORM.                    "show_help_info
+
+*
+* select block in user list
+*
+FORM mark_usr_tabl_block USING act_index LIKE sy-tabix
+                               block_opened_index LIKE sy-tabix.
+  DATA: high_bound       LIKE sy-tabix,
+        low_bound        LIKE sy-tabix,
+        session_alv_line TYPE t_session_alv_line.
+
+  IF act_index > block_opened_index.
+    high_bound = act_index.
+    low_bound = block_opened_index.
+  ELSE.
+    high_bound = block_opened_index.
+    low_bound = act_index.
+  ENDIF.
+
+  WHILE high_bound >= low_bound.
+    READ TABLE session_alv_table INDEX high_bound INTO session_alv_line.
+    IF session_alv_line-selected = 'X'.
+      EXIT.
+    ELSE.
+      session_alv_line-selected = 'X'.
+      MODIFY session_alv_table INDEX high_bound FROM session_alv_line.
+      high_bound = high_bound - 1.
+    ENDIF.
+  ENDWHILE.
+ENDFORM.                    "mark_usr_tabl_block
+
+*&---------------------------------------------------------------------*
+*&      Form  mark_mem_tabl_block
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->ACT_INDEX           text
+*      -->BLOCK_OPENED_INDEX  text
+*----------------------------------------------------------------------*
+FORM mark_mem_tabl_block USING act_index LIKE sy-tabix
+                               block_opened_index LIKE sy-tabix.
+  DATA: high_bound LIKE sy-tabix,
+        low_bound  LIKE sy-tabix.
+
+
+  IF act_index > block_opened_index.
+    high_bound = act_index.
+    low_bound = block_opened_index.
+  ELSE.
+    high_bound = block_opened_index.
+    low_bound = act_index.
+  ENDIF.
+
+  WHILE high_bound >= low_bound.
+    READ TABLE mem_tabl_alv INDEX high_bound.
+    IF mem_tabl_alv-selected = 'X'.
+      EXIT.
+    ELSE.
+      mem_tabl_alv-selected = 'X'.
+      MODIFY mem_tabl_alv INDEX high_bound.
+      high_bound = high_bound - 1.
+    ENDIF.
+  ENDWHILE.
+ENDFORM.                    "mark_mem_tabl_block
+
+*&---------------------------------------------------------------------*
+*&      Form  mark_detailed_mem_tabl_block
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->ACT_INDEX           text
+*      -->BLOCK_OPENED_INDEX  text
+*----------------------------------------------------------------------*
+FORM mark_detailed_mem_tabl_block USING act_index LIKE sy-tabix
+                                        block_opened_index LIKE sy-tabix.
+  DATA: high_bound LIKE sy-tabix,
+        low_bound  LIKE sy-tabix.
+
+
+  IF act_index > block_opened_index.
+    high_bound = act_index.
+    low_bound = block_opened_index.
+  ELSE.
+    high_bound = block_opened_index.
+    low_bound = act_index.
+  ENDIF.
+
+  WHILE high_bound >= low_bound.
+    READ TABLE detailed_mem_tabl_alv INDEX high_bound.
+    IF detailed_mem_tabl_alv-selected = 'X'.
+      EXIT.
+    ELSE.
+      detailed_mem_tabl_alv-selected = 'X'.
+      MODIFY detailed_mem_tabl_alv INDEX high_bound.
+      high_bound = high_bound - 1.
+    ENDIF.
+  ENDWHILE.
+ENDFORM.                    "mark_detailed_mem_tabl_block
+
+*&---------------------------------------------------------------------*
+*&      Form  show_detailed_usr_infos
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->SELECTED   text
+*      -->TID        text
+*----------------------------------------------------------------------*
+FORM show_detailed_usr_infos USING selected TYPE t_session_alv_line-selected.
+  DATA: selected_user TYPE i.
+
+  IF selected <> 'X'.
+    LOOP AT selected_usr_tec.
+      selected = 'X'.
+      EXIT.
+    ENDLOOP.
+
+    IF selected <> 'X'.
+      MESSAGE s101.
+      EXIT.
+    ENDIF.
+  ENDIF.
+
+  DESCRIBE TABLE selected_usr_tec LINES selected_user.
+  SORT selected_usr_tec BY tid.
+  DELETE ADJACENT DUPLICATES FROM selected_usr_tec COMPARING tid.
+  DESCRIBE TABLE selected_usr_tec LINES selected_user.
+
+  PERFORM build_usr_infos.
+  PERFORM build_usr_info_fieldcat USING usr_info_fieldcat[].
+  PERFORM build_usr_info_layout USING usr_info_layout.
+
+  is_variant-handle = 'INFO'.
+
+  IF selected_user > 1.
+    CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+      EXPORTING
+        i_structure_name         = 'USR_INFO'
+        i_callback_program       = sy-repid
+        i_callback_pf_status_set = 'SM04_USR_INFO_SET_STAT'
+        i_callback_user_command  = 'SM04_USR_INFOS_USER_CMD'
+        i_save                   = 'A'
+        it_fieldcat              = usr_info_fieldcat[]
+        is_layout                = usr_info_layout
+        is_variant               = is_variant
+      TABLES
+        t_outtab                 = usr_info.
+  ELSE.
+    PERFORM build_logon_key
+      USING selected_usr_tec-tid selected_usr_tec-uid
+      CHANGING act_session_key.
+
+    CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+      EXPORTING
+        i_structure_name         = 'USR_INFO'
+        i_callback_program       = sy-repid
+        i_callback_pf_status_set = 'SM04_USR_INFO_SET_SINGLE_STAT'
+        i_callback_user_command  = 'SM04_USR_INFOS_USER_CMD'
+        i_save                   = 'A'
+        it_fieldcat              = usr_info_fieldcat[]
+        is_layout                = usr_info_layout
+        is_variant               = is_variant
+      TABLES
+        t_outtab                 = usr_info.
+  ENDIF.
+
+ENDFORM.                    "show_detailed_usr_info
+
+*&---------------------------------------------------------------------*
+*&      Form  sm04_usr_info_user_cmd
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->R_UCOMM      text
+*      -->RS_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM sm04_usr_infos_user_cmd USING r_ucomm LIKE sy-ucomm
+                                   rs_selfield TYPE slis_selfield.
+  PERFORM build_usr_infos.
+  rs_selfield-refresh = 'X'.
+  rs_selfield-col_stable = 'X'.
+  rs_selfield-row_stable = 'X'.
+ENDFORM.                    "sm04_usr_info_user_cmd
+
+*&---------------------------------------------------------------------*
+*&      Form  build_usr_info
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->TID        text
+*----------------------------------------------------------------------*
+FORM build_usr_info USING tid TYPE t_session_alv_line-logon_hdl.
+  REFRESH usr_info.
+
+  CALL 'ThUsrInfo' ID 'OPCODE' FIELD opcode_usr_info
+    ID 'TID' FIELD tid
+    ID 'WITH_APPL_INFO' FIELD with_appl_info
+    ID 'TABLE' FIELD usr_info[].
+ENDFORM.                    "build_usr_info
+
+FORM build_usr_infos.
+  REFRESH usr_info.
+
+  LOOP AT selected_usr_tec.
+    CALL 'ThUsrInfo' ID 'OPCODE' FIELD opcode_usr_info
+      ID 'TID' FIELD selected_usr_tec-tid
+      ID 'WITH_APPL_INFO' FIELD with_appl_info
+      ID 'TABLE' FIELD usr_info[].
+  ENDLOOP.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  build_usr_info_fieldcat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->USR_INFO_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_usr_info_fieldcat USING usr_info_fieldcat TYPE
+slis_t_fieldcat_alv.
+  DATA: ls_fieldcat TYPE slis_fieldcat_alv.
+
+  REFRESH usr_info_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname    = 'FIELD'.
+  ls_fieldcat-key          = 'X'.
+  ls_fieldcat-tabname      = 'USR_INFO'.
+  ls_fieldcat-outputlen    = 30.
+  ls_fieldcat-reptext_ddic = text-045.
+  ls_fieldcat-lowercase    = 'X'.
+  APPEND ls_fieldcat TO usr_info_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname    = 'VALUE'.
+  ls_fieldcat-tabname      = 'USR_INFO'.
+  ls_fieldcat-outputlen    = 70.
+  ls_fieldcat-reptext_ddic = text-046.
+  ls_fieldcat-lowercase    = 'X'.
+  APPEND ls_fieldcat TO usr_info_fieldcat.
+ENDFORM.                    "build_usr_info_fieldcat
+
+*&---------------------------------------------------------------------*
+*&      Form  build_usr_info_layout
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->LAYOUT     text
+*----------------------------------------------------------------------*
+FORM build_usr_info_layout USING layout TYPE slis_layout_alv.
+*  LAYOUT-NO_VLINE      = 'X'.
+*  LAYOUT-F2CODE        = 'HOT'.
+*  LAYOUT-BOX_FIELDNAME = 'SELECTED'.
+  layout-allow_switch_to_list = 'X'.
+ENDFORM.                    "build_usr_info_layout
+
+*&---------------------------------------------------------------------*
+*&      Form  sm04_usr_info_set_status
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->RT_EXTAB   text
+*----------------------------------------------------------------------*
+FORM sm04_usr_info_set_stat USING rt_extab TYPE slis_t_extab.
+  SET TITLEBAR '011'.
+  SET PF-STATUS 'USR_INFO' EXCLUDING rt_extab.
+ENDFORM.                    "sm04_usr_info_set_status
+
+FORM sm04_usr_info_set_single_stat USING rt_extab TYPE slis_t_extab.
+  SET TITLEBAR '016' WITH act_session_key.
+  SET PF-STATUS 'USR_INFO' EXCLUDING rt_extab.
+ENDFORM.                    "sm04_usr_info_set_status
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_MEM_DETAILS_FIELDCAT
+*&---------------------------------------------------------------------*
+FORM build_mem_details_fieldcat USING fieldcat TYPE slis_t_fieldcat_alv.
+  DATA: ls_fieldcat TYPE slis_fieldcat_alv.
+
+  DATA: mem_text(20).
+  DATA: priv_text(20).
+
+  REFRESH fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MANDT'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-key = 'X'.
+  ls_fieldcat-reptext_ddic = text-001.
+  ls_fieldcat-outputlen = 4.
+  ls_fieldcat-ref_tabname = 'USRINFO'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'BNAME'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-key = 'X'.
+  ls_fieldcat-reptext_ddic = text-002.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-ref_tabname = 'USRINFO'.
+*  LS_FIELDCAT-LOWERCASE    = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EXTMODE'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'INT1'.
+  ls_fieldcat-key = 'X'.
+  ls_fieldcat-reptext_ddic = text-007.
+  ls_fieldcat-outputlen = 5.
+  ls_fieldcat-ref_tabname = 'USRINFO'.
+  ls_fieldcat-lowercase    = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TCODE'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-reptext_ddic = text-004.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-ref_tabname = 'USRINFO'.
+*  LS_FIELDCAT-LOWERCASE    = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+* Roll and page memory has been removed!!!
+* TODO: cleanup structures
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'ROLL'.
+*  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+*  ls_fieldcat-datatype = 'DEC'.
+*  ls_fieldcat-reptext_ddic = text-009.
+*  ls_fieldcat-outputlen = 16.
+*  ls_fieldcat-seltext_s = text-009.
+*  ls_fieldcat-seltext_m = text-009.
+*  ls_fieldcat-seltext_l = text-009.
+*  ls_fieldcat-ref_fieldname = 'ROLL'.
+*  ls_fieldcat-ref_tabname = 'UBLKSD'.
+*  APPEND ls_fieldcat TO fieldcat.
+*
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'PAGE'.
+*  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+*  ls_fieldcat-datatype = 'DEC'.
+*  ls_fieldcat-reptext_ddic = text-010.
+*  ls_fieldcat-outputlen = 16.
+*  ls_fieldcat-seltext_s = text-010.
+*  ls_fieldcat-seltext_m = text-010.
+*  ls_fieldcat-seltext_l = text-010.
+*  ls_fieldcat-ref_fieldname = 'PAGE'.
+*  ls_fieldcat-ref_tabname = 'UBLKSD'.
+*  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MEMSUM'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'DEC'.
+  ls_fieldcat-reptext_ddic = text-023.
+  ls_fieldcat-outputlen = 16.
+  ls_fieldcat-seltext_s = text-023.
+  ls_fieldcat-seltext_m = text-023.
+  ls_fieldcat-seltext_l = text-023.
+  ls_fieldcat-ref_fieldname = 'MEMSUM'.
+  ls_fieldcat-ref_tabname = 'UBLKSD'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'PRIVSUM'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'DEC'.
+  ls_fieldcat-reptext_ddic = text-024.
+  ls_fieldcat-outputlen = 16.
+  ls_fieldcat-seltext_s = text-024.
+  ls_fieldcat-seltext_m = text-024.
+  ls_fieldcat-seltext_l = text-024.
+  ls_fieldcat-ref_fieldname = 'PRIVSUM'.
+  ls_fieldcat-ref_tabname = 'UBLKS'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KEY'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'INT4'.
+  ls_fieldcat-reptext_ddic = text-008.
+  ls_fieldcat-outputlen = 7.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-lowercase    = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TID'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'INT4'.
+  ls_fieldcat-reptext_ddic = text-020.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-no_out = 'X'.
+  ls_fieldcat-lowercase    = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+ENDFORM.                    " BUILD_MEM_DETAILS_FIELDCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_MEM_IDETAILS_FIELDCAT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->FIELDCAT   text
+*----------------------------------------------------------------------*
+FORM build_mem_idetails_fieldcat USING fieldcat TYPE slis_t_fieldcat_alv.
+  DATA: ls_fieldcat TYPE slis_fieldcat_alv.
+
+  DATA: mem_text(20).
+  DATA: priv_text(20).
+
+  REFRESH fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MANDT'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-key = 'X'.
+  ls_fieldcat-reptext_ddic = text-001.
+  ls_fieldcat-outputlen = 4.
+  ls_fieldcat-ref_tabname = 'USRINFO'.
+  ls_fieldcat-lowercase    = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'BNAME'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-key = 'X'.
+  ls_fieldcat-reptext_ddic = text-002.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-ref_tabname = 'USRINFO'.
+*  LS_FIELDCAT-LOWERCASE    = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EXTMODE'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'INT1'.
+  ls_fieldcat-key = 'X'.
+  ls_fieldcat-reptext_ddic = text-007.
+  ls_fieldcat-outputlen = 5.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'INTMODE'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'INT1'.
+  ls_fieldcat-key = 'X'.
+  ls_fieldcat-reptext_ddic = text-011.
+  ls_fieldcat-outputlen = 10.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TCODE'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-reptext_ddic = text-004.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-ref_tabname = 'USRINFO'.
+*  LS_FIELDCAT-LOWERCASE    = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+* Roll and page memory has been removed!!!
+* TODO: cleanup structures
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'ROLL'.
+*  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+*  ls_fieldcat-datatype = 'DEC'.
+*  ls_fieldcat-reptext_ddic = text-009.
+*  ls_fieldcat-outputlen = 16.
+*  ls_fieldcat-seltext_s = text-009.
+*  ls_fieldcat-seltext_m = text-009.
+*  ls_fieldcat-seltext_l = text-009.
+*  ls_fieldcat-ref_fieldname = 'ROLL'.
+*  ls_fieldcat-ref_tabname = 'UBLKSD'.
+*  APPEND ls_fieldcat TO fieldcat.
+*
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'PAGE'.
+*  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+*  ls_fieldcat-datatype = 'DEC'.
+*  ls_fieldcat-reptext_ddic = text-010.
+*  ls_fieldcat-outputlen = 16.
+*  ls_fieldcat-seltext_s = text-010.
+*  ls_fieldcat-seltext_m = text-010.
+*  ls_fieldcat-seltext_l = text-010.
+*  ls_fieldcat-ref_fieldname = 'PAGE'.
+*  ls_fieldcat-ref_tabname = 'UBLKSD'.
+*  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MEMSUM'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'DEC'.
+  ls_fieldcat-reptext_ddic = text-025.
+  ls_fieldcat-outputlen = 16.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KEY'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'INT4'.
+  ls_fieldcat-reptext_ddic = text-008.
+  ls_fieldcat-outputlen = 7.
+  ls_fieldcat-no_out = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TID'.
+  ls_fieldcat-tabname = 'DETAILED_MEM_TABL_ALV'.
+  ls_fieldcat-datatype = 'INT4'.
+  ls_fieldcat-reptext_ddic = text-020.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-no_out = 'X'.
+  APPEND ls_fieldcat TO fieldcat.
+
+ENDFORM.                    " BUILD_MEM_IDETAILS_FIELDCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_MEM_DETAILS_LAYOUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM build_mem_details_layout USING layout TYPE slis_layout_alv.
+* Start of ALV Migration changes - C5056145
+*  layout-no_vline = 'X'.
+* End of ALV Migration changes - C5056145
+  layout-info_fieldname = 'LINE_COL'.
+  layout-f2code = 'PMOD'.
+  layout-box_fieldname = 'SELECTED'.
+  layout-allow_switch_to_list = 'X'.
+
+ENDFORM.                    " BUILD_MEM_DETAILS_LAYOUT
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_MEM_IDETAILS_LAYOUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->LAYOUT     text
+*----------------------------------------------------------------------*
+FORM build_mem_idetails_layout USING layout TYPE slis_layout_alv.
+* Start of ALV Migration changes - C5056145
+*  layout-no_vline = 'X'.
+* End of ALV Migration changes - C5056145
+  layout-info_fieldname = 'LINE_COL'.
+  layout-f2code = 'PMOD'.
+  layout-box_fieldname = 'SELECTED'.
+  layout-allow_switch_to_list = 'X'.
+
+ENDFORM.                    " IBUILD_MEM_DETAILS_LAYOUT
+
+
+* Start of ALV Migration changes - C5056145
+
+*&---------------------------------------------------------------------*
+*&      Form  create_footer
+*&---------------------------------------------------------------------*
+*       Displays the number of users along with the modes
+*----------------------------------------------------------------------*
+FORM create_footer USING i_last_line TYPE c.
+
+  DATA: lr_grid  TYPE REF TO cl_salv_form_layout_grid,
+        lr_label TYPE REF TO cl_salv_form_label.
+  CREATE OBJECT lr_grid.
+
+  lr_label = lr_grid->create_label(
+    row     = 1
+    column  = 1
+    text    = i_last_line ).
+
+  CALL METHOD cl_salv_form_content=>set
+    EXPORTING
+      value = lr_grid.
+
+ENDFORM.                    " create_footer
+
+* End of ALV Migration changes - C5056145
+*&---------------------------------------------------------------------*
+*&      Module  CHECKDEBUG  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE checkdebug INPUT.
+  DATA:authority    TYPE c.
+
+  IF okcode = 'DEBU'.
+    AUTHORITY-CHECK  OBJECT 'S_ADMI_FCD'
+      ID 'S_ADMI_FCD' FIELD 'PADM'.
+    IF sy-subrc <> 0.
+      MESSAGE s155.
+      LEAVE SCREEN.
+    ENDIF.
+
+    IF <current_session> IS ASSIGNED.
+      CALL FUNCTION 'SYSTEM_DEBUG_AUTHORITY_CHECK'
+        EXPORTING
+          flag_catch     = 'X'
+          flag_normal    = space
+          flag_kernel    = space
+          flag_replace   = space
+          mandt          = <current_session>-tenant
+          uname          = <current_session>-user_name
+        IMPORTING
+          flag_authority = authority.
+    ENDIF.
+
+    IF authority <> 'X'.
+      MESSAGE s155.
+      LEAVE SCREEN.
+    ENDIF.
+  ENDIF.
+ENDMODULE.                 " CHECKDEBUG  INPUT

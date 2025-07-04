@@ -1,0 +1,164 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRSD0024
+*&
+*&---------------------------------------------------------------------*
+*& Creación libro de pedidos para nuevos materiales
+*& Javier Calás. 26.10.22
+*&---------------------------------------------------------------------*
+REPORT zrsd0024.
+
+TABLES: marc.
+
+PARAMETERS: p_werks TYPE eord-werks OBLIGATORY.
+SELECT-OPTIONS: s_matnr FOR marc-matnr.
+
+
+START-OF-SELECTION .
+  PERFORM f_start_of_selection.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_START_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_start_of_selection .
+
+  SELECT *
+    INTO TABLE @DATA(tl_marc)
+    FROM marc
+    WHERE werks =  @p_werks AND
+          matnr IN @s_matnr.
+  IF tl_marc IS INITIAL.
+    MESSAGE 'No se han encontrado materiales en el centro' TYPE 'E'.
+    RETURN.
+  ENDIF.
+
+  SELECT *
+    INTO TABLE @DATA(tl_eord)
+    FROM eord
+    FOR ALL ENTRIES IN @tl_marc
+    WHERE werks = @tl_marc-werks AND
+          matnr = @tl_marc-matnr AND
+          vdatu <= @sy-datum     AND
+          bdatu >= @sy-datum.
+
+
+  DATA vl_error TYPE xfeld.
+  LOOP AT tl_marc ASSIGNING FIELD-SYMBOL(<fs_marc>).
+    "Si no se encuentra libro de pedidos en las fechas definidas se crea
+    READ TABLE tl_eord ASSIGNING FIELD-SYMBOL(<fs_eord>) WITH KEY werks = <fs_marc>-werks
+                                                                  matnr = <fs_marc>-matnr.
+    CHECK sy-subrc <> 0.
+
+    "A obtener el proveedor y crear el libro de pedidos
+    DATA rl_idx_manager TYPE REF TO zcl_hp_vcpp_idx_manager.
+    CREATE OBJECT rl_idx_manager
+      EXPORTING
+        i_cuobj          = <fs_marc>-cuobj
+      EXCEPTIONS
+        no_valid_iparams = 1
+        OTHERS           = 2.
+
+    rl_idx_manager->get_td100_data(
+      RECEIVING
+        e_yhp_idx_td100 = DATA(wl_td100)
+      EXCEPTIONS
+        no_values       = 1
+        OTHERS          = 2
+    ).
+    IF sy-subrc <> 0.
+      WRITE |Material { <fs_marc>-matnr }. No se ha podido determinar proveedor |.
+      vl_error = 'X'.
+      CONTINUE.
+    ENDIF.
+
+
+    DATA vl_msg TYPE bapiret2-message.
+    PERFORM create_source_list USING  <fs_marc>-matnr <fs_marc>-werks wl_td100-lifnr '1000' space 'X' space
+                               CHANGING vl_msg.
+    IF vl_msg IS INITIAL.
+      vl_msg = 'Libro de pedidos creado'.
+    ELSE.
+      vl_error = 'X'.
+    ENDIF.
+    WRITE |Material { <fs_marc>-matnr }. { vl_msg }|.
+
+  ENDLOOP.
+
+  IF vl_error IS INITIAL.
+    MESSAGE 'Proceso terminado correctamente' TYPE 'S'.
+  ELSE.
+    MESSAGE 'Se han producido errores. Revise log' TYPE 'E'.
+  ENDIF.
+
+
+
+ENDFORM.
+
+
+
+
+*&-------------------------------------
+*& Form create_source_list
+*&-------------------------------------
+*-->P_MATNR text
+*-->P_WERKS text
+*-->P_LIFNR text
+*-->P_EKORG text
+*-->P_FESKZ text
+*-->P_AUTET text
+*-------------------------------------
+FORM create_source_list USING vp_matnr TYPE eord-matnr
+                              vp_werks TYPE eord-werks
+                              vp_lifnr TYPE eord-lifnr
+                              vp_ekorg TYPE eord-ekorg
+                              vp_reswk TYPE eord-reswk
+                              vp_feskz TYPE rm06w-feskz
+                              vp_autet TYPE eord-autet
+                        CHANGING vp_msg_error.
+
+  CLEAR vp_msg_error.
+
+  DATA: tl_eord  TYPE TABLE OF eordu.
+  APPEND INITIAL LINE TO tl_eord ASSIGNING FIELD-SYMBOL(<fs_eord>).
+  <fs_eord>-matnr = vp_matnr.
+  <fs_eord>-werks = vp_werks.
+  <fs_eord>-vdatu = sy-datum.
+  <fs_eord>-bdatu = '99991201'.
+  <fs_eord>-lifnr = vp_lifnr.
+  <fs_eord>-ekorg = vp_ekorg.
+  <fs_eord>-autet = vp_autet.
+  <fs_eord>-fresw = vp_feskz.
+  <fs_eord>-reswk = vp_reswk.
+  <fs_eord>-kz    = 'I' . "I for insert
+
+  CALL FUNCTION 'ME_INITIALIZE_SOURCE_LIST' .
+  CALL FUNCTION 'ME_DIRECT_INPUT_SOURCE_LIST'
+    EXPORTING
+      i_matnr          = vp_matnr
+      i_werks          = vp_werks
+    TABLES
+      t_eord           = tl_eord
+    EXCEPTIONS
+      plant_missing    = 1
+      material_missing = 2
+      error_message    = 4
+      OTHERS           = 5.
+
+  IF sy-subrc <> 0.
+    ROLLBACK WORK.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+      WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 INTO vp_msg_error.
+    RETURN.
+  ENDIF.
+
+  CALL FUNCTION 'ME_POST_SOURCE_LIST_NEW'
+    EXPORTING
+      i_matnr = vp_matnr.
+
+  COMMIT WORK AND WAIT.
+ENDFORM. " create_source_list

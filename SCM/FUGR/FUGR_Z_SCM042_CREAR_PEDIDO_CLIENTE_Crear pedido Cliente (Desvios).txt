@@ -1,0 +1,250 @@
+FUNCTION z_scm042_crear_pedido_cliente.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_KUNNR) TYPE  KUNNR
+*"     VALUE(I_VKORG) TYPE  VKORG
+*"     VALUE(IS_HEADER) TYPE  BAPISDHD1 OPTIONAL
+*"     VALUE(IT_ITEM) TYPE  BAPISDITM_TT
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_TT
+*"     VALUE(E_SALESDOCUMENT) TYPE  BAPIVBELN-VBELN
+*"----------------------------------------------------------------------
+* JGM 02.2024 GAPCM042 Aplicativo Gestión de Desvíos:
+* Crear pedido de cliente (sales order) a partir de datos del Cliente
+* y de datos de la entrega original (items).
+*--------------------------------------------------------------------*
+  CONSTANTS:
+    lc_auart     TYPE auart VALUE 'ZTD1', "*ZTA2
+    lc_bedae_ksv TYPE bedae VALUE 'KSV'.
+*    lc_bstkd TYPE bstkd VALUE 'Desvío CM a Cliente'.
+
+  DATA: lt_return              TYPE bapiret2_tt.
+  DATA: lt_order_items_in      TYPE TABLE OF bapisditm,
+        lt_order_items_inx     TYPE TABLE OF bapisditmx,
+        lt_order_partners      TYPE TABLE OF bapiparnr,
+        lt_order_schedules_in  TYPE TABLE OF bapischdl,
+        lt_order_schedules_inx TYPE TABLE OF bapischdlx.
+
+  DATA: ls_order_header_in  TYPE bapisdhd1,
+        ls_order_header_inx TYPE bapisdhd1x.
+  DATA: ls_order_items_in      TYPE bapisditm,
+        ls_order_items_inx     TYPE bapisditmx,
+        ls_order_partners      TYPE bapiparnr,
+        ls_order_schedules_in  TYPE bapischdl,
+        ls_order_schedules_inx TYPE bapischdlx.
+
+  DATA: lv_salesdocument TYPE bapivbeln-vbeln,
+        lv_posnr         TYPE vbap-posnr.
+
+  DATA: lr_type_error TYPE RANGE OF bapi_mtype.
+
+
+  lr_type_error = VALUE #( sign = 'I' option = 'EQ' ( low = 'E' ) ( low = 'A' ) ).
+
+  SELECT kunnr, vkorg, vtweg, spart
+    INTO TABLE @DATA(lt_knvv)
+    FROM knvv
+    WHERE kunnr EQ @i_kunnr
+      AND vkorg EQ @i_vkorg.
+
+  IF sy-subrc EQ 0.
+    SORT lt_knvv BY kunnr.
+    DATA(ls_knvv) = lt_knvv[ 1 ].
+  ENDIF.
+
+  "Cabecera:
+  IF is_header-doc_type IS INITIAL.
+    ls_order_header_in-doc_type = lc_auart.
+  ELSE.
+    ls_order_header_in-doc_type = is_header-doc_type.
+  ENDIF.
+
+  IF is_header-sales_org IS INITIAL.
+    ls_order_header_in-sales_org = i_vkorg.
+  ELSE.
+    ls_order_header_in-sales_org = is_header-sales_org.
+  ENDIF.
+
+  IF is_header-distr_chan IS INITIAL.
+    ls_order_header_in-distr_chan = ls_knvv-vtweg.
+  ELSE.
+    ls_order_header_in-distr_chan = is_header-distr_chan.
+  ENDIF.
+
+  IF is_header-division IS INITIAL.
+    ls_order_header_in-division = ls_knvv-spart.
+  ELSE.
+    ls_order_header_in-division = is_header-division.
+  ENDIF.
+
+  "Fecha preferente entrega.
+  IF is_header-req_date_h IS INITIAL.
+    ls_order_header_in-req_date_h = sy-datum.
+  ELSE.
+    ls_order_header_in-req_date_h = is_header-req_date_h.
+  ENDIF.
+
+  "Nro. pedido cliente.
+  IF is_header-purch_no_c IS INITIAL.
+    ls_order_header_in-purch_no_c = text-001.
+  ELSE.
+    ls_order_header_in-purch_no_c = is_header-purch_no_c.
+  ENDIF.
+
+  ls_order_header_inx-doc_type    = 'X'.
+  ls_order_header_inx-sales_org   = 'X'.
+  ls_order_header_inx-distr_chan  = 'X'.
+  ls_order_header_inx-division    = 'X'.
+  ls_order_header_inx-req_date_h  = 'X'.
+  ls_order_header_inx-purch_no_c  = 'X'.
+
+*  "Func.interlocutor:
+*  SELECT *
+*    INTO TABLE @DATA(lt_knvp)
+*    FROM knvp
+*    WHERE kunnr EQ @i_kunnr
+*      AND vkorg EQ @i_vkorg
+*      AND vtweg EQ @ls_order_header_in-distr_chan
+*      AND spart EQ @ls_order_header_in-division.
+*
+*  IF sy-subrc EQ 0.
+*    SORT lt_knvp BY kunnr.
+*    IF line_exists( lt_knvp[ parvw = 'AG' ] ).
+*      DATA(ls_knvp) = lt_knvp[ parvw = 'AG' ].
+*      ls_order_partners-partn_role = ls_knvp-parvw.
+*      ls_order_partners-partn_numb = ls_knvp-kunn2.
+*
+*      APPEND ls_order_partners TO lt_order_partners.
+*      CLEAR ls_order_partners.
+*    ENDIF.
+*
+*    IF line_exists( lt_knvp[ parvw = 'WE' ] ).
+*      ls_knvp = lt_knvp[ parvw = 'WE' ].
+*      ls_order_partners-partn_role = ls_knvp-parvw.
+*      ls_order_partners-partn_numb = ls_knvp-kunn2.
+*
+*      APPEND ls_order_partners TO lt_order_partners.
+*      CLEAR ls_order_partners.
+*    ENDIF.
+*  ENDIF.
+
+  "05.09.2024:
+  "Destinatario de Mercancías DM (WE):
+  ls_order_partners-partn_role = 'WE'.
+  ls_order_partners-partn_numb = i_kunnr.
+  APPEND ls_order_partners TO lt_order_partners.
+  CLEAR ls_order_partners.
+
+  "13.09.2024:
+  "Solicitante SO (AG) del nuevo destinatario indicado:
+  "Buscar el nuevo destinatario i_kunnr como destinatario DM (WE), y de los kunnr asociados
+  "dejar los que no sean Destinatarios Mercancías (KNA1-KTOKD <> "ZDES", para no seleccionarse a sí mismo.
+  SELECT a~kunnr, a~parvw, a~kunn2, b~ktokd
+    INTO TABLE @DATA(lt_knvp)
+    FROM knvp AS a
+    INNER JOIN kna1 AS b
+      ON b~kunnr EQ a~kunnr
+    WHERE a~vkorg EQ @i_vkorg
+      AND a~vtweg EQ @ls_order_header_in-distr_chan
+      AND a~spart EQ @ls_order_header_in-division
+      AND a~parvw EQ 'WE'
+      AND a~kunn2 EQ @i_kunnr
+      AND b~ktokd NE 'ZDES'.
+  IF sy-subrc EQ 0.
+    DATA(ls_knvp) = lt_knvp[ 1 ].
+    ls_order_partners-partn_role = 'AG'.  "Solicitante.
+    ls_order_partners-partn_numb = ls_knvp-kunnr.
+    APPEND ls_order_partners TO lt_order_partners.
+    CLEAR ls_order_partners.
+  ENDIF.
+
+
+  "Posiciones:
+  CLEAR lv_posnr.
+  LOOP AT it_item INTO DATA(ls_item).
+    ADD 10 TO lv_posnr.
+
+    ls_order_items_in-itm_number = lv_posnr.
+    ls_order_items_in-material   = ls_item-material.    "+matnr
+    ls_order_items_in-plant      = ls_item-plant.       "+werks
+    ls_order_items_in-store_loc  = ls_item-store_loc.   "lgort-?
+    ls_order_items_in-batch      = ls_item-batch.       "charg-? "Descomentamos al cambiar ZTA2 a ZTD1 porque hay que asignar el lote
+    ls_order_items_in-target_qty = ls_item-target_qty.  "+cantidad
+    ls_order_items_in-target_qu  = ls_item-target_qu.   "+UM
+    ls_order_items_in-reqmts_typ = lc_bedae_ksv.      "No generar OF nueva.
+    APPEND ls_order_items_in TO lt_order_items_in.
+    CLEAR ls_order_items_in.
+
+    ls_order_items_inx-itm_number = lv_posnr.
+    ls_order_items_inx-material   = 'X'.
+    ls_order_items_inx-plant      = 'X'.
+    ls_order_items_inx-store_loc  = 'X'.
+    ls_order_items_inx-batch      = 'X'. "Descomentamos al cambiar ZTA2 a ZTD1 poque hay que asignar el lote
+    ls_order_items_inx-target_qty = 'X'.
+    ls_order_items_inx-target_qu  = 'X'.
+    ls_order_items_inx-reqmts_typ = 'X'.
+    APPEND ls_order_items_inx TO lt_order_items_inx.
+    CLEAR ls_order_items_inx.
+
+
+    "Repartos (VBEP):
+    ls_order_schedules_in-itm_number = lv_posnr.
+    ls_order_schedules_in-req_date   = sy-datum.
+    ls_order_schedules_in-req_qty    = ls_item-target_qty.
+    ls_order_schedules_in-load_date = sy-datum.   "Fecha de carga
+    ls_order_schedules_in-ms_date   = sy-datum.   "Fecha puesta dis.Mat
+    ls_order_schedules_in-tp_date   = sy-datum.   "Fecha planif.transp.
+    ls_order_schedules_in-gi_date   = sy-datum.   "Fecha salida mcías.
+    APPEND ls_order_schedules_in TO lt_order_schedules_in.
+    CLEAR ls_order_schedules_in.
+
+    ls_order_schedules_inx-itm_number = lv_posnr.
+    ls_order_schedules_inx-updateflag = 'I'.
+    ls_order_schedules_inx-req_date   = 'X'.
+    ls_order_schedules_inx-req_qty    = 'X'.
+    ls_order_schedules_inx-load_date  = 'X'.   "Fecha de carga
+    ls_order_schedules_inx-ms_date    = 'X'.   "Fecha puesta dis.Mat
+    ls_order_schedules_inx-tp_date    = 'X'.   "Fecha planif.transp.
+    ls_order_schedules_inx-gi_date    = 'X'.   "Fecha salida mcías.
+    APPEND ls_order_schedules_inx TO lt_order_schedules_inx.
+    CLEAR ls_order_schedules_inx.
+
+  ENDLOOP.
+
+  CALL FUNCTION 'BAPI_SALESORDER_CREATEFROMDAT2'
+    EXPORTING
+      order_header_in     = ls_order_header_in
+      order_header_inx    = ls_order_header_inx
+    IMPORTING
+      salesdocument       = lv_salesdocument
+    TABLES
+      return              = lt_return
+      order_items_in      = lt_order_items_in
+      order_items_inx     = lt_order_items_inx
+      order_partners      = lt_order_partners
+      order_schedules_in  = lt_order_schedules_in
+      order_schedules_inx = lt_order_schedules_inx.
+
+  LOOP AT lt_return TRANSPORTING NO FIELDS WHERE type IN lr_type_error.
+    EXIT.
+  ENDLOOP.
+  IF sy-subrc EQ 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+
+    e_salesdocument = lv_salesdocument.
+
+    "Mensaje creación SO.
+    et_return = VALUE #( FOR wa_ret IN lt_return WHERE ( type EQ 'S' AND id EQ 'V1' AND number EQ '311')
+                       ( CORRESPONDING #( wa_ret ) ) ).
+  ENDIF.
+
+  "Y mensajes de error de la bapi.
+  DELETE lt_return WHERE type NOT IN lr_type_error.
+  APPEND LINES OF lt_return TO et_return.
+
+ENDFUNCTION.

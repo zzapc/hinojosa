@@ -1,0 +1,320 @@
+*&---------------------------------------------------------------------*
+*& Report ZSEI_MIG_00038
+*&-----------------------------------------------------------------------*
+*& This program is intended to extend the validity of cost elements.
+*& The user must enter a cost area and the cost element number.
+*& Extension in the future:
+*&   The newest record will be extended to validity until 31.12.9999
+*& Extension in the past:
+*&   The newest record will be extended to validity up from entered value
+*&-----------------------------------------------------------------------*
+  REPORT ZSEI_MIG_00038.
+
+  DATA gs_ska1  TYPE ska1.
+  DATA gv_ktopl TYPE ktopl.
+  DATA:
+    lt_cskb      TYPE STANDARD TABLE OF cskb WITH NON-UNIQUE DEFAULT KEY,
+    lv_is_newest TYPE abap_bool.
+  TYPES: begin of ty_ska1_fields,
+          ktopl like ska1-ktopl,
+          saknr like ska1-saknr,
+          glaccount_type like ska1-glaccount_type,
+        end of ty_ska1_fields.
+  DATA: gt_ska1_fields TYPE STANDARD TABLE OF ty_ska1_fields WITH HEADER LINE.
+
+  DATA: l_count TYPE i,
+        l_count_char TYPE string,
+        l_count_upd TYPE i,
+        l_auth_primary,     " 'X' authorization for primary costs
+        l_auth_secondary,   " 'X' authorization for secondary costs
+        l_found_primary,    " 'X' at least one primary cost found but no authorization
+        l_found_secondary,  " 'X' at least one secondary cost found but no authorization
+        l_next_costelem,
+        l_message_txt(100),
+        l_saknr(10).
+
+  TABLES: cskb.
+  FIELD-SYMBOLS:
+    <ls_cskb> TYPE cskb.
+
+  PARAMETERS sv_kokrs LIKE cskb-kokrs OBLIGATORY.
+  SELECT-OPTIONS: kstarx FOR cskb-kstar OBLIGATORY.
+  SELECTION-SCREEN SKIP.
+  SELECTION-SCREEN BEGIN OF BLOCK bl1 WITH FRAME TITLE gc_tbl1.
+  PARAMETERS sv_futur RADIOBUTTON GROUP rg1 DEFAULT 'X' USER-COMMAND dummy.
+  PARAMETERS sv_past RADIOBUTTON GROUP rg1.
+  SELECTION-SCREEN BEGIN OF BLOCK bl12 WITH FRAME TITLE gc_tbl12.
+  PARAMETERS sv_datab LIKE cskb-datab MODIF ID pst.
+  SELECTION-SCREEN END OF BLOCK bl12.
+  SELECTION-SCREEN END OF BLOCK bl1.
+  SELECTION-SCREEN SKIP.
+  SELECTION-SCREEN BEGIN OF BLOCK bl2 WITH FRAME TITLE gc_tbl2.
+  PARAMETERS sv_test TYPE allgtest AS CHECKBOX DEFAULT abap_true.
+  PARAMETERS sv_log AS CHECKBOX DEFAULT abap_true.    "Detail log
+  SELECTION-SCREEN END OF BLOCK bl2.
+
+*========================================================================
+  AT SELECTION-SCREEN OUTPUT.
+*========================================================================
+
+    gc_tbl1 = 'Processing Type'(b10).
+    gc_tbl12 = 'New valid from date'(b11).
+    gc_tbl2 = 'Process Control'(b20).
+    LOOP AT SCREEN.
+      CHECK screen-group1 = 'PST'.
+      IF sv_past IS INITIAL.
+        screen-input = 0.
+      ELSE.
+        screen-required = 1.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDLOOP.
+
+*========================================================================
+  AT SELECTION-SCREEN.
+*========================================================================
+
+*   Derive Chart of Accounts from Controlling Area
+    CALL FUNCTION 'GL_ACCT_UTIL_GET_COA'
+      EXPORTING
+        iv_kokrs          = sv_kokrs
+      IMPORTING
+        chart_of_accounts = gv_ktopl
+      EXCEPTIONS
+        not_found         = 1
+        OTHERS            = 2.
+    IF sy-subrc <> 0.
+      MESSAGE e193(fh) WITH sv_kokrs.
+    ENDIF.
+
+    CLEAR gt_ska1_fields.
+    REFRESH gt_ska1_fields.
+*   Read G/L account for type
+    SELECT KTOPL SAKNR GLACCOUNT_TYPE FROM SKA1 APPENDING TABLE gt_ska1_fields
+        WHERE ktopl = gv_ktopl
+        AND   saknr in kstarx
+        AND ( glaccount_type = if_gl_account_master=>gc_glaccount_type-pl_primary
+            OR glaccount_type = if_gl_account_master=>gc_glaccount_type-pl_secondary ).
+    DESCRIBE TABLE gt_ska1_fields LINES l_count.
+    IF l_count = 0.
+       MESSAGE E999(fh) WITH 'No cost elements in chart of accounts'(014) gv_ktopl.
+    ENDIF.
+    CLEAR l_count.
+
+*   Check for "delete" authorization primary
+    CALL FUNCTION 'GL_ACCT_UTIL_CHECK_AUTHORITY'
+      EXPORTING
+        x_chart_of_accounts = abap_true
+        x_controlling_area  = abap_true
+        chart_of_accounts   = gv_ktopl
+        controlling_area    = sv_kokrs
+        glaccount_type      = if_gl_account_master=>gc_glaccount_type-pl_primary
+        activity            = '01'
+      EXCEPTIONS
+        no_authority        = 1
+        OTHERS              = 2.
+    IF sy-subrc = 0.
+      l_auth_primary = 'X'.
+    ELSE.
+      DELETE GT_SKA1_FIELDS
+       WHERE glaccount_type = if_gl_account_master=>gc_glaccount_type-pl_primary.
+      IF SY-SUBRC = 0.             "at least 1 entry deleted
+        l_found_primary = 'X'.
+      ENDIF.
+    ENDIF.
+*   Check for "delete" authorization
+    CALL FUNCTION 'GL_ACCT_UTIL_CHECK_AUTHORITY'
+      EXPORTING
+        x_chart_of_accounts = abap_true
+        x_controlling_area  = abap_true
+        chart_of_accounts   = gv_ktopl
+        controlling_area    = sv_kokrs
+        glaccount_type      = if_gl_account_master=>gc_glaccount_type-pl_secondary
+        activity            = '01'
+      EXCEPTIONS
+        no_authority        = 1
+        OTHERS              = 2.
+    IF sy-subrc = 0.
+      l_auth_secondary = 'X'.
+    ELSE.
+      DELETE GT_SKA1_FIELDS
+       WHERE glaccount_type = if_gl_account_master=>gc_glaccount_type-pl_secondary.
+      IF SY-SUBRC = 0.             "at least 1 entry deleted
+        l_found_secondary = 'X'.
+      ENDIF.
+    ENDIF.
+    IF l_auth_primary is initial AND l_auth_secondary is initial.
+      MESSAGE E999(fh) WITH text-010.
+    ENDIF.
+
+*========================================================================
+  START-OF-SELECTION.
+*========================================================================
+ LOOP AT gt_ska1_fields.
+    CLEAR LT_CSKB.
+    REFRESH LT_CSKB.
+    CLEAR l_next_costelem.
+    CLEAR l_saknr.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        INPUT         =  gt_ska1_fields-saknr
+      IMPORTING
+        OUTPUT        =  l_saknr.
+
+*   Get all cost element time slices
+    SELECT * INTO TABLE lt_cskb FROM cskb
+       WHERE kokrs = sv_kokrs AND kstar = gt_ska1_fields-saknr. "#EC CI_GENBUFF
+    IF sy-subrc <> 0.
+      IF sv_log = abap_true.
+        CLEAR l_message_txt.
+        WRITE 'Cost element &1 doesn''t exist in controlling area'(004) TO l_message_txt.
+        REPLACE '&1' WITH l_saknr INTO l_message_txt.
+        CONDENSE l_message_txt.
+        WRITE / l_message_txt.
+      ENDIF.
+      CONTINUE.
+    ENDIF.
+    SORT lt_cskb BY datbi DESCENDING.
+    lv_is_newest = abap_true.
+
+*========================================================================
+* Preparation
+*========================================================================
+    clear l_next_costelem.
+*   Extension in the future
+    IF sv_futur = abap_true.
+*     Take the newest and only if enddate < 31.12.9999
+      LOOP AT lt_cskb ASSIGNING <ls_cskb>.
+        CHECK l_next_costelem is initial.
+        IF lv_is_newest = abap_true.
+          IF <ls_cskb>-datbi = if_gl_account_master=>gc_validity_date-max.
+           IF sv_log = abap_true.
+            CLEAR l_message_txt.
+            WRITE 'Cost element &1 was already valid until 31/12/9999.'(002) TO l_message_txt.
+            REPLACE '&1' WITH l_saknr INTO l_message_txt.
+            CONDENSE l_message_txt.
+            WRITE / l_message_txt.
+           ENDIF.
+           l_next_costelem = 'X'.
+           EXIT.
+          ELSE.
+            lv_is_newest = abap_false.
+          ENDIF.
+        ELSE.
+          DELETE lt_cskb.
+        ENDIF.
+      ENDLOOP.
+*   Extension in the past
+    ELSE.
+*     Take the newest one, check that extension do not touch an older one
+      LOOP AT lt_cskb ASSIGNING <ls_cskb>.
+*        CHECK l_next_costelem is initial.
+        IF lv_is_newest = abap_true.
+          IF <ls_cskb>-datab <= sv_datab.
+           IF sv_log = abap_true.
+            CLEAR l_message_txt.
+            WRITE 'Cost element &1 was already valid up from &2.'(005) TO l_message_txt.
+            REPLACE '&1' WITH l_saknr INTO l_message_txt.
+            REPLACE '&2' WITH <ls_cskb>-datab INTO l_message_txt.
+            CONDENSE l_message_txt.
+            WRITE / l_message_txt.
+           ENDIF.
+           l_next_costelem = 'X'.
+           EXIT.
+          ELSE.
+            <ls_cskb>-datab = sv_datab.
+            lv_is_newest = abap_false.
+          ENDIF.
+        ELSE.
+          IF <ls_cskb>-datbi >= sv_datab.
+           IF sv_log = abap_true.
+            CLEAR l_message_txt.
+            WRITE 'Cost element &1 from &2 to &3 already exists.'(006) TO l_message_txt.
+            REPLACE '&1' WITH l_saknr INTO l_message_txt.
+            REPLACE '&2' WITH <ls_cskb>-datab INTO l_message_txt.
+            REPLACE '&3' WITH <ls_cskb>-datbi INTO l_message_txt.
+            CONDENSE l_message_txt.
+            WRITE / l_message_txt.
+           ENDIF.
+           l_next_costelem = 'X'.
+           EXIT.
+          ELSE.
+            DELETE lt_cskb.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+*   User info
+    IF sv_test = abap_true AND l_next_costelem IS INITIAL.
+      ADD 1 to l_count.
+      IF sv_log = abap_true.
+       CLEAR l_message_txt.
+       WRITE 'Extension of validity for cost element &1 is possible'(011) TO l_message_txt.
+       REPLACE '&1' WITH l_saknr INTO l_message_txt.
+       CONDENSE l_message_txt.
+       WRITE / l_message_txt.
+      ENDIF.
+    ENDIF.
+
+*========================================================================
+* Database update
+*========================================================================
+    CHECK sv_test = SPACE AND l_next_costelem IS INITIAL.
+
+*   Something to do?
+    CHECK lt_cskb[] IS NOT INITIAL.
+
+*   Extension in the future
+    IF sv_futur = abap_true.
+*     Database update (change of key field -> delete and insert)
+      DELETE cskb FROM TABLE lt_cskb.
+      LOOP AT lt_cskb ASSIGNING <ls_cskb>.
+        <ls_cskb>-datbi = if_gl_account_master=>gc_validity_date-max.
+      ENDLOOP.
+      INSERT cskb FROM TABLE lt_cskb.
+*   Extension in the past
+    ELSE.
+*     Database update
+      UPDATE cskb FROM TABLE lt_cskb.
+    ENDIF.
+
+*   User info
+    IF sy-subrc = 0.
+      COMMIT WORK.
+      ADD 1 to l_count_upd.
+      IF sv_log = abap_true.
+       CLEAR l_message_txt.
+       WRITE 'Cost element &1 has been extended.'(003) TO l_message_txt.
+       REPLACE '&1' WITH l_saknr INTO l_message_txt.
+       CONDENSE l_message_txt.
+       WRITE / l_message_txt.
+      ENDIF.
+    ELSE.
+      IF sv_log = abap_true.
+       CLEAR l_message_txt.
+       WRITE  'Error occurred while saving cost element &1.'(007) TO l_message_txt.
+       REPLACE '&1' WITH l_saknr INTO l_message_txt.
+       CONDENSE l_message_txt.
+       WRITE / l_message_txt.
+      ENDIF.
+    ENDIF.
+ ENDLOOP.
+
+ IF sv_test = abap_true.
+    l_count_char = l_count.
+    CLEAR l_message_txt.
+    CONCATENATE 'Number of cost elements to be changed: '(012) l_count_char INTO l_message_txt SEPARATED BY space.
+    WRITE / l_message_txt.
+ ELSE.
+    l_count_char = l_count_upd.
+    CLEAR l_message_txt.
+    CONCATENATE 'Number of changed cost elements: '(013) l_count_char INTO l_message_txt SEPARATED BY space.
+    WRITE / l_message_txt.
+ ENDIF.
+ IF not l_found_primary is initial AND l_auth_primary is initial.
+    WRITE  / 'No authorization to enhance primary cost elements in CO area'(008).
+ ENDIF.
+ IF not l_found_secondary is initial AND l_auth_secondary is initial.
+    WRITE  / 'No authorization to enhance secondary cost elements in CO area'(009).
+ ENDIF.

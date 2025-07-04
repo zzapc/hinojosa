@@ -1,0 +1,623 @@
+***********************************************************************
+* TIPO : LISTADO
+* TITULO : Bloqueo de útiles
+* DESCRIPCION : Bloqueo de útiles
+*
+* AUTOR: Andrés Picazo                                FECHA: 07/11/2024
+* ANALISTA: Juan Vicente Martínez
+*
+***********************************************************************
+REPORT zrmm0035.
+
+INCLUDE rsdbc1xx.
+
+CLASS lcl_alv DEFINITION INHERITING FROM zcl_ap_alv_check FINAL.
+  PUBLIC SECTION.
+    METHODS handle_user_command REDEFINITION.
+    METHODS visualizar_objeto   REDEFINITION.
+ENDCLASS.
+
+
+CLASS zcl_report DEFINITION INHERITING FROM zcl_dev FINAL.
+  PUBLIC SECTION.
+    TYPES: BEGIN OF t_listado,
+             check      TYPE xfeld,
+             lights     TYPE zico_estado_mensaje,
+             util       TYPE zutil,
+             util_maktx TYPE maktx,
+             ersda      TYPE mara-ersda,
+             util_al    TYPE zalternativa,
+             util_al_m  TYPE maktx,
+             tipo_util  TYPE mtart,
+             util_mstae TYPE mara-mstae,
+             util_werks TYPE marc-werks,
+             util_mmsta TYPE marc-mmsta,
+             util_cuobj TYPE marc-cuobj,
+             tosta      TYPE yrf_tpr_tosta,
+             kunnr      TYPE kna1-kunnr,
+             name1      TYPE kna1-name1,
+             arbpl      TYPE arbpl,
+             ubicacion  TYPE string,
+             matnr      TYPE matnr,
+             maktx      TYPE maktx,
+             mtart      TYPE mtart,
+             mstae      TYPE mara-mstae,
+             werks      TYPE marc-werks,
+             mmsta      TYPE marc-mmsta,
+             cuobj      TYPE marc-cuobj,
+             message    TYPE bapi_msg,
+             error      TYPE abap_bool,
+             color      TYPE lvc_t_scol,
+           END OF t_listado,
+           tt_listado TYPE STANDARD TABLE OF t_listado WITH KEY matnr werks.
+
+    DATA: i_listado TYPE tt_listado,
+          o_alv     TYPE REF TO lcl_alv ##NEEDED.
+
+    METHODS  main.
+
+    METHODS: listado,
+      seleccionar_datos.
+
+  PRIVATE SECTION.
+    METHODS buscar_alternativos
+      IMPORTING matnr           TYPE matnr
+                werks           TYPE werks_d
+                mtart           TYPE mtart
+                i_car           TYPE zt_sel_car
+      RETURNING VALUE(r_result) TYPE tt_listado.
+
+    METHODS get_datos_util
+      EXPORTING i_car TYPE zt_sel_car
+      CHANGING  !list TYPE t_listado.
+
+ENDCLASS.
+
+*------VARIABLES-------------------------------------------------------*
+DATA o_prog TYPE REF TO zcl_report.
+
+DATA: marc          TYPE marc,
+      yhp_idx_td130 TYPE yhp_idx_td130,
+      kna1          TYPE kna1,
+      mara          TYPE mara,
+      yhp_pp_td010  TYPE yhp_pp_td010,
+      o_aicomp      TYPE REF TO zhcl_ai_core.
+
+
+*------PARAMETER/SELECT-OPTIONS EN PANTALLA----------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-utl.
+SELECT-OPTIONS: s_werksu FOR marc-werks,
+                s_matnru FOR marc-matnr,
+                s_mstaeu FOR mara-mstae,
+                s_mmstau FOR marc-mmsta,
+                s_tosta  FOR yhp_pp_td010-tosta.
+SELECTION-SCREEN SKIP 1.
+PARAMETERS: p_cliche AS CHECKBOX DEFAULT 'X',
+            p_troque AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN END OF BLOCK b01.
+*SELECTION-SCREEN BEGIN OF BLOCK b02 WITH FRAME TITLE text-mat.
+*SELECT-OPTIONS: s_werks FOR marc-werks NO-DISPLAY,
+*                s_matnr FOR marc-matnr NO-DISPLAY,
+*                s_mtart FOR mara-mtart NO-DISPLAY,
+*                s_mstae FOR mara-mstae NO-DISPLAY,
+*                s_mmsta FOR marc-mmsta NO-DISPLAY.
+*SELECTION-SCREEN END OF BLOCK b02.
+
+SELECTION-SCREEN BEGIN OF BLOCK b03 WITH FRAME.
+PARAMETERS: p_pbor  AS CHECKBOX DEFAULT 'X',
+            p_utsm  AS CHECKBOX DEFAULT '' USER-COMMAND usm,
+            p_diasc TYPE i DEFAULT 365 MODIF ID usm,
+            p_vari  LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK b03.
+__botones_plantilla.
+
+
+************************************************************************
+*
+* LOGICA DEL PROGRAMA
+*
+************************************************************************
+
+*----------------------------------------------------------------------*
+* CLASS lcl_alv IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_alv IMPLEMENTATION.
+  METHOD visualizar_objeto.
+    DATA l_list TYPE o_prog->t_listado.
+
+    l_list = list.
+    CASE column.
+      WHEN 'UTIL'.
+        SUBMIT yrf_tpr_tp
+           AND RETURN
+               WITH p_werks = l_list-util_werks
+               WITH s_mtart = l_list-tipo_util
+               WITH s_matnr = l_list-util.
+      WHEN 'UTIL_AL'.
+        SET PARAMETER ID 'MAT' FIELD l_list-util_al.
+        SET PARAMETER ID 'WRK' FIELD l_list-werks.
+        CALL TRANSACTION 'MM03' AND SKIP FIRST SCREEN.
+      WHEN 'MATNR'.
+        SET PARAMETER ID 'MAT' FIELD l_list-matnr.
+        SET PARAMETER ID 'WRK' FIELD l_list-werks.
+        CALL TRANSACTION 'MM03' AND SKIP FIRST SCREEN.
+      WHEN 'UTIL_CUOBJ' OR 'KUNNR' OR 'MAQUINA'.
+        zhcl_ai_core=>visualizar_cuobj( l_list-util_cuobj ).
+      WHEN OTHERS. message = 'No implementado'.
+    ENDCASE.
+  ENDMETHOD. " handle_double_click
+
+  METHOD handle_user_command.
+    DATA i_proc TYPE o_prog->tt_listado.
+
+    check_ucomm_sel = 'EJEC'.
+
+    super->handle_user_command( e_salv_function ).
+
+    CASE ucomm.
+      WHEN 'EJEC'.
+        IF line_exists( o_prog->i_listado[ check = 'X' error = 'X' ] ).
+          MESSAGE 'No seleccione líneas con errores' TYPE 'I'.
+          RETURN.
+        ENDIF.
+        CLEAR o_prog->o_log->i_log.
+        DATA(o_mat) = NEW zcl_ap_material( ).
+        LOOP AT o_prog->i_listado ASSIGNING FIELD-SYMBOL(<listado>) WHERE check = 'X'.
+          IF <listado>-util_al IS INITIAL.
+            DATA(l_util) = <listado>-util.
+          ELSE.
+            l_util = <listado>-util_al.
+          ENDIF.
+          ASSIGN i_proc[ util = l_util werks = <listado>-util_werks ] TO FIELD-SYMBOL(<proc>).
+          IF sy-subrc = 0.
+            <listado>-lights  = <proc>-lights.
+            <listado>-message = <proc>-message.
+          ELSE.
+            o_mat->ini_update( matnr = <listado>-matnr ).
+
+            TRY.
+                DATA(tool) = ycl_rf_tpm_tool=>get_instance_by_matnr( if_matnr = l_util
+                                                                          if_werks = <listado>-util_werks ).
+
+                IF tool IS INITIAL.
+                  <listado>-message = o_prog->message( p1 = 'El material' p2 = l_util p3 = 'no es tool'  postponer = 'X' type = 'E' ).
+                  <listado>-lights  = zcl_ap_alv=>set_icono( icono = icon_okay mensaje = <listado>-message ).
+                ELSE.
+                  DATA(lr_message1) = NEW /vcxi/cl_ckxm_message( ).
+                  tool->scrap( CHANGING cr_message = lr_message1 ).
+                  LOOP AT lr_message1->t_msg ASSIGNING FIELD-SYMBOL(<msg>).
+                    o_prog->message( p1 = <msg>-message  postponer = 'X' type = <msg>-msgty ).
+                  ENDLOOP.
+                  ASSIGN lr_message1->t_msg[ msgty = 'E' ] TO <msg>.
+                  IF sy-subrc = 0.
+                    <listado>-message = <msg>-message.
+                    <listado>-lights  = zcl_ap_alv=>set_icono( icono = icon_red_light mensaje = <listado>-message ).
+                    APPEND <listado> TO i_proc.
+                    CONTINUE.
+                  ELSE.
+                    IF NOT <listado>-ubicacion IS INITIAL.
+                      SELECT lgort
+                        FROM mard
+                        WHERE matnr = @l_util
+                          AND werks = @<listado>-util_werks
+                        ORDER BY PRIMARY KEY
+                        INTO @DATA(l_lgort)
+                        UP TO 1 ROWS.
+                      ENDSELECT.
+                      IF sy-subrc = 0.
+                        TRY.
+                            DATA(location_manager) = NEW zcl_wm_tools_location_manager(
+                                i_matnr = l_util
+                          i_werks = <listado>-util_werks
+                            i_lgort = l_lgort ).
+
+                            location_manager->clear_matnr_location( ).
+
+*APC20250324 Nos aseguramos de que la característica ubicación (HP_WAHO1) se borre, sino se vuelve a poner el anterior
+                            DATA ls_td100_new TYPE yrf_tpr_s_td100_mtart.
+                            MOVE-CORRESPONDING tool->s_td100 to ls_td100_new.
+                            CLEAR ls_td100_new-waho1.
+                            tool = ycl_rf_tpm_tool=>get_instance_by_matnr( if_matnr = l_util
+                                                                           if_werks = <listado>-util_werks
+                                                                           is_td100 = ls_td100_new
+                                                                           IF_INIT  = 'X' ).
+
+
+                          CATCH zcx_wm_exception INTO DATA(lr_wm_exception).
+                            <listado>-message = o_prog->message( p1 = 'Util' p2 = l_util p3 = 'en centro' p4 = <listado>-werks p5 = 'error vaciando ubicación' p6 = lr_wm_exception->get_text( ) postponer = 'X' type = 'E' ).
+                            APPEND <listado> TO i_proc.
+                            CONTINUE.
+                          CATCH zcx_exception INTO DATA(lr_exception).
+                            <listado>-message = o_prog->message( p1 = 'Util' p2 = l_util p3 = 'en centro' p4 = <listado>-werks p5 = 'error vaciando ubicación' p6 = lr_exception->get_text( ) postponer = 'X' type = 'E' ).
+                            APPEND <listado> TO i_proc.
+                            CONTINUE.
+                        ENDTRY.
+                      ENDIF.
+                    ENDIF.
+
+                    tool->set_status( if_werks = <listado>-util_werks
+                                      if_matnr = l_util
+                                      if_proce = 'SCRA' ).
+
+                    DATA(msg_tool) = tool->update_material_master( if_black = abap_false ).
+                    LOOP AT msg_tool->t_msg ASSIGNING <msg>.
+                      o_prog->message( p1 = <msg>-message  postponer = 'X' type = <msg>-msgty ).
+                    ENDLOOP.
+                    ASSIGN msg_tool->t_msg[ msgty = 'E' ] TO <msg>.
+                    IF sy-subrc = 0.
+                      <listado>-message = <msg>-message.
+                      <listado>-lights  = zcl_ap_alv=>set_icono( icono = icon_red_light mensaje = <listado>-message ).
+                    ELSE.
+                      <listado>-message = o_prog->message( p1 = 'Se ha pasado el util' p2 = l_util p3 = 'en centro' p4 = <listado>-util_werks p5 = 'a estado YDES' postponer = 'X' type = 'S' ).
+                    ENDIF.
+                  ENDIF.
+*                IF <listado>-mmsta <> '99'.
+*                  SELECT SINGLE * FROM marc
+*                  INTO @DATA(l_marc)
+*                  WHERE matnr = @<listado>-matnr
+*                    AND werks = @<listado>-werks.
+*                  l_marc-mmsta = '99'.
+*                  <listado>-mmsta = '99'.
+*                  o_mat->add_datos_centro( marc = l_marc compras = 'X' ).
+*                  o_mat->update( ).
+*                  ASSIGN o_mat->messages[ type = 'E' ] TO FIELD-SYMBOL(<mess>).
+*                  IF sy-subrc = 0.
+*                    ROLLBACK WORK.
+*                    o_prog->message( p1 = |Error bloqueando material { <mess>-message }| postponer = 'X' ).
+*                  ELSE.
+*                    <listado>-message = o_prog->message( p1 = 'Se ha bloqueado material' p2 = <listado>-matnr p3 = 'en centro' p4 = <listado>-werks postponer = 'X' type = 'S' ).
+*                    <listado>-lights  = zcl_ap_alv=>set_icono( icono = icon_okay mensaje = <listado>-message ).
+*                    COMMIT WORK AND WAIT.
+*                  ENDIF.
+*              ENDIF.
+
+                ENDIF.
+              CATCH /vcxi/cx_ckx INTO DATA(lr_cx_ckx).
+                <listado>-message = o_prog->message( p1 = |Error marcando tool como destruída { lr_cx_ckx->get_text( ) }| postponer = 'X' type = 'E' ).
+                ROLLBACK WORK.                              "#EC *
+            ENDTRY.
+            APPEND <listado> TO i_proc.
+          ENDIF.
+        ENDLOOP.
+        IF sy-subrc = 0.
+          o_prog->o_log->show_log( ).
+          refresh( ).
+        ENDIF.
+      WHEN OTHERS.
+    ENDCASE.
+  ENDMETHOD.
+ENDCLASS.
+
+
+*----------------------------------------------------------------------*
+*       CLASS zcl_report IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS zcl_report IMPLEMENTATION.
+  METHOD main.
+    seleccionar_datos( ).
+    listado( ).
+  ENDMETHOD.                    " REPORT
+
+  METHOD seleccionar_datos.
+    DATA i_alt TYPE tt_listado.
+
+    sgpi_texto( 'Seleccionando datos'(sda) ).
+
+    IF p_cliche = 'X'.
+      SELECT mara~matnr AS util, mara~mtart AS tipo_util, mara~mstae AS util_mstae, mara~ersda,
+             makt~maktx AS util_maktx,
+             marc~werks AS util_werks, marc~mmsta AS util_mmsta, marc~cuobj AS util_cuobj,
+             marc_mat~matnr, marc_mat~werks, marc_mat~mmsta, marc_mat~cuobj,
+             mara_mat~mtart, mara_mat~mstae,
+             makt_mat~maktx
+        FROM marc JOIN mara ON mara~matnr = marc~matnr
+       LEFT OUTER JOIN makt ON  makt~matnr = marc~matnr
+                            AND makt~spras = @sy-langu
+       LEFT OUTER JOIN yhp_idx_td130 ON yhp_idx_td130~prton = marc~matnr
+       LEFT OUTER JOIN marc AS marc_mat ON marc_mat~cuobj = yhp_idx_td130~cuobj
+       LEFT OUTER JOIN mara AS mara_mat ON mara_mat~matnr = marc_mat~matnr
+       LEFT OUTER JOIN makt AS makt_mat ON  makt_mat~matnr = marc_mat~matnr
+                                        AND makt_mat~spras = @sy-langu
+       INTO CORRESPONDING FIELDS OF TABLE @i_listado
+     WHERE marc~matnr     IN @s_matnru
+       AND mara~mstae     IN @s_mstaeu
+       AND mara~mtart      = 'ZCLI'
+       AND marc~mmsta     IN @s_mmstau
+       AND marc~werks     IN @s_werksu
+*       AND marc_mat~matnr IN @s_matnr
+*       AND mara_mat~mstae IN @s_mstae
+*       AND mara_mat~mtart IN @s_mtart
+*       AND marc_mat~mmsta IN @s_mmsta
+*       AND marc_mat~werks IN @s_werks
+    ORDER BY mara~matnr, marc~werks.
+    ENDIF.
+
+    IF p_troque = 'X'.
+      SELECT mara~matnr AS util, mara~mtart AS tipo_util, mara~mstae AS util_mstae, mara~ersda,
+             makt~maktx AS util_maktx,
+             marc~werks AS util_werks, marc~mmsta AS util_mmsta, marc~cuobj AS util_cuobj,
+             marc_mat~matnr, marc_mat~werks, marc_mat~mmsta, marc_mat~cuobj,
+             mara_mat~mtart, mara_mat~mstae,
+             makt_mat~maktx
+        FROM marc JOIN mara ON mara~matnr = marc~matnr
+       LEFT OUTER JOIN makt ON  makt~matnr = marc~matnr
+                            AND makt~spras = @sy-langu
+       LEFT OUTER JOIN yhp_idx_td100 ON yhp_idx_td100~dcutt = marc~matnr
+       LEFT OUTER JOIN marc AS marc_mat ON marc_mat~cuobj = yhp_idx_td100~cuobj
+       LEFT OUTER JOIN mara AS mara_mat ON mara_mat~matnr = marc_mat~matnr
+       LEFT OUTER JOIN makt AS makt_mat ON  makt_mat~matnr = marc_mat~matnr
+                                        AND makt_mat~spras = @sy-langu
+       APPENDING CORRESPONDING FIELDS OF TABLE @i_listado
+     WHERE marc~matnr     IN @s_matnru
+       AND mara~mstae     IN @s_mstaeu
+       AND mara~mtart      = 'ZTRO'
+       AND marc~mmsta     IN @s_mmstau
+       AND marc~werks     IN @s_werksu
+*       AND marc_mat~matnr IN @s_matnr
+*       AND mara_mat~mstae IN @s_mstae
+*       AND mara_mat~mtart IN @s_mtart
+*       AND marc_mat~mmsta IN @s_mmsta
+*       AND marc_mat~werks IN @s_werks
+    ORDER BY mara~matnr, marc~werks.
+    ENDIF.
+
+    SORT i_listado BY matnr werks.
+
+* Quitamos entradas con util y material cuando hay algunas con material
+    LOOP AT i_listado ASSIGNING FIELD-SYMBOL(<listado>) WHERE NOT matnr IS INITIAL.
+      DELETE i_listado WHERE util_cuobj = <listado>-util_cuobj AND matnr IS INITIAL.
+    ENDLOOP.
+
+    DELETE ADJACENT DUPLICATES FROM i_listado COMPARING ALL FIELDS.
+
+    IF p_pbor = 'X'.
+      fecha = sy-datum - p_diasc.
+      LOOP AT i_listado ASSIGNING <listado> WHERE mmsta <> '99'.
+        IF <listado>-matnr IS INITIAL AND p_utsm = 'X' AND <listado>-ersda < fecha.
+* Mantenemos el material
+        ELSE.
+          DELETE i_listado WHERE util_cuobj = <listado>-util_cuobj.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+    o_aicomp = NEW zhcl_ai_core( ).
+    LOOP AT i_listado ASSIGNING <listado> WHERE util_al IS INITIAL.
+      get_datos_util( IMPORTING i_car = DATA(i_car)
+                      CHANGING list   = <listado> ).
+      IF NOT <listado>-tosta IN s_tosta.
+        DELETE i_listado.
+        CONTINUE.
+      ENDIF.
+
+      zcl_ap_alv_grid=>append_color( EXPORTING campo = 'UTIL,UTIL_MAKTX' colorc = 'V' CHANGING tabla_color = <listado>-color ).
+      IF NOT line_exists( i_alt[ util = <listado>-util
+                                 util_werks = <listado>-util_werks ] ).
+        APPEND <listado> TO i_alt.
+        DATA(i_m) = buscar_alternativos( matnr = <listado>-util werks = <listado>-util_werks mtart = <listado>-tipo_util i_car = i_car ).
+        LOOP AT i_m INTO DATA(l_m).
+          l_m-util       = <listado>-util.
+          l_m-util_maktx = <listado>-util_maktx.
+          zcl_ap_alv_grid=>append_color( EXPORTING campo = 'UTIL_AL,UTIL_AL_M' colorc = 'V' CHANGING tabla_color = l_m-color ).
+          APPEND l_m TO i_listado.
+        ENDLOOP.
+      ENDIF.
+    ENDLOOP.
+
+
+*    IF p_pbor = 'X'.
+*      fecha = sy-datum - p_diasc.
+*      LOOP AT i_listado ASSIGNING <listado> WHERE matnr IS INITIAL.
+*        IF p_utsm IS INITIAL OR <listado>-ersda < fecha.
+*          DELETE i_listado.
+*        ENDIF.
+*      ENDLOOP.
+*    ENDIF.
+
+
+    SORT i_listado BY util werks util_al matnr.
+  ENDMETHOD.
+
+  METHOD get_datos_util.
+    CLEAR i_car.
+    IF list-util_cuobj IS INITIAL.
+      list-message = |Material no tiene clasificación|.
+      list-lights  = zcl_ap_alv=>set_icono( icono = icon_red_light mensaje = list-message ).
+    ELSE.
+      i_car = o_aicomp->get_caracteristicas( list-util_cuobj ).
+      ASSIGN i_car[ charact = 'HP_TOSTA' ] TO FIELD-SYMBOL(<tosta>).
+      IF sy-subrc = 0.
+        list-tosta = <tosta>-value.
+      ENDIF.
+
+      ASSIGN i_car[ charact = 'HP_KUNNR' ] TO FIELD-SYMBOL(<kunnr>).
+      IF sy-subrc = 0.
+        list-kunnr = <kunnr>-value.
+        list-name1 = get( tabla = 'KNA1' clave = list-kunnr ).
+      ENDIF.
+      ASSIGN i_car[ charact = 'HP_ARBPL' ] TO FIELD-SYMBOL(<arbpl>).
+      IF sy-subrc = 0.
+        list-arbpl = <arbpl>-value.
+      ENDIF.
+      ASSIGN i_car[ charact = 'HP_WAHO1' ] TO FIELD-SYMBOL(<waho1>).
+      IF sy-subrc = 0.
+        list-ubicacion = <waho1>-value.
+      ENDIF.
+
+      TRY.
+          IF list-tosta = 'YDES'.
+            list-message = |Útil ya está en estado YDES|.
+            list-lights  = zcl_ap_alv=>set_icono( icono = icon_green_light mensaje = list-message ).
+          ELSE.
+            SELECT SINGLE status_from FROM  yrf_tpm_tc004
+              INTO list-tosta
+                   WHERE werks       = list-util_werks
+                     AND mtart       = list-tipo_util
+                     AND minor_amend = 'N'
+                     AND proce       = 'SCRA'
+                     AND status_from = list-tosta
+                     AND status_to   = 'YDES'.
+            IF sy-subrc <> 0.
+              list-message = |No se permite el cambio de estado { list-tosta } a YDES|.
+              list-lights  = zcl_ap_alv=>set_icono( icono = icon_red_light mensaje = list-message ).
+            ENDIF.
+          ENDIF.
+        CATCH /vcxi/cx_ckx INTO DATA(lr_cx_ckx). "# EC* " TODO: variable is assigned but never used (ABAP cleaner)
+          list-message = |No se encuentra tool relevante para el util|.
+          list-lights  = zcl_ap_alv=>set_icono( icono = icon_red_light mensaje = list-message ).
+      ENDTRY.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD listado.
+    sgpi_texto( 'Generando informe'(gin) ).
+
+    o_alv->add_button( button = 'F01' text = 'Bloquear útil'  icon = icon_execute_object ucomm = 'EJEC' ).
+
+    o_alv->set_layout( p_vari ).
+
+    o_alv->set_top_of_page( ).
+
+    o_alv->set_field_hotspot( campo = 'MATNR,CUOBJ,UTIL_CUOBJ,UTIL,UTIL_AL' auto = 'X' ).
+    o_alv->set_field_noout( 'CUOBJ,UTIL_CUOBJ,WERKS' ).
+
+    o_alv->set_field( campo = 'LIGHTS,MATNR' op = 'KEY' ).
+    o_alv->set_field_quitar( 'CHECK,ERROR' ).
+    o_alv->set_field_text( 'UBICACION,UTIL' ).
+    o_alv->set_field_text( campo = 'UTIL_AL' valor = 'Alt.' valor2 = 'Alternativa' ).
+    o_alv->set_field_text( campo = 'UTIL_AL_M' valor = 'Alt.Descripción' ).
+
+    o_alv->set_orden( 'UTIL,UTIL_MAKTX,TIPO_UTIL,UTIL_WERKS' ).
+    o_alv->get_datos_layout( EXPORTING reordenar_tabla = 'X' tabla_ref = 'X' CHANGING t_tabla = i_listado ).
+    o_alv->set_seleccion( CHANGING t_tabla = i_listado ).
+
+    o_alv->show( ).
+  ENDMETHOD.
+
+  METHOD buscar_alternativos.
+    DATA r_matnr TYPE RANGE OF matnr.
+
+    CLEAR r_result.
+    APPEND VALUE #( option = 'CP' sign = 'I' low = |{ matnr(13) }*| ) TO r_matnr.
+    APPEND VALUE #( option = 'EQ' sign = 'E' low = matnr ) TO r_matnr.
+    LOOP AT i_car ASSIGNING FIELD-SYMBOL(<car>) WHERE charact(7) = 'HP_ALTO'.
+      APPEND VALUE #( option = 'EQ' sign = 'I' low = <car>-value  ) TO r_matnr.
+    ENDLOOP.
+
+    IF mtart = 'ZCLI'.
+      SELECT mara~matnr AS util_al, mara~mtart AS tipo_util, mara~mstae AS util_mstae,
+             makt~maktx AS util_al_m,
+             marc~werks AS util_werks, marc~mmsta AS util_mmsta, marc~cuobj AS util_cuobj
+        FROM marc JOIN mara ON mara~matnr = marc~matnr
+       LEFT OUTER JOIN makt ON  makt~matnr = marc~matnr
+                            AND makt~spras = @sy-langu
+       LEFT OUTER JOIN yhp_idx_td130 ON yhp_idx_td130~prton = marc~matnr
+       INTO CORRESPONDING FIELDS OF TABLE @r_result
+     WHERE marc~matnr IN @r_matnr
+       AND marc~werks  = @werks
+       AND mara~mstae IN @s_mstaeu
+       AND marc~mmsta IN @s_mmstau
+    ORDER BY mara~matnr, marc~werks.
+    ENDIF.
+
+    IF mtart = 'ZTRO'.
+      SELECT mara~matnr AS util_al, mara~mtart AS tipo_util, mara~mstae AS util_mstae,
+             makt~maktx AS util_al_m,
+             marc~werks AS util_werks, marc~mmsta AS util_mmsta, marc~cuobj AS util_cuobj
+        FROM marc JOIN mara ON mara~matnr = marc~matnr
+       LEFT OUTER JOIN makt ON  makt~matnr = marc~matnr
+                            AND makt~spras = @sy-langu
+       LEFT OUTER JOIN yhp_idx_td100 ON yhp_idx_td100~dcutt = marc~matnr
+       APPENDING CORRESPONDING FIELDS OF TABLE @r_result
+     WHERE marc~matnr IN @r_matnr
+       AND mara~mstae IN @s_mstaeu
+       AND marc~mmsta IN @s_mmstau
+       AND marc~werks  = @werks
+    ORDER BY mara~matnr, marc~werks.
+    ENDIF.
+
+    SORT r_result BY util_al util_werks.
+    DELETE ADJACENT DUPLICATES FROM r_result COMPARING util_al util_werks.
+    LOOP AT r_result ASSIGNING FIELD-SYMBOL(<list>).
+      get_datos_util( CHANGING list = <list> ).
+    ENDLOOP.
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* INITIALIZATION
+*----------------------------------------------------------------------*
+INITIALIZATION.
+  o_prog = NEW #( status       = 'INICIO_DYN'
+                  status_prog  = 'ZAP_STATUS'
+                  no_param     = 'X'
+                  guardar_logz = 'X' ).
+
+  PERFORM add_button IN PROGRAM zap_status USING 'M01' 'Log'(log) '' ''.
+  IF zcl_usuario=>es_usuario_sistemas( ).
+    PERFORM add_button IN PROGRAM zap_status
+            USING 'M02' 'Parámetros' '' ''.
+  ENDIF.
+
+  o_prog->o_alv = NEW #( status             = 'STANDARD_ALV_DYN'
+                         status_prog        = 'ZAP_STATUS'
+                         top_of_page_auto   = 'X'
+                         top_of_page_titulo = 'X'
+                         color              = 'COLOR'
+                         o_dev              = o_prog ).
+
+  o_prog->initialization_i( CHANGING sscrfields = sscrfields ).
+  IF o_prog->variante_forzada IS INITIAL.
+    p_vari = o_prog->o_alv->get_default_layout( ).
+
+    s_mstaeu[] = VALUE #( option = 'EQ'
+                         sign = 'E'
+                         ( low = '99' )
+                         ( low = 'Z2' )
+                         ( low = 'ZZ' ) ).
+
+    SELECT DISTINCT status_from FROM  yrf_tpm_tc004
+      INTO TABLE @DATA(status)
+           WHERE werks       IN @s_werksu
+             AND minor_amend  = 'N'
+             AND proce        = 'SCRA'
+             AND status_to    = 'YDES'.
+    LOOP AT status ASSIGNING FIELD-SYMBOL(<status>).
+      APPEND VALUE #( option = 'EQ' sign = 'I' low = <status> ) TO s_tosta.
+    ENDLOOP.
+    o_prog->parametros_por_defecto( CHANGING r_werks = s_werksu[] ).
+  ENDIF.
+
+
+AT SELECTION-SCREEN OUTPUT.
+  o_prog->selection_screen_output( CHANGING current_scr = current_scr ).
+  zcl_ap_dynpro=>screen_visible( group1 = 'USM' variable = p_utsm ).
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_vari.
+  p_vari = o_prog->o_alv->get_f4_layout( ).
+
+************************************************************************
+* AT SELECTION-SCREEN.
+************************************************************************
+AT SELECTION-SCREEN.
+  CASE sy-ucomm.
+    WHEN 'ONLI'.
+      o_prog->validar_seleccion_obligatoria( campos_or = '*' msgty = 'W' ).
+      o_prog->validar_centro( r_werks = s_werksu[] obligatorio = 'X' ).
+    WHEN OTHERS.
+      o_prog->at_selection( ).
+  ENDCASE.
+
+AT SELECTION-SCREEN ON EXIT-COMMAND.
+  o_prog->at_selection( ).
+
+*----------------------------------------------------------------------
+* START-OF-SELECTION.
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+  o_prog->main( ).

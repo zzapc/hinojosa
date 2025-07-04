@@ -1,0 +1,254 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZGFPP0008_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&                            TYPINGS
+*&---------------------------------------------------------------------*
+TYPES: tt_fdscr TYPE TABLE OF rlgrap-filename,
+       tt_recip TYPE TABLE OF so_recname,
+       tt_mess  TYPE TABLE OF string.
+
+*
+**&---------------------------------------------------------------------*
+**&                          DATA OBJECTS
+**&---------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+*       CLASS lcl_email_dispatcher DEFINITION
+*----------------------------------------------------------------------*
+CLASS lcl_email_dispatcher DEFINITION.
+  PUBLIC SECTION.
+    METHODS: constructor IMPORTING im_subject     TYPE so_obj_des
+                                   im_tab_mess    TYPE tt_mess
+                                   im_tab_fdscr   TYPE tt_fdscr
+                                   im_tab_recip   TYPE tt_recip.
+
+
+  PRIVATE SECTION.
+
+
+    "tables
+    DATA: it_recipients   TYPE TABLE OF somlreci1,
+          it_packing_list TYPE TABLE OF sopcklsti1,
+          it_message      TYPE TABLE OF solisti1,
+          it_attachments  TYPE TABLE OF solisti1.
+
+
+    "structures
+    DATA: doc_attr        TYPE sodocchgi1.
+
+
+    METHODS: set_doc_attributes IMPORTING f_subject TYPE so_obj_des, "50 chars
+             set_recipients IMPORTING ft_recip TYPE tt_recip,
+             set_automatic_message IMPORTING ft_mess TYPE tt_mess,
+             initialize_packing_list IMPORTING ft_fdscr TYPE tt_fdscr,
+             prepare_data_for_dispatch IMPORTING f_fdscr TYPE rlgrap-filename
+                                       CHANGING f_lines TYPE i
+                                                fs_packing_list TYPE sopcklsti1,
+             get_file_name IMPORTING f_path TYPE rlgrap-filename
+                           EXPORTING f_file TYPE so_obj_des,
+             dispatch.
+
+
+ENDCLASS.                    "lcl_email_dispatcher DEFINITION
+
+
+*----------------------------------------------------------------------*
+*       CLASS lcl_email_dispatcher IMPLEMENTATION
+*----------------------------------------------------------------------*
+CLASS lcl_email_dispatcher IMPLEMENTATION.
+  METHOD constructor.
+    set_doc_attributes( im_subject ).
+    set_recipients( im_tab_recip ).
+    set_automatic_message( im_tab_mess ).
+    initialize_packing_list( im_tab_fdscr ).
+    dispatch( ).
+  ENDMETHOD.                    "constructor
+
+
+  METHOD set_doc_attributes.
+    "---------------------- Document attributes
+    doc_attr-obj_name = 'WAS_FILESEND'.
+    doc_attr-obj_descr = f_subject.
+    doc_attr-obj_langu = sy-langu.
+    doc_attr-sensitivty = 'F'.      "functional message
+  ENDMETHOD.                    "set_doc_attributes
+
+
+  METHOD set_recipients.
+    DATA: wa_recip LIKE LINE OF ft_recip,
+          wa_recipient  TYPE somlreci1.
+
+
+    "---------------------- Recipcients
+    LOOP AT ft_recip INTO wa_recip.
+      wa_recipient-receiver = wa_recip.
+      wa_recipient-rec_type = 'U'.               "internet address
+      wa_recipient-com_type = 'INT'.             "send via internet
+      APPEND wa_recipient TO it_recipients.
+    ENDLOOP.
+  ENDMETHOD.                    "set_recipients
+
+
+  METHOD set_automatic_message.
+    DATA: wa_mess LIKE LINE OF ft_mess.
+
+
+    LOOP AT ft_mess INTO wa_mess.
+      APPEND wa_mess TO it_message.
+    ENDLOOP.
+  ENDMETHOD.                    "set_automatic_message
+
+
+  METHOD initialize_packing_list.
+    DATA: wa_fdscr LIKE LINE OF ft_fdscr,
+          wa_packing_list TYPE sopcklsti1,
+          l_line TYPE i,
+          index(3) TYPE n,
+          file TYPE so_obj_des.                             "char50
+
+
+    "--------------------- describe message
+    wa_packing_list-transf_bin = space.
+    wa_packing_list-body_start = 1.
+    DESCRIBE TABLE it_message.
+    wa_packing_list-body_num = sy-tfill.
+    wa_packing_list-doc_type = 'RAW'.
+*    wa_packing_list-doc_type = 'CSV'.
+    APPEND wa_packing_list TO it_packing_list.
+
+
+    "---------------------- describe attachemnts (one per line)
+    l_line = 1.
+
+
+    LOOP AT ft_fdscr INTO wa_fdscr.
+
+
+      "------------------ construct attachement name
+      get_file_name( EXPORTING f_path = wa_fdscr IMPORTING f_file = file ).
+
+
+      "------------------ attachment attributes
+      CLEAR wa_packing_list.
+      wa_packing_list-transf_bin = 'X'.
+      wa_packing_list-body_start = l_line.
+      index = sy-tabix.
+      CONCATENATE 'ATTACH' index INTO wa_packing_list-obj_name.
+      wa_packing_list-obj_descr = file.
+      wa_packing_list-obj_langu = sy-langu.
+      wa_packing_list-doc_type = 'XLS'.          "send as DAT file
+
+
+      "------------------- get the file form Application server
+      CLEAR l_line.
+      prepare_data_for_dispatch( EXPORTING f_fdscr = wa_fdscr CHANGING f_lines = l_line
+                                                                       fs_packing_list = wa_packing_list ).
+
+
+      "------------------- return read lines
+      wa_packing_list-body_num = l_line.
+
+
+      "------------------- new attachemnt starts from next line
+      l_line = wa_packing_list-body_start + wa_packing_list-body_num.
+
+
+      APPEND wa_packing_list TO it_packing_list.
+    ENDLOOP.
+  ENDMETHOD.                    "initialize_packing_list
+
+
+  METHOD prepare_data_for_dispatch.
+    DATA: l_len TYPE i,
+          wa_attachment TYPE solisti1.
+
+
+    OPEN DATASET f_fdscr FOR INPUT IN BINARY MODE.
+    IF sy-subrc NE 0.
+      "error log here -> can't open file from WAS
+    ELSE.
+      DO.
+        READ DATASET f_fdscr INTO wa_attachment LENGTH l_len.
+        IF sy-subrc NE 0.
+          EXIT.
+        ENDIF.
+        APPEND wa_attachment TO it_attachments.
+        ADD 1 TO f_lines.
+        ADD l_len TO fs_packing_list-doc_size.
+      ENDDO.
+
+
+      "---------------------- all data read in one shot
+      IF l_len <> 0.
+        APPEND wa_attachment TO it_attachments.
+        ADD 1 TO f_lines.
+        ADD l_len TO fs_packing_list-doc_size.
+      ENDIF.
+
+
+      CLOSE DATASET  f_fdscr.
+    ENDIF.
+
+
+  ENDMETHOD.                    "prepare_data_for_dispatch
+
+
+  METHOD get_file_name.
+    DATA: off TYPE i,
+          len TYPE i,
+          file_tmp LIKE f_path.
+
+
+    WHILE sy-subrc = 0.
+      FIND '/' IN SECTION OFFSET off OF f_path
+               MATCH OFFSET off
+               MATCH LENGTH len.
+      IF sy-subrc = 0.
+        off = off + len.
+      ENDIF.
+    ENDWHILE.
+
+
+    file_tmp = f_path.
+
+
+    SHIFT file_tmp BY off PLACES LEFT.
+    len = STRLEN( file_tmp ).
+    SUBTRACT 4 FROM len.
+    f_file = file_tmp(len).
+
+
+  ENDMETHOD.                    "get_file_name
+
+
+  METHOD dispatch.
+    CALL FUNCTION 'SO_NEW_DOCUMENT_ATT_SEND_API1'
+      EXPORTING
+        document_data              = doc_attr
+        put_in_outbox              = 'X'
+        commit_work                = 'X'
+      TABLES
+        packing_list               = it_packing_list
+        contents_bin               = it_attachments
+        contents_txt               = it_message
+        receivers                  = it_recipients
+      EXCEPTIONS
+        too_many_receivers         = 1
+        document_not_sent          = 2
+        document_type_not_exist    = 3
+        operation_no_authorization = 4
+        parameter_error            = 5
+        x_error                    = 6
+        enqueue_error              = 7
+        OTHERS                     = 8.
+    IF sy-subrc = 0.
+      WAIT UP TO 2 SECONDS.
+      SUBMIT rsconn01 WITH mode = 'INT'
+*                        WITH ouput = 'X'
+                      AND RETURN.
+    ENDIF.
+  ENDMETHOD.                    "send_mail
+
+
+ENDCLASS.                    "lcl_email_sender IMPLEMENTATION

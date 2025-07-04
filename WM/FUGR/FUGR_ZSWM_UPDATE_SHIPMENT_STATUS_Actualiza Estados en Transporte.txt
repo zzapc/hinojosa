@@ -1,0 +1,270 @@
+FUNCTION zswm_update_shipment_status.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_TKNUM) TYPE  TKNUM
+*"     VALUE(I_PASO) TYPE  I OPTIONAL
+*"     REFERENCE(I_LGNUM) TYPE  LGNUM OPTIONAL
+*"  EXPORTING
+*"     REFERENCE(TT_LOG) TYPE  BAPIRET2_T
+*"     REFERENCE(ERROR) TYPE  FLAG
+*"----------------------------------------------------------------------
+  "Comprobamos si el parametro “INICIO_FIN_TRANSP_ESTADO” en la tabla ZWM_RF_FUNC. está activo o no
+  DATA: data_u          TYPE zswm_data_ui5_eeeoo_str,
+        lv_flag_ini_fin.
+
+  CLEAR lv_flag_ini_fin.
+  IF i_paso = 5.
+    IF i_lgnum IS INITIAL.
+      CALL FUNCTION 'ZSWM_GET_DATA_USER_UI5'
+        EXPORTING
+          uname      = sy-uname
+          statu      = 'X'
+          no_gen_log = abap_true
+        IMPORTING
+          data_user  = data_u.
+    ELSE.
+      data_u-lgnum = i_lgnum.
+    ENDIF.
+
+    SELECT SINGLE * FROM zwm_rf_func INTO @DATA(ls_parametro) WHERE func = 'INICIO_FIN_TRANSP_ESTADO'.
+    IF sy-subrc = 0.
+      DATA(lv_campo) = 'LG' && data_u-lgnum.
+      ASSIGN COMPONENT lv_campo OF STRUCTURE ls_parametro TO FIELD-SYMBOL(<lv_flag>).
+      IF <lv_flag> IS ASSIGNED AND <lv_flag> IS NOT INITIAL.
+        i_paso = 7.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  DATA desde TYPE zswm_ui5_estadis-desde.
+  GET TIME.
+  desde+0(8) = sy-datum.
+  desde+8(6) = sy-uzeit.
+
+  "Si p_paso es vacio rellenamos todos los estados
+  IF i_paso IS INITIAL.
+    i_paso = 7.
+  ENDIF.
+
+*  select SINGLE STDIS STLAD STTEN into
+  SELECT SINGLE * INTO @DATA(r_vttk) FROM vttk WHERE tknum EQ @i_tknum.
+  IF    r_vttk-stdis EQ abap_true
+    AND r_vttk-stlad EQ abap_true
+    AND r_vttk-stten EQ abap_true.
+*    El transporte & ya estaba cerrado
+    PERFORM mensaje USING 'I' 'ZSWM_UI5' '055' i_tknum space space space CHANGING tt_log[].
+
+  ELSE.
+
+    DATA ls_return TYPE bapiret2.
+    DATA lt_return TYPE TABLE OF bapiret2.
+    DATA ls_header TYPE bapishipmentheader.
+    DATA ls_header_action TYPE bapishipmentheaderaction .
+    DATA: lt_fechas        TYPE TABLE OF bapishipmentheaderdeadline,
+          lt_fechas_action TYPE TABLE OF bapishipmentheaderdeadlineact.
+
+    DATA: lv_datum TYPE sy-datum,
+          lv_uzeit TYPE sy-uzeit.
+
+    ls_header-shipment_num = i_tknum.
+
+    lv_datum = sy-datum.
+    lv_uzeit = sy-uzeit.
+
+    DO i_paso TIMES.
+      DATA(sw_index) = sy-index.
+      CLEAR: ls_header, ls_header_action, lt_return[], error, lt_fechas[], lt_fechas_action[].
+      ls_header-shipment_num = i_tknum.
+
+      SELECT SINGLE * INTO @DATA(reg_vttk) BYPASSING BUFFER FROM vttk WHERE tknum EQ @i_tknum .
+      IF reg_vttk-dpten  < reg_vttk-dptbg.
+
+      ENDIF.
+
+*TIME_TYPE = HDRSTPLDT  --> Date/time of end of planning
+*TIME_TYPE = HDRSTCIPDT --> PLANNED date/time of check-in
+*TIME_TYPE = HDRSTCIADT --> ACTUAL date/time of check-in
+*TIME_TYPE = HDRSTLSPDT --> PLANNED date/time of loading start
+*TIME_TYPE = HDRSTLSADT --> ACTUAL date/time of loading start
+*TIME_TYPE = HDRSTLEPDT --> PLANNED date/time of loading end
+*TIME_TYPE = HDRSTLEADT --> ACTUAL date/time of loading end
+*TIME_TYPE = HDRSTCPDT  --> PLANNED date/time of shipment completion
+*TIME_TYPE = HDRSTCADT  --> ACTUAL date/time of shipment completion
+*TIME_TYPE = HDRSTSSPDT --> PLANNED date/time of shipment start
+*TIME_TYPE = HDRSTSSADT --> ACTUAL date/time of shipment start
+*TIME_TYPE = HDRSTSEPDT --> PLANNED date/time of shipment end
+*TIME_TYPE = HDRSTSEADT --> ACTUAL date/time of shipment end
+
+      CASE sw_index.
+        WHEN 1. " Status de planificación de transporte
+          CHECK r_vttk-stdis NE abap_true.
+          ls_header-status_plan = 'X'.
+          ls_header_action-status_plan = 'C'.
+
+          APPEND INITIAL LINE TO lt_fechas ASSIGNING FIELD-SYMBOL(<fs_dlin>).
+          <fs_dlin>-time_type      = 'HDRSTPLDT' ."Date/time of end of planning
+          <fs_dlin>-time_stamp_utc = lv_datum && lv_uzeit.
+          <fs_dlin>-time_zone      = sy-tzone.
+          APPEND INITIAL LINE TO lt_fechas_action ASSIGNING FIELD-SYMBOL(<fs_dlin_action>).
+          <fs_dlin_action>-time_type      = 'C'.
+          <fs_dlin_action>-time_stamp_utc = 'C'.
+          <fs_dlin_action>-time_zone      = 'C'.
+
+        WHEN 2. " Status Registro
+          CHECK r_vttk-streg NE abap_true.
+          ls_header-status_checkin = 'X'.
+          ls_header_action-status_checkin = 'C'.
+
+          APPEND INITIAL LINE TO lt_fechas ASSIGNING <fs_dlin>.
+          <fs_dlin>-time_type      = 'HDRSTCIPDT'. "PLANNED date/time of check-in
+          <fs_dlin>-time_stamp_utc = lv_datum && lv_uzeit.
+          <fs_dlin>-time_zone      = sy-tzone.
+          APPEND INITIAL LINE TO lt_fechas_action ASSIGNING <fs_dlin_action>.
+          <fs_dlin_action>-time_type      = 'C'.
+          <fs_dlin_action>-time_stamp_utc = 'C'.
+          <fs_dlin_action>-time_zone      = 'C'.
+
+        WHEN 3. " Status Inicio de carga
+          CHECK r_vttk-stlbg NE abap_true.
+          ls_header-status_load_start = 'X'.
+          ls_header_action-status_load_start = 'C'.
+
+          APPEND INITIAL LINE TO lt_fechas ASSIGNING <fs_dlin>.
+          <fs_dlin>-time_type      = 'HDRSTLSPDT'. "PLANNED date/time of loading start
+          <fs_dlin>-time_stamp_utc = lv_datum && lv_uzeit.
+          <fs_dlin>-time_zone      = sy-tzone.
+          APPEND INITIAL LINE TO lt_fechas_action ASSIGNING <fs_dlin_action>.
+          <fs_dlin_action>-time_type      = 'C'.
+          <fs_dlin_action>-time_stamp_utc = 'C'.
+          <fs_dlin_action>-time_zone      = 'C'.
+
+        WHEN 4. " Status de Fin de carga
+          CHECK r_vttk-stlad NE abap_true.
+          ls_header-status_load_end = 'X'.
+          ls_header_action-status_load_end = 'C'.
+
+          APPEND INITIAL LINE TO lt_fechas ASSIGNING <fs_dlin>.
+          <fs_dlin>-time_type      = 'HDRSTLEPDT'. "PLANNED date/time of loading end
+          <fs_dlin>-time_zone      = sy-tzone.
+          APPEND INITIAL LINE TO lt_fechas_action ASSIGNING <fs_dlin_action>.
+          <fs_dlin_action>-time_type      = 'C'.
+          <fs_dlin_action>-time_stamp_utc = 'C'.
+          <fs_dlin_action>-time_zone      = 'C'.
+
+        WHEN 5. " Status de despacho de expedición
+          CHECK r_vttk-stabf NE abap_true.
+          ls_header-status_compl = 'X'.
+          ls_header_action-status_compl = 'C'.
+
+          APPEND INITIAL LINE TO lt_fechas ASSIGNING <fs_dlin>.
+          <fs_dlin>-time_type      = 'HDRSTCPDT'. "PLANNED date/time of shipment completion
+          <fs_dlin>-time_stamp_utc = lv_datum && lv_uzeit.
+          <fs_dlin>-time_zone      = sy-tzone.
+          APPEND INITIAL LINE TO lt_fechas_action ASSIGNING <fs_dlin_action>.
+          <fs_dlin_action>-time_type      = 'C'.
+          <fs_dlin_action>-time_stamp_utc = 'C'.
+          <fs_dlin_action>-time_zone      = 'C'.
+        WHEN 6. " Status de Ini de transporte
+          CHECK r_vttk-stten NE abap_true.
+          ls_header-status_shpmnt_start = 'X'.
+          ls_header_action-status_shpmnt_start = 'C'.
+
+          APPEND INITIAL LINE TO lt_fechas ASSIGNING <fs_dlin>.
+          <fs_dlin>-time_type      = 'HDRSTSSPDT'. "PLANNED date/time of shipment start
+          <fs_dlin>-time_stamp_utc = lv_datum && lv_uzeit.
+          <fs_dlin>-time_zone      = sy-tzone.
+          APPEND INITIAL LINE TO lt_fechas_action ASSIGNING <fs_dlin_action>.
+          <fs_dlin_action>-time_type      = 'C'.
+          <fs_dlin_action>-time_stamp_utc = 'C'.
+          <fs_dlin_action>-time_zone      = 'C'.
+        WHEN 7. " Status de Fin de transporte
+          CHECK r_vttk-stten NE abap_true.
+          ls_header-status_shpmnt_end = 'X'.
+          ls_header_action-status_shpmnt_end = 'C'.
+
+          APPEND INITIAL LINE TO lt_fechas ASSIGNING <fs_dlin>.
+          <fs_dlin>-time_type      = 'HDRSTSEPDT'. "PLANNED date/time of shipment end
+          <fs_dlin>-time_stamp_utc = lv_datum && lv_uzeit.
+          <fs_dlin>-time_zone      = sy-tzone.
+          APPEND INITIAL LINE TO lt_fechas_action ASSIGNING <fs_dlin_action>.
+          <fs_dlin_action>-time_type      = 'C'.
+          <fs_dlin_action>-time_stamp_utc = 'C'.
+          <fs_dlin_action>-time_zone      = 'C'.
+
+      ENDCASE.
+      IF lt_fechas[] IS INITIAL.
+        CALL FUNCTION 'BAPI_SHIPMENT_CHANGE'
+          EXPORTING
+            headerdata       = ls_header
+            headerdataaction = ls_header_action
+          TABLES
+            return           = lt_return.
+
+      ELSE.
+        CALL FUNCTION 'BAPI_SHIPMENT_CHANGE'
+          EXPORTING
+            headerdata           = ls_header
+            headerdataaction     = ls_header_action
+          TABLES
+            headerdeadline       = lt_fechas
+            headerdeadlineaction = lt_fechas_action
+            return               = lt_return.
+      ENDIF.
+
+      LOOP AT lt_return INTO ls_return WHERE type EQ 'E'
+                                          OR type EQ 'A'.
+        MOVE abap_true TO error.
+
+      ENDLOOP.
+      CASE error.
+        WHEN abap_true.
+*          APPEND LINES OF lt_return TO tt_log.
+          CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+*         add jtm 06.11.2022  ERROR
+*         La fecha final es anterior a la inicial " Error Recurrente VW064
+*         Ponemos todas las fechas iguales del transporte y damos otro mensaje para que vuelva a dar salida
+          READ TABLE lt_return WITH KEY id     = 'VW'
+                                        number = '064' TRANSPORTING NO FIELDS.
+          IF sy-subrc EQ 0.
+            DATA error_2 TYPE flag.
+            WAIT UP TO 1 SECONDS.
+            CALL FUNCTION 'ZSWM_SOLVENTAR_ERROR_VW064'
+              EXPORTING
+                tknum = i_tknum
+*               DATUM = SY-DATUM
+*               MODE_BI       = 'N'
+              IMPORTING
+                error = error_2
+*               TT_LOG        =
+              .
+            IF error_2 EQ abap_true.
+              APPEND LINES OF lt_return TO tt_log.
+            ELSE.
+*               Problemas transporte & con temas bloqueo. Volver a dar salida.
+              PERFORM mensaje USING 'E' 'ZSWM_UI5' '191' i_tknum space space space CHANGING tt_log[].
+
+            ENDIF.
+          ELSE.
+            APPEND LINES OF lt_return TO tt_log. " add jtm 07.11.2022
+          ENDIF.
+*         fin de add jtm 06.11.2022
+        WHEN OTHERS.
+          IF sw_index EQ 4.
+*           Transporte & cerrado con éxito.
+            PERFORM mensaje USING 'I' 'ZSWM_UI5' '054' i_tknum space space space CHANGING tt_log[].
+          ENDIF.
+          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+            EXPORTING
+              wait = 'X'.
+          WAIT UP TO 1 SECONDS.
+      ENDCASE.
+      CHECK error EQ abap_true.
+      EXIT.
+    ENDDO.
+    IF error NE abap_true.
+      PERFORM estadisticas_tknum USING i_tknum 'CLTRA' desde abap_true.
+    ENDIF.
+
+  ENDIF.
+ENDFUNCTION.

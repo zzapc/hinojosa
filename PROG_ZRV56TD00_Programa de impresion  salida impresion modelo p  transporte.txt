@@ -1,0 +1,2182 @@
+REPORT zrv56td00.
+
+SET EXTENDED CHECK OFF.
+TABLES: vbpla, thead, ttxern, ttxit, t005, vbddl, stxh, sadr.   "SADR40A
+
+CONSTANTS:
+  gc_pr_kappl  TYPE char1 VALUE 'V',
+  gc_true      TYPE char1 VALUE 'X',
+  gc_false     TYPE char1 VALUE space,
+  gc_english   TYPE char1 VALUE 'E',
+  gc_pdf       TYPE char1 VALUE '2',
+  gc_equal     TYPE char2 VALUE 'EQ',
+  gc_include   TYPE char1 VALUE 'I',
+  gc_cash_sale TYPE char1 VALUE 'C',
+  gc_max_brtwr TYPE brtwr VALUE '999999999.99',
+  BEGIN OF gc_nacha,
+    printer       TYPE na_nacha VALUE 1,
+    fax           TYPE na_nacha VALUE 2,
+    external_send TYPE na_nacha VALUE 5,
+  END OF gc_nacha,
+  BEGIN OF gc_device,
+    printer    TYPE output_device VALUE 'P',
+    fax        TYPE output_device VALUE 'F',
+    email      TYPE output_device VALUE 'E',
+    web_dynpro TYPE output_device VALUE 'W',
+  END OF gc_device.
+
+DATA: gv_device TYPE output_device,
+      gv_email  TYPE ad_smtpadr.
+
+INCLUDE vttkdata.                      "Shipment Header
+INCLUDE vttsdata.                      "Shipment Segment
+INCLUDE vttpdata.                      "Shipment Items
+INCLUDE vbpadata.                      "Partner
+INCLUDE vtfadata.                      "Flow
+INCLUDE sadrdata.                      "Address
+INCLUDE vtlfdata.                      "Delivery Selection
+INCLUDE rvadtabl.                      "Messages
+INCLUDE vsedata.                       "shipping units
+INCLUDE rv56acom.                      "I/O-Structure
+SET EXTENDED CHECK ON.
+
+DATA: s_form          TYPE fpname,
+      fp_outputparams TYPE sfpoutputparams,
+      gv_error        TYPE c,
+      fm_name         TYPE rs38l_fnam,
+      fp_docparams    TYPE sfpdocparams,
+      lvf_device(30)  TYPE c,
+      lvs_recipient   LIKE swotobjid,
+      lvs_sender      LIKE swotobjid.
+DATA:
+  gt_pallet_header_t TYPE /vso/p_loadlist_t,
+  gt_pallet_item_t   TYPE /vso/p_loadlist_ti,
+  gt_vtrlk           TYPE /vso/p_vtrlk_t,
+  wa_vtrlk           TYPE vtrlk,
+  wa_vtrlp           TYPE vtrlp,
+  wa_vttkvb          TYPE vttkvb,
+  wa_vttsvb          TYPE vttsvb,
+  gt_vtrlp           TYPE /vso/p_vtrlp_t,
+  gt_vttsvb          TYPE /vso/p_vttsvb_t,
+  gt_vttkvb_t        TYPE /vso/p_vttkvb_t,
+  lt_hoja_pick       TYPE zstsd_hoja_picking.
+
+DATA:
+  xscreen(1)              TYPE c,
+  retcode                 LIKE sy-subrc VALUE 0,
+  there_was_output(1)     TYPE c        VALUE space,
+  new_page_was_ordered(1) TYPE c        VALUE space.
+
+DATA:  bundling TYPE char1.
+
+
+DATA  pdf_content        TYPE solix_tab.
+
+
+DATA: os_formout   TYPE fpformoutput.
+
+
+CONSTANTS:
+  no(1)  VALUE space,
+  yes(1) VALUE 'X'.
+
+TABLES : tpar .                                             "n_742056.
+
+* >>>>> BUNDLING <<<<< *************************************************
+INCLUDE check_bundling_print.
+* >>>>> BUNDLING <<<<< *************************************************
+
+
+
+"JCB 11.04.24. GAP0105. Pantalla de selección para poder generar el PDF desde programas externos
+PARAMETERS: p_tknum  TYPE vttk-tknum,
+            p_impr   TYPE xfeld,
+            p_previs TYPE xfeld.
+
+START-OF-SELECTION.
+  PERFORM f_start_of_selection.
+
+FORM f_start_of_selection.
+  DATA: vl_return_code LIKE retcode,
+        vl_us_screen   LIKE xscreen.
+  IF p_tknum IS NOT INITIAL.
+    nast-spras = sy-langu.
+    nast-objky = p_tknum.
+
+    IF p_impr = space.
+      nast-nacha = '5'.
+      vl_us_screen = 'W'.
+    ELSE.
+      nast-nacha = '1'.
+    ENDIF.
+
+    nast-anzal = 1.
+
+    tnapr-kschl     = 'ZPCK'.
+    tnapr-sform     = 'ZESSDF_HOJA_PICKING_ZPCK'.
+    tnapr-formtype  = 2.
+
+    PERFORM entry USING vl_return_code vl_us_screen.
+  ENDIF.
+
+ENDFORM.
+"FIN JCB 11.04.24. GAP0105. Pantalla de selección para poder generar el PDF desde programas externos
+
+
+
+
+***********************************************************************
+*       FORM ENTRY                                                    *
+***********************************************************************
+*       Called from the Output Controll program                       *
+***********************************************************************
+*  -->  RETURN_CODE Status                                            *
+*  -->  US_SCREEN                                                     *
+***********************************************************************
+FORM entry USING return_code LIKE sy-subrc                  "#EC CALLED
+                 us_screen   TYPE c.                        "#EC CALLED
+
+  return_code = 1.
+
+  PERFORM data_init USING us_screen.
+
+  PERFORM get_data.
+  CHECK retcode EQ 0.
+
+  PERFORM open_form USING us_screen.
+  CHECK retcode EQ 0.
+
+  PERFORM print_document.
+  CHECK retcode EQ 0.
+
+  PERFORM close_form.
+  CHECK retcode EQ 0.
+
+  return_code = 0.
+ENDFORM.
+
+***********************************************************************
+*       FORM data_init                                               *
+***********************************************************************
+FORM data_init USING VALUE(us_screen) TYPE c.
+  xscreen = us_screen.
+  CLEAR:
+    retcode,
+    there_was_output,
+    new_page_was_ordered.
+ENDFORM.
+
+***********************************************************************
+*       FORM GET_DATA                                                 *
+***********************************************************************
+FORM get_data.
+  DATA language LIKE nast-spras.
+  DATA shipment_number LIKE vttk-tknum.
+
+  language = nast-spras.
+  shipment_number = nast-objky.
+  CALL FUNCTION 'RV_SHIPMENT_PRINT_VIEW'
+    EXPORTING
+      shipment_number     = shipment_number
+      option_tvtk         = 'X'  "Shipmenttype J/N
+      option_ttds         = 'X'  "Disposition J/N
+      language            = language
+      option_items        = 'X'  "Transport Items J/N
+      option_segments     = 'X'  "Transport Segments J/N
+      option_partners     = 'X'  "Partners J/N
+      option_sales_orders = 'X'  "Sales orders J/N
+      option_export_data  = 'X'  "Export data J/N
+      option_packages     = 'X'  "Packages J/N
+      option_flow         = ' '  "Flow J/N
+      option_no_refresh   = ' '  "Refresh Tables J/N
+    IMPORTING
+      f_vttkvb            = vttkvb  "Shipment Header
+      f_tvtk              = tvtk "Shipmenttype
+      f_tvtkt             = tvtkt "Description Shipmenttype
+      f_ttds              = ttds "Disposition
+      f_ttdst             = ttdst "Description Disposition
+      f_vbpla             = vbpla "Packages
+    TABLES
+      f_vttp              = xvttp "Shipment Items
+      f_trlk              = slk  "Delivery
+      f_trlp              = slp  "Delivery Item
+      f_vtts              = xvtts "Shipment Segments
+      f_vtsp              = xvtsp "Segments/Items
+      f_vbpa              = xvbpa "Partner
+      f_vbadr             = xvbadr  "Address
+      f_vtfa              = xvtfa "Flow
+      f_vbplk             = xvbplk  "Shipment Unit Header
+      f_vbplp             = xvbplp  "Shipment Unit
+      f_vbpls             = xvbpls  "Shipment Unit Sum
+    EXCEPTIONS
+      not_found           = 1.
+
+  IF sy-subrc NE 0.
+    syst-msgid = 'VW'.
+    syst-msgno = '010'.
+    syst-msgty = 'E'.
+    syst-msgv1 = dbvttk-tknum.
+    syst-msgv2 = sy-subrc.
+    retcode    = 1.
+    PERFORM protocol_update.
+  ENDIF.
+
+  CHECK retcode EQ 0.
+
+* Sort shipment items by itenary (i.e. TPRFO)                 "n_902657
+  SORT xvttp BY tprfo.                                      "n_902657
+* SORT SEGMENTS BY CORRECT ORDER (I.E. TSRFO)
+  SORT xvtts BY tsrfo.
+
+* CONVERT UNITS IN DELIVERIES AND DELIVERY-ITEMS
+* TO BE CONFORM TO VTTK-UNITS:
+
+  LOOP AT slk.
+* start of insertion HP_364727
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = slk-brgew
+        unit_in  = slk-gewei
+        unit_out = vttkvb-dtmeg
+      IMPORTING
+        output   = slk-brgew.
+
+* end of insertion HP_364727
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = slk-btgew
+        unit_in  = slk-gewei
+        unit_out = vttkvb-dtmeg
+      IMPORTING
+        output   = slk-btgew.
+
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = slk-ntgew
+        unit_in  = slk-gewei
+        unit_out = vttkvb-dtmeg
+      IMPORTING
+        output   = slk-ntgew.
+
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = slk-volum
+        unit_in  = slk-voleh
+        unit_out = vttkvb-dtmev
+      IMPORTING
+        output   = slk-volum.
+
+    slk-gewei = vttkvb-dtmeg.
+    slk-voleh = vttkvb-dtmev.
+    MODIFY slk.
+  ENDLOOP.
+
+  LOOP AT slp.
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = slp-brgew
+        unit_in  = slp-gewei
+        unit_out = vttkvb-dtmeg
+      IMPORTING
+        output   = slp-brgew.
+
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = slp-ntgew
+        unit_in  = slp-gewei
+        unit_out = vttkvb-dtmeg
+      IMPORTING
+        output   = slp-ntgew.
+
+    slp-gewei = vttkvb-dtmeg.
+    MODIFY slp.
+  ENDLOOP.
+* Transfer address number for mail
+*  IF nast-nacha = '5'.                "e-mail                "v_n_742056.
+** Determine the type of the partner number
+*    SELECT SINGLE * FROM tpar
+*                  WHERE parvw = nast-parvw.
+*    IF sy-subrc NE 0.
+*      EXIT.
+*    ENDIF.
+** Search the address number
+*    LOOP AT xvbpa
+*     WHERE parvw = nast-parvw.
+*      CASE tpar-nrart.             "type of the partner number
+*        WHEN 'KU'.                 "- customer
+*          CHECK xvbpa-kunnr = nast-parnr.
+*        WHEN 'LI'.                 "- vendor
+*          CHECK xvbpa-lifnr = nast-parnr.
+*        WHEN 'AP'.                 "- contact person
+*          CHECK xvbpa-parnr = nast-parnr.
+*        WHEN 'PE'.                 "- personell number
+*          CHECK xvbpa-pernr = nast-parnr.
+*      ENDCASE.
+*      "^_n_742056.
+** deleted line of n_656692
+*      addr_key-addrnumber = xvbpa-adrnr.
+*      addr_key-persnumber = xvbpa-adrnp.
+*      EXIT.
+*    ENDLOOP.
+*  ENDIF.                                                    "n_742056.
+
+*Transfer address number for mail
+*  LOOP AT xvbpa
+*          WHERE parvw = nast-parvw.
+*    CHECK xvbpa-lifnr = nast-parnr.
+*    CHECK xvbpa-posnr = 0.
+*    addr_key-addrnumber = xvbpa-adrnr.
+*    addr_key-persnumber = xvbpa-adrnp.
+*    EXIT.
+*  ENDLOOP.
+
+  SELECT  SINGLE a~addrnumber, a~persnumber
+  FROM    kna1 AS c
+  INNER JOIN adr6 AS a
+  ON      a~addrnumber = c~adrnr
+  WHERE   kunnr = @nast-parnr
+  INTO    ( @addr_key-addrnumber, @addr_key-persnumber ).
+
+ENDFORM.
+
+***********************************************************************
+*       FORM PRINT_DOCUMENT                                           *
+***********************************************************************
+FORM print_document.
+
+  s_form = tnapr-sform.
+
+*1.--- Get the name of the generated function module
+  TRY.
+      CALL FUNCTION 'FP_FUNCTION_MODULE_NAME'
+        EXPORTING
+          i_name     = s_form
+        IMPORTING
+          e_funcname = fm_name.
+    CATCH cx_fp_api_repository cx_fp_api_usage cx_fp_api_internal.
+      sy-subrc = 1.
+      gv_error = '1'.
+*      MESSAGE e012 WITH s_form.  "No active form available.
+  ENDTRY.
+
+  CHECK gv_error IS INITIAL.
+
+
+
+  IF p_impr = 'X'.
+    fp_outputparams-device  = 'PRINTER'.
+    fp_outputparams-dest   = 'LOCB'.
+    fp_outputparams-preview  = p_previs.
+    fp_outputparams-REQIMM = fp_outputparams-reqnew = abap_true.
+  ENDIF.
+
+
+* 2.--- Open the spool job
+  CLEAR: bundling.
+  IMPORT bundling FROM MEMORY ID 'BUNDLING'.
+  IF sy-subrc NE 0 OR bundling NE 'X' OR
+     nast-nacha NE '1'.
+    CLEAR: bundling.
+    CALL FUNCTION 'FP_JOB_OPEN'
+      CHANGING
+*     Ausgabeparameter festlegen
+        ie_outputparams = fp_outputparams
+      EXCEPTIONS
+        cancel          = 1
+        usage_error     = 2
+        system_error    = 3
+        internal_error  = 4
+        OTHERS          = 5.
+    IF sy-subrc <> 0.
+      gv_error = '1'.
+*    MESSAGE e010. "die Formverarbeitung konnte nicht begonnen werden.
+    ENDIF.
+  ENDIF.
+
+  CHECK gv_error = ''.
+
+*    IF Fp_outputparams-preview IS INITIAL "In case of preview message should be displayed only
+*    AND ( nast-nacha EQ 5 OR nast-tdarmod = 2 OR  nast-nacha EQ 2 ).
+** Setting output parameters only if communication type is fax or email.
+*    IF nast-nacha EQ 5. "Envío externo
+**      IF ( lvs_comm_type EQ 'FAX' OR lvs_comm_type EQ 'INT' ).
+*        fp_outputparams-getpdf = abap_true.
+*
+*        IF itcpo-tdtelenum EQ space.
+*          fp_outputparams-nodialog = ' '.
+*        ENDIF.
+**      ENDIF.
+*    ELSE.
+*      fp_outputparams-getpdf = abap_true.
+*    ENDIF.
+*
+**   Specific setting for FAX
+*    IF nast-nacha EQ 2.
+**     Setting output parameters
+*      fp_outputparams-device = 'TELEFAX'.
+*      IF nast-telfx EQ space.
+*        fp_outputparams-nodialog = ' '.
+*      ENDIF.
+*    ENDIF.
+*  ENDIF.
+
+
+
+
+*3.--- Call the generated function module
+
+**print deliveries in shipment
+  DATA sum_weight LIKE vtrlk-btgew.
+  DATA sum_volume LIKE vtrlk-volum.
+  CHECK NOT slk[] IS INITIAL.
+  CLEAR: sum_weight, sum_volume, vtrlk.
+  LOOP AT slk.                         "DELIVERY HEADER
+    sum_weight = sum_weight + slk-btgew.
+    sum_volume = sum_volume + slk-volum.
+  ENDLOOP.
+  vtrlk-btgew = sum_weight.
+  vtrlk-volum = sum_volume.
+
+**transport_sum
+  LOOP AT vttk.
+    MOVE vttk TO wa_vttkvb.
+    APPEND wa_vttkvb TO gt_vttkvb_t.
+  ENDLOOP.
+
+**deliveries / deliveries details
+  LOOP AT slk.
+    MOVE slk TO wa_vtrlk.
+    APPEND wa_vtrlk TO gt_vtrlk.
+    LOOP AT slp WHERE vbeln EQ slk-vbeln.  "DELIVERY-ITEMS
+      MOVE slp TO wa_vtrlp.
+      APPEND wa_vtrlp TO gt_vtrlp.
+    ENDLOOP.
+  ENDLOOP.
+
+  CLEAR: lt_hoja_pick-cabecera, lt_hoja_pick-posiciones.
+  REFRESH: lt_hoja_pick-posiciones.
+
+
+*  IF sy-uname = 'PARTNERSAP4'.
+*    DO 60 TIMES.
+*      WAIT UP TO 1 SECONDS.
+*    ENDDO.
+*  ENDIF.
+
+
+  SET COUNTRY 'ES'.
+  PERFORM cargar_hoja_picking.
+  SET COUNTRY fp_docparams-country.
+
+
+
+  CALL FUNCTION fm_name
+    EXPORTING
+      /1bcdwb/docparams  = fp_docparams
+      hoja_picking       = lt_hoja_pick
+      archive_index      = toa_dara
+      archive_params     = arc_params
+      device             = lvf_device
+      dialog             = ' '
+*     FORM               = TNAPR-FONAM   "SCRIPT
+*     sform              = tnapr-sform
+*     LANGUAGE           = NAST-SPRAS
+*     OPTIONS            = LVS_ITCPO
+      mail_sender        = lvs_sender
+      mail_recipient     = lvs_recipient
+*     gs_vbddl           = vbddl
+*     gs_vttkvb          = vttkvb
+*     gt_vttkvb          = gt_vttkvb_t
+*     gs_vtrlk_s         = vtrlk
+*     gs_vtrlk           = gt_vtrlk
+*     gs_vtrlp           = gt_vtrlp
+*     gs_vttsvb          = gt_vttsvb
+*     gs_vbplk           = vbplk
+*     gs_vbplp           = vbplp
+*     gs_rv56a           = rv56a
+*     gt_sadr            = sadr
+*     gt_ttdst           = ttdst
+*     gt_tvtkt           = tvtkt
+**     gt_rslt_vhcl      = gt_vehicl_data
+**     gt_loadlist_plth  = gt_pallet_header_t
+**     gt_loadlist_plti  = gt_pallet_item_t
+*     sum_volume         = vtrlk-volum
+*     sum_weight         = vtrlk-btgew
+*     e_interface_type   = interfacetype
+    IMPORTING
+      /1bcdwb/formoutput = os_formout
+*    TABLES
+    EXCEPTIONS
+      usage_error        = 1
+      system_error       = 2
+      internal_error     = 3
+      OTHERS             = 4.
+  IF sy-subrc <> 0.
+*      MESSAGE e726 WITH fm_name sy-subrc.
+  ENDIF.
+
+
+* CGV - 01.07.10 - SAT 7000026430 - Ticket 55780
+*** ENVIO MAIL
+  IF nast-kschl = 'ZPAE'.
+*    PERFORM envio_mail USING os_formout.
+    PERFORM envio_mail_1 USING os_formout.
+  ENDIF.
+
+
+**   Enhancements for web dynpro pdf output  ****EHP5
+*  IF xscreen = 'W'.
+*    DATA vl_pdf_file TYPE xstring.
+*    zcl_ap_smartforms=>get_pdf_from_otfdata( EXPORTING i_otfdata   = job_output_info-otfdata
+*                                                       get_xstring = 'X'
+*                                             IMPORTING xstring     = vl_pdf_file ).
+*    EXPORT lv_pdf_file = vl_pdf_file TO MEMORY ID 'PDF_FILE'.
+*  ENDIF.
+
+
+
+
+
+
+ENDFORM.
+
+***********************************************************************
+*      Form  PACKING_TREE                                             *
+***********************************************************************
+FORM packing_tree USING VALUE(shenr) LIKE vekp-venum.
+  MOVE space TO xvbplk.
+  xvbplk-venum = shenr.
+  READ TABLE xvbplk.
+  vbplk = xvbplk.
+  PERFORM print USING 'SHIPPING_UNIT'.
+
+  LOOP AT xvbplp WHERE venum = shenr.
+    IF xvbplp-posnr IS INITIAL.
+      PERFORM packing_tree USING xvbplp-unvel.
+    ELSE.
+      vbplp = xvbplp.
+      PERFORM print USING 'SHIPPING_UNIT_DELIVERY_ITEM'.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+***********************************************************************
+********                                                      *********
+********                 T E C H N I C A L                    *********
+********                                                      *********
+***********************************************************************
+
+***********************************************************************
+*      Form  PRINT                                                    *
+***********************************************************************
+FORM print USING textelement TYPE c.
+  IF new_page_was_ordered EQ yes.
+    CALL FUNCTION 'CONTROL_FORM'
+      EXPORTING
+        command = 'ENDPROTECT'.
+    CALL FUNCTION 'WRITE_FORM'
+      EXPORTING
+        element = 'NEW_PAGE'
+      EXCEPTIONS
+        OTHERS  = 1.
+    IF sy-subrc NE 0.
+      PERFORM protocol_update.
+    ENDIF.
+    new_page_was_ordered = no.
+  ENDIF.
+  IF there_was_output EQ no.
+    CALL FUNCTION 'CONTROL_FORM'
+      EXPORTING
+        command = 'PROTECT'.
+    there_was_output = yes.
+  ENDIF.
+  CALL FUNCTION 'WRITE_FORM'
+    EXPORTING
+      element = textelement
+    EXCEPTIONS
+      OTHERS  = 1.
+  IF sy-subrc NE 0.
+    PERFORM protocol_update.
+  ENDIF.
+ENDFORM.
+
+***********************************************************************
+*       FORM OPEN_FORM                                                *
+***********************************************************************
+*  -->  VALUE(US_SCREEN)  Output on screen                            *
+*                         ' ' = printer                               *
+*                         'X' = screen                                *
+***********************************************************************
+FORM open_form USING VALUE(us_screen) TYPE c.
+  DATA us_country LIKE t005-land1.
+
+  PERFORM get_sender_country USING us_country.
+  CHECK retcode EQ 0.
+*  INCLUDE rvadopfo.
+  INCLUDE zrvadopfo_print_opt.
+ENDFORM.
+
+***********************************************************************
+*       FORM Get_Sender_Country
+*                                                                     *
+***********************************************************************
+*       Determines the country of the transport-disposition-unit      *
+***********************************************************************
+FORM get_sender_country USING sender_country LIKE t005-land1.
+* data:
+*   l_addr1_sel like addr1_sel.
+
+* l_addr1_sel-addrnumber = ttds-adrnr.                    "SADR40A
+* call function 'ADDR_GET'
+*      exporting
+*        address_selection = l_addr1_sel
+*        address_group     = 'CA01'        "it's a Customizing-Address
+*      importing
+*        sadr              = sadr                            "SADR40A
+*      exceptions
+*           others  = 1.
+* if sy-subrc eq 0.
+*   sender_country = sadr-land1.                             "SADR40A
+* else.
+*   syst-msgid = 'VW'.
+*   syst-msgno = '087'.
+*   syst-msgty = 'E'.
+*   syst-msgv1 = dbvttk-tknum.
+*   syst-msgv2 = sy-subrc.
+*   perform protocol_update.
+* endif.
+  DATA: l_vbadr LIKE vbadr.
+  DATA: l_vbpa LIKE vbpa.
+
+  LOOP AT xvbpa WHERE vbeln = nast-objky AND
+                      parvw = nast-parvw.
+    sender_country = xvbpa-land1.
+    EXIT.
+  ENDLOOP.
+  IF sy-subrc IS INITIAL  AND  sender_country IS INITIAL.
+    l_vbpa = xvbpa.
+    CALL FUNCTION 'VIEW_VBADR'
+      EXPORTING
+        input         = l_vbpa
+        partnernummer = nast-parnr
+      IMPORTING
+        adresse       = l_vbadr.
+    sender_country = l_vbadr-land1.
+  ENDIF.
+
+ENDFORM.
+
+***********************************************************************
+*       FORM CLOSE_FORM                                               *
+***********************************************************************
+FORM close_form.
+
+* 4. Formularverarbeitung beenden
+  IF bundling NE 'X'.
+    CALL FUNCTION 'FP_JOB_CLOSE'
+      EXCEPTIONS
+        usage_error    = 1
+        system_error   = 2
+        internal_error = 3
+        OTHERS         = 4.
+    IF sy-subrc NE 0.
+*    MESSAGE i713.
+    ENDIF.
+  ENDIF.
+*
+*  CALL FUNCTION 'CLOSE_FORM'
+*    EXCEPTIONS
+*      OTHERS = 1.
+*  IF sy-subrc NE 0.
+*    retcode = sy-subrc.
+*    PERFORM protocol_update.
+*  ENDIF.
+*  SET COUNTRY space.
+
+
+
+
+
+
+ENDFORM.
+
+***********************************************************************
+*       FORM PROTOCOL_UPDATE                                          *
+***********************************************************************
+*       The messages are collected for the processing protocol.       *
+***********************************************************************
+FORM protocol_update.
+
+  IF xscreen = space.
+    CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+      EXPORTING
+        msg_arbgb = syst-msgid
+        msg_nr    = syst-msgno
+        msg_ty    = syst-msgty
+        msg_v1    = syst-msgv1
+        msg_v2    = syst-msgv2
+        msg_v3    = syst-msgv3
+        msg_v4    = syst-msgv4.
+  ELSE.
+    MESSAGE ID syst-msgid TYPE 'I' NUMBER syst-msgno
+            WITH syst-msgv1 syst-msgv2 syst-msgv3 syst-msgv4.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CARGAR_HORA_PICKING
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM cargar_hoja_picking .
+
+  DATA: lv_bezei TYPE vttk_add01_t,
+        ls_xvttp TYPE vttpvb,
+        lv_bukrs TYPE bukrs.
+
+  " Datos de cabecera del transporte:
+  MOVE-CORRESPONDING vttkvb TO lt_hoja_pick-cabecera.
+  lt_hoja_pick-cabecera-num_contenedor = vttkvb-exti2.
+  lt_hoja_pick-cabecera-cod_tknum = vttkvb-tknum.
+
+  IF lt_hoja_pick-cabecera-tplst EQ '3000'.
+    PERFORM obtener_logo USING 'ZLOGO_ALQUERIA'
+                         CHANGING lt_hoja_pick-cabecera-logo.
+  ELSEIF lt_hoja_pick-cabecera-tplst EQ '3020'.
+    PERFORM obtener_logo USING 'ZLOGO_SARRIA'
+                         CHANGING lt_hoja_pick-cabecera-logo.
+  ENDIF.
+
+*  DATA: LV_SOC TYPE BUKRS.
+*   LV_SOC = lt_hoja_pick-cabecera-tplst.
+*  CALL FUNCTION 'ZRECUPERA_LOGOS_SOCIEDAD'
+*    EXPORTING
+*      iv_bukrs       = LV_SOC
+*   IMPORTING
+*     EV_PATH        = lt_hoja_pick-cabecera-logo
+*            .
+
+
+  CLEAR: lt_hoja_pick-cabecera-tplst_bezei.
+  SELECT SINGLE bezei INTO lt_hoja_pick-cabecera-tplst_bezei
+  FROM ttdst
+  WHERE spras EQ 'S'
+    AND tplst EQ lt_hoja_pick-cabecera-tplst.
+
+  " Secuencia Carga (Textos):
+  CONDENSE: lt_hoja_pick-cabecera-dplbg, lt_hoja_pick-cabecera-uplbg.
+  CONCATENATE lt_hoja_pick-cabecera-dplbg+6(2) lt_hoja_pick-cabecera-dplbg+4(2)
+              lt_hoja_pick-cabecera-dplbg+0(4)
+              INTO lt_hoja_pick-cabecera-dplbg_txt SEPARATED BY '.'.
+  CONCATENATE lt_hoja_pick-cabecera-uplbg+0(2) lt_hoja_pick-cabecera-uplbg+2(2) lt_hoja_pick-cabecera-uplbg+4(2)
+              INTO lt_hoja_pick-cabecera-uplbg_txt SEPARATED BY ':'.
+
+  " Datos transporte (Agencia/Datos camión/Transportista):
+  lt_hoja_pick-cabecera-dat_transporte-tdlnr = vttkvb-tdlnr.
+  IF lt_hoja_pick-cabecera-dat_transporte-tdlnr IS NOT INITIAL.
+    SELECT SINGLE name1 INTO lt_hoja_pick-cabecera-dat_transporte-name1
+    FROM lfa1
+    WHERE lifnr = lt_hoja_pick-cabecera-dat_transporte-tdlnr.
+  ENDIF.
+  lt_hoja_pick-cabecera-dat_transporte-signi = vttkvb-signi.
+  lt_hoja_pick-cabecera-dat_transporte-tpbez = vttkvb-tpbez.
+  IF vttkvb-text1 IS NOT INITIAL.
+    lt_hoja_pick-cabecera-dat_transporte-text1 = vttkvb-text1.
+  ELSEIF vttkvb-add01 IS NOT INITIAL.
+    CLEAR lv_bezei.
+    SELECT SINGLE bezei INTO lv_bezei
+      FROM vtadd01t
+      WHERE spras = nast-spras
+      AND add_info = vttkvb-add01.
+    CONCATENATE vttkvb-add01 lv_bezei INTO lt_hoja_pick-cabecera-dat_transporte-text1
+         SEPARATED BY '/'.
+  ENDIF.
+
+  " Peso permitido (Texto):
+  WRITE lt_hoja_pick-cabecera-allowed_twgt TO lt_hoja_pick-cabecera-allowed_twgt_txt.
+  CONDENSE lt_hoja_pick-cabecera-allowed_twgt_txt.
+*  CONCATENATE lt_hoja_pick-cabecera-allowed_twgt_txt lt_hoja_pick-cabecera-dtmeg
+*              INTO lt_hoja_pick-cabecera-allowed_twgt_txt SEPARATED BY space.
+
+  " Fecha y Hora prevista de entrega (Texto):
+  CONDENSE: lt_hoja_pick-cabecera-dpten, lt_hoja_pick-cabecera-upten.
+  CONCATENATE lt_hoja_pick-cabecera-dpten+6(2) lt_hoja_pick-cabecera-dpten+4(2)
+              lt_hoja_pick-cabecera-dpten+0(4)
+              INTO lt_hoja_pick-cabecera-dpten_txt SEPARATED BY '.'.
+  CONCATENATE lt_hoja_pick-cabecera-upten+0(2) lt_hoja_pick-cabecera-upten+2(2)
+              lt_hoja_pick-cabecera-upten+4(2)
+              INTO lt_hoja_pick-cabecera-upten_txt SEPARATED BY ':'.
+
+  " Texto Picking:
+  lt_hoja_pick-cabecera-texto_picking-tdname = lt_hoja_pick-cabecera-tknum.
+  lt_hoja_pick-cabecera-texto_picking-tdobject = 'VTTK'.
+  lt_hoja_pick-cabecera-texto_picking-tdid = '0002'.
+  lt_hoja_pick-cabecera-texto_picking-tdspras = nast-spras.
+
+*APC20240614 Como queremos varios textos en el mismo sitio, los construimos en un string,
+* dependiendo de si existen
+*  lt_hoja_pick-cabecera-texto_picking_string = zcl_ap_textos=>get_texto_string( name   = lt_hoja_pick-cabecera-tknum
+*                                                                                object = 'VTTK'
+*                                                                                id     = '0002' ).
+
+  DATA(l_instrucciones_carretillas) = zcl_ap_textos=>get_texto_string( name   = lt_hoja_pick-cabecera-tknum
+                                                                             object = 'VTTK'
+                                                                             id     = 'ZCCA' ).
+  IF NOT l_instrucciones_carretillas IS INITIAL.
+    CONCATENATE 'Instrucciones de carretilla:' l_instrucciones_carretillas INTO l_instrucciones_carretillas SEPARATED BY space.
+    IF lt_hoja_pick-cabecera-texto_picking_string IS INITIAL.
+      lt_hoja_pick-cabecera-texto_picking_string = l_instrucciones_carretillas.
+    ELSE.
+      CONCATENATE lt_hoja_pick-cabecera-texto_picking_string l_instrucciones_carretillas
+      INTO lt_hoja_pick-cabecera-texto_picking_string SEPARATED BY cl_abap_char_utilities=>cr_lf.
+    ENDIF.
+  ENDIF.
+
+  DATA(l_instrucciones_transportistas) = zcl_ap_textos=>get_texto_string( name   = lt_hoja_pick-cabecera-tknum
+                                                                             object = 'VTTK'
+                                                                             id     = '0001' ).
+  IF NOT l_instrucciones_transportistas IS INITIAL.
+    CONCATENATE 'Instrucciones transportista:' l_instrucciones_transportistas INTO l_instrucciones_transportistas SEPARATED BY space.
+    IF lt_hoja_pick-cabecera-texto_picking_string IS INITIAL.
+      lt_hoja_pick-cabecera-texto_picking_string = l_instrucciones_transportistas.
+    ELSE.
+      CONCATENATE lt_hoja_pick-cabecera-texto_picking_string l_instrucciones_transportistas
+      INTO lt_hoja_pick-cabecera-texto_picking_string SEPARATED BY cl_abap_char_utilities=>cr_lf.
+    ENDIF.
+  ENDIF.
+
+
+  " Texto LOPD:
+  CLEAR lv_bukrs.
+  SELECT SINGLE bukrs INTO lv_bukrs
+    FROM ttds
+    WHERE tplst = vttkvb-tplst.
+  CONCATENATE 'ZLOPD_' lv_bukrs INTO lt_hoja_pick-lopd-tdname.
+  lt_hoja_pick-lopd-tdobject = 'TEXT'.
+  lt_hoja_pick-lopd-tdid = 'ST'.
+  lt_hoja_pick-lopd-tdspras = nast-spras.
+
+  " Texto Registro Marcantil:
+  CONCATENATE 'ZREG_MERC_' lv_bukrs INTO lt_hoja_pick-reg_mercantil-tdname.
+  lt_hoja_pick-reg_mercantil-tdobject = 'TEXT'.
+  lt_hoja_pick-reg_mercantil-tdid = 'ST'.
+  lt_hoja_pick-reg_mercantil-tdspras = nast-spras.
+
+
+  CASE tnapr-kschl.
+    WHEN 'ZPCK'.
+      PERFORM cargar_posiciones_zpck USING lt_hoja_pick-cabecera-tplst.
+    WHEN OTHERS.
+      PERFORM cargar_posiciones USING lt_hoja_pick-cabecera-tplst.
+  ENDCASE.
+
+ENDFORM.                    " CARGAR_HORA_PICKING
+*&---------------------------------------------------------------------*
+*&      Form  CARGAR_DEST_MERC
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_XVTTP_KUNWE  text
+*      <--P_LT_HOJA_PICK_CABECERA_DEST_MER  text
+*----------------------------------------------------------------------*
+FORM cargar_dest_merc  USING    p_kunwe
+                       CHANGING ps_dest_merc TYPE zstsd_hoja_pick_dir.
+
+  DATA: lv_adrnr TYPE adrnr,
+        lv_stceg TYPE stceg,
+        ls_adrc  TYPE adrc.
+
+
+  CLEAR: lv_adrnr, lv_stceg.
+
+  SELECT SINGLE adrnr stceg INTO (lv_adrnr, lv_stceg)
+    FROM kna1
+    WHERE kunnr = p_kunwe.
+
+  ps_dest_merc-adrnr = lv_adrnr.
+  ps_dest_merc-stceg = lv_stceg.
+
+
+  IF ps_dest_merc-adrnr IS NOT INITIAL.
+    CLEAR ls_adrc.
+    SELECT SINGLE * INTO ls_adrc
+      FROM adrc
+      WHERE addrnumber = ps_dest_merc-adrnr.
+
+    IF ls_adrc IS NOT INITIAL.
+
+      MOVE-CORRESPONDING ls_adrc TO ps_dest_merc.
+      TRANSLATE ps_dest_merc-name1 TO UPPER CASE.
+      " Dirección 1:
+      CONDENSE: ps_dest_merc-street, ps_dest_merc-house_num1.
+      IF ps_dest_merc-house_num1 IS NOT INITIAL.
+        CONCATENATE ps_dest_merc-street ps_dest_merc-house_num1
+                    INTO ps_dest_merc-direc_1 SEPARATED BY ', '.
+      ELSE.
+        WRITE ps_dest_merc-street TO ps_dest_merc-direc_1.
+      ENDIF.
+      TRANSLATE ps_dest_merc-direc_1 TO UPPER CASE.
+      " Dirección 2:
+      CONDENSE: ps_dest_merc-post_code1, ps_dest_merc-city1.
+      CONCATENATE ps_dest_merc-post_code1 ps_dest_merc-city1
+                INTO ps_dest_merc-direc_2 SEPARATED BY space.
+      TRANSLATE ps_dest_merc-direc_2 TO UPPER CASE.
+      IF ps_dest_merc-region IS NOT INITIAL.
+        TRANSLATE ps_dest_merc-city1 TO UPPER CASE.
+        SELECT SINGLE bezei INTO ps_dest_merc-bezei
+          FROM t005u
+          WHERE bland = ls_adrc-region
+          AND spras = ls_adrc-langu
+          AND land1 = ls_adrc-country.
+        TRANSLATE ps_dest_merc-bezei TO UPPER CASE.
+        IF ps_dest_merc-bezei IS NOT INITIAL AND ps_dest_merc-bezei NE ps_dest_merc-city1.
+          CONCATENATE ps_dest_merc-direc_2 ps_dest_merc-bezei
+                      INTO ps_dest_merc-direc_2 SEPARATED BY ' - '.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    " FAX:
+    SELECT SINGLE fax_number INTO ps_dest_merc-fax_number
+      FROM adr3
+      WHERE addrnumber = ps_dest_merc-adrnr.
+  ENDIF.
+
+ENDFORM.                    " CARGAR_DEST_MERC
+*&---------------------------------------------------------------------*
+*&      Form  CARGAR_POSICIONES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM cargar_posiciones USING p_tplst TYPE tplst.
+
+  " Tablas internas:
+  DATA: BEGIN OF lt_agrup OCCURS 0,
+          kunwe TYPE kunwe,
+          name1 TYPE ad_name1,
+          city1 TYPE ad_city1,
+          lprio TYPE lprio,
+          bezei TYPE bezei20,
+        END OF lt_agrup.
+
+  DATA: BEGIN OF lt_agrup_ent OCCURS 0,
+          kunwe TYPE kunwe,
+          lprio TYPE lprio,
+          vbeln TYPE vbeln_vl,
+        END OF lt_agrup_ent.
+
+  " Estructuras:
+  DATA: ls_xvttp          TYPE         vttpvb,
+        ls_agrup          LIKE LINE OF lt_agrup,
+        ls_agrup_ent      LIKE LINE OF lt_agrup_ent,
+        ls_hoja_pick_lin  TYPE         zstsd_hoja_pick_pos_lin,
+        ls_hoja_pick_pos  TYPE         zstsd_hoja_pick_pos_ent_lin,
+        ls_hoja_pick_part TYPE         zstsd_hoja_pick_part_ent_lin,
+        ls_slp            TYPE         vtrlp,
+        ls_slp_part       TYPE         vtrlp.
+
+  " Datos:
+  DATA: lv_index      LIKE sy-tabix,
+        lv_name1      TYPE ad_name1,
+        lv_city1      TYPE ad_city1,
+        lv_bezei      TYPE bezei20,
+        lv_prio       TYPE lprio,
+        lv_cant_e(17),
+        lv_cant_d(3),
+        lv_string     TYPE string,
+        lv_canti      TYPE lfimg,
+        lv_canti_15_3 TYPE lfimg.
+
+  DATA: lv_kunag TYPE kunnr.
+
+  DATA: lv_mtart TYPE mtart,
+        lv_auart TYPE auart.
+
+
+  CLEAR: lt_agrup, lt_agrup_ent, lt_hoja_pick-cabecera-num_bobinas.
+  REFRESH: lt_agrup, lt_agrup_ent.
+
+  " 1) Identificamos combinaciones dest.merc. y prioridad:
+
+  LOOP AT xvttp INTO ls_xvttp.
+    CLEAR: ls_agrup, ls_agrup_ent, lv_name1, lv_city1, lv_bezei, lv_prio.
+
+    SELECT SINGLE name1 ort01 INTO (lv_name1, lv_city1)
+      FROM kna1
+      WHERE kunnr = ls_xvttp-kunwe.
+
+    SELECT SINGLE lprio INTO lv_prio
+      FROM likp
+      WHERE vbeln = ls_xvttp-vbeln.
+
+*    IF lv_prio IS NOT INITIAL OR lv_prio = '00'.
+    SELECT SINGLE bezei INTO lv_bezei
+      FROM tprit
+      WHERE spras = nast-spras
+      AND lprio = lv_prio.
+*    ENDIF.
+
+    READ TABLE lt_agrup INTO ls_agrup WITH KEY kunwe = ls_xvttp-kunwe
+                                               lprio = lv_prio.
+
+    IF ls_agrup IS INITIAL.
+
+      ls_agrup-kunwe = ls_xvttp-kunwe.
+      ls_agrup-name1 = lv_name1.
+      ls_agrup-city1 = lv_city1.
+      ls_agrup-lprio = lv_prio.
+      ls_agrup-bezei = lv_bezei.
+
+      APPEND ls_agrup TO lt_agrup.
+
+      ls_agrup_ent-kunwe = ls_xvttp-kunwe.
+      ls_agrup_ent-lprio = lv_prio.
+      ls_agrup_ent-vbeln = ls_xvttp-vbeln.
+      APPEND ls_agrup_ent TO lt_agrup_ent.
+
+    ELSE.
+      ls_agrup_ent-kunwe = ls_xvttp-kunwe.
+      ls_agrup_ent-lprio = lv_prio.
+      ls_agrup_ent-vbeln = ls_xvttp-vbeln.
+      APPEND ls_agrup_ent TO lt_agrup_ent.
+
+    ENDIF.
+
+  ENDLOOP.
+
+  " 2) Posiciones y particiones de entrega:
+  LOOP AT lt_agrup INTO ls_agrup.
+    CLEAR: ls_hoja_pick_lin, lv_kunag.
+
+    ls_hoja_pick_lin-kunwe = ls_agrup-kunwe.
+    ls_hoja_pick_lin-name1 = ls_agrup-name1.
+    ls_hoja_pick_lin-city1 = ls_agrup-city1.
+    ls_hoja_pick_lin-lprio = ls_agrup-lprio.
+    ls_hoja_pick_lin-bezei = ls_agrup-bezei.
+
+    IF p_tplst = '4000'.
+      SELECT SINGLE kunn2 FROM knvp
+        INTO lv_kunag
+        WHERE kunnr = ls_hoja_pick_lin-kunwe AND
+              parvw = 'AG'. "'SO'. DBM - SO es el valor convertido al idioma
+      IF sy-subrc = 0.
+        SELECT SINGLE name1 FROM kna1
+          INTO ls_hoja_pick_lin-kunag_name1
+          WHERE kunnr = lv_kunag.
+      ENDIF.
+    ENDIF.
+
+    LOOP AT lt_agrup_ent INTO ls_agrup_ent WHERE kunwe = ls_agrup-kunwe
+                                           AND lprio = ls_agrup-lprio.
+      LOOP AT slp INTO ls_slp WHERE uecha IS INITIAL
+                              AND vbeln = ls_agrup_ent-vbeln.
+
+        CLEAR ls_hoja_pick_pos.
+        MOVE-CORRESPONDING ls_slp TO ls_hoja_pick_pos.
+        IF ls_slp-lfimg IS NOT INITIAL.
+          ls_hoja_pick_pos-tot_entrega = ls_slp-lfimg.
+          IF ls_slp-vrkme <> 'KG' AND lt_hoja_pick-cabecera-tplst <> '4000'.
+            CLEAR lv_canti.
+            CALL FUNCTION 'ZCONVERTIR_CANTIDAD'
+              EXPORTING
+                i_matnr    = ls_slp-matnr
+                i_canti    = ls_slp-lfimg
+                i_meins_or = ls_slp-vrkme
+                i_meins_fi = 'KG'
+              IMPORTING
+                e_canti    = lv_canti.
+
+            IF ls_slp-werks <> '4000'.
+              lt_hoja_pick-cabecera-total_kg = lt_hoja_pick-cabecera-total_kg + lv_canti.
+            ENDIF.
+            ls_hoja_pick_pos-tot_entrega = lv_canti.
+          ELSE.
+            IF ls_slp-werks <> '4000'.
+              lt_hoja_pick-cabecera-total_kg = lt_hoja_pick-cabecera-total_kg + ls_slp-lfimg.
+            ENDIF.
+          ENDIF.
+        ELSEIF ls_slp-kcmeng IS NOT INITIAL.
+          ls_hoja_pick_pos-tot_entrega = ls_slp-kcmeng.
+          IF ls_slp-meins <> 'KG' AND lt_hoja_pick-cabecera-tplst <> '4000'.
+            CLEAR lv_canti.
+            lv_canti_15_3 = ls_slp-kcmeng.
+            CALL FUNCTION 'ZCONVERTIR_CANTIDAD'
+              EXPORTING
+                i_matnr    = ls_slp-matnr
+                i_canti    = lv_canti_15_3 "ls_slp-kcmeng
+                i_meins_or = ls_slp-meins
+                i_meins_fi = 'KG'
+              IMPORTING
+                e_canti    = lv_canti.
+            IF ls_slp-werks <> '4000'.
+              lt_hoja_pick-cabecera-total_kg = lt_hoja_pick-cabecera-total_kg + lv_canti.
+            ENDIF.
+            ls_hoja_pick_pos-tot_entrega = lv_canti.
+          ELSE.
+            IF ls_slp-werks <> '4000'.
+              lt_hoja_pick-cabecera-total_kg = lt_hoja_pick-cabecera-total_kg + ls_slp-kcmeng.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+
+        CLEAR: lv_cant_e, lv_cant_d.
+        WRITE ls_hoja_pick_pos-tot_entrega TO ls_hoja_pick_pos-tot_entrega_txt.
+        CONDENSE ls_hoja_pick_pos-tot_entrega_txt.
+
+        SPLIT ls_hoja_pick_pos-tot_entrega_txt AT ',' INTO lv_cant_e lv_cant_d.
+        CONDENSE: lv_cant_e, lv_cant_d.
+        IF lv_cant_d <> '000'.
+          WRITE ls_hoja_pick_pos-tot_entrega TO ls_hoja_pick_pos-tot_entrega_txt.
+          CONDENSE ls_hoja_pick_pos-tot_entrega_txt.
+        ELSE.
+          CLEAR lv_string.
+          CONDENSE lv_cant_e.
+          CONCATENATE lv_cant_e '       ' INTO lv_string.
+          WRITE lv_string TO ls_hoja_pick_pos-tot_entrega_txt.
+          CONDENSE ls_hoja_pick_pos-tot_entrega_txt.
+        ENDIF.
+
+        " Particiones de cada entrega:
+        LOOP AT slp INTO ls_slp_part WHERE uecha = ls_slp-posnr
+                                     AND vbeln = ls_slp-vbeln.
+
+          CLEAR: ls_hoja_pick_part, lv_cant_e, lv_cant_d.
+          MOVE-CORRESPONDING ls_slp_part TO ls_hoja_pick_part.
+          IF ls_hoja_pick_part-vrkme <> 'KG' AND lt_hoja_pick-cabecera-tplst <> '4000'.
+            CLEAR lv_canti.
+            CALL FUNCTION 'ZCONVERTIR_CANTIDAD'
+              EXPORTING
+                i_matnr    = ls_hoja_pick_part-matnr
+                i_canti    = ls_hoja_pick_part-lfimg
+                i_meins_or = ls_hoja_pick_part-vrkme
+                i_meins_fi = 'KG'
+              IMPORTING
+                e_canti    = lv_canti.
+
+            ls_hoja_pick_part-lfimg = lv_canti.
+          ENDIF.
+          WRITE ls_hoja_pick_part-lfimg TO ls_hoja_pick_part-lfimg_txt.
+          CONDENSE ls_hoja_pick_part-lfimg_txt.
+          SPLIT ls_hoja_pick_part-lfimg_txt AT ',' INTO lv_cant_e lv_cant_d.
+          CONDENSE: lv_cant_e, lv_cant_d.
+          IF lv_cant_d <> '000'.
+            WRITE ls_hoja_pick_part-lfimg TO ls_hoja_pick_part-lfimg_txt.
+            CONDENSE ls_hoja_pick_part-lfimg_txt.
+          ELSE.
+            CLEAR lv_string.
+            CONDENSE lv_cant_e.
+            CONCATENATE lv_cant_e '       ' INTO lv_string.
+            WRITE lv_string TO ls_hoja_pick_part-lfimg_txt.
+            CONDENSE ls_hoja_pick_part-lfimg_txt.
+          ENDIF.
+
+          ADD 1 TO  lt_hoja_pick-cabecera-num_bobinas.
+
+          APPEND ls_hoja_pick_part TO ls_hoja_pick_pos-part_entrega.
+
+        ENDLOOP.
+
+*       orden
+        IF ls_slp-werks = '4000'.
+          CLEAR: lv_mtart, lv_auart.
+          SELECT SINGLE mtart FROM mara
+            INTO lv_mtart
+            WHERE matnr = ls_slp-matnr.
+
+          CASE lv_mtart.
+            WHEN 'ZPLP'.
+              lv_auart = 'ZC01'. "de extrusión
+
+            WHEN 'ZPMP'.
+              lv_auart = 'ZC02'. "de manipulado
+          ENDCASE.
+
+          SELECT SINGLE aufnr FROM aufk
+              INTO ls_hoja_pick_pos-aufnr
+              WHERE auart = lv_auart AND
+                    werks = ls_slp-werks AND
+                    zzebeln4 = ls_slp-vbeln_vauf AND
+                    zzebelp4 = ls_slp-posnr_vauf.
+
+
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+            EXPORTING
+              input  = ls_hoja_pick_pos-aufnr
+            IMPORTING
+              output = ls_hoja_pick_pos-aufnr.
+        ENDIF.
+
+        APPEND ls_hoja_pick_pos TO ls_hoja_pick_lin-pos_entrega.
+      ENDLOOP.
+
+      DATA: lv_btgew TYPE likp-btgew,
+            lv_werks TYPE werks_d.
+
+      SELECT SINGLE werks FROM lips
+        INTO lv_werks
+        WHERE vbeln = ls_agrup_ent-vbeln.
+
+      IF lv_werks = '4000'.
+
+        CLEAR: lv_btgew.
+        SELECT SINGLE btgew FROM likp
+          INTO lv_btgew
+          WHERE vbeln = ls_agrup_ent-vbeln.
+
+        lt_hoja_pick-cabecera-total_kg = lt_hoja_pick-cabecera-total_kg + lv_btgew.
+      ENDIF.
+    ENDLOOP.
+
+    APPEND ls_hoja_pick_lin TO lt_hoja_pick-posiciones.
+  ENDLOOP.
+
+  " Total Peso Kilos:
+  WRITE lt_hoja_pick-cabecera-total_kg TO lt_hoja_pick-cabecera-total_kg_txt.
+  CONDENSE lt_hoja_pick-cabecera-total_kg_txt.
+  SPLIT lt_hoja_pick-cabecera-total_kg_txt AT ',' INTO lv_cant_e lv_cant_d.
+  CONDENSE: lv_cant_e, lv_cant_d.
+  IF lv_cant_d <> '000'.
+    WRITE lt_hoja_pick-cabecera-total_kg TO lt_hoja_pick-cabecera-total_kg_txt.
+    CONDENSE lt_hoja_pick-cabecera-total_kg_txt.
+  ELSE.
+    CLEAR lv_string.
+    CONDENSE lv_cant_e.
+    CONCATENATE lv_cant_e '       ' INTO lv_string.
+    WRITE lv_string TO lt_hoja_pick-cabecera-total_kg_txt.
+    CONDENSE lt_hoja_pick-cabecera-total_kg_txt.
+  ENDIF.
+
+  lt_hoja_pick-cabecera-gewei = 'KG'.
+
+
+
+  "JCB 13.09.22. Horas de entrega e instrucciones envio
+  LOOP AT lt_hoja_pick-posiciones ASSIGNING FIELD-SYMBOL(<fs_posiciones>).
+    PERFORM horas_descarga USING lt_hoja_pick-cabecera-dplbg <fs_posiciones>-kunwe
+                           CHANGING <fs_posiciones>-horas_descarga_manyana
+                                    <fs_posiciones>-horas_descarga_tarde
+                                    <fs_posiciones>-horas_descarga.
+
+
+    LOOP AT <fs_posiciones>-pos_entrega ASSIGNING FIELD-SYMBOL(<fs_pos_entrega>).
+      <fs_pos_entrega>-instrucciones_envio-tdspras   = 'S'.
+
+*APC20240614 Ahora las instrucciones de envío estarán a nivel de posición
+*      <fs_pos_entrega>-instrucciones_envio-tdid      = 'ZC02'.
+*      <fs_pos_entrega>-instrucciones_envio-tdobject  = 'VBBK'.
+*      <fs_pos_entrega>-instrucciones_envio-tdname    = <fs_pos_entrega>-vbeln.
+      <fs_pos_entrega>-instrucciones_envio-tdid      = 'ZC03'.
+      <fs_pos_entrega>-instrucciones_envio-tdobject  = 'VBBP'.
+      <fs_pos_entrega>-instrucciones_envio-tdname    = <fs_pos_entrega>-vbeln && <fs_pos_entrega>-posnr.
+
+    ENDLOOP.
+  ENDLOOP.
+
+
+ENDFORM.                    " CARGAR_POSICIONES
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  CARGAR_POSICIONES_ZPCK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM cargar_posiciones_zpck USING p_tplst TYPE tplst.
+
+  " Tablas internas:
+  DATA: BEGIN OF lt_agrup OCCURS 0,
+          kunwe TYPE kunwe,
+          kunag TYPE likp-kunag,
+          name1 TYPE ad_name1,
+          city1 TYPE ad_city1,
+          lprio TYPE lprio,
+          bezei TYPE bezei20,
+        END OF lt_agrup.
+
+  DATA: BEGIN OF lt_agrup_ent OCCURS 0,
+          kunwe TYPE kunwe,
+          kunag TYPE likp-kunag,
+          lprio TYPE lprio,
+          vbeln TYPE vbeln_vl,
+        END OF lt_agrup_ent.
+
+  " Estructuras:
+  DATA: ls_xvttp          TYPE         vttpvb,
+        ls_agrup          LIKE LINE OF lt_agrup,
+        ls_agrup_ent      LIKE LINE OF lt_agrup_ent,
+        ls_hoja_pick_lin  TYPE         zstsd_hoja_pick_pos_lin,
+        ls_hoja_pick_pos  TYPE         zstsd_hoja_pick_pos_ent_lin,
+        ls_hoja_pick_part TYPE         zstsd_hoja_pick_part_ent_lin,
+        ls_slp            TYPE         vtrlp,
+        ls_slp_part       TYPE         vtrlp.
+
+  " Datos:
+  DATA: lv_index      LIKE sy-tabix,
+        lv_name1      TYPE ad_name1,
+        lv_city1      TYPE ad_city1,
+        lv_bezei      TYPE bezei20,
+        lv_prio       TYPE lprio,
+        vl_kunag      TYPE likp-kunag,
+        lv_cant_e(17),
+        lv_cant_d(3),
+        lv_string     TYPE string,
+        lv_canti      TYPE lfimg,
+        lv_canti_15_3 TYPE lfimg.
+
+  DATA: lv_kunag TYPE kunnr.
+
+  DATA: lv_mtart TYPE mtart,
+        lv_auart TYPE auart.
+
+
+  CLEAR: lt_agrup, lt_agrup_ent, lt_hoja_pick-cabecera-num_bobinas.
+  REFRESH: lt_agrup, lt_agrup_ent.
+
+  " 1) Identificamos combinaciones dest.merc. y prioridad:
+
+
+  LOOP AT xvttp INTO ls_xvttp.
+    CLEAR: ls_agrup, ls_agrup_ent, lv_name1, lv_city1, lv_bezei, lv_prio, vl_kunag.
+
+
+    SELECT SINGLE lprio kunag
+      INTO (lv_prio, vl_kunag)
+      FROM likp
+      WHERE vbeln = ls_xvttp-vbeln.
+
+
+    SELECT SINGLE name1 ort01 INTO (lv_name1, lv_city1)
+      FROM kna1
+      WHERE kunnr = ls_xvttp-kunwe.
+
+
+*    IF lv_prio IS NOT INITIAL OR lv_prio = '00'.
+    SELECT SINGLE bezei INTO lv_bezei
+      FROM tprit
+      WHERE spras = nast-spras
+      AND lprio = lv_prio.
+*    ENDIF.
+
+    READ TABLE lt_agrup INTO ls_agrup WITH KEY kunwe = ls_xvttp-kunwe
+                                               kunag = vl_kunag
+                                               lprio = lv_prio.
+
+    IF ls_agrup IS INITIAL.
+      ls_agrup-kunwe = ls_xvttp-kunwe.
+      ls_agrup-kunag = vl_kunag.
+      ls_agrup-name1 = lv_name1.
+      ls_agrup-city1 = lv_city1.
+      ls_agrup-lprio = lv_prio.
+      ls_agrup-bezei = lv_bezei.
+
+      APPEND ls_agrup TO lt_agrup.
+
+      ls_agrup_ent-kunwe = ls_xvttp-kunwe.
+      ls_agrup_ent-kunag = vl_kunag.
+      ls_agrup_ent-lprio = lv_prio.
+      ls_agrup_ent-vbeln = ls_xvttp-vbeln.
+      APPEND ls_agrup_ent TO lt_agrup_ent.
+
+    ELSE.
+      ls_agrup_ent-kunwe = ls_xvttp-kunwe.
+      ls_agrup_ent-kunag = vl_kunag.
+      ls_agrup_ent-lprio = lv_prio.
+      ls_agrup_ent-vbeln = ls_xvttp-vbeln.
+      APPEND ls_agrup_ent TO lt_agrup_ent.
+
+    ENDIF.
+
+  ENDLOOP.
+
+  " 2) Posiciones y particiones de entrega:
+  SELECT domname, domvalue_l, ddtext
+    INTO TABLE @DATA(tl_dd07t_gestion_picos)
+    FROM dd07t
+    WHERE domname     = 'ZGESTION_PICOS' AND
+          ddlanguage  = @sy-langu.
+
+
+  IF lt_agrup_ent[] IS NOT INITIAL.
+    SELECT vbeln, vkorg
+      INTO TABLE @DATA(tl_likp)
+      FROM likp
+      FOR ALL ENTRIES IN @lt_agrup_ent
+      WHERE vbeln = @lt_agrup_ent-vbeln.
+  ENDIF.
+
+
+
+  LOOP AT lt_agrup INTO ls_agrup.
+    CLEAR: ls_hoja_pick_lin, lv_kunag.
+
+    ls_hoja_pick_lin-kunwe = ls_agrup-kunwe.
+    ls_hoja_pick_lin-name1 = ls_agrup-name1.
+    ls_hoja_pick_lin-city1 = ls_agrup-city1.
+    ls_hoja_pick_lin-lprio = ls_agrup-lprio.
+    ls_hoja_pick_lin-bezei = ls_agrup-bezei.
+
+    "JCB 06.10.22.
+    SELECT SINGLE name1
+      FROM kna1
+      INTO ls_hoja_pick_lin-kunag_name1
+      WHERE kunnr = ls_agrup-kunag.
+
+
+
+
+    LOOP AT lt_agrup_ent INTO ls_agrup_ent WHERE kunwe = ls_agrup-kunwe AND
+                                                 kunag = ls_agrup-kunag AND
+                                                 lprio = ls_agrup-lprio.
+      LOOP AT slp INTO ls_slp WHERE uecha IS INITIAL
+                              AND vbeln = ls_agrup_ent-vbeln.
+        CLEAR ls_hoja_pick_pos.
+        MOVE-CORRESPONDING ls_slp TO ls_hoja_pick_pos.
+
+        "JCB 17.09.24. Gestión de picos
+        READ TABLE tl_likp ASSIGNING FIELD-SYMBOL(<fs_likp>) WITH KEY vbeln = ls_slp-vbeln.
+        IF sy-subrc = 0.
+          SELECT SINGLE zzgestion_picos
+            INTO @DATA(vl_gestion_picos)
+            FROM knvv
+            WHERE kunnr = @ls_agrup-kunwe   AND
+                  vkorg = @<fs_likp>-vkorg  AND
+                  vtweg = @ls_slp-vtweg     AND
+                  spart = @ls_slp-spart.
+          IF vl_gestion_picos IS NOT INITIAL.
+            READ TABLE tl_dd07t_gestion_picos ASSIGNING FIELD-SYMBOL(<fs_dd07t_gestion_picos>) WITH KEY domvalue_l = vl_gestion_picos.
+            IF sy-subrc = 0.
+              ls_hoja_pick_pos-gestion_picos = <fs_dd07t_gestion_picos>-ddtext.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+
+        SELECT SINGLE kdmat, cuobj, vgbel, vgpos, werks
+          INTO @DATA(wl_lips)
+          FROM lips
+          WHERE vbeln = @ls_slp-vbeln AND
+                posnr = @ls_slp-posnr.
+        IF sy-subrc <> 0.
+          CLEAR wl_lips.
+        ELSEIF wl_lips-kdmat IS NOT INITIAL.
+          ls_hoja_pick_pos-arktx = |{ wl_lips-kdmat } { ls_hoja_pick_pos-arktx }|.
+        ENDIF.
+
+        IF ls_slp-lfimg = 0.
+          ls_slp-lfimg = ls_slp-kcmeng.
+          IF ls_slp-meins <> ls_slp-vrkme.
+            CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+              EXPORTING
+                i_matnr              = ls_slp-matnr
+                i_in_me              = ls_slp-meins
+                i_out_me             = ls_slp-vrkme
+                i_menge              = ls_slp-lfimg
+              IMPORTING
+                e_menge              = ls_slp-lfimg
+              EXCEPTIONS
+                error_in_application = 1
+                error                = 2
+                OTHERS               = 3.
+          ENDIF.
+        ENDIF.
+
+        ls_hoja_pick_pos-tot_entrega = ls_slp-lfimg.
+        WRITE ls_hoja_pick_pos-tot_entrega TO ls_hoja_pick_pos-tot_entrega_txt UNIT ls_slp-vrkme.
+
+        ls_hoja_pick_pos-cantidad_lote = ls_slp-lfimg.
+        WRITE ls_hoja_pick_pos-cantidad_lote TO ls_hoja_pick_pos-cantidad_lote_txt UNIT ls_slp-vrkme.
+        CONDENSE ls_hoja_pick_pos-cantidad_lote_txt.
+
+
+        DATA: lo_idx_mng   TYPE REF TO zcl_hp_vcpp_idx_manager,
+              ls_idx_td151 TYPE yhp_idx_td151.
+        CREATE OBJECT lo_idx_mng TYPE zcl_hp_vcpp_idx_manager
+          EXPORTING
+            i_cuobj          = wl_lips-cuobj   " Configuración (número de objeto interno)
+          EXCEPTIONS
+            no_valid_iparams = 1
+            OTHERS           = 2.
+        IF sy-subrc = 0.
+          CLEAR: ls_idx_td151.
+          lo_idx_mng->get_td151_data(
+            EXPORTING
+              i_shuty          = 'UNIT'" MTS: 02.11.22 Modificamos A UNIT para calculo palets  estaba en STACK 'STACK'    " VCXI-XCS: ID for Shipping Unit Type
+            RECEIVING
+              e_yhp_idx_td151  = ls_idx_td151
+            EXCEPTIONS
+              no_valid_iparams = 1
+              no_values        = 2
+              OTHERS           = 3
+          ).
+
+          IF ls_idx_td151-tbqty <> 0.
+            ls_hoja_pick_pos-cantidad_palet = ceil( ls_slp-lfimg / ls_idx_td151-tbqty ).
+            WRITE ls_hoja_pick_pos-cantidad_palet TO ls_hoja_pick_pos-cantidad_palet_txt UNIT ls_slp-vrkme.
+            CONDENSE ls_hoja_pick_pos-cantidad_palet_txt.
+
+            IF ls_idx_td151-tbqty NE 0.
+              ls_hoja_pick_pos-cajas_palet = ls_idx_td151-tbqty.
+              ls_hoja_pick_pos-cajas_palet_txt = |Cajas/Palé: { zcl_ap_string=>ctd2string( ls_hoja_pick_pos-cajas_palet ) } UN|.
+            ENDIF.
+          ENDIF.
+*APC20240617
+          IF ls_idx_td151-length NE 0 OR ls_idx_td151-width NE 0 OR ls_idx_td151-height NE 0.
+            ls_hoja_pick_pos-dimensiones = |{ ls_idx_td151-length NUMBER = ENVIRONMENT DECIMALS = 0 }x{ ls_idx_td151-width NUMBER = ENVIRONMENT DECIMALS = 0 }x{ ls_idx_td151-height NUMBER = ENVIRONMENT DECIMALS = 2 }|.
+          ENDIF.
+
+*APC20240617
+          lo_idx_mng->get_td151_data(
+            EXPORTING
+              i_shuty          = 'CONTAINER'
+            RECEIVING
+              e_yhp_idx_td151  = DATA(ls_idx_td151_container)
+            EXCEPTIONS
+              no_valid_iparams = 1
+              no_values        = 2
+              OTHERS           = 3 ).
+          IF sy-subrc = 0.
+            IF ls_idx_td151_container-laptr = 1.
+              ls_hoja_pick_pos-apilabilidad = 'No'.
+            ELSEIF ls_idx_td151_container-laptr > 1.
+              ls_hoja_pick_pos-apilabilidad = 'Sí'.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+
+        lv_canti = ls_hoja_pick_pos-tot_entrega.
+        IF ls_slp-vrkme <> 'KG'.
+          CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+            EXPORTING
+              i_matnr              = ls_slp-matnr
+              i_in_me              = ls_slp-vrkme
+              i_out_me             = 'KG'
+              i_menge              = lv_canti
+            IMPORTING
+              e_menge              = lv_canti
+            EXCEPTIONS
+              error_in_application = 1
+              error                = 2
+              OTHERS               = 3.
+        ENDIF.
+        ADD lv_canti TO lt_hoja_pick-cabecera-total_kg.
+
+
+        " Particiones de cada entrega:
+        LOOP AT slp INTO ls_slp_part WHERE uecha = ls_slp-posnr
+                                     AND vbeln = ls_slp-vbeln.
+
+          MOVE-CORRESPONDING ls_slp_part TO ls_hoja_pick_part.
+
+          IF ls_hoja_pick_part-lfimg <> 0.
+            WRITE ls_hoja_pick_part-lfimg TO ls_hoja_pick_part-lfimg_txt UNIT ls_slp_part-vrkme.
+            ADD 1 TO  lt_hoja_pick-cabecera-num_bobinas.
+            APPEND ls_hoja_pick_part TO ls_hoja_pick_pos-part_entrega.
+          ENDIF.
+        ENDLOOP.
+
+*       orden
+        IF ls_slp-werks = '4000'.
+          CLEAR: lv_mtart, lv_auart.
+          SELECT SINGLE mtart FROM mara
+            INTO lv_mtart
+            WHERE matnr = ls_slp-matnr.
+
+          CASE lv_mtart.
+            WHEN 'ZPLP'.
+              lv_auart = 'ZC01'. "de extrusión
+
+            WHEN 'ZPMP'.
+              lv_auart = 'ZC02'. "de manipulado
+          ENDCASE.
+
+          SELECT SINGLE aufnr FROM aufk
+              INTO ls_hoja_pick_pos-aufnr
+              WHERE auart = lv_auart AND
+                    werks = ls_slp-werks AND
+                    zzebeln4 = ls_slp-vbeln_vauf AND
+                    zzebelp4 = ls_slp-posnr_vauf.
+        ELSE.
+*APC20240614 Cambiamos esto para coger la orden méas reciente independiente del status
+*          SELECT SINGLE aufnr
+*            INTO @ls_hoja_pick_pos-aufnr
+*            FROM aufk
+*            WHERE kdauf EQ @wl_lips-vgbel AND
+*                  kdpos EQ @wl_lips-vgpos AND
+*                  werks EQ @wl_lips-werks AND
+*                  NOT EXISTS ( SELECT * FROM jest WHERE jest~objnr = aufk~objnr  AND
+*                                                        jest~inact = @space   AND
+*                                                        jest~stat  IN ('I0045', 'I0076') ).    "Cierre técnico, petición de borrado
+*          SELECT aufnr FROM aufk
+*            INTO @ls_hoja_pick_pos-aufnr
+*            UP TO 1 ROWS
+*            WHERE kdauf EQ @wl_lips-vgbel AND
+*                  kdpos EQ @wl_lips-vgpos AND
+*                  werks EQ @wl_lips-werks
+*          ORDER BY erdat DESCENDING, aufnr DESCENDING.
+*          ENDSELECT.
+          ls_hoja_pick_pos-aufnr = NEW zhcl_pp_core( )->get_of_from_doc( vgbel = wl_lips-vgbel
+                                                                         vgpos = wl_lips-vgpos
+                                                                         werks = wl_lips-werks
+                                                                         matnr = ls_hoja_pick_pos-matnr ).
+        ENDIF.
+
+
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = ls_hoja_pick_pos-aufnr
+          IMPORTING
+            output = ls_hoja_pick_pos-aufnr.
+
+
+        ls_hoja_pick_pos-orden_apilabilidad = ls_hoja_pick_pos-aufnr.
+        IF NOT ls_hoja_pick_pos-apilabilidad IS INITIAL.
+          ls_hoja_pick_pos-orden_apilabilidad+150 = |Apilabilidad: { ls_hoja_pick_pos-apilabilidad }|.
+        ENDIF.
+
+        IF NOT  ls_hoja_pick_pos-cajas_palet_txt IS INITIAL.
+          IF ls_hoja_pick_pos-apilabilidad IS INITIAL.
+            ls_hoja_pick_pos-orden_apilabilidad+158 = ls_hoja_pick_pos-cajas_palet_txt.
+          ELSE.
+            DATA l_linea(255).
+            l_linea+158 = ls_hoja_pick_pos-cajas_palet_txt.
+            CONCATENATE ls_hoja_pick_pos-orden_apilabilidad l_linea INTO ls_hoja_pick_pos-orden_apilabilidad  SEPARATED BY cl_abap_char_utilities=>cr_lf.
+          ENDIF.
+        ENDIF.
+
+
+        APPEND ls_hoja_pick_pos TO ls_hoja_pick_lin-pos_entrega.
+      ENDLOOP.
+
+      DATA: lv_btgew TYPE likp-btgew,
+            lv_werks TYPE werks_d.
+
+      SELECT SINGLE werks FROM lips
+        INTO lv_werks
+        WHERE vbeln = ls_agrup_ent-vbeln.
+
+      IF lv_werks = '4000'.
+
+        CLEAR: lv_btgew.
+        SELECT SINGLE btgew FROM likp
+          INTO lv_btgew
+          WHERE vbeln = ls_agrup_ent-vbeln.
+
+        lt_hoja_pick-cabecera-total_kg = lt_hoja_pick-cabecera-total_kg + lv_btgew.
+      ENDIF.
+    ENDLOOP.
+
+    APPEND ls_hoja_pick_lin TO lt_hoja_pick-posiciones.
+  ENDLOOP.
+
+  " Total Peso Kilos:
+  WRITE lt_hoja_pick-cabecera-total_kg TO lt_hoja_pick-cabecera-total_kg_txt.
+  CONDENSE lt_hoja_pick-cabecera-total_kg_txt.
+  SPLIT lt_hoja_pick-cabecera-total_kg_txt AT ',' INTO lv_cant_e lv_cant_d.
+  CONDENSE: lv_cant_e, lv_cant_d.
+  IF lv_cant_d <> '000'.
+    WRITE lt_hoja_pick-cabecera-total_kg TO lt_hoja_pick-cabecera-total_kg_txt.
+    CONDENSE lt_hoja_pick-cabecera-total_kg_txt.
+  ELSE.
+    CLEAR lv_string.
+    CONDENSE lv_cant_e.
+    CONCATENATE lv_cant_e '       ' INTO lv_string.
+    WRITE lv_string TO lt_hoja_pick-cabecera-total_kg_txt.
+    CONDENSE lt_hoja_pick-cabecera-total_kg_txt.
+  ENDIF.
+
+  lt_hoja_pick-cabecera-gewei = 'KG'.
+
+
+
+  "JCB 13.09.22. Horas de entrega e instrucciones envio
+  LOOP AT lt_hoja_pick-posiciones ASSIGNING FIELD-SYMBOL(<fs_posiciones>).
+    PERFORM horas_descarga USING lt_hoja_pick-cabecera-dplbg <fs_posiciones>-kunwe
+                           CHANGING <fs_posiciones>-horas_descarga_manyana
+                                    <fs_posiciones>-horas_descarga_tarde
+                                    <fs_posiciones>-horas_descarga.
+
+
+    LOOP AT <fs_posiciones>-pos_entrega ASSIGNING FIELD-SYMBOL(<fs_pos_entrega>).
+      <fs_pos_entrega>-instrucciones_envio-tdspras   = 'S'.
+*APC20240614 Ahora las instrucciones de envío estarán a nivel de posición
+*      <fs_pos_entrega>-instrucciones_envio-tdid      = 'ZC02'.
+*      <fs_pos_entrega>-instrucciones_envio-tdobject  = 'VBBK'.
+*      <fs_pos_entrega>-instrucciones_envio-tdname    = <fs_pos_entrega>-vbeln.
+      <fs_pos_entrega>-instrucciones_envio-tdid      = 'ZC03'.
+      <fs_pos_entrega>-instrucciones_envio-tdobject  = 'VBBP'.
+      <fs_pos_entrega>-instrucciones_envio-tdname    = <fs_pos_entrega>-vbeln && <fs_pos_entrega>-posnr.
+    ENDLOOP.
+  ENDLOOP.
+
+
+ENDFORM.                    " CARGAR_POSICIONES_ZPCK
+
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_LOGO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_1179   text
+*      <--P_LT_HOJA_PICK_CABECERA_LOGO  text
+*----------------------------------------------------------------------*
+FORM obtener_logo  USING    VALUE(p_nombre)
+                   CHANGING logo TYPE xstringval.
+
+  CALL METHOD cl_ssf_xsf_utilities=>get_bds_graphic_as_bmp
+    EXPORTING
+      p_object       = 'GRAPHICS'
+      p_name         = p_nombre
+      p_id           = 'BMAP'
+      p_btype        = 'BCOL'
+    RECEIVING
+      p_bmp          = logo       " g_logo must be typed xstring
+    EXCEPTIONS
+      not_found      = 1
+      internal_error = 2
+      OTHERS         = 3.
+
+ENDFORM.                    " OBTENER_LOGO
+*&---------------------------------------------------------------------*
+*&      Form  XSTRING_TO_SOLIX
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_OS_FORMOUT_PDF  text
+*----------------------------------------------------------------------*
+FORM xstring_to_solix  USING ip_xstring TYPE xstring.
+
+  DATA:
+    lp_offset          TYPE i,
+    lt_solix           TYPE solix_tab,
+    ls_solix_line      TYPE solix,
+    lp_pdf_string_len  TYPE i,
+    lp_solix_rows      TYPE i,
+    lp_last_row_length TYPE i,
+    lp_row_length      TYPE i.
+
+  CLEAR pdf_content.
+
+* transform xstring to SOLIX
+  DESCRIBE TABLE lt_solix.
+  lp_row_length = sy-tleng.
+  lp_offset = 0.
+
+  lp_pdf_string_len = xstrlen( ip_xstring ).
+
+  lp_solix_rows = lp_pdf_string_len DIV lp_row_length.
+  lp_last_row_length = lp_pdf_string_len MOD lp_row_length.
+  DO lp_solix_rows TIMES.
+    ls_solix_line-line =
+           ip_xstring+lp_offset(lp_row_length).
+    APPEND ls_solix_line TO pdf_content.
+    ADD lp_row_length TO lp_offset.
+  ENDDO.
+  IF lp_last_row_length > 0.
+    CLEAR ls_solix_line-line.
+    ls_solix_line-line = ip_xstring+lp_offset(lp_last_row_length).
+    APPEND ls_solix_line TO pdf_content.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ENVIO_MAIL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM envio_mail USING os_formout TYPE fpformoutput.
+
+  CONSTANTS: prntev_new VALUE '1',     "Neudruck
+             prntev_chg VALUE '2'.     "Änderungsdruck
+
+
+  DATA: xdruvo TYPE c,
+        l_xfz  TYPE c.
+
+
+* BCS data
+  DATA:
+    send_request   TYPE REF TO cl_bcs,
+    document       TYPE REF TO cl_document_bcs,
+    recipient      TYPE REF TO if_recipient_bcs,
+    bcs_exception  TYPE REF TO cx_bcs,
+    lv_sent_to_all TYPE        os_boolean,
+    lp_pdf_size    TYPE        so_obj_len,
+    lv_subject     TYPE        so_obj_des,
+    lv_add_nr      TYPE        adr6-addrnumber,
+    lv_inupd       TYPE        i.
+
+
+  DATA:  lv_emailaddr TYPE adr6-smtp_addr.
+
+* Archiving specific data declaration
+  DATA: lv_pdf_size      TYPE i,
+        l_errstr         TYPE        string,
+        lv_archiveformat LIKE toadd-doc_type,  "PDF or OTF
+        lv_documentclass LIKE toadv-doc_type.
+
+
+  IF nast-aende EQ space.
+    xdruvo = prntev_new.
+  ELSE.
+    xdruvo = prntev_chg.
+  ENDIF.
+
+
+
+*   ---------- create persistent send request ----------------------
+  send_request = cl_bcs=>create_persistent( ).
+
+*   ---------- add document ----------------------------------------
+*   get PDF xstring and convert it to BCS format
+  lp_pdf_size = xstrlen( os_formout-pdf ).
+
+  PERFORM xstring_to_solix
+              USING
+                 os_formout-pdf.
+
+  lv_subject = fp_outputparams-covtitle.
+
+  document = cl_document_bcs=>create_document(
+        i_type    = 'PDF' " cf. RAW, DOC
+        i_hex     = pdf_content
+        i_length  = lp_pdf_size
+        i_subject = lv_subject ).                           "#EC NOTEXT
+
+*   add document to send request
+  send_request->set_document( document ).
+
+
+
+  lv_emailaddr = 'carla.gijon@gruposothis.es'.
+  recipient = recipient = cl_cam_address_bcs=>create_internet_address( i_address_string = lv_emailaddr ).
+
+
+*   ---------- send document ---------------------------------------
+  lv_sent_to_all = send_request->send(
+      i_with_error_screen = 'X' ).
+
+  send_request->add_recipient( i_recipient = recipient ).
+
+* Issue message and COMMINT only if the subroutine is not called in update task
+  IF lv_inupd = 0.
+    IF lv_sent_to_all = 'X'.
+      MESSAGE i022(so).
+    ENDIF.
+
+*   ---------- explicit 'commit work' is mandatory! ----------------
+    COMMIT WORK.
+  ENDIF.
+
+
+* Get the PDF length
+  lp_pdf_size = xstrlen( os_formout-pdf ).
+
+*     which format to be used for archiving: OTF or PDF?
+  CALL FUNCTION 'ARCHIV_GET_PRINTFORMAT'
+    EXPORTING
+      application = 'PDF'
+    IMPORTING
+      printformat = lv_archiveformat.
+
+
+  IF lv_archiveformat EQ 'PDF'.
+    lv_documentclass = 'PDF'.
+
+    CALL FUNCTION 'ARCHIV_CREATE_OUTGOINGDOCUMENT'
+      EXPORTING
+        arc_p                    = arc_params
+        arc_i                    = toa_dara
+        pdflen                   = lv_pdf_size
+        documentclass            = lv_documentclass                "Since the output is in PDF document class is also PDF
+        document                 = os_formout-pdf
+      EXCEPTIONS
+        error_archiv             = 1
+        error_communicationtable = 2
+        error_connectiontable    = 3
+        error_kernel             = 4
+        error_parameter          = 5
+        OTHERS                   = 6.
+    CASE sy-subrc.
+      WHEN 0. " o.k.
+      WHEN 1. RAISE error_archiv.
+      WHEN 2. RAISE error_communicationtable.
+      WHEN 3. RAISE error_connectiontable.
+      WHEN 4. RAISE error_kernel.
+      WHEN 5. RAISE error_parameter.
+      WHEN 6. RAISE error_archiv. "?
+    ENDCASE.
+
+  ELSE.
+    " Other than PDF format raise error.
+    MESSAGE e789(po) WITH lv_archiveformat.
+  ENDIF.
+
+  CALL FUNCTION 'FP_GET_LAST_ADS_ERRSTR'
+    IMPORTING
+      e_adserrstr = l_errstr.
+
+
+  IF nast-tdarmod EQ 3.
+    fp_outputparams-getpdf = abap_false.
+  ENDIF.
+
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ENVIO_MAIL_1
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_OS_FORMOUT  text
+*----------------------------------------------------------------------*
+FORM envio_mail_1 USING ls_fpformoutput TYPE fpformoutput.
+
+  DATA: lo_document     TYPE REF TO cl_document_bcs,
+        lt_message_body TYPE bcsy_text,
+        lp_pdf_size     TYPE so_obj_len,
+        pdf_content     TYPE solix_tab,
+        send_request    TYPE REF TO cl_bcs,
+        l_recipient     TYPE ad_smtpadr,
+        recipient       TYPE REF TO if_recipient_bcs,
+        lv_sub          TYPE so_obj_des.
+
+  DATA: gt_smtp_addr TYPE TABLE OF ad_smtpadr,
+        lv_addr      TYPE ad_smtpadr.
+
+
+  DATA: wa_lfa1  TYPE lfa1,
+        wa_adr6  TYPE adr6,
+        lv_tknum TYPE tknum.
+
+
+* Abrimos spool y modificamos parametros de salida
+  fp_outputparams-getpdf 	= gc_true.
+  fp_outputparams-preview = gc_false.
+
+* Creamos el cuerpo del mail
+  APPEND 'Adjuntamos documento con packing list' TO lt_message_body.
+
+* Sacamos tamaño del PDF
+  lp_pdf_size = xstrlen( ls_fpformoutput-pdf ).
+
+* Convertimos el PDF a HEX
+  pdf_content = cl_document_bcs=>xstring_to_solix(
+      ip_xstring = ls_fpformoutput-pdf ).
+
+* Creamos llamada persistente
+  send_request = cl_bcs=>create_persistent( ).
+
+* Creamos asunto del mail con la entrega
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+    EXPORTING
+      input  = lt_hoja_pick-cabecera-tknum
+    IMPORTING
+      output = lv_tknum.
+
+  CONCATENATE 'Packing list' lv_tknum INTO lv_sub SEPARATED BY space.
+
+* Creamos el email
+  lo_document = cl_document_bcs=>create_document(
+                   i_type = 'RAW'
+                   i_text = lt_message_body
+                   i_subject = lv_sub )."'Notificación de Recogida' ).
+
+* Creamos attch
+  lo_document->add_attachment(
+    EXPORTING
+      i_attachment_type     = 'PDF'
+      i_attachment_subject  = 'Documento Transporte-Packing List'
+      i_attachment_size     = lp_pdf_size
+      i_att_content_hex     = pdf_content ).
+
+* Añadimos el documento al send_request
+  send_request->set_document( lo_document ).
+
+* Añadimos usuarios a send_request
+*  SELECT SINGLE * FROM lfa1 INTO wa_lfa1
+*    WHERE lifnr = lt_hoja_pick-cabecera-dat_transporte-tdlnr.
+*
+*  SELECT SINGLE * FROM adr6
+*    INTO wa_adr6
+*    WHERE addrnumber = wa_lfa1-adrnr.
+
+  SELECT  SINGLE a~smtp_addr
+  FROM    kna1 AS c
+  INNER JOIN adr6 AS a
+  ON      a~addrnumber = c~adrnr
+  WHERE   kunnr = @nast-parnr
+  INTO    @lv_addr.
+
+
+  "lv_addr = wa_adr6-smtp_addr.
+  APPEND lv_addr TO gt_smtp_addr.
+
+
+  LOOP AT gt_smtp_addr INTO lv_addr.
+*   Pasamos dir email
+    l_recipient = lv_addr.
+
+*   Creamos direcciones internas
+    recipient = cl_cam_address_bcs=>create_internet_address( l_recipient ).
+
+*   Añadimos dirección
+    send_request->add_recipient(
+      EXPORTING
+        i_recipient     = recipient
+        i_express       = 'X' ).
+
+  ENDLOOP.
+
+* Enviamos mail
+  send_request->send( i_with_error_screen = 'X' ).
+
+** Hacemos commit
+  "COMMIT WORK.
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  horas_descarga
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_OS_FORMOUT  text
+*----------------------------------------------------------------------*
+
+FORM horas_descarga  USING    p_lfdat
+                              p_kunnr
+                     CHANGING p_horas_descarga_manyana
+                              p_horas_descarga_tarde
+                              p_horas_descarga.
+
+  DATA: l_dia_sem TYPE p,
+        lw_knva   TYPE knva.
+
+
+  DATA: p_mh_ini TYPE char10,
+        p_mh_fin TYPE char10,
+        p_th_ini TYPE char10,
+        p_th_fin TYPE char10.
+
+  CALL FUNCTION 'DAY_IN_WEEK'
+    EXPORTING
+      datum = p_lfdat
+    IMPORTING
+      wotnr = l_dia_sem.
+
+  SELECT SINGLE *
+    INTO lw_knva
+    FROM knva
+    WHERE kunnr = p_kunnr.
+
+  IF lw_knva IS NOT INITIAL AND l_dia_sem IS NOT INITIAL.
+
+    CASE l_dia_sem.
+      WHEN '1'. "Lunes
+        IF lw_knva-moab1 <> '000000' OR lw_knva-mobi1 <> '000000'.
+          CONCATENATE lw_knva-moab1+0(2) lw_knva-moab1+2(2) INTO p_mh_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-mobi1+0(2) lw_knva-mobi1+2(2) INTO p_mh_fin SEPARATED BY ':'.
+        ENDIF.
+        IF lw_knva-moab2 <> '000000' OR lw_knva-mobi2 <> '000000'.
+          CONCATENATE lw_knva-moab2+0(2) lw_knva-moab2+2(2) INTO p_th_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-mobi2+0(2) lw_knva-mobi2+2(2) INTO p_th_fin SEPARATED BY ':'.
+        ENDIF.
+      WHEN '2'. "Martes
+        IF lw_knva-diab1 <> '000000' OR lw_knva-dibi1 <> '000000'.
+          CONCATENATE lw_knva-diab1+0(2) lw_knva-diab1+2(2) INTO p_mh_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-dibi1+0(2) lw_knva-dibi1+2(2) INTO p_mh_fin SEPARATED BY ':'.
+        ENDIF.
+        IF lw_knva-diab2 <> '000000' OR lw_knva-dibi2 <> '000000'.
+          CONCATENATE lw_knva-diab2+0(2) lw_knva-diab2+2(2) INTO p_th_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-dibi2+0(2) lw_knva-dibi2+2(2) INTO p_th_fin SEPARATED BY ':'.
+        ENDIF.
+      WHEN '3'. "Miércoles
+        IF lw_knva-miab1 <> '000000' OR lw_knva-mibi1 <> '000000'.
+          CONCATENATE lw_knva-miab1+0(2) lw_knva-miab1+2(2) INTO p_mh_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-mibi1+0(2) lw_knva-mibi1+2(2) INTO p_mh_fin SEPARATED BY ':'.
+        ENDIF.
+        IF lw_knva-miab2 <> '000000' OR lw_knva-mibi2 <> '000000'.
+          CONCATENATE lw_knva-miab2+0(2) lw_knva-miab2+2(2) INTO p_th_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-mibi2+0(2) lw_knva-mibi2+2(2) INTO p_th_fin SEPARATED BY ':'.
+        ENDIF.
+      WHEN '4'. "Jueves
+        IF lw_knva-doab1 <> '000000' OR lw_knva-dobi1 <> '000000'.
+          CONCATENATE lw_knva-doab1+0(2) lw_knva-doab1+2(2) INTO p_mh_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-dobi1+0(2) lw_knva-dobi1+2(2) INTO p_mh_fin SEPARATED BY ':'.
+        ENDIF.
+        IF lw_knva-doab2 <> '000000' OR lw_knva-dobi2 <> '000000'.
+          CONCATENATE lw_knva-doab2+0(2) lw_knva-doab2+2(2) INTO p_th_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-dobi2+0(2) lw_knva-dobi2+2(2) INTO p_th_fin SEPARATED BY ':'.
+        ENDIF.
+      WHEN '5'. "Viernes
+        IF lw_knva-frab1 <> '000000' OR lw_knva-frbi1 <> '000000'.
+          CONCATENATE lw_knva-frab1+0(2) lw_knva-frab1+2(2) INTO p_mh_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-frbi1+0(2) lw_knva-frbi1+2(2) INTO p_mh_fin SEPARATED BY ':'.
+        ENDIF.
+        IF lw_knva-frab2 <> '000000' OR lw_knva-frbi2 <> '000000'.
+          CONCATENATE lw_knva-frab2+0(2) lw_knva-frab2+2(2) INTO p_th_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-frbi2+0(2) lw_knva-frbi2+2(2) INTO p_th_fin SEPARATED BY ':'.
+        ENDIF.
+      WHEN '6'. "Sábado
+        IF lw_knva-saab1 <> '000000' OR lw_knva-sabi1 <> '000000'.
+          CONCATENATE lw_knva-saab1+0(2) lw_knva-saab1+2(2) INTO p_mh_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-sabi1+0(2) lw_knva-sabi1+2(2) INTO p_mh_fin SEPARATED BY ':'.
+        ENDIF.
+        IF lw_knva-saab2 <> '000000' OR lw_knva-sabi2 <> '000000'.
+          CONCATENATE lw_knva-saab2+0(2) lw_knva-saab2+2(2) INTO p_th_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-sabi2+0(2) lw_knva-sabi2+2(2) INTO p_th_fin SEPARATED BY ':'.
+        ENDIF.
+      WHEN '7'. "Domingo
+        IF lw_knva-soab1 <> '000000' OR lw_knva-sobi1 <> '000000'.
+          CONCATENATE lw_knva-soab1+0(2) lw_knva-soab1+2(2) INTO p_mh_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-sobi1+0(2) lw_knva-sobi1+2(2) INTO p_mh_fin SEPARATED BY ':'.
+        ENDIF.
+        IF lw_knva-soab2 <> '000000' OR lw_knva-sobi2 <> '000000'.
+          CONCATENATE lw_knva-soab2+0(2) lw_knva-soab2+2(2) INTO p_th_ini SEPARATED BY ':'.
+          CONCATENATE lw_knva-sobi2+0(2) lw_knva-sobi2+2(2) INTO p_th_fin SEPARATED BY ':'.
+        ENDIF.
+    ENDCASE.
+  ENDIF.
+
+  IF p_mh_ini IS NOT INITIAL AND p_mh_fin IS NOT INITIAL.
+    p_horas_descarga_manyana = |{ p_mh_ini } - { p_mh_fin }|.
+  ENDIF.
+
+  IF p_th_ini IS NOT INITIAL AND p_th_fin IS NOT INITIAL.
+    p_horas_descarga_tarde   = |{ p_th_ini } - { p_th_fin }|.
+  ENDIF.
+
+  IF p_horas_descarga_tarde IS NOT INITIAL.
+    IF p_horas_descarga_manyana IS INITIAL.
+      p_horas_descarga = p_horas_descarga_tarde.
+    ELSE.
+      p_horas_descarga = |{ p_horas_descarga_manyana }; { p_horas_descarga_tarde }|.
+    ENDIF.
+  ELSE.
+    p_horas_descarga = p_horas_descarga_manyana.
+  ENDIF.
+
+ENDFORM.

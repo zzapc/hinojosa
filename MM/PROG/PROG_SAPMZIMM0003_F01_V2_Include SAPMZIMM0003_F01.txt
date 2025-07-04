@@ -1,0 +1,1030 @@
+*&---------------------------------------------------------------------*
+*&  Include           SAPMZIMM0003_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  USER_COMMAND_9000
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM user_command_9000 .
+  DATA l_okcode TYPE sy-ucomm.
+
+  l_okcode = okcode_9000.
+  CLEAR okcode_9000.
+
+  CASE l_okcode.
+    WHEN 'ACEPTAR'.  PERFORM registrar_bobinas.
+    WHEN OTHERS.
+  ENDCASE.
+
+ENDFORM.                    " USER_COMMAND_9000
+*&---------------------------------------------------------------------*
+*&      Form  INICIALIZAR_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM inicializar_datos .
+
+  IF zemm_0003_scr-budat IS INITIAL.
+    zemm_0003_scr-budat = sy-datum.
+  ENDIF.
+
+  IF zemm_0003_scr-bldat IS INITIAL.
+    zemm_0003_scr-bldat = sy-datum.
+  ENDIF.
+
+  zemm_0003_scr-gewei = 'KG'.
+
+ENDFORM.                    " INICIALIZAR_DATOS
+*&---------------------------------------------------------------------*
+*&      Form  EXIT_COMMAND_9001
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM exit_command_9001 .
+  DATA l_continuar TYPE bool.
+  DATA numreg TYPE i.
+  DATA respuesta TYPE c.
+
+  CLEAR okcode_9001.
+
+  DESCRIBE TABLE gt_regem LINES numreg.
+  IF numreg > 0.
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        titlebar              = 'EM Registradas'
+        text_question         = 'Las EM Registradas se perderán. ¿Desea realmente salir?. NOTA: Existen lotes ya creados'
+        default_button        = '2'
+        display_cancel_button = ' '
+      IMPORTING
+        answer                = respuesta.
+
+    IF respuesta = 'J' OR respuesta = 'Y' OR respuesta = '1'.
+      l_continuar = si.
+    ELSE.
+      l_continuar = no.
+    ENDIF.
+  ELSE.
+    l_continuar = si.
+  ENDIF.
+
+  CHECK l_continuar = si.
+
+  CLEAR zemm_0003_scr-xblnr.
+  CLEAR zemm_0003_scr-bktxt.
+  CLEAR zemm_0003_scr-peso_ent.
+
+  LEAVE TO SCREEN 0.
+
+ENDFORM.                    " EXIT_COMMAND_9001
+*&---------------------------------------------------------------------*
+*&      Form  USER_COMMAND_9001
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM user_command_9001 .
+  DATA l_okcode TYPE sy-ucomm.
+
+  l_okcode = okcode_9001.
+  CLEAR okcode_9001.
+
+  CASE l_okcode.
+    WHEN 'NBOB'.   PERFORM annadir_posicion.
+    WHEN 'CLASIF'. PERFORM clasificar_lote_pos.
+    WHEN 'DELETE'. PERFORM eliminar_posicion.
+    WHEN 'CONTAB'. PERFORM contabilizar_em.
+    WHEN OTHERS.
+  ENDCASE.
+ENDFORM.                    " USER_COMMAND_9001
+*&---------------------------------------------------------------------*
+*&      Form  ANNADIR_POSICION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM annadir_posicion .
+  DATA l_continuar TYPE bool VALUE si.
+  DATA lw_ekko TYPE ekko.
+  DATA lt_ekpo TYPE STANDARD TABLE OF ekpo.
+  DATA lw_ekpo TYPE ekpo.
+  DATA lw_eina TYPE eina.
+  DATA l_wglif TYPE wglif.
+  DATA lw_posem TYPE zemm_0003_regem_alv.
+  DATA: lv_ebeln TYPE ebeln,
+        lv_ebelp TYPE ebelp,
+        lv_error TYPE xfeld.
+
+*  DATA: lt_eina LIKE eina OCCURS 0,
+*        ls_eina TYPE eina.
+
+* Nº Pedido, Bobina Proveedor e INFO Bobina deben estar rellenos.
+  IF zemm_0003_scr-info_bob IS INITIAL OR zemm_0003_scr-bobprv IS INITIAL OR zemm_0003_scr-ebeln IS INITIAL.
+    MESSAGE i039(zmm).
+    l_continuar = no.
+  ENDIF.
+  CHECK l_continuar = si.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = zemm_0003_scr-ebeln
+    IMPORTING
+      output = zemm_0003_scr-ebeln.
+
+* El pedido indicado debe ser de tipo ZPE1.
+  SELECT SINGLE * INTO lw_ekko FROM ekko
+    WHERE ebeln = zemm_0003_scr-ebeln
+      AND bsart = c_bsart_zpe1.
+  IF sy-subrc <> 0.
+    MESSAGE i040(zmm) WITH zemm_0003_scr-ebeln c_bsart_zpe1.
+    l_continuar = no.
+  ENDIF.
+  CHECK l_continuar = si.
+
+* Si ya hemos tratado un pedido, tendremos relleno el proveedor. Si el usuario nos cambia de pedido
+* debe ser del mismo proveedor.
+  IF zemm_0003_scr-lifnr IS NOT INITIAL AND lw_ekko-lifnr <> zemm_0003_scr-lifnr.
+    MESSAGE i055(zmm) WITH zemm_0003_scr-lifnr.
+    l_continuar = no.
+  ENDIF.
+  CHECK l_continuar = si.
+
+* Comprobamos que tenga posiciones abiertas.
+  SELECT * FROM ekpo INTO TABLE lt_ekpo
+    WHERE ebeln = lw_ekko-ebeln
+      AND elikz = no
+      AND loekz = no.
+  IF sy-subrc <> 0.
+    MESSAGE i041(zmm) WITH zemm_0003_scr-ebeln.
+    l_continuar = no.
+  ENDIF.
+  CHECK l_continuar = si.
+
+* Buscamos el material a través del registro info.
+  l_wglif = zemm_0003_scr-info_bob(9).   "Grupo de mercancía.
+
+*  SELECT SINGLE * FROM eina INTO lw_eina
+*    WHERE lifnr = lw_ekko-lifnr
+*      AND wglif = l_wglif
+*      AND loekz = no.
+
+*  CLEAR: lt_eina, ls_eina. " del - cvivo - 66893 - Dejamos ahora únicamente la nueva lógica de determ.de material
+*  REFRESH lt_eina.
+*  SELECT *  INTO CORRESPONDING FIELDS OF TABLE lt_eina
+*    FROM eina
+*    WHERE lifnr = lw_ekko-lifnr
+*      AND wglif = l_wglif
+*      AND loekz = no.
+*  IF sy-subrc <> 0.
+  " 65520 - cvivo - Automatizar desde lógica WM
+  SELECT * FROM ztmm0002
+  INTO TABLE @DATA(gt_ztmm0002).
+
+  SORT gt_ztmm0002 BY lifnr DESCENDING. " para que coja primero las de proveedor
+
+  LOOP AT gt_ztmm0002 INTO DATA(ls_ztmm0002) WHERE zzcalidad(2) = zemm_0003_scr-info_bob(2).
+    DATA l_matnr TYPE matnr.
+    CONCATENATE ls_ztmm0002-matkl '0' zemm_0003_scr-info_bob+2(3) zemm_0003_scr-info_bob+5(4) INTO l_matnr.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = l_matnr
+      IMPORTING
+        output = l_matnr.
+
+    IF line_exists( lt_ekpo[ matnr = l_matnr ] ).
+      lw_eina-matnr = l_matnr.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+  IF sy-subrc NE 0.
+    MESSAGE i042(zmm) WITH lw_ekko-lifnr l_wglif.
+    l_continuar = no.
+  ENDIF.
+*  ELSE.
+*    LOOP AT lt_eina INTO ls_eina.
+*      SELECT SINGLE *
+*      FROM ekpo
+*      WHERE ebeln = lw_ekko-ebeln
+*      AND matnr = ls_eina-matnr
+*      AND loekz = ''.
+*      IF sy-subrc = 0.
+*        lw_eina = ls_eina.
+*        EXIT.
+*      ENDIF.
+*    ENDLOOP.
+*  ENDIF.
+  CHECK l_continuar = si.
+
+  zemm_0003_scr-matnr = lw_eina-matnr.   "Tomamos el artículo.
+
+* Comprobamos que exista el artículo en algunas de las posiciones cargadas de EKPO.
+  READ TABLE lt_ekpo INTO lw_ekpo WITH KEY matnr = zemm_0003_scr-matnr.
+  IF sy-subrc <> 0.
+    MESSAGE i043(zmm) WITH lw_ekko-ebeln lw_eina-matnr.
+    l_continuar = no.
+  ENDIF.
+  CHECK l_continuar = si.
+
+
+* COMPROBAR SI EL MATERIAL ESTA EN DOS POSICIONES DEL PEDIDO DE COMPRAS
+  CLEAR lv_error.
+  PERFORM material_duplicado USING lw_ekko-ebeln
+                                   zemm_0003_scr-matnr
+                                   zemm_0003_scr-info_bob
+                             CHANGING lv_ebeln
+                                      lv_ebelp
+                                      lv_error.
+  IF lv_error = 'X'.
+    MESSAGE i083(zmm) WITH lw_eina-matnr lw_ekko-ebeln.
+    l_continuar = no.
+  ENDIF.
+  CHECK l_continuar = si.
+
+* Cargamos finalmente la posición.
+* PARA ASIGANR EL PEDIDO Y POSICION DEL QUE TIENE QUE HACER LA ENTRADA
+* VEREMOS DE QUE POSICION HAY CANTIDAD SUFICIENTE.
+  IF NOT lv_ebeln IS INITIAL AND NOT lv_ebelp IS INITIAL.
+    lw_posem-ebeln = lv_ebeln.
+    lw_posem-ebelp = lv_ebelp.
+  ELSE.
+    lw_posem-ebeln = lw_ekko-ebeln.
+    lw_posem-ebelp = lw_ekpo-ebelp.
+  ENDIF.
+
+  lw_posem-matnr = zemm_0003_scr-matnr.
+  lw_posem-txz01 = lw_ekpo-txz01.
+  lw_posem-werks = lw_ekpo-werks.
+  lw_posem-lote_prov = zemm_0003_scr-bobprv.
+
+  MOVE zemm_0003_scr-info_bob+9(4) TO lw_posem-menge.
+  IF lw_posem-menge IS INITIAL.
+    MESSAGE i053(zmm).
+    l_continuar = no.
+  ENDIF.
+  CHECK l_continuar = si.
+
+  lw_posem-meins = 'KG'.
+
+  PERFORM generar_lote USING lw_posem-matnr lw_ekpo-werks lw_posem-lote_prov CHANGING lw_posem-charg.
+  CHECK lw_posem-charg IS NOT INITIAL.
+
+  MOVE zemm_0003_scr-info_bob+13(5) TO lw_posem-laeng.
+  lw_posem-meins_laeng = 'M'.
+
+  lw_posem-lgort = lw_ekpo-lgort.
+  IF lw_posem-lgort IS INITIAL.
+    lw_posem-lgort = c_lgort_1000.
+  ENDIF.
+
+  APPEND lw_posem TO gt_regem.
+
+* Actualizamos la estructura de la pantalla 9001.
+  zemm_0003_scr-lifnr = lw_ekko-lifnr.
+  SELECT SINGLE name1 INTO zemm_0003_scr-name1 FROM lfa1 WHERE lifnr = zemm_0003_scr-lifnr.
+  IF sy-subrc <> 0.
+    CLEAR zemm_0003_scr-name1.
+  ENDIF.
+  CLEAR: zemm_0003_scr-bobprv, zemm_0003_scr-info_bob.
+
+
+ENDFORM.                    " ANNADIR_POSICION
+*&---------------------------------------------------------------------*
+*&      Form  GENERAR_LOTE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LW_POSEM_MATNR  text
+*      -->P_LW_EKPO_WERKS  text
+*      <--P_LW_POSEM_CHARG  text
+*----------------------------------------------------------------------*
+FORM generar_lote  USING    p_matnr TYPE matnr
+                            p_werks TYPE werks_d
+                            p_licha TYPE lichn
+                   CHANGING p_charg TYPE charg_d.
+
+  DATA material TYPE bapibatchkey-material.
+  DATA plant TYPE bapibatchkey-plant.
+  DATA batch TYPE bapibatchkey-batch.
+  DATA lt_return TYPE STANDARD TABLE OF bapiret2.
+  DATA lw_return TYPE bapiret2.
+  DATA batch_attr TYPE bapibatchatt.
+
+  CLEAR p_charg.
+
+  MOVE p_matnr TO material.
+  MOVE p_werks TO plant.
+
+  batch_attr-vendrbatch = p_licha.
+
+  CALL FUNCTION 'BAPI_BATCH_CREATE'
+    EXPORTING
+      material        = material
+      plant           = plant
+      batchattributes = batch_attr
+    IMPORTING
+      batch           = batch
+    TABLES
+      return          = lt_return.
+
+  READ TABLE lt_return INTO lw_return WITH KEY type = 'E'.
+  IF sy-subrc <> 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = si.
+
+    MOVE batch TO p_charg.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+
+    MESSAGE ID lw_return-id TYPE 'I' NUMBER lw_return-number
+      WITH lw_return-message_v1 lw_return-message_v2 lw_return-message_v3 lw_return-message_v4.
+  ENDIF.
+
+ENDFORM.                    " GENERAR_LOTE
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_ALV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_alv .
+  DATA is_layout TYPE lvc_s_layo.
+  DATA it_toolbar_excluding TYPE ui_functions.
+
+  CREATE OBJECT g_cont_9001
+    EXPORTING
+      container_name              = 'CONT_9001'
+    EXCEPTIONS
+      cntl_error                  = 1
+      cntl_system_error           = 2
+      create_error                = 3
+      lifetime_error              = 4
+      lifetime_dynpro_dynpro_link = 5
+      OTHERS                      = 6.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+               WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  CREATE OBJECT g_alv_9001
+    EXPORTING
+      i_parent          = g_cont_9001
+    EXCEPTIONS
+      error_cntl_create = 1
+      error_cntl_init   = 2
+      error_cntl_link   = 3
+      error_dp_create   = 4
+      OTHERS            = 5.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+               WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  PERFORM crear_catalogo_campos.
+  PERFORM excluir_botones CHANGING it_toolbar_excluding.
+
+
+  IF event_rec IS INITIAL.
+    CREATE OBJECT event_rec.
+  ENDIF.
+  SET HANDLER event_rec->handle_data_changed FOR g_alv_9001.
+  CALL METHOD g_alv_9001->register_edit_event EXPORTING i_event_id = cl_gui_alv_grid=>mc_evt_modified.
+
+  g_alv_9001->set_table_for_first_display(
+    EXPORTING
+       i_save                        = 'A'
+       is_layout                     = is_layout
+       it_toolbar_excluding          = it_toolbar_excluding
+    CHANGING
+      it_outtab                     = gt_regem
+      it_fieldcatalog               = gt_fcat
+    EXCEPTIONS
+      invalid_parameter_combination = 1
+      program_error                 = 2
+      too_many_lines                = 3
+      OTHERS                        = 4
+         ).
+
+ENDFORM.                    " CREAR_ALV
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_CATALOGO_CAMPOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_catalogo_campos .
+  DATA lw_fcat TYPE lvc_s_fcat.
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = 'ZEMM_0003_REGEM_ALV'
+    CHANGING
+      ct_fieldcat            = gt_fcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+  LOOP AT gt_fcat INTO lw_fcat.
+    CASE lw_fcat-fieldname.
+      WHEN 'CAD_CUST'.
+        lw_fcat-coltext = 'Cad.Cust.'.
+        lw_fcat-edit = si.
+        lw_fcat-outputlen = 10.
+        lw_fcat-checkbox = si.
+        lw_fcat-no_out = no.
+      WHEN 'LOTE_PROV'.
+        lw_fcat-coltext = 'Lote Prov.'.
+      WHEN 'LGORT'.
+        lw_fcat-edit = si.
+      WHEN 'MENGE'.
+        lw_fcat-do_sum = si.
+      WHEN OTHERS.
+    ENDCASE.
+    MODIFY gt_fcat FROM lw_fcat.
+  ENDLOOP.
+
+ENDFORM.                    " CREAR_CATALOGO_CAMPOS
+*&---------------------------------------------------------------------*
+*&      Form  EXCLUIR_BOTONES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_IT_TOOLBAR_EXCLUDING  text
+*----------------------------------------------------------------------*
+FORM excluir_botones  CHANGING pt_toolbar_excl TYPE ui_functions.
+  REFRESH pt_toolbar_excl.
+
+  APPEND cl_gui_alv_grid=>mc_fc_auf TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_average TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_back_classic TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_call_abc TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_call_chain TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_call_crbatch TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_call_crweb TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_call_lineitems TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_call_master_data TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_call_more TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_call_report TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_call_xint TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_call_xxl TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_check TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_col_invisible TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_count TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_detail TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_expcrdata TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_expcrdesig TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_expcrtempl TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_expmdb TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_extend TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_help TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_html TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_info TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_append_row TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_copy TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_copy_row TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_cut TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_delete_row TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_insert_row TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_move_row TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_paste TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_paste_new_row TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_loc_undo TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_maximum TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_minimum TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_pc_file TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_print TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_print_back TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_print_prev TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_reprep TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_send TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_separator TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_subtot TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_to_office TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_to_rep_tree TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_unfix_columns TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_url_copy_to_clipboard TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_views TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_view_crystal TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_view_excel TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_view_grid TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_view_lotus TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fc_word_processor TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_mb_export TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_mb_paste TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_mb_subtot TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_mb_view TO pt_toolbar_excl.
+  APPEND cl_gui_alv_grid=>mc_fg_edit TO pt_toolbar_excl.
+ENDFORM.                    " EXCLUIR_BOTONES
+*&---------------------------------------------------------------------*
+*&      Form  CLASIFICAR_LOTE_POS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM clasificar_lote_pos .
+  DATA l_index TYPE i.
+  DATA lw_posem TYPE zemm_0003_regem_alv.
+  DATA lw_mcha TYPE mcha.
+  DATA xchar_of_batch TYPE clbatch OCCURS 0 WITH HEADER LINE.
+  DATA lt_return TYPE bapiret2 OCCURS 0 WITH HEADER LINE.
+  DATA l_atinn TYPE atinn.
+  DATA l_atnam TYPE atnam.
+  DATA btch_del_flag TYPE batchdelflg.
+
+  PERFORM obtener_reg_selecc CHANGING lw_posem l_index.
+  CHECK l_index <> 0.
+
+  SELECT SINGLE * INTO lw_mcha FROM mcha
+    WHERE matnr = lw_posem-matnr
+      AND werks = lw_posem-werks
+      AND charg = lw_posem-charg.
+
+* Debemos actualizar el lote de proveedor a nivel de centro.
+  SELECT SINGLE licha INTO lw_mcha-licha FROM mch1
+    WHERE matnr = lw_posem-matnr
+      AND charg = lw_posem-charg.
+
+* Longitud
+  SELECT SINGLE atinn atnam INTO (l_atinn, l_atnam) FROM cabn
+    WHERE atnam = c_atnam_longitud.
+
+  xchar_of_batch-atinn = l_atinn.
+  xchar_of_batch-atnam = l_atnam.
+  xchar_of_batch-xdelete = ''.
+  WRITE lw_posem-laeng TO xchar_of_batch-atwtb NO-GROUPING DECIMALS 0.
+  APPEND xchar_of_batch.
+
+* Cadena custodia.
+  SELECT SINGLE atinn atnam INTO (l_atinn, l_atnam) FROM cabn
+    WHERE atnam = c_atnam_cadcus.
+
+  xchar_of_batch-atinn = l_atinn.
+  xchar_of_batch-atnam = l_atnam.
+  xchar_of_batch-xdelete = ''.
+  xchar_of_batch-atwtb = lw_posem-cad_cust.
+  APPEND xchar_of_batch.
+
+  btch_del_flag-mch1_not_del = si.
+  btch_del_flag-mcha_not_del = si.
+  btch_del_flag-mchb_not_del = si.
+
+  CALL FUNCTION 'VB_CHANGE_BATCH'
+    EXPORTING
+      ymcha                       = lw_mcha
+*     YUPDMCHA                    = lw_mcha
+*     CHANGE_LGORT                = CHANGE_LGORT
+      bypass_lock                 = si
+*     BYPASS_POST                 = ' '
+*     X_BNCOM                     = X_BNCOM
+      kzcla                       = '3'
+*     XKCFC                       = XKCFC
+*     CLASS                       = CLASS
+      no_check_of_qm_char         = 'X'
+*     REF_MATNR                   = REF_MATNR
+*     REF_CHARG                   = REF_CHARG
+*     REF_WERKS                   = REF_WERKS
+      set_old_batch               = space
+*     BUFFER_REFRESH              = BUFFER_REFRESH
+*     NO_CHANGE_DOCUMENT          = ' '
+*     GRUND                       = ' '
+      no_cfc_calls                = 'X'
+      batch_del_flags             = btch_del_flag
+*     SEND_SYS                    = ' '
+    IMPORTING
+      ymcha                       = lw_mcha
+*     EMKPF                       = EMKPF
+    TABLES
+      char_of_batch               = xchar_of_batch
+*     CHANGED_BATCH               = CHANGED_BATCH
+*     ZIMSEG                      = ZIMSEG
+      return                      = lt_return
+    EXCEPTIONS
+      no_material                 = 1
+      no_batch                    = 2
+      no_plant                    = 3
+      material_not_found          = 4
+      plant_not_found             = 5
+      lock_on_material            = 6
+      lock_on_plant               = 7
+      lock_on_batch               = 8
+      lock_system_error           = 9
+      no_authority                = 10
+      batch_not_exist             = 11
+      no_class                    = 12
+      error_in_classification     = 13
+      error_in_valuation_change   = 14
+      error_in_status_change      = 15
+      region_of_origin_not_found  = 16
+      country_of_origin_not_found = 17
+      OTHERS                      = 18.
+
+  IF sy-subrc <> 0.
+* Implement suitable error handling here
+  ENDIF.
+
+  COMMIT WORK AND WAIT.
+
+ENDFORM.                    " CLASIFICAR_LOTE_POS
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_REG_SELECC
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LW_POSEM  text
+*      <--P_L_INDEX  text
+*----------------------------------------------------------------------*
+FORM obtener_reg_selecc  CHANGING pw_posem TYPE zemm_0003_regem_alv
+                                  p_index TYPE i.
+
+  DATA et_index_rows TYPE lvc_t_row.
+  DATA lw_row TYPE lvc_s_row.
+  DATA l_numreg TYPE i.
+
+  CLEAR pw_posem.
+  CLEAR p_index.
+
+  g_alv_9001->get_selected_rows( IMPORTING et_index_rows = et_index_rows ).
+
+  DESCRIBE TABLE et_index_rows LINES l_numreg.
+  IF l_numreg <= 0 OR l_numreg >= 2.
+    MESSAGE 'Seleccione sólo un registro a tratar' TYPE 'I'.
+  ELSE.
+    READ TABLE et_index_rows INTO lw_row INDEX 1.
+
+    p_index = lw_row-index.
+    READ TABLE gt_regem INDEX p_index INTO pw_posem.
+  ENDIF.
+
+
+ENDFORM.                    " OBTENER_REG_SELECC
+*&---------------------------------------------------------------------*
+*&      Form  ELIMINAR_POSICION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM eliminar_posicion .
+  DATA l_index TYPE syindex.
+  DATA lw_posem TYPE zemm_0003_regem_alv.
+  DATA l_answer TYPE c.
+  DATA: lv_index LIKE sy-tabix.
+
+  PERFORM obtener_reg_selecc CHANGING lw_posem l_index.
+  CHECK l_index <> 0.
+
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar              = 'Eliminar Posición'(001)
+      text_question         = '¿Desea realmente eliminar la posición marcada?'(002)
+      default_button        = '2'
+      display_cancel_button = ''
+    IMPORTING
+      answer                = l_answer.
+
+  CHECK l_answer = 'J' OR l_answer = '1' OR l_answer = 'Y'.
+
+  DELETE gt_regem INDEX l_index.
+
+  g_alv_9001->refresh_table_display( ).
+
+* COMPROBAMOS SI LA POSICION ES DOBLE Y LA TENEMOS GUARDADA EN LA TABLA INTERNA
+* PARA CUADRAR LAS CANTIDADES PENDIENTES
+  READ TABLE gt_datos INTO gs_datos
+  WITH KEY ebeln = lw_posem-ebeln
+           ebelp = lw_posem-ebelp.
+  IF sy-subrc = 0.
+    lv_index = sy-tabix.
+    gs_datos-menge_recep = gs_datos-menge_recep - lw_posem-menge.
+* calcular  cantidad pendiente de recepcionar
+    gs_datos-menge_pdte_recep = gs_datos-menge_pdte_recep + gs_datos-menge_recep.
+* calcular pedt recepcionar maxima
+    gs_datos-menge_pdte_recep_max = gs_datos-menge_pdte_recep_max + gs_datos-menge_recep.
+
+    MODIFY gt_datos FROM gs_datos INDEX lv_index.
+
+  ENDIF.
+
+
+
+
+ENDFORM.                    " ELIMINAR_POSICION
+*&---------------------------------------------------------------------*
+*&      Form  CONTABILIZAR_EM
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM contabilizar_em .
+  DATA goodsmvt_header TYPE bapi2017_gm_head_01.
+  DATA goodsmvt_code TYPE bapi2017_gm_code.
+  DATA materialdocument TYPE bapi2017_gm_head_ret-mat_doc.
+  DATA matdocumentyear TYPE bapi2017_gm_head_ret-doc_year.
+  DATA goodsmvt_item TYPE STANDARD TABLE OF bapi2017_gm_item_create.
+  DATA lw_item TYPE bapi2017_gm_item_create.
+  DATA return TYPE STANDARD TABLE OF bapiret2.
+  DATA lw_return TYPE bapiret2.
+  DATA l_error TYPE bool VALUE no.
+  DATA lw_posem TYPE zemm_0003_regem_alv.
+
+* Datos de cabecera
+  goodsmvt_header-pstng_date = zemm_0003_scr-budat.
+  goodsmvt_header-doc_date = zemm_0003_scr-bldat.
+  goodsmvt_header-ref_doc_no = zemm_0003_scr-xblnr.
+  goodsmvt_header-header_txt = zemm_0003_scr-bktxt.
+
+  goodsmvt_code = '01'.
+
+* Posiciones.
+  LOOP AT gt_regem INTO lw_posem.
+    lw_item-material = lw_posem-matnr.
+    lw_item-plant = lw_posem-werks.
+    lw_item-stge_loc = lw_posem-lgort.
+    lw_item-batch = lw_posem-charg.
+    lw_item-move_type = '101'.
+    lw_item-entry_qnt = lw_posem-menge.
+    lw_item-entry_uom = lw_posem-meins.
+    lw_item-po_number = lw_posem-ebeln.
+    lw_item-po_item = lw_posem-ebelp.
+    lw_item-mvt_ind = 'B'.
+
+    IF lw_posem-lgort IS INITIAL.
+      l_error = si.
+      EXIT.
+    ENDIF.
+
+    APPEND lw_item TO goodsmvt_item.
+  ENDLOOP.
+  IF l_error = si.
+    MESSAGE i047(zmm) WITH lw_posem-ebeln lw_posem-ebelp.
+  ENDIF.
+  CHECK l_error = no.
+
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header  = goodsmvt_header
+      goodsmvt_code    = goodsmvt_code
+    IMPORTING
+      materialdocument = materialdocument
+      matdocumentyear  = matdocumentyear
+    TABLES
+      goodsmvt_item    = goodsmvt_item
+      return           = return.
+
+  READ TABLE return INTO lw_return WITH KEY type = 'E'.
+  IF sy-subrc = 0.  "Se han producido errores.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+
+    MESSAGE ID lw_return-id TYPE 'I' NUMBER lw_return-number
+      WITH lw_return-message_v1 lw_return-message_v2 lw_return-message_v3 lw_return-message_v4.
+  ELSE.
+*    perform clasifica_lote_em.              .
+    IF zemm_0003_scr-peso_ent IS NOT INITIAL.
+      PERFORM actualizar_ztmm0001 USING materialdocument matdocumentyear.
+    ENDIF.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = si.
+
+    SET PARAMETER ID 'MBN' FIELD materialdocument.
+    SET PARAMETER ID 'MJA' FIELD matdocumentyear.
+
+    MESSAGE s054(zmm) WITH materialdocument matdocumentyear.
+
+* Nos salimos a la pantalla anterior.
+    LEAVE TO SCREEN 0.
+  ENDIF.              .
+
+ENDFORM.                    " CONTABILIZAR_EM
+*&---------------------------------------------------------------------*
+*&      Form  ACTUALIZAR_ZTMM0001
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_MATERIALDOCUMENT  text
+*      -->P_MATDOCUMENTYEAR  text
+*----------------------------------------------------------------------*
+FORM actualizar_ztmm0001  USING    p_mblnr TYPE mblnr
+                                   p_mjahr TYPE gjahr..
+  DATA lw_ztmm1 TYPE ztmm0001.
+
+  lw_ztmm1-mblnr = p_mblnr.
+  lw_ztmm1-mjahr = p_mjahr.
+  lw_ztmm1-peso_ent = zemm_0003_scr-peso_ent.
+  lw_ztmm1-gewei = 'KG'.
+  lw_ztmm1-aedat = sy-datum.
+  lw_ztmm1-aezeit = sy-uzeit.
+  lw_ztmm1-aenam = sy-uname.
+
+  INSERT ztmm0001 FROM lw_ztmm1.
+
+ENDFORM.                    " ACTUALIZAR_ZTMM0001
+*&---------------------------------------------------------------------*
+*&      Form  VERIFICAR_PERIODO_ABIERTO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM verificar_periodo_abierto .
+  DATA lw_marv TYPE marv.
+  DATA l_spmon_budat TYPE spmon.
+  DATA l_spmon_marv1 TYPE spmon.
+  DATA l_spmon_marv2 TYPE spmon.
+
+  CONCATENATE zemm_0003_scr-budat(4) zemm_0003_scr-budat+4(2) INTO l_spmon_budat.
+
+  SELECT SINGLE * INTO lw_marv FROM marv WHERE bukrs = c_bukrs_2030.
+
+  CONCATENATE lw_marv-vmgja lw_marv-vmmon INTO l_spmon_marv1.
+  CONCATENATE lw_marv-lfgja lw_marv-lfmon INTO l_spmon_marv2.
+
+  IF l_spmon_budat <> l_spmon_marv1 AND l_spmon_budat <> l_spmon_marv2.
+    MESSAGE e052(zmm) WITH l_spmon_budat+4(2) l_spmon_budat(4) c_bukrs_2030.
+  ENDIF.
+
+ENDFORM.                    " VERIFICAR_PERIODO_ABIERTO
+*&---------------------------------------------------------------------*
+*&      Form  REGISTRAR_BOBINAS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM registrar_bobinas .
+
+  CLEAR:zemm_0003_scr-ebeln, zemm_0003_scr-bobprv, zemm_0003_scr-info_bob.
+  CLEAR zemm_0003_scr-lifnr.
+  CLEAR zemm_0003_scr-name1.
+
+  IF g_alv_9001 IS NOT INITIAL.
+    REFRESH gt_regem.
+    CLEAR gt_datos.
+    REFRESH gt_datos.
+  ENDIF.
+
+  SET PARAMETER ID 'EKO' FIELD c_ekorg_1000.
+  SET PARAMETER ID 'BSA' FIELD c_bsart_zpe1.
+
+  CALL SCREEN 9001.
+
+ENDFORM.                    " REGISTRAR_BOBINAS
+*&---------------------------------------------------------------------*
+*&      Form  DATA_CHANGED
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_ER_DATA_CHANGED  text
+*----------------------------------------------------------------------*
+FORM data_changed  USING p_er_chg TYPE REF TO cl_alv_changed_data_protocol.
+
+ENDFORM.                    " DATA_CHANGED
+
+*&---------------------------------------------------------------------*
+*&      Form  MATERIAL_DUPLICADO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM material_duplicado USING tv_ebeln
+                              tv_matnr
+                              tv_info_bob
+                        CHANGING sv_ebeln TYPE ebeln
+                                 sv_ebelp TYPE ebelp
+                                 sv_error TYPE xfeld.
+
+
+
+  DATA: ls_ekbe TYPE ekbe.
+  DATA: lv_rep TYPE i.
+  DATA: lv_index LIKE sy-tabix.
+  DATA: lv_menge TYPE menge_d.
+* COMPROBAR CUANTAS LINEAS DE UN MATERIAL HAY EN EL PEDIDO
+  CLEAR: lv_rep, sv_error.
+  SELECT COUNT(*) INTO lv_rep
+  FROM ekpo
+  WHERE ebeln = tv_ebeln
+  AND matnr = tv_matnr
+  AND elikz = no
+  AND loekz = no.
+  IF lv_rep > 1. " EN CASO DE QUE SE REPITA EL MATERIAL
+
+* PRIMERO MIRAMOS SI YA ESTA EN LA TABLA INTERNA
+    READ TABLE  gt_datos INTO gs_datos
+    WITH KEY ebeln = tv_ebeln
+             matnr = tv_matnr.
+    IF sy-subrc <> 0.
+
+      SELECT * APPENDING CORRESPONDING FIELDS OF TABLE gt_datos
+      FROM ekpo
+      WHERE ebeln = tv_ebeln
+      AND matnr = tv_matnr
+      AND elikz = no
+      AND loekz = no.
+
+      LOOP AT gt_datos INTO gs_datos WHERE ebeln = tv_ebeln
+                                     AND matnr = tv_matnr.
+        lv_index = sy-tabix.
+* CANTIDAD RECEPCIONADA
+        SELECT * INTO ls_ekbe
+        FROM ekbe
+        WHERE ebeln = gs_datos-ebeln
+        AND ebelp = gs_datos-ebelp
+        AND vgabe = '1'.
+          IF ls_ekbe-shkzg = 'S'.
+            gs_datos-menge_recep = gs_datos-menge_recep + ls_ekbe-menge.
+          ELSEIF ls_ekbe-shkzg = 'H'.
+            gs_datos-menge_recep = gs_datos-menge_recep - ls_ekbe-menge.
+          ENDIF.
+        ENDSELECT.
+
+* calcular la cantidad maxima a recepcionar
+        IF gs_datos-uebtk = 'X'.
+          gs_datos-menge_max = 9999999999.
+        ELSE.
+          gs_datos-menge_max = gs_datos-menge + ( ( gs_datos-menge * gs_datos-uebto ) / 100 ).
+        ENDIF.
+
+* calcular  cantidad pendiente de recepcionar
+        gs_datos-menge_pdte_recep = gs_datos-menge - gs_datos-menge_recep.
+* calcular pedt recepcionar maxima
+        gs_datos-menge_pdte_recep_max = gs_datos-menge_max - gs_datos-menge_recep.
+
+        MODIFY gt_datos FROM gs_datos INDEX lv_index.
+      ENDLOOP.
+    ENDIF.
+
+
+    CLEAR lv_menge.
+    MOVE tv_info_bob+9(4) TO lv_menge.
+
+    LOOP AT gt_datos INTO gs_datos WHERE ebeln = tv_ebeln
+                                 AND matnr = tv_matnr
+                                 AND menge_pdte_recep >= lv_menge.
+      lv_index = sy-tabix.
+
+      sv_ebeln = gs_datos-ebeln.
+      sv_ebelp = gs_datos-ebelp.
+
+      gs_datos-menge_recep = gs_datos-menge_recep + lv_menge.
+* calcular  cantidad pendiente de recepcionar
+      gs_datos-menge_pdte_recep = gs_datos-menge - gs_datos-menge_recep.
+* calcular pedt recepcionar maxima
+      gs_datos-menge_pdte_recep_max = gs_datos-menge_max - gs_datos-menge_recep.
+
+      MODIFY gt_datos FROM gs_datos INDEX lv_index.
+      EXIT.
+    ENDLOOP.
+    IF sy-subrc <> 0.
+
+      LOOP AT gt_datos INTO gs_datos WHERE ebeln = tv_ebeln
+                                       AND matnr = tv_matnr
+                                       AND menge_pdte_recep_max >= lv_menge.
+        lv_index = sy-tabix.
+
+        sv_ebeln = gs_datos-ebeln.
+        sv_ebelp = gs_datos-ebelp.
+
+        gs_datos-menge_recep = gs_datos-menge_recep + lv_menge.
+* calcular  cantidad pendiente de recepcionar
+        gs_datos-menge_pdte_recep = gs_datos-menge - gs_datos-menge_recep.
+* calcular pedt recepcionar maxima
+        gs_datos-menge_pdte_recep_max = gs_datos-menge_max - gs_datos-menge_recep.
+
+        MODIFY gt_datos FROM gs_datos INDEX lv_index.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc <> 0.
+        sv_error = 'X'.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+ENDFORM.                    " MATERIAL_DUPLICADO

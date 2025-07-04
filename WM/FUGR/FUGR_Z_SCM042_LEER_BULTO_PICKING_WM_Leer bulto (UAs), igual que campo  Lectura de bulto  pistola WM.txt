@@ -1,0 +1,167 @@
+FUNCTION z_scm042_leer_bulto_picking_wm.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_TKNUM) TYPE  TKNUM
+*"     VALUE(I_VBELN) TYPE  VBELN_VL
+*"     VALUE(IT_EXIDV) TYPE  HUM_EXIDV_T
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_TT
+*"     VALUE(ET_EXIDV) TYPE  HUM_EXIDV_T
+*"----------------------------------------------------------------------
+* JGM 02.2024 GAPCM042 Aplicativo Gestión de Desvíos:
+* Lee UAs para el picking de las posiciones de la entrega.
+* Misma función de Picking por pistola del aplicativo en UI5 de WM.
+*--------------------------------------------------------------------*
+  CONSTANTS:
+        lc_tcode_rf_ui5 TYPE tcode VALUE 'ZWM_RF_UI5_EXP_001'.
+
+  DATA: lv_error                TYPE  flag,
+        lv_barcode01            TYPE  barcode,
+        lv_lfimg_tot            TYPE lfimg,
+        lv_pos_error            TYPE flag,
+        lv_pick_error           TYPE flag,
+        lv_muelle               TYPE zswm_muelles_verifica,
+        lv_code_muelle_verifica TYPE barcode,
+        lv_werks_actual         TYPE lips-werks.
+
+  DATA: lt_log         TYPE  bapiret2_t,
+        lt_exidv_resto TYPE hum_exidv_t.
+
+  DATA: lr_type_error   TYPE RANGE OF bapi_mtype,
+        lr_mtart_pallet TYPE RANGE OF mtart,
+        lr_lenum        TYPE RANGE OF lein-lenum.
+
+
+  "Inicio picking".
+  PERFORM fill_return USING 'S' 'ZSCM042' '027' i_vbeln space space space CHANGING et_return.
+
+  IF it_exidv IS INITIAL.
+    "No hay UAs para leer bulto en entrega".
+    PERFORM fill_return USING 'E' 'ZSCM042' '041' i_vbeln space space space CHANGING et_return.
+    RETURN.
+  ENDIF.
+
+  IF i_tknum IS NOT INITIAL AND i_vbeln IS NOT INITIAL.
+    lr_type_error = VALUE #( sign = 'I' option = 'EQ' ( low = 'E' ) ( low = 'A' ) ).
+
+    lr_mtart_pallet = VALUE #( ( sign = 'I' option = 'EQ' low = 'ZPAL' ) ).
+
+    SELECT vbeln, posnr, pstyv, matnr, werks, lgort, charg, lfimg, meins, vrkme, mtart
+      INTO TABLE @DATA(lt_lips)
+      FROM lips
+      WHERE vbeln EQ @i_vbeln.
+
+    IF sy-subrc EQ 0.
+      SORT lt_lips BY vbeln posnr.
+**      SORT it_exidv BY exidv.
+      lt_exidv_resto = it_exidv.
+
+      lr_lenum = VALUE #( FOR wa_exidv IN it_exidv ( VALUE #( sign = 'I' option = 'EQ' low = wa_exidv ) ) ).
+
+      "Datos de cantidad de las UA.
+      IF lr_lenum IS NOT INITIAL.
+        SELECT a~lenum, a~lgnum, a~letyp,
+               b~lqnum, b~matnr, b~werks, b~charg, b~lgtyp, b~lgpla, b~meins, b~gesme, b~verme
+          INTO TABLE @DATA(lt_ua)
+          FROM lein AS a
+          INNER JOIN lqua AS b
+          ON  a~lgnum EQ b~lgnum
+          AND a~lenum EQ b~lenum
+          WHERE a~lenum IN @lr_lenum.
+      ENDIF.
+
+      LOOP AT lt_lips INTO DATA(ls_lips) WHERE mtart NOT IN lr_mtart_pallet.
+
+        IF lv_werks_actual NE ls_lips-werks.
+          lv_werks_actual = ls_lips-werks.
+
+          CLEAR: lv_muelle,
+                 lv_code_muelle_verifica.
+
+          CALL FUNCTION 'Z_SCM042_LEER_MUELLE'
+            EXPORTING
+              i_werks  = lv_werks_actual
+            IMPORTING
+              e_muelle = lv_muelle.
+
+          IF lv_muelle IS NOT INITIAL.
+            lv_code_muelle_verifica = lv_muelle.
+          ELSE.
+            "No hay muelle verificación activo para centro".
+            PERFORM fill_return USING 'E' 'ZSCM042' '021' lv_werks_actual space space space CHANGING et_return.
+            RETURN.
+          ENDIF.
+        ENDIF.
+
+        LOOP AT lt_ua INTO DATA(ls_ua) WHERE matnr EQ ls_lips-matnr
+                                         AND verme LE ls_lips-lfimg. "*
+
+          lv_lfimg_tot = lv_lfimg_tot + ls_ua-verme.  "Cant.bulto.
+
+          "Asignar UAs mientras haya cantidad a completar.
+          IF lv_lfimg_tot LE ls_lips-lfimg.
+
+            lv_barcode01 = ls_ua-lenum.
+            ">
+            CLEAR lv_error.
+            FREE lt_log.
+
+            CALL FUNCTION 'ZSWM_READ_EXIDV_PICKING_UI5'
+              EXPORTING
+                tcode                = lc_tcode_rf_ui5
+*               UNAME                = SY-UNAME
+*               OPERARIO             = lv_operario
+                tknum                = i_tknum
+                vbeln                = ls_lips-vbeln
+                posnr                = ls_lips-posnr
+                barcode01            = lv_barcode01
+*               BARCODE02            =
+                code_muelle_verifica = lv_code_muelle_verifica
+*               NO_ADMITE_PICOS      =
+              IMPORTING
+                error                = lv_error
+                tt_log               = lt_log.
+
+            IF lv_error IS INITIAL.
+              "UA ya no disponible.
+              DELETE lt_ua          WHERE lenum EQ ls_ua-lenum.
+              DELETE lt_exidv_resto WHERE exidv EQ ls_ua-lenum.
+            ELSE.
+              "Mensajes de error FM WM.
+              DELETE lt_log WHERE type NOT IN lr_type_error.
+              APPEND LINES OF lt_log TO et_return.
+
+              lv_pos_error = 'X'.
+              lv_pick_error = 'X'.
+              EXIT.
+            ENDIF.
+            "<
+          ELSE.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+
+        IF lv_pos_error IS INITIAL.
+          "Picking entrega-pos".
+          PERFORM fill_return USING 'S' 'ZSCM042' '013' ls_lips-vbeln ls_lips-posnr space space CHANGING et_return.
+        ELSE.
+          "Error Picking entrega-pos".
+          PERFORM fill_return USING 'E' 'ZSCM042' '024' ls_lips-vbeln ls_lips-posnr space space CHANGING et_return.
+          EXIT.
+        ENDIF.
+
+        CLEAR: lv_lfimg_tot, lv_pos_error.
+      ENDLOOP.
+
+      IF lv_pick_error IS INITIAL.
+**        "NOTA: errores tabla z picking y/o bloqueos/errores en Cierre Transporte.
+*        COMMIT WORK AND WAIT.
+      ENDIF.
+
+      "UA disponibles restantes.
+      et_exidv = lt_exidv_resto.
+    ENDIF.  "select lips
+  ENDIF.
+
+ENDFUNCTION.

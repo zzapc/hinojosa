@@ -1,0 +1,389 @@
+***********************************************************************
+*  Programa    : ZRFI0001_V2
+*  Tx          :
+*  Descripcion : Compensación automática
+***********************************************************************
+REPORT  zrfi0001_v2 MESSAGE-ID zfi
+                    NO STANDARD PAGE HEADING
+                    LINE-SIZE 132
+                    LINE-COUNT 65.
+
+INCLUDE zincbatc.
+
+*&--------------------------------------------------------------------*
+*& Tablas
+*&--------------------------------------------------------------------*
+TABLES: bsik.
+
+*---------------------------------------------------------------------*
+* Declaración de Estructuras
+*---------------------------------------------------------------------*
+
+DATA: gt_bsik TYPE TABLE OF bsik WITH HEADER LINE.
+
+TYPES: BEGIN OF tipo_fecha,
+         bukrs TYPE bukrs,
+         belnr TYPE belnr_d,
+         gjahr TYPE gjahr,
+         bldat TYPE bldat.
+TYPES: END OF tipo_fecha.
+TYPES: tty_fechas TYPE TABLE OF tipo_fecha.
+
+DATA: gt_fechas  TYPE tty_fechas.
+
+
+
+*---------------------------------------------------------------------*
+* Declaración de Variables
+*---------------------------------------------------------------------*
+DATA: gv_fecha(10).
+
+*........Constants......................................................
+
+*&--------------------------------------------------------------------*
+*& DEFINICION DE TABLAS Y ESTRUCTURAS NECESARIAS ALV
+*&--------------------------------------------------------------------*
+* Type Pool donde vienen definidas todas las estructuras y tablas
+**TYPE-POOLS: slis.
+
+*&--------------------------------------------------------------------*
+*&      VENTANA DE SELECCION
+*&--------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_bukrs FOR bsik-bukrs OBLIGATORY,
+                s_blart FOR bsik-blart OBLIGATORY DEFAULT 'KE',
+                s_lifnr FOR bsik-lifnr,
+                s_umskz FOR bsik-umskz OBLIGATORY DEFAULT 'K'.
+PARAMETERS:     p_zfbdt TYPE dzfbdt OBLIGATORY.
+SELECT-OPTIONS: s_saknr FOR bsik-saknr OBLIGATORY DEFAULT '5729999'.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-002.
+PARAMETERS: p_mode TYPE ctu_mode OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK b2.
+
+*&--------------------------------------------------------------------*
+*&      INITIALIZATION
+*&--------------------------------------------------------------------*
+**INITIALIZATION.
+
+*&--------------------------------------------------------------------*
+*&       AT SELECTION-SCREEN
+*&--------------------------------------------------------------------*
+**AT SELECTION-SCREEN OUTPUT.
+**  LOOP AT SCREEN.
+**    CASE screen-name.
+**      WHEN 'P_BLART'.
+***          screen-active = '0'.
+**        screen-input = '1'.
+**        MODIFY SCREEN.
+**    ENDCASE.
+**  ENDLOOP.
+
+*&--------------------------------------------------------------------*
+*&      START-OF-SELECTION.
+*&--------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  PERFORM seleccion_datos  TABLES gt_fechas.
+
+END-OF-SELECTION.
+
+  PERFORM ejec_proceso TABLES gt_fechas.
+
+***********************************************************************
+*                 FORMS
+***********************************************************************
+*&---------------------------------------------------------------------*
+*&      Form  SELECCION_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM seleccion_datos TABLES gt_fechas  TYPE STANDARD TABLE..
+
+  TYPES: BEGIN OF tipo_duplicado,
+           dmbtr TYPE dmbtr,
+           cont  TYPE sy-tabix.
+  TYPES:END OF tipo_duplicado.
+  TYPES: tty_duplicados TYPE TABLE OF tipo_duplicado.
+  DATA: t_duplicados  TYPE tty_duplicados,
+        wa_duplicados TYPE LINE OF tty_duplicados,
+        enc           TYPE xfeld.
+
+  FIELD-SYMBOLS: <wa_bsik> TYPE bsik.
+  DATA: lv_index TYPE sy-tabix.
+
+  DATA: wa_fechas TYPE LINE OF tty_fechas.
+
+  DATA: lv_bldat    TYPE bldat,
+        lv_index_ky TYPE sy-tabix.
+
+  CLEAR gt_bsik. REFRESH gt_bsik.
+
+  IF s_lifnr[] IS INITIAL.
+
+    SELECT * FROM bsik INTO TABLE gt_bsik
+      WHERE blart IN s_blart
+        AND bukrs IN s_bukrs
+        AND umskz IN s_umskz
+        AND zfbdt LE p_zfbdt.
+
+  ELSE.
+
+    SELECT * FROM bsik INTO TABLE gt_bsik
+      WHERE blart IN s_blart
+        AND bukrs IN s_bukrs
+        AND umskz IN s_umskz
+        AND zfbdt LE p_zfbdt
+        AND lifnr IN s_lifnr.
+
+  ENDIF.
+
+
+* INI CGV - 02.10.19 - SAT 7000027704 - TICKET 57291
+* La lógica que sigue el programa de compensaciones de proveedor es a partir
+* de la fecha de vencimiento en la tabla de partidas abiertas de proveedores.
+* Sin embargo, estas partidas se están compensado antes de la contabilización
+* del extracto bancario por lo que hay que modificar la selección de partidas
+* abiertas, para asegurar que la posición del proveedor CME se compensa cuando
+* se ha contabilizado el extracto electrónico.
+  CHECK gt_bsik[] IS NOT INITIAL.
+
+  SELECT * FROM bseg
+    INTO TABLE @DATA(t_bseg)
+    FOR ALL ENTRIES IN @gt_bsik
+    WHERE bukrs = @gt_bsik-bukrs AND
+          belnr = @gt_bsik-belnr  AND
+          gjahr = @gt_bsik-gjahr AND
+          bschl = '50' AND
+          koart = 'S'.
+
+
+  LOOP AT gt_bsik ASSIGNING <wa_bsik>.
+    CLEAR: t_duplicados. REFRESH: t_duplicados.
+
+    lv_index = sy-tabix.
+    READ TABLE t_bseg INTO DATA(wa_bseg) WITH KEY bukrs = <wa_bsik>-bukrs
+                                                  belnr = <wa_bsik>-belnr
+                                                  gjahr = <wa_bsik>-gjahr.
+    IF sy-subrc = 0 AND wa_bseg-augbl IS INITIAL.
+      DELETE gt_bsik INDEX lv_index.
+    ELSE.
+
+      wa_fechas-bukrs = <wa_bsik>-bukrs.
+      wa_fechas-belnr = <wa_bsik>-belnr.
+      wa_fechas-gjahr = <wa_bsik>-gjahr.
+
+      SELECT * FROM bse_clr
+        INTO TABLE @DATA(t_bse_clr)
+        WHERE bukrs_clr = @wa_bseg-bukrs AND
+              belnr_clr = @wa_bseg-augbl AND
+              gjahr_clr = @wa_bseg-auggj AND  "CGIJON - 23.01.20 - SAT 7000029683 Ticket ## 59018
+              dmbtr = @<wa_bsik>-dmbtr.
+
+      READ TABLE t_bse_clr INTO DATA(wa_bse_clr) WITH KEY belnr  = <wa_bsik>-belnr.
+      IF sy-subrc = 0.
+        CLEAR: enc .
+        LOOP AT t_bse_clr INTO wa_bse_clr WHERE shkzg = 'S'.
+          READ TABLE t_duplicados INTO wa_duplicados  WITH KEY dmbtr = wa_bse_clr-dmbtr.
+          IF sy-subrc <> 0.
+            wa_duplicados-cont = 1.
+            wa_duplicados-dmbtr = wa_bse_clr-dmbtr.
+            APPEND wa_duplicados TO t_duplicados .
+          ELSE.
+            lv_index  = sy-tabix.
+            wa_duplicados-cont = wa_duplicados-cont + 1.
+            MODIFY t_duplicados  FROM wa_duplicados INDEX lv_index .
+
+            enc  = 'X'.
+          ENDIF.
+        ENDLOOP.
+
+
+        IF enc = 'X'.
+          SELECT belnr, bldat, budat FROM bkpf
+           INTO TABLE @DATA(t_bkpf_ky)
+           FOR ALL ENTRIES IN @t_bse_clr
+           WHERE bukrs = @t_bse_clr-bukrs AND
+                 belnr = @t_bse_clr-belnr AND
+                 gjahr = @t_bse_clr-gjahr AND
+                 blart = 'KY'.
+
+          SORT t_bkpf_ky BY bldat ASCENDING.
+          READ TABLE t_bkpf_ky INTO DATA(wa_bkpf_ky) WITH KEY belnr = <wa_bsik>-belnr.
+          lv_index_ky = sy-tabix.
+
+          SELECT belnr, bldat, budat FROM bkpf
+           INTO TABLE @DATA(t_bkpf_ec)
+           FOR ALL ENTRIES IN @t_bse_clr
+           WHERE bukrs = @t_bse_clr-bukrs AND
+                 belnr = @t_bse_clr-belnr AND
+                 gjahr = @t_bse_clr-gjahr AND
+                 blart = 'EC' .
+
+          SORT t_bkpf_ec BY bldat ASCENDING.
+          READ TABLE t_bkpf_ec INTO DATA(wa_bkpf_ec) INDEX lv_index_ky.
+          IF sy-subrc = 0.
+*            CONCATENATE wa_bkpf_ec-budat+6(2) wa_bkpf_ec-budat+4(2) wa_bkpf_ec-budat(4) INTO lv_bldat.
+            wa_fechas-bldat = wa_bkpf_ec-budat.
+          ENDIF.
+
+        ELSE.
+***INICIO 71499 MODIFICACION LER 14.06.2022************************************************************
+* Para aquellos casos de compensacion que no caen en los EC ni KY, se lee de la tabla BKPF a partir de *
+* los documentos de compensacion de la t_bse_clr - belnr_clr en lugar de belnr.                        *
+********************************************************************************************************
+             SELECT belnr, bldat, budat FROM bkpf
+               INTO TABLE @DATA(t_bkpf)
+               FOR ALL ENTRIES IN @t_bse_clr
+               WHERE bukrs = @t_bse_clr-bukrs AND
+                    belnr = @t_bse_clr-belnr_clr AND
+                    gjahr = @t_bse_clr-gjahr_clr.
+
+***FIN 71499 MODIFICACION LER 14.06.2022
+
+          DELETE t_bkpf WHERE bldat = '' OR  bldat = '00000000'.
+          READ TABLE t_bkpf INTO DATA(wa_bkpf) INDEX 1.
+          IF sy-subrc = 0.
+            wa_fechas-bldat = wa_bkpf-bldat.
+*            CONCATENATE wa_bkpf-bldat+6(2) wa_bkpf-bldat+4(2) wa_bkpf-bldat(4) INTO lv_bldat.
+          ENDIF.
+        ENDIF.
+
+        APPEND wa_fechas TO gt_fechas.
+
+
+*        CLEAR bdc_tab. REFRESH bdc_tab.
+*        PERFORM fill_batch_input USING <wa_bsik>
+*                                       lv_bldat.
+*        PERFORM call_transaccion_f_44.
+      ENDIF.
+
+    ENDIF.
+  ENDLOOP.
+* FIN CGV - 02.10.19 - SAT 7000027704 - TICKET 57291
+
+ENDFORM.                    " SELECCION_DATOS
+
+*&---------------------------------------------------------------------*
+*&      Form  ejec_proceso
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM ejec_proceso TABLES gt_fechas  TYPE STANDARD TABLE.
+
+  DATA: ls_bsik   TYPE bsik,
+        wa_fechas TYPE LINE OF tty_fechas,
+        lt_fechas TYPE tty_fechas,
+        lv_bldat  TYPE bldat.
+
+
+
+  lt_fechas[] = gt_fechas[].
+
+  LOOP AT gt_bsik INTO ls_bsik.
+
+    READ TABLE lt_fechas INTO wa_fechas WITH KEY bukrs = ls_bsik-bukrs
+                                                 belnr = ls_bsik-belnr
+                                                 gjahr  = ls_bsik-gjahr.
+
+    IF sy-subrc = 0.
+      CONCATENATE wa_fechas-bldat+6(2)
+                  wa_fechas-bldat+4(2)
+                  wa_fechas-bldat(4)
+      INTO lv_bldat.
+    ENDIF.
+
+    CLEAR bdc_tab. REFRESH bdc_tab.
+    PERFORM fill_batch_input USING ls_bsik
+                                   lv_bldat.
+    PERFORM call_transaccion_f_44.
+
+  ENDLOOP.
+
+ENDFORM.                    " ejec_proceso
+
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_batch_input
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM fill_batch_input USING ls_bsik STRUCTURE bsik
+                            lv_budat.
+
+  PERFORM bdc_dynpro      USING 'SAPMF05A'        '0131'.
+  PERFORM bdc_field       USING 'BDC_CURSOR'      'RF05A-XPOS1(01)'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'      '/00'.
+  PERFORM bdc_field       USING 'RF05A-AGKON'     ls_bsik-lifnr.
+  PERFORM bdc_field       USING 'BKPF-BUDAT'      lv_budat. "gv_fecha.
+  PERFORM bdc_field       USING 'BKPF-MONAT'      '11'.
+  PERFORM bdc_field       USING 'BKPF-BUKRS'      ls_bsik-bukrs.
+  PERFORM bdc_field       USING 'BKPF-WAERS'      ls_bsik-waers.
+  PERFORM bdc_field       USING 'RF05A-AGUMS'     ls_bsik-umskz.
+  PERFORM bdc_field       USING 'RF05A-XNOPS'     ''.
+  PERFORM bdc_field       USING 'RF05A-XPOS1(01)' ''.
+  PERFORM bdc_field       USING 'RF05A-XPOS1(03)' 'X'.
+
+  PERFORM bdc_dynpro      USING 'SAPMF05A'        '0731'.
+  PERFORM bdc_field       USING 'BDC_CURSOR'      'RF05A-SEL01(01)'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'      '/00'.
+  PERFORM bdc_field       USING 'RF05A-SEL01(01)' ls_bsik-belnr.
+
+  PERFORM bdc_dynpro      USING 'SAPMF05A'        '0731'.
+  PERFORM bdc_field       USING 'BDC_CURSOR'      'RF05A-SEL01(01)'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'      '=SLK'.
+
+  PERFORM bdc_dynpro      USING 'SAPMF05A'        '0710'.
+  PERFORM bdc_field       USING 'BDC_CURSOR'      'RF05A-XPOS1(01)'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'      '=PA'.
+  PERFORM bdc_field       USING 'RF05A-AGBUK'     ls_bsik-bukrs.
+  PERFORM bdc_field       USING 'RF05A-AGKON'     s_saknr-low.
+  PERFORM bdc_field       USING 'RF05A-AGKOA'     'S'.
+  PERFORM bdc_field       USING 'RF05A-AGUMS'     ''.
+  PERFORM bdc_field       USING 'RF05A-XNOPS'     'X'.
+  PERFORM bdc_field       USING 'RF05A-XPOS1(01)' ''.
+  PERFORM bdc_field       USING 'RF05A-XPOS1(03)' 'X'.
+
+  PERFORM bdc_dynpro      USING 'SAPMF05A'        '0731'.
+  PERFORM bdc_field       USING 'BDC_CURSOR'      'RF05A-SEL01(01)'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'      '/00'.
+  PERFORM bdc_field       USING 'RF05A-SEL01(01)' ls_bsik-belnr.
+
+  PERFORM bdc_dynpro      USING 'SAPMF05A'        '0731'.
+  PERFORM bdc_field       USING 'BDC_CURSOR'      'RF05A-SEL01(01)'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'      '=PA'.
+
+  PERFORM bdc_dynpro      USING 'SAPDF05X'        '3100'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'      '=AB'.
+  PERFORM bdc_field       USING 'BDC_CURSOR'      'RF05A-ABPOS'.
+  PERFORM bdc_field       USING 'RF05A-ABPOS'     '1'.
+
+  PERFORM bdc_dynpro      USING 'SAPMF05A'        '0700'.
+  PERFORM bdc_field       USING 'BDC_CURSOR'      'BKPF-XBLNR'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'      '=BU'.
+  PERFORM bdc_field       USING 'BKPF-XBLNR'      'Act.Autom.Riesgo'.
+
+ENDFORM.                    "llenar_bdcdata
+*&---------------------------------------------------------------------*
+*&      Form  call_transaccion_f_44
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM call_transaccion_f_44.
+
+  CALL TRANSACTION 'F-44' USING  bdc_tab
+                          MODE   p_mode
+                          UPDATE 'S'
+                          MESSAGES INTO messtab.
+
+ENDFORM.                    " CALL_TRANSACCION

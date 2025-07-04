@@ -1,0 +1,319 @@
+
+class ZDYN_CL_AR_XML_GENERATOR definition
+  public
+  final
+  create public .
+
+public section.
+
+  methods PROCESS
+    importing
+      !IT_TEMPLATE type ZDYN_LWS_XML
+      !IST_XML_MAP type DATA
+      !IC_TIME_FORMAT type CHAR3 optional
+      !IC_CURRENCY type CHAR3 optional
+    exporting
+      !ET_XML type ZDYN_LSTRING
+    exceptions
+      ERROR_OCCURRED .
+protected section.
+
+  data MR_XML_MAP type ref to DATA .
+  data MT_XML type ZDYN_LSTRING .
+  data MI_CONTROL type I .
+  data MC_SUBFLAG type CHAR1 .
+  data MC_SUBNAME type CHAR26 .
+  data MT_SUBSTRUCTURE type ZDYN_LWS_XML .
+  data MC_TIME_FORMAT type CHAR3 .
+  data MC_CURRENCY type CHAR3 .
+  data MO_GENERATOR type ref to ZDYN_CL_AR_XML_GENERATOR .
+
+  methods SET_CURRENCY
+    importing
+      !IC_CURRENCY type ANY
+    exceptions
+      ERROR_OCCURRED .
+  methods SET_TIME_FORMAT
+    importing
+      !IC_TIME_FORMAT type ANY
+    exceptions
+      ERROR_OCCURRED .
+  methods ADD_TO_SUBSTRUCTURE
+    importing
+      !IST_LINE type DATA
+      !IB_SKIP_STRUC_NAME type ABAP_BOOL default ABAP_FALSE .
+  methods RECURSE
+    exceptions
+      ERROR_OCCURRED .
+  methods PROCESS_SUBSTRUCTURE
+    importing
+      !IST_LINE type ZDYN_WS_CXML
+    exceptions
+      ERROR_OCCURRED .
+  methods PROCESS_LINE
+    importing
+      !IST_LINE type ZDYN_WS_CXML .
+private section.
+endclass. "ZDYN_CL_AR_XML_GENERATOR definition
+class ZDYN_CL_AR_XML_GENERATOR implementation.
+METHOD add_to_substructure.
+
+  DATA lst_line TYPE zdyn_ws_cxml.
+
+  lst_line = ist_line.
+
+  IF ib_skip_struc_name = abap_true.
+    CLEAR lst_line-seq_or_line.
+    CLEAR lst_line-struct_name.
+  ENDIF.
+
+  APPEND lst_line TO mt_substructure.
+
+ENDMETHOD.
+METHOD process.
+
+  DATA: lt_xml TYPE TABLE OF char255.
+
+  FIELD-SYMBOLS: <c_timeformat> TYPE any,
+                 <st_line>      TYPE zdyn_ws_cxml.
+
+  GET REFERENCE OF ist_xml_map INTO mr_xml_map.
+
+  set_time_format( EXPORTING  ic_time_format = ic_time_format
+                   EXCEPTIONS OTHERS         = 1 ).
+  IF sy-subrc <> 0.
+    RAISE error_occurred.
+  ENDIF.
+
+  set_currency( EXPORTING  ic_currency = ic_currency
+                EXCEPTIONS OTHERS      = 1 ).
+  IF sy-subrc <> 0.
+    RAISE error_occurred.
+  ENDIF.
+
+  IF mc_currency IS INITIAL OR mc_time_format IS INITIAL.
+    zdyn_cl_msg=>add_msg( ic_msgid  = 'ZDYN_WS'
+                          ic_msgno  = '033' ).
+*   MESSAGE e033(zdyn_ws).
+    RAISE error_occurred.
+  ENDIF.
+
+  CLEAR: mt_xml,
+         mo_generator,
+         mt_substructure,
+         mc_subflag,
+         mc_subname.
+
+  LOOP AT it_template ASSIGNING <st_line>.
+    IF mc_subflag = 'S'.
+*     substructure
+      process_substructure( EXPORTING ist_line = <st_line>
+                            EXCEPTIONS OTHERS  = 1 ).
+      IF sy-subrc <> 0.
+        RAISE error_occurred.
+      ENDIF.
+    ELSE.
+      CASE <st_line>-seq_or_line.
+        WHEN 'S'.
+*         starting sequence of XML lines with substructure
+          mc_subflag = <st_line>-seq_or_line.
+          mc_subname = <st_line>-struct_name.
+          add_to_substructure( ist_line = <st_line>
+                               ib_skip_struc_name = abap_true ).
+*         Saved the first line of a substructure in buffer.
+*         Each line after this is automatically added to the same buffer, because is supposed
+*         to belong to the same sequence until the sequence flag and its name appear the second time.
+*         Collecting is over and the whole sequence can be then processed recursively.
+        WHEN 'L'.
+*         substructure is a series of single XML lines, copy single line like for seqences
+          mc_subflag = <st_line>-seq_or_line.
+          mc_subname = <st_line>-struct_name.
+          add_to_substructure( ist_line           = <st_line>
+                               ib_skip_struc_name = abap_true ).
+
+*         call new instance of parser with substructure data
+          recurse( EXCEPTIONS OTHERS  = 1 ).
+          IF sy-subrc <> 0.
+            RAISE error_occurred.
+          ENDIF.
+        WHEN OTHERS.
+          IF  <st_line>-seq_or_line IS NOT INITIAL.
+            zdyn_cl_msg=>add_msg( ic_msgty  = 'W'
+                                  ic_msgid  = 'ZDYN_WS'
+                                  ic_msgno  = '034'
+                                  ic_msgv1  = <st_line>-line_num ).
+*           MESSAGE e034(zdyn_ws) with space.
+          ENDIF.
+*         the template line is not marked as a substructure
+          process_line( ist_line = <st_line> ).
+      ENDCASE.
+    ENDIF.
+  ENDLOOP.
+
+  et_xml = mt_xml.
+
+ENDMETHOD.
+METHOD process_line.
+
+* processes the XML by populating values into placeholders
+  DATA: lst_line   TYPE zdyn_ws_cxml,
+        lc_escaped TYPE c LENGTH 255.
+
+  FIELD-SYMBOLS: <field>      TYPE any,
+                 <st_xml_map> TYPE any.
+
+  lst_line = ist_line.
+  ASSIGN mr_xml_map->* TO <st_xml_map>.
+  CHECK <st_xml_map> IS ASSIGNED.
+
+* check if there is the main (second) placeholder to remove
+  IF lst_line-attribute_2 IS INITIAL.
+*   no placeholder, add XML output text to the output table.
+    APPEND lst_line-xml_out TO mt_xml.
+  ELSE.
+*   find data for placeholder
+    ASSIGN COMPONENT lst_line-value_2 OF STRUCTURE <st_xml_map> TO <field>.
+    IF sy-subrc = 0 AND <field> IS ASSIGNED AND <field> IS NOT INITIAL.
+      lc_escaped = escape( val    = <field>
+                              format = cl_abap_format=>e_xml_text ).
+      REPLACE ALL OCCURRENCES OF lst_line-attribute_2 IN  lst_line-xml_out WITH lc_escaped.
+*     check for the first placeholder
+      IF lst_line-value_1 IS NOT INITIAL.
+        CASE lst_line-value_1.
+          WHEN 'TIME_FORMAT'.
+            REPLACE ALL OCCURRENCES OF lst_line-attribute_1 IN lst_line-xml_out WITH mc_time_format.
+          WHEN 'CURRCODE'.
+            REPLACE ALL OCCURRENCES OF lst_line-attribute_1 IN lst_line-xml_out WITH mc_currency.
+          WHEN OTHERS.
+            ASSIGN COMPONENT lst_line-value_1 OF STRUCTURE <st_xml_map> TO <field>.
+            IF sy-subrc = 0 AND <field> IS ASSIGNED.
+              IF <field> IS NOT INITIAL.
+                lc_escaped = escape( val = <field> format = cl_abap_format=>e_xml_attr ).
+                REPLACE ALL OCCURRENCES OF lst_line-attribute_1 IN lst_line-xml_out WITH lc_escaped.
+              ELSE.
+                REPLACE ALL OCCURRENCES OF lst_line-attribute_1 IN lst_line-xml_out WITH ''.
+              ENDIF.
+            ENDIF.
+        ENDCASE.
+      ENDIF.
+      APPEND lst_line-xml_out TO mt_xml.
+    ENDIF.
+  ENDIF.
+
+ENDMETHOD.
+METHOD process_substructure.
+
+  IF ist_line-struct_name = mc_subname.
+*   closing tag of substructure, last line to be added
+    add_to_substructure( ist_line           = ist_line
+                         ib_skip_struc_name = abap_true ).
+
+*   generate substructure
+    recurse( EXCEPTIONS OTHERS  = 1 ).
+    IF sy-subrc <> 0.
+      RAISE error_occurred.
+    ENDIF.
+
+    CLEAR: mt_substructure,
+           mc_subflag,
+           mc_subname.
+  ELSE.
+*   no closing tag, just copy the line into temporary substructure data
+    add_to_substructure( ist_line = ist_line ).
+  ENDIF.
+
+ENDMETHOD.
+METHOD recurse.
+
+  DATA: lt_xml     LIKE mt_xml.
+  FIELD-SYMBOLS: <st_xml_map>     TYPE any,
+                 <t_subtable>     TYPE ANY TABLE,
+                 <st_sub_xml_map> TYPE any.
+
+  ASSIGN mr_xml_map->* TO <st_xml_map>.
+  IF sy-subrc <> 0.
+    zdyn_cl_msg=>add_msg( ic_msgid  = 'ZDYN_WS'
+                          ic_msgno  = '035' ).
+*   MESSAGE e035(zdyn_ws).
+    RAISE error_occurred.
+  ENDIF.
+
+  ASSIGN COMPONENT mc_subname OF STRUCTURE <st_xml_map> TO <t_subtable>.
+  IF sy-subrc <> 0.
+    zdyn_cl_msg=>add_msg( ic_msgid  = 'ZDYN_WS'
+                          ic_msgno  = '036' ).
+*   MESSAGE e036(zdyn_ws).
+    RAISE error_occurred.
+  ENDIF.
+
+  IF mo_generator IS INITIAL.
+    CREATE OBJECT mo_generator.
+  ENDIF.
+
+* loop through the substructure table and start the process for every line
+  LOOP AT <t_subtable> ASSIGNING <st_sub_xml_map>.
+    mo_generator->process( EXPORTING  it_template    = mt_substructure
+                                      ist_xml_map    = <st_sub_xml_map>
+                                      ic_time_format = mc_time_format
+                                      ic_currency    = mc_currency
+                           IMPORTING  et_xml         = lt_xml
+                           EXCEPTIONS OTHERS         = 1 ).
+    IF sy-subrc = 0 AND lt_xml IS NOT INITIAL.
+      APPEND LINES OF lt_xml TO mt_xml.
+    ELSEIF sy-subrc <> 0.
+      zdyn_cl_msg=>add_msg( ic_msgid  = 'ZDYN_WS'
+                            ic_msgno  = '037' ).
+*       MESSAGE e037(zdyn_ws).
+      RAISE error_occurred.
+    ENDIF.
+  ENDLOOP.
+
+  CLEAR: mc_subname,
+         mc_subflag,
+         mt_substructure.
+
+ENDMETHOD.
+METHOD set_currency.
+
+  FIELD-SYMBOLS: <c_currency> TYPE any,
+                 <st_xml_map> TYPE any.
+
+  ASSIGN mr_xml_map->* TO <st_xml_map>.
+
+  IF ic_currency IS INITIAL.
+    ASSIGN COMPONENT 'CURRCODE' OF STRUCTURE <st_xml_map> TO <c_currency>.
+    IF sy-subrc <> 0 AND <c_currency> IS ASSIGNED.
+      zdyn_cl_msg=>add_msg( ic_msgid  = 'ZDYN_WS'
+                            ic_msgno  = '032'
+                            ic_msgv1  = 'CURRENCY CODE' ).
+*     MESSAGE e032(zdyn_ws) with space.
+      RAISE error_occurred.
+    ENDIF.
+    mc_currency = <c_currency>.
+  ELSE.
+    mc_currency = ic_currency.
+  ENDIF.
+
+ENDMETHOD.
+METHOD set_time_format.
+
+  FIELD-SYMBOLS: <c_time_format> TYPE any,
+                 <st_xml_map>    TYPE any.
+
+  ASSIGN mr_xml_map->* TO <st_xml_map>.
+
+  IF ic_time_format IS INITIAL.
+    ASSIGN COMPONENT 'TIME_FORMAT' OF STRUCTURE <st_xml_map> TO <c_time_format>.
+    IF sy-subrc <> 0 AND <c_time_format> IS ASSIGNED.
+      zdyn_cl_msg=>add_msg( ic_msgid  = 'ZDYN_WS'
+                            ic_msgno  = '032'
+                            ic_msgv1  = 'TIME_FORMAT' ).
+*     MESSAGE e032(zdyn_ws) with space.
+      RAISE error_occurred.
+    ENDIF.
+    mc_time_format = <c_time_format>.
+  ELSE.
+    mc_time_format = ic_time_format.
+  ENDIF.
+
+ENDMETHOD.

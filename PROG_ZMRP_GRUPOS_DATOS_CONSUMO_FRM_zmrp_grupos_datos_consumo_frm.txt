@@ -1,0 +1,605 @@
+*&---------------------------------------------------------------------*
+*&  Include  zmrp_grupos_datos_consumo_frm
+*&---------------------------------------------------------------------*
+
+FORM f_get_data_diff.
+  SELECT * FROM zmm_v_prod_gdif
+  INTO CORRESPONDING FIELDS OF TABLE gt_main_diff
+  WHERE werks = p_werks
+  AND prgrp IN so_grp
+  AND ( current_diff = abap_true
+  OR hist_diff = abap_true ).
+
+ENDFORM.
+
+FORM f_show_log.
+  DATA: ls_key TYPE salv_s_layout_key.
+
+  TRY.
+      cl_salv_table=>factory(
+*  EXPORTING
+*    list_display   = IF_SALV_C_BOOL_SAP=>FALSE    " ALV Displayed in List Mode
+*    r_container    =     " Abstract Container for GUI Controls
+*    container_name =
+        IMPORTING
+          r_salv_table   = DATA(lr_salv)    " Basis Class Simple ALV Tables
+        CHANGING
+          t_table        = gt_log
+      ).
+
+      DATA(lr_layout) = lr_salv->get_layout( ).
+      ls_key-report = sy-repid.
+      lr_layout->set_key( ls_key ).
+      lr_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+      lr_layout->set_default( abap_true ).
+
+      lr_salv->get_columns( )->get_column( columnname = 'TRANC' )->set_technical( abap_true ).
+      lr_salv->get_columns( )->get_column( columnname = 'MANDT' )->set_technical( abap_true ).
+      lr_salv->get_columns( )->get_column( columnname = 'D_IND' )->set_technical( abap_true ).
+      lr_salv->get_columns( )->get_column( columnname = 'ERR' )->set_long_text( 'Error' ).
+      lr_salv->get_columns( )->get_column( columnname = 'ERR' )->set_short_text( 'Error' ).
+      lr_salv->get_columns( )->get_column( columnname = 'ERR' )->set_medium_text( 'Error' ).
+      lr_salv->get_columns( )->get_column( columnname = 'MESSAGE' )->set_long_text( 'Messaje' ).
+      lr_salv->get_columns( )->get_column( columnname = 'MESSAGE' )->set_short_text( 'Messaje' ).
+      lr_salv->get_columns( )->get_column( columnname = 'MESSAGE' )->set_medium_text( 'Messaje' ).
+      lr_salv->get_columns( )->set_optimize( abap_true ).
+      lr_salv->get_functions( )->set_all( abap_true ).
+      lr_salv->display( ).
+    CATCH cx_root.
+  ENDTRY.
+*  CATCH cx_salv_msg.    "
+
+ENDFORM.
+
+FORM f_get_hist_data.
+*  CLEAR gt_main_hist.
+*  CHECK lines( gt_main_diff ) > 0.
+*  DATA(lt_diff) = gt_main_diff.
+*  DELETE lt_diff WHERE id_exec IS INITIAL.
+*  CHECK lines( lt_diff ) > 0.
+*
+*  SELECT * FROM zmrp_mver_hst
+*  INTO CORRESPONDING FIELDS OF TABLE gt_main_hist
+*  FOR ALL ENTRIES IN lt_diff
+*  WHERE id_exec = lt_diff-id_exec
+*  AND matnr = lt_diff-matnr
+*  AND werks = lt_diff-werks
+*  AND gjahr = lt_diff-gjahr
+*  AND prgrp = lt_diff-prgrp.
+ENDFORM.
+
+FORM f_get_curr_data USING iv_expand.
+  DATA : zperkz  TYPE perkz.
+  FIELD-SYMBOLS <fs_curr1> TYPE zmm_v_prod_grp.
+  DATA(index) = CONV sytabix( 1 ).
+
+
+
+  CLEAR gt_main_curr.
+
+
+
+  " DEL - cvivo - 62813
+*  SELECT * FROM zmm_v_prod_grp
+*  INTO CORRESPONDING FIELDS OF TABLE gt_main_curr
+*  WHERE werks = p_werks
+*  AND prgrp IN so_grp.
+
+  " cvivo - 62813 - Sustituir PGMI por ZWM_COMPATIBLES
+  "   En vez de rehacer la lógica lo que voy a hacer es informar la vista desde la nueva tabla ZWM_COMPATIBLES
+  "   nombrando el grupo de productos con el código de material principal
+  "   Ojo, puede ser que en la tabla no haya materiales sino grupo art. o grupo art+gramaje; en cuyo caso tenemos que
+  "   simular un grupo de productos por cada ancho
+
+  CALL METHOD zcl_wm_compatibles=>get_grupos
+    EXPORTING
+      iv_werks           = p_werks
+      ir_group           = so_grp[]
+    RECEIVING
+      et_zwm_compatibles = DATA(t_compat).
+
+  LOOP AT t_compat INTO DATA(compat).
+    index = 1.
+
+    DO 8 TIMES.
+      IF index EQ 1.
+        DATA(matnr) = compat-principal.
+        DATA(group) = matnr.
+      ELSE.
+        ASSIGN COMPONENT |compatible{ index - 1 }| OF STRUCTURE compat TO FIELD-SYMBOL(<field>).
+
+        IF <field> IS ASSIGNED.
+          matnr = <field>.
+        ENDIF.
+      ENDIF.
+
+      IF matnr IS INITIAL.
+        EXIT. " salimos del DO
+      ENDIF.
+
+      ADD 1 TO index.
+
+      SELECT * FROM mver
+        INNER JOIN mara
+        ON mver~matnr EQ mara~matnr
+        WHERE mver~matnr EQ @matnr
+          AND mver~werks EQ @compat-werks
+        INTO @DATA(mver).
+
+        APPEND INITIAL LINE TO gt_main_curr ASSIGNING <fs_curr1>.
+        MOVE-CORRESPONDING mver-mver TO <fs_curr1>.
+        MOVE mver-mara-meins TO <fs_curr1>-meins.
+
+        <fs_curr1>-prgrp = group.
+        <fs_curr1>-main_prod = COND #( WHEN matnr EQ compat-principal THEN abap_true ELSE abap_false ).
+        <fs_curr1>-wemit = compat-werks.
+      ENDSELECT.
+    ENDDO.
+  ENDLOOP.
+
+
+
+
+
+* delete records from different period from master data->
+  LOOP AT gt_main_curr ASSIGNING <fs_curr1>.
+    CLEAR zperkz.
+    SELECT SINGLE perkz INTO zperkz FROM marc
+                WHERE matnr = <fs_curr1>-matnr AND
+                      werks = <fs_curr1>-werks.
+    IF sy-subrc EQ 0.
+      DELETE  gt_main_curr WHERE matnr = <fs_curr1>-matnr AND
+                       perkz NE zperkz.
+    ENDIF.
+
+  ENDLOOP.
+
+
+  " must add entries for years that don't exist -> main prods only
+  CHECK sy-subrc = 0
+  AND  iv_expand = abap_true.
+
+  LOOP AT gt_main_curr ASSIGNING FIELD-SYMBOL(<fs_curr>)
+  WHERE main_prod NE abap_true.
+    CHECK NOT line_exists(
+    gt_main_curr[ main_prod = abap_true prgrp = <fs_curr>-prgrp
+        werks = <fs_curr>-werks pgtyp = <fs_curr>-pgtyp
+        wemit = <fs_curr>-wemit datum = <fs_curr>-datum
+        vsnda = <fs_curr>-vsnda gjahr = <fs_curr>-gjahr
+        perkz = <fs_curr>-perkz zahlr = <fs_curr>-zahlr
+        ]
+    ).
+
+    TRY.
+        APPEND VALUE #( main_prod = abap_true prgrp = <fs_curr>-prgrp
+            werks = <fs_curr>-werks pgtyp = <fs_curr>-pgtyp
+            wemit = <fs_curr>-wemit datum = <fs_curr>-datum
+            vsnda = <fs_curr>-vsnda matnr =  gt_main_curr[ main_prod = abap_true prgrp = <fs_curr>-prgrp
+            werks = <fs_curr>-werks pgtyp = <fs_curr>-pgtyp
+            wemit = <fs_curr>-wemit datum = <fs_curr>-datum
+            vsnda = <fs_curr>-vsnda perkz = <fs_curr>-perkz
+            ]-matnr
+            perkz = <fs_curr>-perkz
+            zahlr = <fs_curr>-zahlr
+             gjahr = <fs_curr>-gjahr ) TO gt_main_curr.
+      CATCH cx_root.
+    ENDTRY.
+
+  ENDLOOP.
+
+
+  " evaluate PERKZ uniqueness across the group
+  PERFORM f_check_perkz TABLES gt_main_curr.
+
+  PERFORM f_build_weeks TABLES gt_main_curr.
+
+
+ENDFORM.
+
+FORM f_build_weeks TABLES it_main_curr STRUCTURE zmm_v_prod_grp.
+  DATA: lv_week   TYPE scal-week,
+        lv_monday LIKE sy-datum,
+        lv_sunday LIKE sy-datum.
+  DATA(lt_main) = it_main_curr[].
+  DELETE lt_main WHERE perkz NE 'W'.
+  CHECK lines( lt_main ) > 0.
+  SORT lt_main BY gjahr.
+  DELETE ADJACENT DUPLICATES FROM lt_main COMPARING gjahr.
+
+
+  LOOP AT lt_main INTO DATA(ls_main).
+    DATA(lv_date) = CONV datum( ls_main-gjahr && '0101' ).
+    DO.
+
+      CALL FUNCTION 'GET_WEEK_INFO_BASED_ON_DATE'
+        EXPORTING
+          date   = lv_date
+        IMPORTING
+          week   = lv_week
+          monday = lv_monday
+          sunday = lv_sunday.
+
+      IF lv_monday(4) <= ls_main-gjahr.
+        APPEND VALUE #( gjahr = ls_main-gjahr wk_nr = lv_week+4
+        monday = lv_monday sunday = lv_sunday ) TO gt_week.
+      ELSEIF lv_monday(4) > ls_main-gjahr.
+        EXIT.
+      ENDIF.
+
+      CALL FUNCTION 'RP_CALC_DATE_IN_INTERVAL'
+        EXPORTING
+          date      = lv_date
+          days      = 7
+          months    = 0
+*         signum    = '+'
+          years     = 0
+        IMPORTING
+          calc_date = lv_date.
+    ENDDO.
+
+  ENDLOOP.
+
+ENDFORM.
+
+FORM f_check_perkz TABLES ct_main_curr STRUCTURE zmm_v_prod_grp.
+
+  DATA(lt_aux) = ct_main_curr[].
+  DELETE lt_aux WHERE main_prod = abap_false.
+  SORT lt_aux BY prgrp matnr.
+  DELETE ADJACENT DUPLICATES FROM lt_aux COMPARING prgrp matnr.
+  LOOP AT lt_aux INTO DATA(ls_aux).
+
+    LOOP AT ct_main_curr INTO DATA(ls_main_curr)
+    WHERE main_prod = abap_false
+    AND prgrp = ls_aux-prgrp
+    AND werks = ls_aux-werks
+    AND perkz <> ls_aux-perkz.
+
+      DATA(ls_log) = CORRESPONDING ty_log( ls_main_curr ).
+      ls_log-err = abap_true.
+      ls_log-message = |{ text-001 } { ls_main_curr-perkz } { text-002 } { ls_aux-perkz }|.
+      PERFORM f_add_log_entry USING ls_log.
+
+      DELETE ct_main_curr.
+    ENDLOOP.
+
+  ENDLOOP.
+
+ENDFORM.
+
+
+FORM f_init_update.
+  CLEAR: gt_amveg_ueb , gt_amveu_ueb, gt_err.
+ENDFORM.
+FORM f_add_update_line USING is_data TYPE zmm_v_prod_grp.
+
+  DATA lv_date TYPE datum.
+  DATA(lv_times) = COND #( WHEN is_data-perkz = 'W' THEN 13 ELSE 12 ).
+  DO lv_times TIMES.
+    PERFORM f_build_date USING is_data sy-index CHANGING lv_date.
+    CHECK lv_date <= p_date AND lv_date IS NOT INITIAL.
+    DATA(lv_cns_field) = 'GSV' && CONV numc2( sy-index ).
+    DATA(lv_cnsc_field) = 'MGV' && CONV numc2( sy-index ).
+    ASSIGN COMPONENT : lv_cns_field OF STRUCTURE is_data TO FIELD-SYMBOL(<fs_cons>),
+                       lv_cnsc_field OF STRUCTURE is_data TO FIELD-SYMBOL(<fs_consc>).
+    CHECK: <fs_cons> IS ASSIGNED, <fs_consc> IS ASSIGNED.
+    APPEND VALUE: #( matnr = is_data-matnr werks = is_data-werks ertag = lv_date
+                    vbwrt = <fs_cons> kovbw = <fs_consc> prgrp = is_data-prgrp
+                    antei = 1 ) TO gt_amveg_ueb, " cvivo
+                  #( matnr = is_data-matnr werks = is_data-werks ertag = lv_date
+                    vbwrt = <fs_cons> kovbw = <fs_consc> prgrp = is_data-prgrp
+                    antei = 1 ) TO gt_amveu_ueb. " cvivo
+    UNASSIGN: <fs_cons>, <fs_consc>.
+  ENDDO.
+
+ENDFORM.
+
+FORM f_build_date USING is_data  TYPE zmm_v_prod_grp iv_idx
+CHANGING cv_date TYPE datum.
+  CLEAR cv_date.
+  IF is_data-perkz = 'W'.
+    DATA(lv_week) = CONV numc2( ( is_data-zahlr - 1 ) * 13 + iv_idx ).
+    IF is_data-gjahr = '2015' AND lv_week > '53'.
+      lv_week = 53.
+    ENDIF.
+    TRY. " cvivo 61615 DUMP en años con menos de 54 semanas
+        cv_date = gt_week[ gjahr = is_data-gjahr wk_nr = lv_week ]-monday.
+      CATCH cx_sy_itab_line_not_found.
+    ENDTRY.
+
+  ELSE.
+    DATA(lv_n) = CONV numc2( iv_idx ).
+    cv_date = is_data-gjahr && lv_n && '01'.
+  ENDIF.
+ENDFORM.
+
+FORM f_call_update CHANGING cv_err .
+
+  cv_err = abap_false.
+  CHECK: lines( gt_amveg_ueb ) > 0 AND lines( gt_amveu_ueb ) > 0.
+  DATA(lt_amveg_ueb) = CORRESPONDING tty_mveg_ueb( gt_amveg_ueb ).
+  DATA(lt_amveu_ueb) = CORRESPONDING tty_mveg_ueb( gt_amveu_ueb ).
+  IF p_test = abap_false.
+    CALL FUNCTION 'MVER_MAINTAIN_DARK'
+*  EXPORTING
+*    sperrmodus      = SPACE
+*    max_errors      = 0
+      TABLES
+        amveg_ueb       = lt_amveg_ueb
+        amveu_ueb       = lt_amveu_ueb
+        amerrdat_f      = gt_err
+      EXCEPTIONS
+        update_error    = 1
+        internal_error  = 2
+        too_many_errors = 3
+        OTHERS          = 4.
+    IF sy-subrc <> 0 OR lines( gt_err ) > 0.
+      cv_err = abap_true.
+    ENDIF.
+  ENDIF.
+  LOOP AT gt_amveg_ueb INTO DATA(ls_ueb).
+    DATA(ls_log) = CORRESPONDING ty_log( ls_ueb ).
+    ls_log-err = cv_err.
+
+    IF p_test = abap_true.
+      ls_log-message = 'Test Mode'.
+    ELSEIF lines( gt_err ) > 0.
+      DATA(ls_err) = gt_err[ 1 ].
+
+      MESSAGE ID ls_err-msgid TYPE ls_err-msgty NUMBER ls_err-msgno
+              INTO ls_log-message
+              WITH ls_err-msgv1 ls_err-msgv2 ls_err-msgv3 ls_err-msgv4.
+
+    ENDIF.
+    PERFORM f_add_log_entry USING ls_log.
+  ENDLOOP.
+  PERFORM f_init_update.
+ENDFORM.
+
+FORM f_add_log_entry USING is_data.
+  APPEND is_data TO gt_log.
+ENDFORM.
+
+FORM f_handle_deletion CHANGING cs_data TYPE zmm_v_prod_grp.
+  " must restore all correction values to the same value of consumption
+  DO 13 TIMES.
+    DATA(lv_cns_field) = 'GSV' && CONV numc2( sy-index ).
+    DATA(lv_cnsc_field) = 'MGV' && CONV numc2( sy-index ).
+    ASSIGN COMPONENT : lv_cns_field OF STRUCTURE cs_data TO FIELD-SYMBOL(<fs_cons>),
+                      lv_cnsc_field OF STRUCTURE cs_data TO FIELD-SYMBOL(<fs_consc>).
+    CHECK: <fs_cons> IS ASSIGNED, <fs_consc> IS ASSIGNED.
+    <fs_consc> = <fs_cons>.
+    UNASSIGN: <fs_cons>, <fs_consc>.
+  ENDDO.
+ENDFORM.
+
+FORM f_create_history.
+  "  DATA lt_hist TYPE TABLE OF zmrp_mver_hst.
+  DATA lv_id TYPE zmrp_mver_hst-id_exec.
+  DATA lr_hist_id TYPE RANGE OF zmrp_mver_hst-id_exec.
+  DATA ls_hist TYPE zmrp_mver_hst.
+
+  CHECK p_test = abap_false.
+
+
+  " update old history
+  SELECT *
+   FROM zmrp_mver_hst
+  INTO TABLE @DATA(lt_hist)
+  WHERE werks = @p_werks
+  AND prgrp IN @so_grp
+  AND status = @gc_stat_active.
+
+  IF sy-subrc = 0.
+
+
+    ls_hist-status = gc_stat_processed.
+    MODIFY lt_hist FROM ls_hist
+TRANSPORTING status
+WHERE matnr IS NOT INITIAL.
+
+    MODIFY zmrp_mver_hst FROM TABLE lt_hist.
+    COMMIT WORK AND WAIT.
+
+  ENDIF.
+
+  PERFORM f_get_curr_data
+    USING
+     abap_false
+    .
+
+  CALL FUNCTION 'NUMBER_GET_NEXT'
+    EXPORTING
+      nr_range_nr             = '01'   " Número rango de números
+      object                  = 'ZMVERHSTID'   " Nombre del objeto rango de números
+*     quantity                = '1'    " Cantidad de números
+*     subobject               = SPACE    " Valor del objeto inferior
+*     toyear                  = '0000'    " Valor del 'Hasta ejercicio'
+      ignore_buffer           = abap_true
+    IMPORTING
+      number                  = lv_id   " Número libre
+*     quantity                =     " Cantidad de números
+*     returncode              =     " Código retorno
+    EXCEPTIONS
+      interval_not_found      = 1
+      number_range_not_intern = 2
+      object_not_found        = 3
+      quantity_is_0           = 4
+      quantity_is_not_1       = 5
+      interval_overflow       = 6
+      buffer_overflow         = 7
+      OTHERS                  = 8.
+  CLEAR lt_hist.
+  lt_hist = VALUE zmrp_mver_hst_tt( FOR ls_curr IN gt_main_curr (
+  id_exec = lv_id
+matnr = ls_curr-matnr
+werks = ls_curr-werks
+gjahr = ls_curr-gjahr
+prgrp = ls_curr-prgrp
+perkz = ls_curr-perkz
+zahlr = ls_curr-zahlr
+status = 'A'
+main_prod = ls_curr-main_prod
+  ) ).
+  MODIFY zmrp_mver_hst FROM TABLE lt_hist.
+  COMMIT WORK AND WAIT.
+
+
+ENDFORM.
+
+FORM f_build_update.
+  DATA lv_succ TYPE boolean.
+  DATA ls_data TYPE zmm_v_prod_grp.
+  " 1 - check for changes in groups - deletion of components
+  LOOP AT gt_main_diff INTO DATA(ls_diff).
+    " item deleted -> must restore it's value in full
+    IF ls_diff-hist_diff = abap_true.
+      TRY.
+          SELECT SINGLE * FROM mver INTO CORRESPONDING FIELDS OF ls_data
+          WHERE matnr = ls_diff-matnr AND werks = ls_diff-werks
+          AND gjahr = ls_diff-gjahr AND perkz = ls_diff-perkz
+          AND zahlr = ls_diff-zahlr.
+
+          CHECK sy-subrc = 0.
+
+          PERFORM f_handle_deletion CHANGING ls_data.
+          PERFORM f_add_update_line USING ls_data.
+
+        CATCH cx_root.
+      ENDTRY.
+    ENDIF.
+  ENDLOOP.
+
+  PERFORM f_call_update CHANGING lv_succ.
+
+  SORT gt_main_curr BY matnr gjahr zahlr ASCENDING. " cvivo - para debuggear mejor
+
+  " 2 - now handle changes
+  LOOP AT gt_main_curr INTO DATA(ls_curr)
+  WHERE main_prod = abap_true.
+    PERFORM f_handle_main_prod USING ls_curr.
+    PERFORM f_call_update CHANGING lv_succ.
+  ENDLOOP.
+
+ENDFORM.
+
+FORM f_get_main_for_comp USING is_data TYPE zmm_v_prod_grp
+CHANGING cs_main.
+
+  TRY.
+      cs_main = gt_main_curr[ prgrp = is_data-prgrp werks = is_data-werks pgtyp = is_data-pgtyp
+                            wemit = is_data-wemit datum = is_data-datum vsnda = is_data-vsnda
+                            main_prod = abap_true gjahr = is_data-gjahr
+      ].
+
+    CATCH cx_root.
+      CLEAR cs_main.
+  ENDTRY.
+
+
+ENDFORM.
+
+FORM f_handle_main_prod USING is_data TYPE zmm_v_prod_grp.
+  CHECK is_data-main_prod = abap_true.
+
+  DATA(ls_data) = is_data.
+
+  " init main line
+  DO 13 TIMES.
+    DATA(lv_cns_field) = 'GSV' && CONV numc2( sy-index ).
+    DATA(lv_cnsc_field) = 'MGV' && CONV numc2( sy-index ).
+    ASSIGN COMPONENT :
+                      lv_cnsc_field OF STRUCTURE ls_data TO FIELD-SYMBOL(<fs_consc_main>),
+                      lv_cns_field OF STRUCTURE ls_data TO FIELD-SYMBOL(<fs_cons_main>).
+    CHECK: <fs_cons_main> IS ASSIGNED, <fs_consc_main> IS ASSIGNED.
+    <fs_consc_main> = <fs_cons_main>.
+  ENDDO.
+
+
+  LOOP AT gt_main_curr ASSIGNING FIELD-SYMBOL(<fs_comp>)
+  WHERE prgrp = is_data-prgrp
+  AND werks = is_data-werks
+  AND pgtyp = is_data-pgtyp
+  AND wemit = is_data-wemit AND datum = is_data-datum
+  AND vsnda = is_data-vsnda AND main_prod = abap_false
+  AND gjahr = is_data-gjahr
+  AND perkz = is_data-perkz
+  AND zahlr = is_data-zahlr.
+    DO 13 TIMES.
+      lv_cns_field = 'GSV' && CONV numc2( sy-index ).
+      lv_cnsc_field = 'MGV' && CONV numc2( sy-index ).
+      ASSIGN COMPONENT : lv_cnsc_field OF STRUCTURE <fs_comp> TO FIELD-SYMBOL(<fs_consc>),
+                        lv_cns_field OF STRUCTURE <fs_comp> TO FIELD-SYMBOL(<fs_cons>),
+                        lv_cnsc_field OF STRUCTURE ls_data TO <fs_consc_main>.
+
+      CHECK: <fs_consc> IS ASSIGNED, <fs_consc_main> IS ASSIGNED,
+      <fs_cons> IS ASSIGNED.
+      <fs_consc_main> = <fs_consc_main> + <fs_cons>.
+      <fs_consc> = 0.
+      UNASSIGN: <fs_consc_main>, <fs_consc>, <fs_cons>.
+    ENDDO.
+
+    PERFORM: f_add_update_line
+      USING
+        <fs_comp>.
+
+  ENDLOOP.
+
+  PERFORM f_add_update_line USING ls_data.
+  PERFORM: f_update_curr_data USING ls_data.
+ENDFORM.
+
+FORM f_handle_comp_prod USING is_data TYPE zmm_v_prod_grp.
+  DATA ls_main LIKE is_data.
+
+
+  CHECK is_data-main_prod = abap_false.
+
+  " 1 - find main prod
+  PERFORM f_get_main_for_comp USING is_data CHANGING ls_main.
+  CHECK ls_main IS NOT INITIAL.
+
+  " 2 - now add values
+  " must restore all correction values to the same value of consumption
+  DATA(ls_data) = is_data.
+  DO 13 TIMES.
+    DATA(lv_cnsc_field) = 'MGV' && CONV numc2( sy-index ).
+    ASSIGN COMPONENT : lv_cnsc_field OF STRUCTURE ls_data TO FIELD-SYMBOL(<fs_consc>),
+                      lv_cnsc_field OF STRUCTURE ls_main TO FIELD-SYMBOL(<fs_consc_main>).
+    CHECK: <fs_consc> IS ASSIGNED, <fs_consc_main> IS ASSIGNED,
+    <fs_consc> <> 0.
+    DATA(lv_chg) = abap_true.
+    <fs_consc_main> = <fs_consc_main> + <fs_consc>.
+    CLEAR <fs_consc>.
+    UNASSIGN: <fs_consc>, <fs_consc_main>.
+  ENDDO.
+
+  CHECK lv_chg = abap_true.
+  PERFORM: f_add_update_line
+    USING
+      ls_data,
+      f_add_update_line
+    USING
+      ls_main
+    .
+
+  PERFORM: f_update_curr_data USING ls_data,
+            f_update_curr_data USING ls_main.
+
+
+ENDFORM.
+
+
+FORM f_update_curr_data USING is_data TYPE zmm_v_prod_grp.
+  TRY.
+      ASSIGN gt_main_curr[ matnr = is_data-matnr prgrp = is_data-prgrp werks = is_data-werks pgtyp = is_data-pgtyp
+                                  wemit = is_data-wemit datum = is_data-datum vsnda = is_data-vsnda
+                                  gjahr = is_data-gjahr main_prod = is_data-main_prod perkz = is_data-perkz
+                                  zahlr = is_data-zahlr
+            ] TO FIELD-SYMBOL(<fs_data>).
+      CHECK <fs_data> IS ASSIGNED.
+      <fs_data> = is_data.
+    CATCH cx_root.
+  ENDTRY.
+
+ENDFORM.

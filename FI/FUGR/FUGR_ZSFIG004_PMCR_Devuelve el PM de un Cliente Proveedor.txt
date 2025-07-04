@@ -1,0 +1,501 @@
+FUNCTION ZSFIG004_PMCR.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_KOART) TYPE  KOART
+*"     VALUE(S_BUKRS) TYPE  EVAL_IV_BUKRS_RANGE_T OPTIONAL
+*"     VALUE(S_BELNR) TYPE  FQMR_ACCDOC_NUMBER OPTIONAL
+*"     VALUE(S_GJAHR) TYPE  BKK_R_GJAHR OPTIONAL
+*"     VALUE(S_KUNNR) TYPE  FIAPPT_T_KUNNR OPTIONAL
+*"     VALUE(S_LIFNR) TYPE  FIP_T_LIFNR_RANGE OPTIONAL
+*"     REFERENCE(NEGATIVO) TYPE  FLAG OPTIONAL
+*"     REFERENCE(LEER_DE_TABLA_Z) TYPE  FLAG OPTIONAL
+*"     REFERENCE(S_KKBER) TYPE  ZSSDD306_TT_KKBER OPTIONAL
+*"  EXPORTING
+*"     REFERENCE(DIAS) TYPE  ZSFIS004_DIAS
+*"     REFERENCE(TOTALCOBR) TYPE  DMBTR
+*"  TABLES
+*"      T_OUT STRUCTURE  ZSFIS004 OPTIONAL
+*"      T_COBR STRUCTURE  ZSSDCOM_TRAZA_COBR OPTIONAL
+*"----------------------------------------------------------------------
+  TYPES: BEGIN OF ty_acdoca,
+           bukrs LIKE bseg-bukrs,
+           belnr LIKE bseg-belnr,
+           gjahr LIKE bseg-gjahr,
+           buzei LIKE bseg-buzei,
+           lifnr LIKE bseg-lifnr,
+           kunnr LIKE bseg-kunnr,
+           pswsl LIKE bseg-pswsl,
+           dmbtr LIKE bseg-dmbtr,
+           koart LIKE bseg-koart,
+           shkzg LIKE bseg-shkzg,
+           bschl LIKE bseg-bschl,
+           augdt LIKE bseg-augdt,
+           dmbe2 LIKE bseg-dmbe2,
+           umskz LIKE bseg-umskz.
+  TYPES: END OF ty_acdoca.
+
+  DATA cobrado2     TYPE dmbtr.
+  DATA cobrado      TYPE dmbtr.
+  DATA i_faede      TYPE faede.
+  DATA e_tage       TYPE i.
+  DATA tabla        TYPE string.
+  DATA cond_syntax  TYPE string.
+  DATA e_anulado    TYPE flag.
+  DATA e_t001       TYPE t001.
+  DATA ct_traza     TYPE zttsdcom_traza_or WITH HEADER LINE.
+  DATA ct_trazados  TYPE zttsdcom_traza_or WITH HEADER LINE.
+  DATA ct_doc_cobro TYPE zttsdcom_traza_or WITH HEADER LINE.
+  DATA ti_t001          TYPE TABLE OF t001.
+  DATA gt_output        TYPE TABLE OF zsfis004      WITH HEADER LINE.
+  DATA ti_zpmcr_c_doc   TYPE TABLE OF zpmcr_c_doc   WITH HEADER LINE.
+  DATA ti_zpmcr_c_bschl TYPE TABLE OF zpmcr_c_bschl WITH HEADER LINE.
+  DATA ti_acdoca        TYPE TABLE OF ty_acdoca     WITH HEADER LINE.
+  DATA: BEGIN OF ti_facturas OCCURS 0,
+          belnr LIKE bsad-belnr,
+          bukrs LIKE bsak-bukrs,
+          gjahr LIKE bsak-gjahr,
+          buzei LIKE bsad-buzei,
+          blart LIKE bsad-blart,
+        END OF ti_facturas.
+  DATA gt_cobrado TYPE TABLE OF zssdcom_traza_cobr WITH HEADER LINE.
+
+  RANGES r_blart FOR bkpf-blart.
+  RANGES r_bschl FOR bseg-bschl.
+
+  "Si no pasan el parámetro (es opcional y por defecto viene vacío)
+  "Hacemos el calculo como hasta ahora
+  IF leer_de_tabla_z IS INITIAL."EMP: 20.09.18
+
+    CLEAR dias.
+
+    SELECT * INTO TABLE ti_t001 FROM t001
+      WHERE bukrs IN s_bukrs.
+
+    CASE i_koart.
+      WHEN 'K'.
+        tabla = 'BSAK'.
+        cond_syntax = 'lifnr IN s_lifnr AND lifnr <> space'.
+      WHEN 'D'.
+        tabla = 'BSAD'.
+        cond_syntax = 'kunnr IN s_kunnr AND kunnr <> space AND kkber IN s_kkber'.
+      WHEN OTHERS.
+        RETURN.
+    ENDCASE.
+
+* Obtenemos los tipos de facturas
+    SELECT * INTO TABLE ti_zpmcr_c_doc FROM zpmcr_c_doc
+      WHERE koart = i_koart.
+    LOOP AT ti_zpmcr_c_doc.
+      r_blart-option = 'EQ'.
+      r_blart-sign = 'I'.
+      r_blart-low = ti_zpmcr_c_doc-blart.
+      APPEND r_blart.
+    ENDLOOP.
+
+* Obtenemos las claves de contabilizacion
+    SELECT * INTO TABLE ti_zpmcr_c_bschl FROM zpmcr_c_bschl
+      WHERE koart = i_koart.
+    LOOP AT ti_zpmcr_c_bschl.
+      r_bschl-option = 'EQ'.
+      r_bschl-sign = 'I'.
+      r_bschl-low = ti_zpmcr_c_bschl-bschl.
+      APPEND r_bschl.
+    ENDLOOP.
+
+* Buscamos las facturas segun los parametros de seleccion
+    SELECT belnr bukrs gjahr buzei blart INTO TABLE ti_facturas
+      FROM (tabla)
+      WHERE bukrs IN s_bukrs
+        AND belnr IN s_belnr
+        AND gjahr IN s_gjahr
+        AND blart IN r_blart
+        AND bschl IN r_bschl
+        AND (cond_syntax).
+
+    IF ti_facturas[] IS NOT INITIAL.
+*   Obtenemos todos los datos necesarios para el cálculo del pmc
+      SELECT bukrs belnr gjahr buzei lifnr kunnr pswsl dmbtr koart shkzg bschl augdt dmbe2 umskz INTO TABLE ti_acdoca
+            FROM bseg FOR ALL ENTRIES IN ti_facturas
+            WHERE bukrs = ti_facturas-bukrs
+              AND belnr = ti_facturas-belnr
+              AND gjahr = ti_facturas-gjahr
+              AND buzei = ti_facturas-buzei.
+    ENDIF.
+
+* Recorremos cada una de las facturas
+    LOOP AT ti_acdoca.
+
+      CLEAR: ti_facturas, ct_traza[], e_anulado, ct_trazados[], cobrado, ct_doc_cobro[], i_faede, e_tage, e_t001, cobrado2.
+
+*   Obtenemos la traza
+      CALL FUNCTION 'ZSFIG004_PMCR_NEW_TRAZA'
+        EXPORTING
+          i_bukrs     = ti_acdoca-bukrs
+          i_belnr     = ti_acdoca-belnr
+          i_gjahr     = ti_acdoca-gjahr
+          i_buzei     = ti_acdoca-buzei
+          i_valut     = sy-datum
+          i_first     = 'X'
+        IMPORTING
+          e_anulado   = e_anulado
+        CHANGING
+          ct_traza    = ct_traza[]
+          ct_trazados = ct_trazados[].
+
+*   A partir de la traza obtenemos los documentos de cobro/pago
+      IF ct_traza[] IS NOT INITIAL.
+
+        CASE ti_acdoca-shkzg.
+          WHEN 'H'.
+            IF i_koart <> 'K'.
+              ti_acdoca-dmbtr = -1 * ti_acdoca-dmbtr.
+            ENDIF.
+          WHEN 'S'.
+            IF i_koart = 'K'.
+              ti_acdoca-dmbtr = -1 * ti_acdoca-dmbtr.
+            ENDIF.
+        ENDCASE.
+
+        CLEAR ct_trazados[].
+
+*     Clientes
+        IF i_koart <> 'K'.
+          CALL FUNCTION 'ZSFIG004_PMCR_NEW_IMPORTE'
+            EXPORTING
+              i_belnr      = ti_acdoca-belnr
+              i_gjahr      = ti_acdoca-gjahr
+              i_bukrs      = ti_acdoca-bukrs
+              i_valut      = sy-datum
+              i_buzei      = ti_acdoca-buzei
+              i_dmbtr      = ti_acdoca-dmbtr
+              i_first      = 'X'
+              negativo     = negativo
+            CHANGING
+              e_cobrado    = cobrado
+              ct_traza     = ct_traza[]
+              ct_trazados  = ct_trazados[]
+              ct_doc_cobro = ct_doc_cobro[].
+        ELSE.
+          CALL FUNCTION 'ZSFIG004_PMCR_NEW_IMPORTE_ACR'
+            EXPORTING
+              i_belnr      = ti_acdoca-belnr
+              i_gjahr      = ti_acdoca-gjahr
+              i_bukrs      = ti_acdoca-bukrs
+              i_valut      = sy-datum
+              i_buzei      = ti_acdoca-buzei
+              i_dmbtr      = ti_acdoca-dmbtr
+              i_first      = 'X'
+            CHANGING
+              e_cobrado    = cobrado
+              ct_traza     = ct_traza[]
+              ct_trazados  = ct_trazados[]
+              ct_doc_cobro = ct_doc_cobro[].
+        ENDIF.
+
+        LOOP AT ct_doc_cobro.
+          gt_cobrado-doc = ti_acdoca-belnr.
+          gt_cobrado-gjh = ti_acdoca-gjahr.
+          gt_cobrado-buk = ti_acdoca-bukrs.
+          gt_cobrado-buz = ti_acdoca-buzei.
+          MOVE-CORRESPONDING ct_doc_cobro TO gt_cobrado.
+          APPEND gt_cobrado.
+        ENDLOOP.
+        t_cobr[] = gt_cobrado[].
+
+      ENDIF.
+
+      "Movemos los datos a la tabla de salida
+      gt_output-buzei = ti_acdoca-buzei.
+      gt_output-bukrs = ti_acdoca-bukrs.
+      gt_output-belnr = ti_acdoca-belnr.
+      gt_output-gjahr = ti_acdoca-gjahr.
+
+      CASE i_koart.
+        WHEN 'K'.
+          gt_output-lifnr = ti_acdoca-lifnr.
+          SELECT SINGLE name1 INTO gt_output-name1 FROM lfa1
+            WHERE lifnr = gt_output-lifnr.
+        WHEN 'D'.
+          gt_output-lifnr = ti_acdoca-kunnr.
+          SELECT SINGLE name1 INTO gt_output-name1 FROM kna1
+            WHERE kunnr = gt_output-lifnr.
+      ENDCASE.
+
+      SELECT SINGLE hwaer INTO gt_output-rtcur FROM bkpf
+            WHERE belnr = ti_acdoca-belnr
+              AND gjahr = ti_acdoca-gjahr
+              AND bukrs = ti_acdoca-bukrs.
+
+      IF ti_acdoca-shkzg = 'H'.
+        IF i_koart <> 'K'.
+          gt_output-tsl = -1 * ti_acdoca-dmbtr."tsl.
+          gt_output-dmbe2 = -1 * ti_acdoca-dmbe2.
+        ELSE.
+          gt_output-tsl = ti_acdoca-dmbtr."tsl.
+          gt_output-dmbe2 = ti_acdoca-dmbe2.
+        ENDIF.
+      ELSE.
+        IF i_koart <> 'K'.
+          gt_output-tsl = ti_acdoca-dmbtr."tsl.
+          gt_output-dmbe2 = ti_acdoca-dmbe2.
+        ELSE.
+          gt_output-tsl = ti_acdoca-dmbtr."tsl.
+          gt_output-dmbe2 = ti_acdoca-dmbe2.
+        ENDIF.
+      ENDIF.
+      gt_output-anulado = e_anulado.
+
+      "Obtenemos la Via de Pago
+      SELECT SINGLE zlsch zterm zbd1t zbd2t zbd3t zfbdt rebzg
+        INTO (gt_output-zlsch, gt_output-zterm, gt_output-zbd1t,
+              gt_output-zbd2t, gt_output-zbd3t, gt_output-zfbdt,
+              gt_output-rebzg)
+        FROM bseg
+        WHERE bukrs = ti_acdoca-bukrs
+          AND belnr = ti_acdoca-belnr
+          AND gjahr = ti_acdoca-gjahr
+          AND buzei = ti_acdoca-buzei.
+
+      IF gt_output-zlsch IS NOT INITIAL.
+        CLEAR e_t001.
+        READ TABLE ti_t001 INTO e_t001 WITH KEY bukrs = ti_acdoca-bukrs.
+        IF sy-subrc = 0.
+          SELECT SINGLE text1 INTO gt_output-text1 FROM t042z
+            WHERE land1 = e_t001-land1
+              AND zlsch = gt_output-zlsch.
+        ENDIF.
+      ENDIF.
+
+      SELECT SINGLE budat bldat INTO (gt_output-budat, i_faede-bldat)  FROM bkpf
+        WHERE belnr = ti_acdoca-belnr
+          AND gjahr = ti_acdoca-gjahr
+          AND bukrs = ti_acdoca-bukrs.
+
+      i_faede-koart = ti_acdoca-koart.
+      i_faede-shkzg = ti_acdoca-shkzg.
+      i_faede-zfbdt = gt_output-zfbdt.
+      i_faede-zbd1t = gt_output-zbd1t.
+      i_faede-zbd2t = gt_output-zbd2t.
+      i_faede-zbd3t = gt_output-zbd3t.
+      i_faede-rebzg = gt_output-rebzg.
+
+      CALL FUNCTION 'DETERMINE_DUE_DATE'
+        EXPORTING
+          i_faede                    = i_faede
+          i_gl_faede                 = 'X'
+        IMPORTING
+          e_faede                    = i_faede
+        EXCEPTIONS
+          account_type_not_supported = 1
+          OTHERS                     = 2.
+
+      gt_output-netdt = i_faede-netdt.
+      gt_output-bldat = i_faede-bldat.
+
+      LOOP AT ct_doc_cobro.
+
+        CLEAR cobrado2.
+        CASE ct_doc_cobro-shkzg.
+          WHEN 'H'.
+            IF ti_acdoca-shkzg = 'S'.
+              gt_output-cobrado = gt_output-cobrado - ct_doc_cobro-dmbtr.
+              cobrado2 = - ct_doc_cobro-dmbtr.
+            ELSE.
+              gt_output-cobrado = gt_output-cobrado + ct_doc_cobro-dmbtr.
+              cobrado2 = ct_doc_cobro-dmbtr.
+            ENDIF.
+          WHEN 'S'.
+            IF ti_acdoca-shkzg = 'S'.
+              gt_output-cobrado = gt_output-cobrado + ct_doc_cobro-dmbtr.
+              cobrado2 = ct_doc_cobro-dmbtr.
+            ELSE.
+              gt_output-cobrado = gt_output-cobrado - ct_doc_cobro-dmbtr.
+              cobrado2 = - ct_doc_cobro-dmbtr.
+            ENDIF.
+        ENDCASE.
+        "Calculamos los dias
+        CLEAR e_tage.
+
+
+        IF ( ( ct_doc_cobro-bschl = '31' OR ct_doc_cobro-bschl = '32' OR ct_doc_cobro-bschl = '33' OR ct_doc_cobro-bschl = '34'
+               OR ct_doc_cobro-bschl = '35' OR ct_doc_cobro-bschl = '36' OR ct_doc_cobro-bschl = '37'
+          OR ct_doc_cobro-bschl = '38' OR ct_doc_cobro-bschl = '39' OR ct_doc_cobro-bschl = '11' ) AND i_koart <> 'K' )
+
+          OR
+
+          (
+          ( ct_doc_cobro-bschl = '21' OR ct_doc_cobro-bschl = '01' OR ct_doc_cobro-bschl = '02'
+          OR ct_doc_cobro-bschl = '03' OR ct_doc_cobro-bschl = '04'
+          OR ct_doc_cobro-bschl = '05' OR ct_doc_cobro-bschl = '06' OR ct_doc_cobro-bschl = '07'
+          OR ct_doc_cobro-bschl = '08' OR ct_doc_cobro-bschl = '09'
+          OR ct_doc_cobro-bschl = '0A' OR ct_doc_cobro-bschl = '0B' OR ct_doc_cobro-bschl = '0C'
+          OR ct_doc_cobro-bschl = '0X' OR ct_doc_cobro-bschl = '0Y' OR ct_doc_cobro-bschl = '24'
+          OR ct_doc_cobro-bschl = '29'
+               OR ct_doc_cobro-bschl = '0Z' OR ct_doc_cobro-bschl = '1V' OR ct_doc_cobro-bschl = 'Z3') AND i_koart = 'K'
+          ).
+
+          CALL FUNCTION 'FIMA_DAYS_BETWEEN_TWO_DATES'
+            EXPORTING
+              i_datum_von = i_faede-bldat
+              i_datum_bis = ct_doc_cobro-augdt
+              i_stgmeth   = '2'
+            IMPORTING
+              e_tage      = e_tage.
+        ELSE.
+          CALL FUNCTION 'FIMA_DAYS_BETWEEN_TWO_DATES'
+            EXPORTING
+              i_datum_von = i_faede-bldat
+              i_datum_bis = ct_doc_cobro-bldat
+              i_stgmeth   = '2'
+            IMPORTING
+              e_tage      = e_tage.
+        ENDIF.
+
+        DATA indice LIKE sy-tabix.
+        READ TABLE gt_cobrado WITH KEY belnr = ct_doc_cobro-belnr
+                                       gjahr = ct_doc_cobro-gjahr
+                                       bukrs = ct_doc_cobro-bukrs
+                                       buzei = ct_doc_cobro-buzei
+                                       buz = ti_acdoca-buzei
+                                       doc = ti_acdoca-belnr.
+        IF sy-subrc = 0.
+          indice = sy-tabix.
+          gt_cobrado-dias = e_tage.
+          MODIFY gt_cobrado INDEX indice.
+        ENDIF.
+
+        gt_output-diascobro = gt_output-diascobro + ( e_tage * cobrado2 ).
+
+        IF gt_output-cobrado IS NOT INITIAL.
+          gt_output-dias = gt_output-diascobro / gt_output-cobrado.
+        ENDIF.
+
+      ENDLOOP.
+
+      "Fecha de Cobro
+      IF gt_output-dias IS NOT INITIAL.
+        DATA diasc TYPE fiappl_arrear.
+        CLEAR diasc.
+        diasc = gt_output-dias.
+        CALL FUNCTION 'FIAPPL_ADD_DAYS_TO_DATE'
+          EXPORTING
+            i_date      = gt_output-bldat
+            i_days      = diasc
+            signum      = '+'
+          IMPORTING
+            e_calc_date = gt_output-fcobro.
+      ENDIF.
+
+      CASE ti_acdoca-shkzg.
+        WHEN 'H'.
+          IF i_koart <> 'K'.
+            IF gt_output-cobrado < ti_acdoca-dmbtr.
+              gt_output-cobrado = ti_acdoca-dmbtr.
+            ENDIF.
+            gt_output-tsl = gt_output-tsl * -1.
+            gt_output-dmbe2 = -1 * gt_output-dmbe2.
+          ELSE.
+            IF gt_output-cobrado > ti_acdoca-dmbtr.
+              gt_output-cobrado = ti_acdoca-dmbtr.
+            ENDIF.
+          ENDIF.
+        WHEN 'S'.
+          IF i_koart <> 'K'.
+            IF gt_output-cobrado > ti_acdoca-dmbtr.
+              gt_output-cobrado = ti_acdoca-dmbtr.
+            ENDIF.
+          ELSE.
+            IF gt_output-cobrado < ti_acdoca-dmbtr.
+              gt_output-cobrado = ti_acdoca-dmbtr.
+            ENDIF.
+          ENDIF.
+      ENDCASE.
+
+      IF gt_output-dmbe2 IS INITIAL.
+        gt_output-dmbe2 = gt_output-cobrado.
+      ELSEIF gt_output-tsl <> gt_output-cobrado.
+        gt_output-dmbe2 = gt_output-dmbe2 * gt_output-cobrado / gt_output-tsl.
+      ENDIF.
+
+      gt_output-shkzg = ti_acdoca-shkzg.
+
+      IF gt_output-anulado = 'X'.
+        CLEAR gt_output-cobrado.
+      ENDIF.
+      APPEND gt_output. CLEAR gt_output.
+
+    ENDLOOP.
+
+    IF i_koart = 'K'.
+      LOOP AT gt_output.
+        IF gt_output-tsl < 0 AND gt_output-cobrado > 0.
+          gt_output-cobrado = - gt_output-cobrado.
+          gt_output-dmbe2 = - gt_output-dmbe2.
+        ENDIF.
+        MODIFY gt_output.
+      ENDLOOP.
+    ENDIF.
+
+  ENDIF. "EMP: 20.09.18
+
+  "EMP: 20.09.18
+  "Si pasan el paráemtro, leemos directamente de tabla Z
+  IF leer_de_tabla_z = 'X'.
+    DATA: l_where TYPE string.
+    CONCATENATE l_where     'BUKRS IN S_BUKRS'  INTO l_where SEPARATED BY space.
+    CONCATENATE l_where 'AND GJAHR IN S_GJAHR'  INTO l_where SEPARATED BY space.
+    CONCATENATE l_where 'AND BELNR IN S_BELNR'  INTO l_where SEPARATED BY space.
+    IF i_koart = 'D'.
+      CONCATENATE l_where 'AND LIFNR IN S_KUNNR'  INTO l_where SEPARATED BY space.
+    ENDIF.
+    IF i_koart = 'K'.
+      CONCATENATE l_where 'AND LIFNR IN S_LIFNR'  INTO l_where SEPARATED BY space.
+    ENDIF.
+    CLEAR gt_output[].
+    SELECT *
+      INTO CORRESPONDING FIELDS OF TABLE gt_output
+      FROM zsfit004_pmcr
+      WHERE (l_where).
+  ENDIF.
+  "FIN EMP: 20.09.18
+
+
+  t_out[] = gt_output[].
+
+  DELETE gt_output WHERE anulado = 'X'.
+
+* Calcular el PMP/PMC si solo viene un cliente/proveedor
+  DATA i TYPE i.
+  DATA nlineas TYPE i.
+  DATA ndias(20) TYPE n.
+  "DATA totalcobr TYPE dmbtr.
+  DATA cobr TYPE dmbtr.
+
+  IF i_koart = 'K'.
+    DESCRIBE TABLE s_lifnr LINES i.
+    IF i = 1.
+      LOOP AT gt_output WHERE dias IS NOT INITIAL.
+        cobr = cobr + ( gt_output-dias * gt_output-cobrado ).
+        totalcobr = totalcobr + gt_output-cobrado.
+      ENDLOOP.
+      IF sy-subrc = 0.
+        dias = cobr DIV totalcobr.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  IF i_koart = 'D'.
+    DESCRIBE TABLE s_kunnr LINES i.
+    IF i = 1.
+      LOOP AT gt_output WHERE dias IS NOT INITIAL.
+        cobr = cobr + ( gt_output-dias * gt_output-cobrado ).
+        totalcobr = totalcobr + gt_output-cobrado.
+      ENDLOOP.
+      IF sy-subrc = 0.
+        dias = cobr DIV totalcobr.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFUNCTION.

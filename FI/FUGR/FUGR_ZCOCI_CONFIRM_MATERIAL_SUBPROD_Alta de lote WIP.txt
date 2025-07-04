@@ -1,0 +1,1504 @@
+FUNCTION ZCOCI_CONFIRM_MATERIAL_SUBPROD.
+*"--------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(DEST_NAME) LIKE  RCTC51-CSDES
+*"  TABLES
+*"      SCOME STRUCTURE  COME
+*"      SCOMH STRUCTURE  COMH
+*"      SCOMP STRUCTURE  RCOMP
+*"--------------------------------------------------------------------
+
+* Retrograde Entnahme: Es wird nur ein Warenausgang gebucht, sofern
+* keine retrograde Entnahme vorgesehen ist.
+
+* ----------------------------------------------------------------------
+* Lokale Daten
+* ----------------------------------------------------------------------
+
+* Interne Tabellen ---------------------------------------------------
+
+* Parameter  des Funktionsbausteins
+  DATA BEGIN OF c_para OCCURS 0.
+  DATA para_name LIKE tc50a-dspara.
+  DATA END   OF c_para.
+
+* Zuordnung Merkmale zu Zielfeldern
+  DATA BEGIN OF itc50a OCCURS 0.
+          INCLUDE STRUCTURE tc50a.
+  DATA END   OF itc50a.
+
+* Eingabedaten der Materialbelegpositionen
+  DATA BEGIN OF imseg OCCURS 0.
+          INCLUDE STRUCTURE imseg.
+  DATA END   OF imseg.
+
+* Ausgabedaten der Materialbelegpositionen
+  DATA BEGIN OF emseg OCCURS 0.
+          INCLUDE STRUCTURE emseg.
+  DATA END   OF emseg.
+
+* Tabelle zur Ermittlung der zul. Mengeneinheiten zu einem Material
+  DATA BEGIN OF rmmme_itab OCCURS 0.
+          INCLUDE STRUCTURE rmmme.
+  DATA END   OF rmmme_itab.
+
+* Tabelle der gefundenen Reservierungen
+  DATA:
+   tresb LIKE resb OCCURS 0.
+
+* Temporäre Felder
+  DATA: l_vornr TYPE vornr.
+
+* Steuerflag für die Warenbewegung
+  DATA: goods_movement_ok LIKE rc27x-flg_sel.
+
+
+* Strukturen ----------------------------------------------------------
+  DATA:
+   imkpf LIKE imkpf,
+   emkpf LIKE emkpf,
+   scaufv LIKE caufv,
+   safvc LIKE afvc.
+
+  DATA:
+   BEGIN OF flg,
+    batch_included,
+    res_number_included,
+    res_item_included,
+    operation_included,
+    phase_included,
+    final_issue_included,
+    uom_valid,
+    loc_included,
+    unplanned_goods_issue,
+   END OF flg.
+
+* Struktur TCOKO, mit Bewegungsarten zum Auftrag
+  DATA itcoko LIKE tcoko.
+
+* Struktur für Materialdaten
+  DATA wmara LIKE mara.
+
+* Felder
+  DATA:
+*    Empf.spez. Zielfelder
+     process_order      LIKE   afko-aufnr,                  "obl
+     material           LIKE   mara-matnr,                  "obl
+     batch              LIKE   mcha-charg,
+     storage_location        LIKE   t001l-lgort,            "obl
+     operation          LIKE   plpo-vornr,
+     phase              LIKE   plpo-vornr,
+     reservation        LIKE   rm07m-rsnum,
+     reservation_item   LIKE   rm07m-rspos,
+     final_issue        LIKE   imseg-kzear,
+     quantity_consumed  LIKE   mseg-erfmg,                  "obl
+     unit_of_measure    LIKE   mseg-erfme,                  "obl
+     event_date TYPE d,                                     "obl
+     event_time TYPE t,                                     "obl
+*    Bewegungsart
+     bwart_order_from_wh LIKE t156-bwart,
+*    Special stock indicator
+     special_stock LIKE resb-sobkz,
+*    Vendor
+     vendor LIKE resb-lifnr.
+ "CJ
+* Konstanten
+  DATA:
+*  Bewegungskennzeichen: Warenbewegung zum Fertigungsauftrag
+*  KZBEW_F            LIKE  IMSEG-KZBEW VALUE 'F',
+*  Arbeitsgebiet zum Lesen der Bewegungsarten
+   arbge               LIKE tcoko-arbge VALUE 'CO',
+*  Bewegungsarten -> nicht mehr als Konstanten def., werden gelesen
+*  BWART_ORDER_FROM_WH LIKE T156-BWART VALUE '261',
+*  Empfängerspez. Zielfelder
+   c_process_order     LIKE tc50a-dspara  VALUE 'PROCESS_ORDER',
+   c_material          LIKE tc50a-dspara  VALUE 'MATERIAL    ',
+   c_batch             LIKE tc50a-dspara  VALUE 'BATCH ',
+   c_storage_location       LIKE tc50a-dspara  VALUE 'STORAGE_LOCATION',
+   c_operation         LIKE tc50a-dspara  VALUE 'OPERATION   ',
+   c_phase             LIKE tc50a-dspara  VALUE 'PHASE       ',
+   c_reservation LIKE tc50a-dspara  VALUE 'RESERVATION_NUMBER',
+   c_reservation_item   LIKE tc50a-dspara  VALUE 'RESERVATION_ITEM',
+   c_quantity_consumed LIKE tc50a-dspara VALUE 'QUANTITY_CONSUMED',
+   c_unit_of_measure   LIKE tc50a-dspara VALUE 'UNIT_OF_MEASURE  ',
+   c_final_issue       LIKE tc50a-dspara VALUE 'FINAL_ISSUE      ',
+   c_event_date        LIKE tc50a-dspara  VALUE 'EVENT_DATE  ',
+   c_event_time        LIKE tc50a-dspara  VALUE 'EVENT_TIME  ',
+*  Special stock indicator
+   c_special_stock LIKE tc50a-dspara VALUE 'SPECIAL_STOCK',
+*  Vendor
+   c_vendor LIKE tc50a-dspara VALUE 'VENDOR',                    "CJ
+*  Returncodes
+   ekz_dest_error LIKE comh-errkz VALUE '8',
+   ekz_dest_warn  LIKE comh-errkz VALUE '4',
+*  Transaktionscode für Materialbewegung
+   tcode_cons LIKE sy-tcode VALUE 'MB11'.
+
+* Assignment of current user for process message header
+  DATA:
+    lo_badi_cocb_msd TYPE REF TO badi_cocb_msd_proc.
+
+* ---------------------------------------------------------------------
+* Vorabprüfung
+* ---------------------------------------------------------------------
+* Prüfung ob Mledungen zu verarbeiten sind (erf. da im Folgenden
+* mit SELECT ... FOR ALL ENTRIES IN SCOMH selektiert wird.)
+  DESCRIBE TABLE scomh LINES hlp-lines.
+  CHECK hlp-lines > 0.
+
+* ----------------------------------------------------------------------
+* Initialisierungen
+* ----------------------------------------------------------------------
+  keycome-mandt = sy-mandt.
+
+* Parametertabelle füllen
+  REFRESH c_para.
+  MOVE c_process_order  TO c_para.
+  APPEND c_para.
+  MOVE  c_material          TO c_para.
+  APPEND c_para.
+  MOVE  c_batch             TO c_para.
+  APPEND c_para.
+  MOVE  c_storage_location       TO c_para.
+  APPEND c_para.
+  MOVE  c_operation  TO c_para.
+  APPEND c_para.
+  MOVE  c_phase      TO c_para.
+  APPEND c_para.
+  MOVE  c_quantity_consumed TO c_para.
+  APPEND c_para.
+  MOVE  c_unit_of_measure   TO c_para.
+  APPEND c_para.
+  MOVE  c_reservation       TO c_para.
+  APPEND c_para.
+  MOVE  c_reservation_item  TO c_para.
+  APPEND c_para.
+  MOVE  c_final_issue       TO c_para.
+  APPEND c_para.
+  MOVE  c_event_date TO c_para.
+  APPEND c_para.
+  MOVE  c_event_time TO c_para.
+  APPEND c_para.
+  MOVE c_special_stock TO c_para.
+  APPEND c_para.
+  MOVE c_vendor TO c_para.                                           "CJ
+  APPEND c_para.                                                     "CJ
+
+* Interne Tabelle mit Empfängerspez. Zielfeldern füllen
+  CALL FUNCTION 'TC50A_ARRAY_READ'
+       EXPORTING
+            destination            = dest_name
+       TABLES
+            char_target_fields     = itc50a
+            message_headers        = scomh
+       EXCEPTIONS
+*           INVALID_CHARACTERISTIC = 1                "Abbruchmeldung
+            no_entries_found       = 2.
+
+* SELECT * FROM TC50A INTO TABLE ITC50A FOR ALL ENTRIES IN SCOMH
+*   WHERE
+*     WERKS = SCOMH-WERK  AND
+*     CSTYP = CSTYP_MS    AND
+*     COSTR = SCOMH-MSCLA AND
+*     CSDES = DEST_NAME.
+
+* Bewegungsart aus Tabelle TCOKO ermitteln, falls noch nicht gelesen
+  IF itcoko-arbge <> arbge.
+    CALL FUNCTION 'CO_TA_TCOKO_READ'
+         EXPORTING
+              arbge    = arbge
+         IMPORTING
+              tcoko_wa = itcoko.
+  ENDIF.
+  bwart_order_from_wh = itcoko-wa_bwart.
+
+* ----------------------------------------------------------------------
+* Verarbeiten der einzelnen Meldungen
+* ----------------------------------------------------------------------
+  LOOP AT scomh.
+
+*   Initialisierungen für neue Meldung
+    CLEAR:
+      flg,
+      imkpf,
+      emkpf,
+      scaufv,
+      safvc,
+      sresb,
+      imseg,
+      emseg,
+      rmmme_itab.
+
+    REFRESH:
+      tresb,
+      imseg,
+      emseg,
+      rmmme_itab.
+
+
+*   Zielfelder füllen
+    keycome-msid = scomh-msid.
+    LOOP AT c_para.
+      LOOP AT itc50a
+       WHERE
+         werks = scomh-werk AND
+         cstyp = cstyp_ms    AND
+         costr = scomh-mscla AND
+         dspara =  c_para.
+
+        keycome-atinn = itc50a-atinn.
+        READ TABLE scome
+          WITH KEY keycome.
+        IF sy-subrc <> 0.
+          hlp-subrc = sy-subrc.
+        ELSE.
+          hlp-subrc = 0.
+        ENDIF.
+
+        CASE  c_para.
+*         Prozeßauftrag
+          WHEN c_process_order.
+            IF hlp-subrc <> 0.
+*             Batchrezeptnummer nicht in Meldung -> Destinationerror
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 1.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+            ELSEIF scome-atwrt IS INITIAL.
+*             Prozessauftrag  nicht bewertet   -> Destinationerror
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 2.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+            ELSE.
+              process_order = scome-atwrt.
+            ENDIF.
+
+*         Vorgangsnummer
+          WHEN c_operation.
+            IF hlp-subrc <> 0.
+*             Vorgangsnnummer nicht in Meldung -> kein Protokollsatz
+              flg-operation_included = space.
+            ELSEIF scome-atwrt IS INITIAL.
+*             Vorgangsnnummer nicht bewertet -> Warnung
+              scomh-errkz = ekz_dest_warn.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 2.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+              flg-operation_included = space.
+            ELSE.
+              flg-operation_included =  kreuz.
+              operation       = scome-atwrt.
+            ENDIF.
+
+*         Phasennummer
+          WHEN c_phase.
+            IF hlp-subrc <> 0.
+*             Phasennummer    nicht in Meldung -> kein Protokollsatz
+              flg-phase_included = space.
+            ELSEIF scome-atwrt IS INITIAL.
+*             Phasennummer  nicht bewertet -> Warnung
+              scomh-errkz = ekz_dest_warn.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 2.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+              flg-phase_included = space.
+            ELSE.
+              flg-phase_included =  kreuz.
+              phase       = scome-atwrt.
+            ENDIF.
+
+*         Material
+          WHEN c_material.
+            IF hlp-subrc <> 0.
+*             Materialnummer nicht in Meldung -> Destinationerror
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 1.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+            ELSEIF scome-atwrt IS INITIAL.
+*             Materialnummer nicht bewertet   -> Destinationerror
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 2.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+            ELSE.
+              material = scome-atwrt.
+            ENDIF.
+
+*         Lagerort
+          WHEN c_storage_location.
+            IF hlp-subrc <> 0.
+*             Lagerort nicht in Meldung -> kein Protokollsatz
+              flg-loc_included = space.
+            ELSEIF scome-atwrt IS INITIAL.
+*             Lagerort nicht bewertet -> Warnung
+              scomh-errkz = ekz_dest_warn.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 2.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+              flg-loc_included = space.
+            ELSE.
+              flg-loc_included = kreuz.
+              storage_location = scome-atwrt.
+            ENDIF.
+
+*         Charge
+          WHEN c_batch.
+            IF hlp-subrc <> 0.
+*             Chargennummer nicht in Meldung -> kein Protokollsatz
+              flg-batch_included = space.
+            ELSEIF scome-atwrt IS INITIAL.
+*             Chargennummer nicht bewertet -> Warnung
+              scomh-errkz = ekz_dest_warn.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 2.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+              flg-batch_included = space.
+            ELSE.
+              flg-batch_included = kreuz.
+              batch    = scome-atwrt.
+            ENDIF.
+
+*         Reservierungsnummer
+          WHEN c_reservation.
+            IF hlp-subrc <> 0.
+*             Reservierungsnummer nicht in Meldung -> kein Protokollsatz
+              flg-res_number_included = space.
+            ELSEIF scome-atwrt IS INITIAL.
+*             Reservierungsnummer nicht bewertet -> Warnung
+              scomh-errkz = ekz_dest_warn.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 2.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+              flg-res_number_included = space.
+            ELSE.
+              flg-res_number_included = kreuz.
+              reservation = scome-atwrt.
+            ENDIF.
+
+*         Reservierungsposition
+          WHEN c_reservation_item.
+            IF hlp-subrc <> 0.
+*             Reservierungspos.   nicht in Meldung -> kein Protokollsatz
+              flg-res_item_included = space.
+            ELSEIF scome-atwrt IS INITIAL.
+*             Reservierungspos. nicht bewertet -> Warnung
+              scomh-errkz = ekz_dest_warn.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 2.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+              flg-res_item_included = space.
+            ELSE.
+              flg-res_item_included = kreuz.
+              reservation_item =   scome-atwrt.
+            ENDIF.
+
+*         Menge des entnommenen Materials
+          WHEN c_quantity_consumed.
+            IF hlp-subrc <> 0.
+*             Menge nicht in Meldung -> Destinationerror
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 1.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+            ELSE.
+*             Initialbewertung erlaubt
+              quantity_consumed = scome-atflv.
+            ENDIF.
+
+*         Mengeneinheit
+          WHEN c_unit_of_measure.
+            IF hlp-subrc <> 0.
+*             Mengeneinheit nicht in Meldung -> Destinationerror
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 1.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+            ELSEIF scome-atwrt IS INITIAL.
+*             Mengeneinheit   nicht bewertet   -> Destinationerror
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+*             Protokollsatz
+              hlp-reason_for_error = 2.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+            ELSE.
+              unit_of_measure = scome-atwrt.
+            ENDIF.
+
+*         Kennzeichen: Endausfassung
+          WHEN c_final_issue.
+            IF hlp-subrc <> 0.
+*             EndausfassungsKZ nicht in Meldung -> kein Protokollsatz
+              flg-final_issue_included = space.
+            ELSE.
+*             Initiale Bewertung erlaubt
+              flg-final_issue_included = kreuz.
+              final_issue      =   scome-atwrt.
+            ENDIF.
+
+*         Ereigniszeitpunkt
+          WHEN c_event_time.
+            IF hlp-subrc <> 0.
+*             Ereigniszeitpunkt nicht in Meldung -> Destinationerror
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+              CLEAR event_time.
+              hlp-reason_for_error = 1.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+            ELSE.
+*             Konvertierung in Zeitformat, initiale Bewertung zulässig
+              CALL FUNCTION 'COC1_CONVERT_VALUES_TO_CHAR'
+                   EXPORTING
+                        characteristic_value       = ' '
+                        characteristic_value_float = scome-atflv
+                        format                     = 'TIME'
+                   IMPORTING
+                        characteristic_value_char  = event_time.
+            ENDIF.
+
+*         Ereignisdatum
+          WHEN c_event_date.
+            IF hlp-subrc <> 0.
+*             Ereignisdatum nicht in Meldung -> Destinationerror
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+              CLEAR event_date.
+              hlp-reason_for_error = 1.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+            ELSEIF scome-atflv IS INITIAL.
+*             Ereignisdatum   nicht bewertet   -> Destinationerror
+              scomh-errkz = ekz_dest_error.
+              MODIFY scomh.
+              CLEAR event_date.
+              hlp-reason_for_error = 2.
+              PERFORM fill_structure_rcomp
+                USING
+                  dest_name
+                  c_para-para_name
+                  itc50a-atinn
+                  scomh-errkz
+                  hlp-reason_for_error
+                CHANGING
+                  scomp.
+              scomp-msid = scomh-msid.
+              APPEND scomp.
+            ELSE.
+*             Konvertierung in Datumsformat
+              CALL FUNCTION 'COC1_CONVERT_VALUES_TO_CHAR'
+                   EXPORTING
+                        characteristic_value       = ' '
+                        characteristic_value_float = scome-atflv
+                        format                     = 'DATE'
+                   IMPORTING
+                        characteristic_value_char  = event_date.
+            ENDIF.
+
+*         Special stock indicator
+          WHEN c_special_stock.
+            IF hlp-subrc = 0.
+              IF NOT scome-atwrt IS INITIAL.
+                special_stock = scome-atwrt.
+              ENDIF.
+            ENDIF.
+
+          WHEN c_vendor.                                             "CJ
+             IF hlp-subrc = 0.
+               IF NOT scome-atwrt IS INITIAL.
+                  vendor = scome-atwrt.
+               ENDIF.
+             ENDIF.
+
+        ENDCASE.
+        EXIT.
+      ENDLOOP.                         " ITC50A
+
+      IF sy-subrc <> 0      "Zielfeld nicht in Zuordnungstabelle
+      AND c_para NE c_batch "und Merkmal nicht optional
+      AND c_para NE c_storage_location
+      AND c_para NE c_operation
+      AND c_para NE c_phase
+      AND c_para NE c_reservation
+      AND c_para NE c_reservation_item
+      AND c_para NE c_final_issue
+      AND c_para NE c_special_stock
+      AND c_para NE c_vendor.
+*       TC50A nicht gepflegt -> Destinationerror
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+*       Protokollsatz
+        IF 1 = 0.
+          MESSAGE i340 WITH dest_name c_para scomh-mscla.
+*                                  Empfänger &: Zielfeld & wurde kein
+*                                  Merkmal der Meldungsart & zugeordnet
+        ENDIF.
+        scomp-msgty = 'I'.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '340'.
+        scomp-msgv1 = dest_name.
+        scomp-msgv2 = c_para.
+        scomp-msgv3 = scomh-mscla.
+        scomp-msgv4 = space.
+        scomp-detlevel  = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+      ENDIF.
+
+      IF scomh-errkz = ekz_dest_error.
+        EXIT.                          " LOOP über C_PARA verlassen
+      ENDIF.
+    ENDLOOP.                           " C_PARA
+
+    CHECK scomh-errkz <> ekz_dest_error.
+
+* ----------------------------------------------------------------------
+* Prüfungen
+* ----------------------------------------------------------------------
+
+*   ---  Auftrag --------------------------------------------------
+    CALL FUNCTION 'CO_SF_CAUFV_READ'
+         EXPORTING
+              aufnr_imp = process_order
+         IMPORTING
+              caufv_exp = scaufv
+         EXCEPTIONS
+              not_found = 01.
+
+    IF sy-subrc <> 0.
+*     Prozeßauftrag nicht angelegt --> Destinationerror
+      scomh-errkz = ekz_dest_error.
+      MODIFY scomh.
+*     Protokollsatz
+      IF 1 = 0.
+*       Statement für Verwendungsnachweis
+        MESSAGE i346 WITH process_order dest_name.
+*                                     Prozeßauftrag & ist nicht angelegt
+      ENDIF.
+      scomp-msgty = 'I'.
+      scomp-msgid = 'CB'.
+      scomp-msgno = '346'.
+      scomp-msgv1 = process_order.
+      scomp-msgv2 = dest_name.
+      scomp-msgv3 = space.
+      scomp-msgv4 = space.
+      scomp-detlevel = '1'.
+      scomp-probclass = '1'.
+      scomp-msid = scomh-msid.
+      APPEND scomp.
+    ENDIF.
+    CHECK scomh-errkz <> ekz_dest_error.
+
+*   ---- Material und Mengeneinheit prüfen -------------------------
+    CALL FUNCTION 'MATERIAL_UNIT_FIND'
+         EXPORTING
+              kzall = kreuz
+              matnr = material
+              meinh = unit_of_measure
+*             MEINS = E04
+         IMPORTING
+              kzexi = flg-uom_valid
+         TABLES
+              rmmme_itab = rmmme_itab
+         EXCEPTIONS
+              material_not_found = 01.
+
+    IF sy-subrc = 01.
+*     Destinationerror
+      scomh-errkz = ekz_dest_error.
+      MODIFY scomh.
+*     Protokollsatz
+      IF 1 = 0.
+*       Statement für Verwendungsnachweis
+        MESSAGE i503 WITH material dest_name.
+*                                         Material & ist nicht vorhanden
+      ENDIF.
+      scomp-msgty = 'I'.
+      scomp-msgid = 'CB'.
+      scomp-msgno = '503'.
+      scomp-msgv1 = material.
+      scomp-msgv2 = dest_name.
+      scomp-msgv3 = space.
+      scomp-msgv4 = space.
+      scomp-detlevel = '1'.
+      scomp-probclass = '1'.
+      scomp-msid = scomh-msid.
+      APPEND scomp.
+    ENDIF.
+    CHECK scomh-errkz <> ekz_dest_error.
+
+    IF flg-uom_valid <> kreuz.
+*     Destinationerror
+      scomh-errkz = ekz_dest_error.
+      MODIFY scomh.
+*     Protokollsatz
+      IF 1 = 0.
+*       Statement für Verwendungsnachweis
+        MESSAGE i504 WITH unit_of_measure material dest_name.
+*                                    Mengeneinheit & ist
+*                                    für Material & nicht zulässig
+      ENDIF.
+      scomp-msgty = 'I'.
+      scomp-msgid = 'CB'.
+      scomp-msgno = '504'.
+      scomp-msgv1 = unit_of_measure.
+      scomp-msgv2 = material.
+      scomp-msgv3 = dest_name.
+      scomp-msgv4 = space.
+      scomp-detlevel = '1'.
+      scomp-probclass = '1'.
+      scomp-msid = scomh-msid.
+      APPEND scomp.
+    ENDIF.
+    CHECK scomh-errkz <> ekz_dest_error.
+
+*   --- Vorgangsnummer -----------------------------------------------
+    IF flg-operation_included = kreuz.
+      CALL FUNCTION 'CO_SF_AFVG_READ'
+           EXPORTING
+                aufnr_imp = process_order
+                vornr_imp = operation
+           IMPORTING
+                afvc_exp  = safvc
+           EXCEPTIONS
+                not_found = 01.
+
+      IF sy-subrc <> 0.
+*     Vorgangsnummer nicht angelegt --> Destinationerror
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+*     Protokollsatz
+        IF 1 = 0.
+*       Statement für Verwendungsnachweis
+          MESSAGE i509 WITH operation process_order dest_name.
+*                     Empfänger &: Vorgang & im Auftrag & nicht angelegt
+        ENDIF.
+        scomp-msgty = 'I'.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '509'.
+        scomp-msgv1 = operation.
+        scomp-msgv2 = process_order.
+        scomp-msgv3 = dest_name.
+        scomp-msgv4 = space.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+      ENDIF.
+    ENDIF.
+    CHECK scomh-errkz <> ekz_dest_error.
+
+*   --- Phasennummer -----------------------------------------------
+    IF flg-phase_included = kreuz.
+      CALL FUNCTION 'CO_SF_AFVG_READ'
+           EXPORTING
+                aufnr_imp = process_order
+                vornr_imp = phase
+           IMPORTING
+                afvc_exp  = safvc
+           EXCEPTIONS
+                not_found = 01.
+
+      IF sy-subrc <> 0.
+*       Phasennummer nicht angelegt --> Destinationerror
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+*       Protokollsatz
+        IF 1 = 0.
+*         Statement für Verwendungsnachweis
+          MESSAGE i520 WITH phase process_order dest_name.
+*                       Empfänger &: Phase & im Auftrag & nicht angelegt
+        ENDIF.
+        scomp-msgty = 'I'.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '520'.
+        scomp-msgv1 = phase.
+        scomp-msgv2 = process_order.
+        scomp-msgv3 = dest_name.
+        scomp-msgv4 = space.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+      ENDIF.
+    ENDIF.
+    CHECK scomh-errkz <> ekz_dest_error.
+
+*   --- EndausfassungsKZ --------------------------------------------
+    IF flg-final_issue_included = kreuz AND
+      final_issue <> space AND
+      final_issue <> kreuz.
+*     Destinationerror
+      scomh-errkz = ekz_dest_error.
+      MODIFY scomh.
+*     Protokollsatz
+      IF 1 = 0.
+*       Statement für Verwendungsnachweis
+        MESSAGE i508 WITH dest_name.
+*                                    Bitte als Endausfassungskennzeichen
+*                                                'X' oder ' ' eingeben
+      ENDIF.
+      scomp-msgty = 'I'.
+      scomp-msgid = 'CB'.
+      scomp-msgno = '508'.
+      scomp-msgv1 = dest_name.
+      scomp-msgv2 = space.
+      scomp-msgv3 = space.
+      scomp-msgv4 = space.
+      scomp-detlevel = '1'.
+      scomp-probclass = '1'.
+      scomp-msid = scomh-msid.
+      APPEND scomp.
+    ENDIF.
+    CHECK scomh-errkz <> ekz_dest_error.
+
+*   --- Reservierungen lesen -------------------------------------------
+
+    IF flg-res_number_included = kreuz AND
+       flg-res_item_included = kreuz.
+*     Reservierung über Reservierungsnummer lesen
+      CALL FUNCTION 'CO_SF_RESB_READ'
+           EXPORTING
+                aufnr_imp         = process_order
+*               VORNR_IMP         = OPERATION
+                rsnum_imp         = reservation
+                rspos_imp         = reservation_item
+                matnr_imp         = material
+           IMPORTING
+                resb_exp          = sresb
+           EXCEPTIONS
+                missing_parameter = 01
+                not_found         = 02.
+
+      IF sy-subrc <> 0.
+*       Reservierung nicht vorhanden -> Destinationerror
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+*       Protokollsatz
+        IF 1 = 0.
+*         Statement für Verwendungsnachweis
+          MESSAGE i532 WITH reservation reservation_item
+                       process_order dest_name.
+*                          Reservierung & & für Auftrag & nicht angelegt
+        ENDIF.
+        scomp-msgty = 'I'.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '532'.
+        scomp-msgv1 = reservation.
+        scomp-msgv2 = reservation_item.
+        scomp-msgv3 = process_order.
+        scomp-msgv4 = dest_name.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+      ELSEIF sresb-splkz = '1'.
+*       Reservation is a batch totals record -> Destination error
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+*       Log record
+        IF 1 = 0.
+*         Needed for where-used list
+          MESSAGE i548 WITH '&' '&'.
+*       Entnahmebuchung zum Chargensummensatz (Res. &1 &2) nicht möglich
+        ENDIF.
+        scomp-msgty = 'I'.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '548'.
+        scomp-msgv1 = reservation.
+        scomp-msgv2 = reservation_item.
+        scomp-msgv3 = dest_name.
+        scomp-msgv4 = space.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+      ENDIF.
+      CHECK scomh-errkz <> ekz_dest_error.
+    ELSE.
+*     Reservierung nicht in Meldung
+      hlp-subrc = 4.
+
+      IF flg-phase_included = space AND
+         flg-operation_included = space.
+*       Reservierung ohne Vorgang/Phase lesen
+        CALL FUNCTION 'CO_SF_RESB_READ'
+             EXPORTING
+                  aufnr_imp         = process_order
+*                 VORNR_IMP         = OPERATION
+*                 RSNUM_IMP         = RESERVATION
+*                 RSPOS_IMP         = RESERVATION_ITEM
+                  matnr_imp         = material
+             IMPORTING
+                  resb_exp          = sresb
+             TABLES
+                  tresb_exp         = tresb
+             EXCEPTIONS
+                  missing_parameter = 01
+                  not_found         = 02.
+        hlp-subrc = sy-subrc.
+      ENDIF.
+
+      IF flg-phase_included = kreuz.
+*       Reservierung mit Phase lesen
+        CALL FUNCTION 'CO_SF_RESB_READ'
+             EXPORTING
+                  aufnr_imp         = process_order
+                  vornr_imp         = phase
+*                 RSNUM_IMP         = RESERVATION
+*                 RSPOS_IMP         = RESERVATION_ITEM
+                  matnr_imp         = material
+             IMPORTING
+                  resb_exp          = sresb
+             TABLES
+                  tresb_exp         = tresb
+             EXCEPTIONS
+                  missing_parameter = 01
+                  not_found         = 02.
+        hlp-subrc = sy-subrc.
+      ENDIF.
+
+      IF hlp-subrc <> 0 AND flg-operation_included = kreuz.
+*       Reservierung mit Vorgang lesen
+        CALL FUNCTION 'CO_SF_RESB_READ'
+             EXPORTING
+                  aufnr_imp         = process_order
+                  vornr_imp         = operation
+*                 RSNUM_IMP         = RESERVATION
+*                 RSPOS_IMP         = RESERVATION_ITEM
+                  matnr_imp         = material
+             IMPORTING
+                  resb_exp          = sresb
+             TABLES
+                  tresb_exp         = tresb
+             EXCEPTIONS
+                  missing_parameter = 01
+                  not_found         = 02.
+        hlp-subrc = sy-subrc.
+      ENDIF.
+
+      IF hlp-subrc <> 0.
+*       Ungeplante Entnahme => Warnung
+        flg-unplanned_goods_issue = kreuz.
+        scomh-errkz = ekz_dest_warn.
+        MODIFY scomh.
+*       Protokollsatz
+        IF 1 = 0.
+*         Statement für Verwendungsnachweis
+          MESSAGE i510 WITH dest_name.
+*                         Kein Reservierung gemäß Meldungsdaten gefunden
+        ENDIF.
+        scomp-msgty = 'I'.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '510'.
+        scomp-msgv1 = dest_name.
+        scomp-msgv2 = space.
+        scomp-msgv3 = space.
+        scomp-msgv4 = space.
+        scomp-detlevel = '1'.
+        scomp-probclass = '3'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+      ENDIF.
+    ENDIF.
+    CHECK scomh-errkz <> ekz_dest_error.
+
+*   Reservierungsdaten aufbereiten, falls keine ungeplante Entnahme
+    IF flg-unplanned_goods_issue = space.
+
+*     Gefundene Reservierung übernemhmen, falls sie in der Meldung nicht
+*     mitgegeben wurde
+      IF flg-res_number_included = space OR
+         flg-res_item_included = space.
+
+*       No goods movement is allowed for batch totals records
+        DELETE tresb[] WHERE splkz = '1'.
+
+*       Anzahl der gefundenen Reservierungen ermitteln
+        DESCRIBE TABLE tresb LINES hlp-lines.
+
+        IF  hlp-lines = 1.                                  "1642066
+          READ TABLE tresb INDEX 1 INTO sresb.
+        ENDIF.
+
+        CLEAR sy-subrc.
+        IF hlp-lines > 1.
+*         Reservierungsposition konnte nicht eindeutig ermittelt werden
+          scomh-errkz = ekz_dest_warn.
+          MODIFY scomh.
+*         Protokollsatz
+          IF 1 = 0.
+*           Statement für Verwendungsnachweis
+            MESSAGE i519 WITH material dest_name.
+*                                   Reservierungspos. zu
+*                                   Material & nicht eindeutig bestimmba
+          ENDIF.
+          scomp-msgty = 'I'.
+          scomp-msgid = 'CB'.
+          scomp-msgno = '519'.
+          scomp-msgv1 = material.
+          scomp-msgv2 = dest_name.
+          scomp-msgv3 = space.
+          scomp-msgv4 = space.
+          scomp-detlevel = '1'.
+          scomp-probclass = '3'.
+          scomp-msid = scomh-msid.
+          APPEND scomp.
+
+          CLEAR sresb. "Unplanned Goods Issue.
+*         Get the first reservation which has no final issue, is not
+*         backflushed and matches the batch given in PI_CONS message.
+          LOOP AT tresb INTO sresb WHERE kzear = space
+                                     AND rgekz = space
+                                     AND charg = batch.
+            EXIT.
+          ENDLOOP.
+          IF sy-subrc <> 0. "No reservation exists.
+*           Get the first reservation that is not backflushed and
+*           matches the batch given in PI_CONS
+            LOOP AT tresb INTO sresb WHERE rgekz = space
+                                       AND charg = batch.
+              EXIT.
+            ENDLOOP.
+*           No reservation found and the batch is given in PI_CONS
+            IF sy-subrc <> 0 AND NOT batch IS INITIAL.
+              LOOP AT tresb INTO sresb WHERE rgekz = space
+                                         AND charg = space.
+                EXIT.
+              ENDLOOP.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+        IF sy-subrc IS INITIAL. "Matching reservation
+          reservation      = sresb-rsnum.
+          reservation_item = sresb-rspos.
+        ELSE.
+          CLEAR reservation.
+          CLEAR reservation_item.
+        ENDIF.
+
+*       Gefundene Reservierung ins Protokoll schreiben
+        IF 1 = 0.
+*         Statement für Verwendungsnachweis
+          MESSAGE i533 WITH reservation reservation_item.
+*                              Warenausgangsbuchung zu Reservierung & &.
+        ENDIF.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '533'.
+        scomp-msgv1 = reservation.
+        scomp-msgv2 = reservation_item.
+        scomp-msgv3 = space.
+        scomp-msgv4 = space.
+        scomp-msgty = 'I'.
+        scomp-detlevel = '1'.
+        scomp-probclass = '4'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+      ENDIF.
+
+*     Keine weitere Verarbeitung, falls retrograde Entnahme
+*     vorgesehen ist
+      IF NOT sresb-rgekz IS INITIAL.
+*       Status 'Destination Error'.
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+*       Protokollsatz
+        IF 1 = 0.
+*         Statement für Verwendungsnachweis
+          MESSAGE e522 WITH sresb-rsnum sresb-rspos dest_name.
+*                                     Retrograde Entnahme
+*                                     vorgesehen, keine Warenausgangsbuc
+        ENDIF.
+        scomp-msgty = 'E'.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '522'.
+        scomp-msgv1 = sresb-rsnum.
+        scomp-msgv2 = sresb-rspos.
+        scomp-msgv3 = dest_name.
+        scomp-msgv4 = space.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+        CHECK scomh-errkz <> ekz_dest_error.
+      ENDIF.
+
+     IF reservation IS NOT INITIAL.    "Note 1608042
+*     Gefundene Reservierung sperren (nötig da XRERE = SPACE)
+      PERFORM lock_reservation TABLES   scomh scomp
+                               USING    reservation
+                               CHANGING hlp-subrc.
+      CHECK hlp-subrc = 0.
+     ENDIF.
+*     Reservierung nochmals von DB lesen und dabei Konsistenz prüfen
+      IF flg-phase_included = kreuz.
+        l_vornr = phase.
+      ELSEIF flg-operation_included = kreuz.
+        l_vornr = operation.
+      ELSE.
+        CLEAR l_vornr.
+      ENDIF.
+      CALL FUNCTION 'CO_SF_RESB_READ'
+           EXPORTING
+                rsnum_imp         = reservation
+                rspos_imp         = reservation_item
+                matnr_imp         = material
+                vornr_imp         = l_vornr
+                db_read_imp       = on
+           IMPORTING
+                resb_exp          = sresb
+           EXCEPTIONS
+                missing_parameter = 01
+                not_found         = 02.
+      IF sy-subrc <> 0.
+*       Die Parameter in der Prozeßmeldung sind nicht konsistent oder
+*       die RESB wurde nach dem ersten Lesen verändert
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+*       Protokollsatz
+        IF 1 = 0.
+*         Statement für Verwendungsnachweis
+          MESSAGE e510 WITH dest_name.
+*                         Kein Reservierung gemäß Meldungsdaten gefunden
+        ENDIF.
+        scomp-msgty = 'E'.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '510'.
+        scomp-msgv1 = dest_name.
+        scomp-msgv2 = space.
+        scomp-msgv3 = space.
+        scomp-msgv4 = space.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+        CHECK scomh-errkz <> ekz_dest_error.
+      ENDIF.
+    ELSE.
+*     Bei ungeplanter Entnahme darf es kein Reservierungsdaten geben
+      CLEAR: reservation, reservation_item.
+    ENDIF.
+
+*
+*   -------------------------------------------------------------------
+*   Warenausgang für Auftrag buchen
+*   -------------------------------------------------------------------
+
+*   Füllen der Materialbelegkopfstruktur
+    imkpf-bldat = scomh-sedat.
+    imkpf-budat = event_date.
+
+**   Eingabedaten der Materialbelegpositionen
+*    IF flg-unplanned_goods_issue = space.
+**     Übernahme der Reservierungsdaten
+*      MOVE-CORRESPONDING sresb TO imseg.
+*      imseg-mat_kdauf = sresb-kdauf.
+*      imseg-mat_kdpos = sresb-kdpos.
+*    ELSE.
+*     Ungeplante Entnahme (keine Reservierung)
+      imseg-werks = scomh-werk.
+      imseg-bwart = '531'."bwart_order_from_wh.
+*    ENDIF.
+
+*   Assign Special stock indicator
+    IF NOT special_stock IS INITIAL.
+      imseg-sobkz = special_stock.
+    ENDIF.
+
+* Assign Vendor                                                 "CJ 4.6C
+    IF NOT vendor IS INITIAL.
+       imseg-lifnr = vendor.
+    ENDIF.
+
+*   Umrechnungsfaktoren zu Mengeneinheit übernehmen
+    LOOP AT rmmme_itab
+     WHERE
+      meinh = unit_of_measure.
+      imseg-umrez = rmmme_itab-umrez.
+      imseg-umren = rmmme_itab-umren.
+      EXIT.
+    ENDLOOP.
+
+*     Ist Herstelldatum zu übergeben?
+*     Is there a production date to pass?
+      CALL FUNCTION 'MARA_SINGLE_READ'
+           EXPORTING
+                matnr             = material
+           IMPORTING
+                wmara             = wmara
+           EXCEPTIONS
+*               LOCK_ON_MATERIAL  = 1
+*               LOCK_SYSTEM_ERROR = 2
+*               WRONG_CALL        = 3
+                not_found         = 4.
+*               OTHERS            = 5.
+
+      IF sy-subrc = 04.
+*        Destinationerror
+        scomh-errkz = ekz_dest_error.
+        MODIFY scomh.
+*       Protokollsatz
+        IF 1 = 0.
+*         Statement für Verwendungsnachweis
+          MESSAGE i503 WITH material dest_name.
+*   Material & ist nicht vorhanden
+*   Material & does not exist
+        ENDIF.
+        scomp-msgty = 'I'.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '503'.
+        scomp-msgv1 = material.
+        scomp-msgv2 = dest_name.
+        scomp-msgv3 = space.
+        scomp-msgv4 = space.
+        scomp-detlevel = '1'.
+        scomp-probclass = '1'.
+        scomp-msid = scomh-msid.
+        APPEND scomp.
+      ENDIF.
+      CHECK scomh-errkz <> ekz_dest_error.
+
+*  EVENT_DATE ist als Herstelldatum zu übergeben, wenn Gesamthaltbar-
+*  keit im Materialstamm gepflegt ist.
+     IF NOT wmara-mhdhb IS INITIAL.
+        imseg-mhdat = event_date.
+     ENDIF.
+
+    CLEAR imseg-kzvbr.
+    imseg-aufnr = process_order.
+*   IMSEG-KZBEW = KZBEW_F.    "=> wird nur bei Zugangsbuchung gesetzt
+    imseg-erfmg = quantity_consumed.
+    imseg-erfme = unit_of_measure.
+    imseg-matnr = material.
+    IF flg-loc_included = kreuz.
+*     Lagerort in Meldung => Vorschlagslagerort d. Auftr.pos. wird
+*     überschreiben
+      imseg-lgort = storage_location.
+    ENDIF.
+    IF flg-batch_included = kreuz.
+*     Charge in Meldung => Vorschlagscharge d. Auftr.pos. wird
+*     überschreiben
+      imseg-charg = batch.
+    ENDIF.
+    imseg-rsnum = reservation.
+    imseg-rspos = reservation_item.
+    imseg-kzear = final_issue.
+
+    TRY.
+*     Assign current user to IMKPF structure
+      GET BADI lo_badi_cocb_msd.
+      CALL BADI lo_badi_cocb_msd->set_user_for_mat_conf
+        EXPORTING
+          is_comh    = scomh
+          is_imkpf   = imkpf
+          is_imseg   = imseg
+        CHANGING
+          cv_mat_conf_creator  = imkpf-usnam.
+*     Avoid empty user name field
+      IF imkpf-usnam IS INITIAL.
+        imkpf-usnam = sy-uname.
+      ENDIF.
+      CATCH cx_badi.
+    ENDTRY.
+
+    APPEND imseg.
+
+*   flag optimistischerweise auf O.K. setzen:
+    goods_movement_ok = 'X'.
+
+    CALL FUNCTION 'MB_CREATE_GOODS_MOVEMENT'
+         EXPORTING
+              imkpf = imkpf
+              xallp = ' '
+              xallr = 'X'
+              ctcod = tcode_cons
+         IMPORTING
+              emkpf = emkpf
+         TABLES
+              emseg = emseg
+              imseg = imseg.
+
+*   Die zu buchende Position war in Ordnung ==> emkpf-subrc = 1.
+    IF emkpf-subrc = 1.
+      CALL FUNCTION 'MB_POST_GOODS_MOVEMENT'
+           IMPORTING
+                emkpf  = emkpf
+           EXCEPTIONS
+                OTHERS = 0.
+*     Fehler im mb_post......
+      IF emkpf-subrc NE 0.
+        CLEAR goods_movement_ok.
+      ENDIF.
+    ELSE.
+*     Die zu buchende Position war nicht in Ordnung
+      CLEAR goods_movement_ok.
+    ENDIF.
+
+    IF goods_movement_ok IS INITIAL.
+
+*       Sperrproblem?
+      IF emkpf-xmsgx = on.
+*        Fehler aufgrund von Sperreen --> Temp.Fehler
+        scomh-errkz = ekz_dest_temp.
+      ELSE.
+*         Fehler bei Erzeugen des Warenzugangs --> Destinationerror
+        scomh-errkz = ekz_dest_error.
+      ENDIF.
+      MODIFY scomh.
+
+      IF NOT emkpf-msgid IS INITIAL AND
+         NOT emkpf-msgno IS INITIAL.
+*       Fehlermeldung in Protokoll übernehemen
+        MOVE-CORRESPONDING emkpf TO scomp.
+      ELSE.
+*       Eigene Fehlermeldung
+        IF 1 = 0.
+*         Statement für Verwendungsnachweis
+          MESSAGE i506 WITH dest_name.
+*                                        Fehler bei Warenausgangsbuchung
+        ENDIF.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '506'.
+        scomp-msgv1 = dest_name.
+        scomp-msgv2 = space.
+        scomp-msgv3 = space.
+        scomp-msgv4 = space.
+      ENDIF.
+      scomp-msgty = 'I'.
+      scomp-detlevel = '1'.
+      scomp-probclass = '1'.
+      scomp-msid = scomh-msid.
+      APPEND scomp.
+    ENDIF.
+
+    LOOP AT imseg
+      WHERE
+        beakz IS INITIAL.
+      hlp-index = sy-tabix.
+      READ TABLE emseg INDEX hlp-index.
+
+*     Protokolleintrag
+      IF NOT emseg-msgid IS INITIAL AND
+         NOT emseg-msgno IS INITIAL.
+*       Fehlermeldung in Protokoll übernehemen
+        MOVE-CORRESPONDING emseg TO scomp.
+      ELSEIF scomh-errkz <> ekz_dest_error.
+*       Eigene Fehlermeldung (wird nur geschrieben, wenn nicht
+*       bereits bei Behandlung von EMKPF-SUBRC <> 0 eine Fehlermeldung
+*       geschrieben wurde.
+        IF 1 = 0.
+*         Statement für Verwendungsnachweis
+          MESSAGE i506 WITH dest_name.
+*                                       Fehler bei Warenausgangsbuchung
+        ENDIF.
+        scomp-msgty = 'I'.
+        scomp-msgid = 'CB'.
+        scomp-msgno = '506'.
+        scomp-msgv1 = dest_name.
+        scomp-msgv2 = space.
+        scomp-msgv3 = space.
+        scomp-msgv4 = space.
+      ENDIF.
+      scomp-msgty = 'I'.
+      scomp-detlevel = '1'.
+      scomp-probclass = '1'.
+      scomp-msid = scomh-msid.
+      APPEND scomp.
+
+*     Fehlerstatus der Meldung setzten
+      IF emseg-xmsgx = on.
+*       Fehler aufgrund von Sperreen --> Temp.Fehler
+        scomh-errkz = ekz_dest_temp.
+      ELSE.
+*       Fehler bei Erzeugen des Warenzugangs --> Destinationerror
+        scomh-errkz = ekz_dest_error.
+      ENDIF.
+      MODIFY scomh.
+
+    ENDLOOP.
+    CHECK scomh-errkz <> ekz_dest_error AND
+          scomh-errkz <> ekz_dest_temp.
+
+    IF lo_badi_cocb_msd IS BOUND AND
+      goods_movement_ok = 'X'.
+*     Reduce buffer table content
+      CALL BADI lo_badi_cocb_msd->remove_entry_buf_comh_imseg
+        EXPORTING
+          is_comh = scomh.
+    ENDIF.
+
+*   Erzeugter Materialbeleg als Info ins Protokoll
+    PERFORM scomp_append_with_mat_doc
+      USING
+        emkpf-mblnr
+        scomh-msid
+      CHANGING
+        scomp.
+    APPEND scomp.
+
+  ENDLOOP.
+
+ENDFUNCTION.

@@ -1,0 +1,394 @@
+FUNCTION zswm_create_id_f_od.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(TCODE) TYPE  TCODE OPTIONAL
+*"     VALUE(UNAME) TYPE  SY-UNAME DEFAULT SY-UNAME
+*"     VALUE(OPERARIO) TYPE  ZLNUM_OPER OPTIONAL
+*"     VALUE(TKNUM) TYPE  TKNUM OPTIONAL
+*"     VALUE(TT_PEDIDOS) TYPE  ZST_RF_EM_PO_TT
+*"     VALUE(TT_PICKING) TYPE  ZSEWM_DATOS_UI5_PICKING_TT
+*"     VALUE(VERUR) TYPE  VERUR_VL
+*"     VALUE(NO_GEN_LOG) TYPE  FLAG OPTIONAL
+*"  EXPORTING
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_TT
+*"     VALUE(VBELN) TYPE  VBELN_VL
+*"----------------------------------------------------------------------
+
+  DATA: lt_pedidos      TYPE zst_rf_em_po_tt,
+        lt_pick         TYPE zsewm_datos_ui5_picking_tt,
+        lt_pick_collect TYPE zsewm_datos_ui5_picking_tt.
+
+  DATA: l_vbeln      TYPE vbeln_vl,
+        l_rfpos      TYPE rfpos_vl,
+        l_lifnr      TYPE lifnr,
+        l_num_bultos TYPE i,
+        l_msgno      TYPE sy-msgno.
+
+  DATA: ls_vbsk    TYPE vbsk,
+        ls_komdlgn TYPE komdlgn,
+        ls_vbfs    TYPE vbfs,
+        ls_vbls    TYPE vbls,
+        ls_verko   TYPE verko,
+        ls_verpo   TYPE verpo,
+        lt_komdlgn TYPE TABLE OF komdlgn,
+        lt_vbfs    TYPE TABLE OF vbfs,
+        lt_vbls    TYPE TABLE OF vbls,
+        lt_verko   TYPE TABLE OF verko,
+        lt_verpo   TYPE TABLE OF verpo.
+
+  DATA: lt_lenum  TYPE zswm_print_exidv_lenum_tt,
+        ls_lenum  TYPE zswm_print_exidv_lenum_scr,
+        l_num_reg TYPE i,
+        l_num_exi TYPE i,
+        l_num_vec TYPE i.
+
+  DATA: BEGIN OF lt_lotes OCCURS 0,
+          ebeln LIKE ekko-ebeln,
+          ebelp LIKE ekpo-ebelp,
+          vbeln LIKE lips-vbeln,
+          posnr LIKE lips-posnr,
+          matnr LIKE mara-matnr,
+          charg LIKE eket-charg,
+          werks LIKE ekpo-werks,
+          lifnr LIKE lfa1-lifnr,
+          licha LIKE mch1-licha,
+          hsdat LIKE mch1-hsdat,
+          vfdat LIKE mch1-vfdat,
+          xchpf LIKE mara-xchpf,
+        END OF lt_lotes.
+
+  REFRESH lt_lotes[].
+
+  lt_pedidos = tt_pedidos.
+  lt_pick = tt_picking.
+
+  DATA: l_menge TYPE menge_d.
+
+  LOOP AT lt_pedidos ASSIGNING FIELD-SYMBOL(<fs_pedidos>).
+    DATA(idx_ped) = sy-tabix.
+
+    l_menge = 0.
+
+    CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+      EXPORTING
+        input        = <fs_pedidos>-matnr
+      IMPORTING
+        output       = <fs_pedidos>-matnr
+      EXCEPTIONS
+        length_error = 1
+        OTHERS       = 2.
+
+    LOOP AT lt_pick ASSIGNING FIELD-SYMBOL(<fs_pick>) WHERE ebeln EQ <fs_pedidos>-ebeln
+                                                        AND ebelp EQ <fs_pedidos>-ebelp
+                                                        AND vbeln EQ <fs_pedidos>-vbeln
+                                                        AND posnr EQ <fs_pedidos>-posnr.
+      DATA(idx_pic) = sy-tabix.
+
+      CLEAR: <fs_pick>-exidv, <fs_pick>-etenr, <fs_pick>-nlpla.
+
+      CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+        EXPORTING
+          input        = <fs_pick>-matnr
+        IMPORTING
+          output       = <fs_pick>-matnr
+        EXCEPTIONS
+          length_error = 1
+          OTHERS       = 2.
+
+      ADD  <fs_pick>-menge_pick  TO l_menge.
+      CHECK <fs_pick>-menge_pick > 0.
+
+      READ TABLE lt_lotes WITH KEY ebeln = <fs_pick>-ebeln
+                                   ebelp = <fs_pick>-ebelp
+                                   vbeln = <fs_pick>-vbeln
+                                   posnr = <fs_pick>-posnr.
+      IF sy-subrc NE 0.
+        CLEAR lt_lotes.
+        lt_lotes-ebeln = <fs_pick>-ebeln.
+        lt_lotes-ebelp = <fs_pick>-ebelp.
+        lt_lotes-vbeln = <fs_pick>-vbeln.
+        lt_lotes-posnr = <fs_pick>-posnr.
+        lt_lotes-matnr = <fs_pick>-matnr.
+        lt_lotes-charg = <fs_pick>-charg.
+
+        SELECT SINGLE werks INTO lt_lotes-werks FROM ekpo WHERE ebeln EQ <fs_pick>-ebeln
+                                                            AND ebelp EQ <fs_pick>-ebelp.
+
+        SELECT SINGLE xchpf INTO lt_lotes-xchpf FROM marc WHERE matnr EQ lt_lotes-matnr
+                                                            AND werks EQ lt_lotes-werks.
+
+        SELECT SINGLE lifnr INTO t_lotes-lifnr FROM ekko WHERE ebeln EQ <fs_pick>-ebeln.
+
+        APPEND lt_lotes.
+      ENDIF.
+
+      COLLECT <fs_pick> INTO lt_pick_collect.  "Un registro por lote
+    ENDLOOP.
+
+    <fs_pedidos>-menge_pick = l_menge.
+  ENDLOOP.
+
+  DELETE lt_pedidos WHERE menge_pick <= 0.
+  DELETE lt_pick WHERE menge_pick <= 0.
+
+  IF lt_pick_collect IS INITIAL.
+    MOVE abap_true TO error.
+    READ TABLE tt_pedidos INTO DATA(ls_pedido) INDEX 1.
+    PERFORM mensaje USING 'E' 'ZSWM_UI5' '043' ls_pedido-ebeln space space space CHANGING tt_log[].
+  ENDIF.
+
+  IF error NE abap_true.
+
+    PERFORM crear_lotes TABLES lt_lotes CHANGING error tt_log_global.
+
+    IF error NE abap_true.
+      CLEAR l_rfpos.
+      l_vbeln = '$       1'.
+
+      LOOP AT lt_pick_collect INTO DATA(ls_picking).
+        ADD 1 TO l_rfpos.
+
+        IF l_lifnr IS INITIAL.
+          SELECT SINGLE lifnr INTO l_lifnr FROM ekko WHERE ebeln = ls_picking-ebeln.
+        ENDIF.
+
+        CLEAR ls_komdlgn.
+        ls_komdlgn-rfbel = l_vbeln.
+        ls_komdlgn-lfdat = sy-datum.
+        ls_komdlgn-posnr = l_rfpos * 10.
+        ls_komdlgn-rfpos = l_rfpos.
+
+        ls_komdlgn-lifnr = l_lifnr.
+        ls_komdlgn-verur = ls_komdlgn-lifex = verur.
+        ls_komdlgn-arktx = ls_picking-maktx.
+        ls_komdlgn-matnr = ls_picking-matnr.
+        ls_komdlgn-lfart = 'EL'.
+        READ TABLE lt_lotes WITH KEY ebeln = ls_picking-ebeln
+                                     ebelp = ls_picking-ebelp
+                                     vbeln = ls_picking-vbeln
+                                     posnr = ls_picking-posnr.
+
+        IF sy-subrc EQ 0 AND lt_lotes-xchpf EQ abap_true.
+          ls_komdlgn-charg = lt_lotes-charg.
+        ENDIF.
+
+        SELECT SINGLE * INTO @DATA(ls_ekpo) FROM ekpo WHERE ebeln EQ @ls_picking-ebeln
+                                                        AND ebelp EQ @ls_picking-ebelp.
+        ls_komdlgn-lfimg = ls_picking-menge_pick.
+        ls_komdlgn-uebtk = ls_ekpo-uebtk.
+        ls_komdlgn-uebto = ls_ekpo-uebto.
+        ls_komdlgn-untto = ls_ekpo-untto.
+        ls_komdlgn-werks = ls_ekpo-werks.
+        ls_komdlgn-lgort = ls_ekpo-lgort.
+        ls_komdlgn-vrkme = ls_ekpo-meins.
+        ls_komdlgn-meins = ls_ekpo-lmein.
+        ls_komdlgn-umvkz = ls_ekpo-umrez.
+        ls_komdlgn-umvkn = ls_ekpo-umren.
+        ls_komdlgn-vgbel = ls_ekpo-ebeln.
+        ls_komdlgn-vgpos = ls_ekpo-ebelp.
+        ls_komdlgn-vgtyp = 'V'.
+        ls_komdlgn-kzazu = 'X'.
+
+        APPEND ls_komdlgn TO lt_komdlgn.
+
+        LOOP AT tt_picking INTO DATA(ls_picking_det) WHERE ebeln EQ ls_picking-ebeln
+                                                       AND ebelp EQ ls_picking-ebelp
+                                                       AND vbeln EQ ls_picking-vbeln
+                                                       AND posnr EQ ls_picking-posnr
+                                                       AND charg EQ ls_picking-charg.
+          CLEAR ls_verko.
+          ADD 1 TO l_num_bultos.
+
+          IF ls_picking_det-exidv IS NOT INITIAL.
+            ls_picking_det-exidv = |{ ls_picking_det-exidv ALPHA = IN }|.
+            UPDATE vekp SET status = '0060' WHERE exidv = ls_picking_det-exidv.
+            ls_picking_det-exidv = |{ ls_picking_det-exidv ALPHA = OUT }|.
+          ENDIF.
+
+          ls_verko-exidv = ls_picking_det-exidv.
+          ls_verko-exidv2 = ls_picking_det-nlpla.
+          ls_verko-exida = 'A'.
+
+          CALL FUNCTION 'ZSWM_UI5_GET_VHILM'
+            EXPORTING
+              matnr = ls_picking-matnr
+              werks = ls_ekpo-werks
+              charg = ls_picking-charg
+              vbtyp = '7'
+            IMPORTING
+              vhilm = ls_verko-vhilm.
+
+          APPEND ls_verko TO lt_verko.
+
+          CLEAR ls_verpo.
+          ls_verpo-exidv_ob = ls_verpo-exidv = ls_picking_det-exidv.
+          ls_verpo-velin = '1'.
+          ls_verpo-vbeln = ls_verpo-rfbel = l_vbeln.
+          ls_verpo-rfpos = l_rfpos.
+          ls_verpo-posnr = l_rfpos * 10.
+          ls_verpo-tmeng = ls_picking_det-menge_pick.
+          ls_verpo-matnr = ls_picking-matnr.
+          ls_verpo-bestq = ls_picking-bestq.
+          ls_verpo-sobkz = ls_picking-sobkz.
+          ls_verpo-sonum = ls_picking-sonum.
+          ls_verpo-vrkme = ls_ekpo-meins.
+          ls_verpo-werks = ls_ekpo-werks.
+          ls_verpo-lgort = ls_ekpo-lgort.
+
+          READ TABLE lt_lotes WITH KEY ebeln = ls_picking-ebeln
+                                       ebelp = ls_picking-ebelp
+                                       vbeln = ls_picking-vbeln
+                                       posnr = ls_picking-posnr.
+
+          IF sy-subrc EQ 0 AND lt_lotes-xchpf EQ abap_true.
+            ls_verpo-charg = lt_lotes-charg.
+          ENDIF.
+
+          APPEND ls_verpo TO lt_verpo.
+        ENDLOOP.
+      ENDLOOP.
+
+      ls_vbsk-mandt = sy-mandt.
+      ls_vbsk-ernam = sy-uname.
+      ls_vbsk-erdat = sy-datum.
+      ls_vbsk-uzeit = sy-uzeit.
+      ls_vbsk-smart = 'L'.
+
+      CALL FUNCTION 'GN_DELIVERY_CREATE'
+        EXPORTING
+          vbsk_i   = ls_vbsk
+        IMPORTING
+          vbsk_e   = ls_vbsk
+        TABLES
+          xkomdlgn = lt_komdlgn
+          xvbfs    = lt_vbfs
+          xvbls    = lt_vbls
+          xverko   = lt_verko
+          xverpo   = lt_verpo
+        EXCEPTIONS
+          OTHERS   = 1.
+
+      LOOP AT lt_vbfs INTO ls_vbfs WHERE msgty EQ 'E'
+                                      OR msgty EQ 'A'.
+        MOVE abap_true TO error.
+        MOVE ls_vbfs-msgno TO l_msgno.
+        PERFORM mensaje USING  ls_vbfs-msgty ls_vbfs-msgid l_msgno ls_vbfs-msgv1 ls_vbfs-msgv2 ls_vbfs-msgv3 ls_vbfs-msgv4 CHANGING tt_log_global[].
+      ENDLOOP.
+
+      IF sy-subrc EQ 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = abap_true.
+
+        READ TABLE lt_vbls INTO ls_vbls INDEX 1.
+
+        SELECT SINGLE vbeln INTO @DATA(l_vbeln_id)
+          FROM lips BYPASSING BUFFER
+          WHERE vbeln EQ @ls_vbls-vbeln_lif.
+
+        IF tknum IS NOT INITIAL.
+          CALL FUNCTION 'ZSWM_ADD_DELV_TO_SHIPMENT_UI5'
+            EXPORTING
+              tcode    = tcode
+              uname    = uname
+              operario = operario
+              tknum    = tknum
+              vbeln    = l_vbeln_id
+            IMPORTING
+              error    = error
+              tt_log   = tt_log_global.
+        ENDIF.
+
+        IF error NE abap_true.
+          CALL FUNCTION 'ZSWM_POST_ID_DELIVERY'
+            EXPORTING
+              tcode                = tcode
+              uname                = uname
+              vbeln                = l_vbeln_id
+              operario             = operario
+              tknum                = tknum
+              num_bultos           = l_num_bultos
+              no_cerrar_transporte = abap_true
+              no_gen_log           = abap_true
+            IMPORTING
+              error                = error
+              tt_log               = tt_log_global.
+
+          IF error NE abap_true  AND tcode EQ c_entrada_con_ree.
+
+            REFRESH lt_lenum. CLEAR ls_lenum.
+
+            LOOP AT lt_pick INTO ls_picking_det.
+              ls_lenum-lenum = ls_picking_det-exidv.
+              COLLECT ls_lenum INTO lt_lenum.
+            ENDLOOP.
+
+            DESCRIBE TABLE lt_lenum LINES l_num_reg.
+            l_num_exi = l_num_vec = 0.
+            DO 5 TIMES.
+
+              l_num_vec = sy-index.
+              l_num_exi = 0.
+
+              WAIT UP TO 1 SECONDS.
+
+              LOOP AT lt_lenum INTO ls_lenum.
+                SELECT SINGLE COUNT( * )
+                  FROM lein BYPASSING BUFFER
+                  WHERE lenum EQ ls_lenum.
+
+                CHECK sy-subrc EQ 0.
+                ADD 1 TO l_num_exi.
+              ENDLOOP.
+
+              CHECK l_num_exi EQ l_num_reg.
+              EXIT.
+            ENDDO.
+
+            IF sy-subrc EQ 0.
+              CALL FUNCTION 'ZSWM_PRINT_EXIDV'
+                EXPORTING
+                  tcode    = tcode
+                  uname    = uname
+                  operario = operario
+                  tt_lenum = lt_lenum
+                  mvttype  = 'A'
+                IMPORTING
+                  error    = error
+                  tt_log   = tt_log_global.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  tt_log[] = tt_log_global[].
+
+  CHECK no_gen_log NE abap_true.
+
+  DATA(l_fval) = CONV bdc_fval( verur ).
+
+  SELECT SINGLE * INTO @DATA(reg_wkqu)
+    FROM lrf_wkqu
+    WHERE bname EQ @uname
+      AND statu EQ 'X'.
+
+  CALL METHOD zcl_ui5_log=>save_log
+    EXPORTING
+      mf         = 'ZSWM_CREATE_ID_F_OD'
+      uname      = uname
+      tcode      = tcode
+      error      = error
+      lgnum      = reg_wkqu-lgnum
+      operario   = operario
+      fieldname  = 'VERUR'
+      fval       = l_fval
+      tknum      = tknum
+      tt_log     = tt_log
+      commit     = 'X'
+      tt_pedidos = tt_pedidos
+      tt_picking = tt_picking.
+ENDFUNCTION.

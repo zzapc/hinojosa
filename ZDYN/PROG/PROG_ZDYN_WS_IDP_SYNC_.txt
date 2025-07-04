@@ -1,0 +1,154 @@
+*&---------------------------------------------------------------------*
+*& Report  ZDYN_WS_IDP_SYNC
+*&
+*&---------------------------------------------------------------------*
+*&  Synchronize data between Routty IDP and SAP
+*&  Get output documents
+*&  Send master data and document data updates
+*&---------------------------------------------------------------------*
+REPORT zdyn_ws_idp_sync.
+
+INCLUDE zdyn_ws_idp_sync_top.
+INCLUDE zdyn_ws_idp_sync_sel.
+INCLUDE zdyn_ws_idp_sync_f01.
+
+INITIALIZATION.
+  gc_tcode = con_ta_main.
+  PERFORM authority_check.
+  CLEAR gc_tcode.
+
+  CREATE OBJECT go_file.
+
+
+START-OF-SELECTION.
+
+  CLEAR: gt_messages, gc_log_object, gc_log_subobject.
+
+* take care that there is only one combination of apikey, username and bukrs
+  SELECT SINGLE * FROM zdyn_idp_tgen INTO CORRESPONDING FIELDS OF gst_config
+                  WHERE sysid    = sy-sysid
+                    AND username = puser.
+  IF sy-subrc = 0.
+    gs_user = gst_config-username.
+
+    gs_pw = gst_config-password.
+    gs_pw_clear = gs_pw.
+*    gs_pw_clear = cl_http_utility=>if_http_utility~decode_base64( encoded = gs_pw ).
+  ELSE.
+    WRITE: 'Configuration missing'(cfg).
+    EXIT.
+  ENDIF.
+
+  gst_config-skip_http_test   = prt_http.
+  gst_config-skip_attach_add  = prt_satt.
+
+* now dynamic class generation.
+  IF NOT gst_config-clsname IS INITIAL.
+    TRY.
+        CREATE OBJECT go_rest TYPE (gst_config-clsname)
+          EXPORTING
+            ist_config = gst_config.
+    ENDTRY.
+  ENDIF.
+  IF go_rest IS NOT BOUND.
+    CREATE OBJECT go_rest
+      EXPORTING
+        ist_config = gst_config.
+  ENDIF.
+
+  zdyn_lic_cl_checker=>check_license( EXPORTING ic_product       = con_lic_component
+                                      IMPORTING eb_license_valid = gb_ok
+                                      CHANGING  ct_messages      = gt_messages ).
+  IF gb_ok EQ abap_false.
+    gt_msg = go_rest->map_bapiret2_to_bal( gt_messages ).
+
+    go_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+                                   ic_log_subobject = gc_log_subobject
+                                   ic_extnumber     = 'License test'(lic)
+                                   it_msg           = gt_msg
+                           EXCEPTIONS OTHERS        = 0 ).
+    RETURN.
+  ENDIF.
+
+  IF pauth = abap_true OR prf_file = abap_false OR
+    ( prf_file = abap_true AND prt_http = abap_false ).
+    go_rest->prepare_client( EXCEPTIONS OTHERS = 1 ).
+    IF sy-subrc <> 0.
+      go_rest->log_write( EXPORTING  ic_log_object     = gc_log_object
+                                     ic_log_subobject  = gc_log_subobject
+                                     ic_extnumber      = 'Communication'(com)
+                                     ii_level          = pmsglv
+                              EXCEPTIONS OTHERS            = 0 ).
+      RETURN.
+    ENDIF.
+
+    gb_ok = go_rest->authenticate( is_user     = gs_user
+                                   is_password = gs_pw_clear
+                                   ib_test     = pauth ).
+    IF pauth = abap_true OR gb_ok EQ abap_false.
+      go_rest->log_write( EXPORTING  ic_log_object     = gc_log_object
+                                     ic_log_subobject  = gc_log_subobject
+                                     ic_extnumber      = 'Communication'(com)
+                                     ii_level          = pmsglv
+                              EXCEPTIONS OTHERS            = 0 ).
+      RETURN.
+    ENDIF.
+  ENDIF.
+********************************************************************************************
+* Get Metadata and show it on the screen
+  IF pmeta = abap_true.
+
+    IF gs_doctype IS INITIAL.
+      gs_doctype = go_rest->get_current_doctype( ).
+    ENDIF.
+    IF gt_metadata IS INITIAL.
+      gt_metadata = go_rest->get_metadata_doctype(
+                             EXPORTING ii_doctype = gs_doctype-documenttypeid ).
+    ENDIF.
+
+*  Now the output - should be improved later on
+    IF gt_metadata IS NOT INITIAL.
+      PERFORM output_metadata.
+    ENDIF.
+
+  ENDIF.
+********************************************************************************************
+* Output documents (Invoices)
+  IF pidp = abap_true.
+
+    gb_ok = go_rest->mo_access_protection->set_for_doc_receive( ic_module = zdyn_if_product_info=>con_module_idp
+                                                                ).
+    IF gb_ok = abap_false.
+      PERFORM lock_msg.
+      RETURN.
+    ENDIF.
+
+*   If the 'read from' file is selected, the data will be taken from that file and transferred to SAP.
+*   If the 'receive to' file is selected, the data will be received from RSO and stored in the local machine.
+    go_rest->mo_file->set_doc_file_params( EXPORTING ib_doc_to_file  = prt_file
+                                                         is_doc_pathname = prt_path
+                                                         ib_file_to_doc  = prf_file
+                                                         is_doc_filename = prf_fnam ).
+    go_rest->inbound_process( ic_xslt          = gst_config-xslt
+                              ib_skip_feedback = prt_fdbk ).
+
+    gt_messages_full = zdyn_cl_msg=>get_messages_full( ib_skip_duplicates = abap_false
+                                                       ii_level           = pmsglv ).
+    IF NOT gt_messages_full IS INITIAL.
+      IF papplg = abap_true.
+        gc_log_object    = con_log_object.
+        gc_log_subobject = con_log_subobject_document.
+      ENDIF.
+      go_rest->log_write( EXPORTING  ic_log_object    = gc_log_object
+                                     ic_log_subobject = gc_log_subobject
+                                     ic_extnumber     = 'IDP output documents'(o19)
+                                     it_msg_full      = gt_messages_full
+                          EXCEPTIONS OTHERS           = 0 ).
+    ENDIF.
+  ENDIF.
+
+*********************************************************************************************
+
+  go_rest->mo_access_protection->unset( ).
+
+*********************************************************************************************

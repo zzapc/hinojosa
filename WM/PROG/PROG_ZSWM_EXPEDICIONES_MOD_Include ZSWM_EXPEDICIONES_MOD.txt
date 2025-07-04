@@ -1,0 +1,238 @@
+*----------------------------------------------------------------------*
+***INCLUDE ZSWM_EXPEDICIONES_MOD.
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0100  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE status_0100 OUTPUT.
+  SET TITLEBAR '0600'.
+  SET PF-STATUS 'MAIN'.
+  variant-report = sy-repid.
+  variant-handle = 'TRA3'.
+  variant-variant = p_varian.
+
+  PERFORM load_data_into_grid TABLES tt_transportes[]
+                              USING 'CC_ALV_TRA' variant 'ZSWM_DATA_INCL_TRANSPORTES_STR'
+                              CHANGING g_custom_container alv_tra gs_layout gt_fieldcatalog funciones.
+
+  variant-report = sy-repid.
+  variant-handle = 'ENTR'.
+  variant-variant = p_varian.
+
+  PERFORM load_data_into_grid TABLES tt_head
+                              USING 'CC_ENTREGAS' variant 'ZSWM_GET_ENTREGAS_HEAD_UI5_STR'
+                              CHANGING g_custom_container alv_ent gs_layout gt_fieldcatalog funciones.
+
+  variant-report = sy-repid.
+  variant-handle = 'POSI'.
+  variant-variant = p_varian.
+
+  PERFORM load_data_into_grid TABLES tt_entre
+                              USING 'CC_POSICIONES' variant 'ZSWM_GET_ENTREGAS_UI5_STR'
+                              CHANGING g_custom_container alv_posi gs_layout gt_fieldcatalog funciones.
+
+  variant-report = sy-repid.
+  variant-handle = 'STOC'.
+  variant-variant = p_varian.
+
+  PERFORM load_data_into_grid TABLES tt_stock
+                              USING 'CC_STOCK' variant 'ZSWM_UI5_STOCK_AND_PICKING_SC2'
+                              CHANGING g_custom_container alv_stock gs_layout gt_fieldcatalog funciones.
+  variant-report = sy-repid.
+  variant-handle = 'PICK'.
+  variant-variant = p_varian.
+
+  PERFORM load_data_into_grid TABLES tt_picking
+                              USING 'CC_PICKING' variant 'ZSWM_UI5_STOCK_AND_PICKING_SCR'
+                              CHANGING g_custom_container alv_picking gs_layout gt_fieldcatalog funciones.
+  LOOP AT SCREEN.
+    CASE screen-name.
+      WHEN 'B_CHANGE'.
+        CHECK zswm_get_entregas_ui5_str-kcmeng >= zswm_get_entregas_ui5_str-menge_hasta.
+        screen-input = 0.
+      WHEN 'BARCODE02'.
+        IF zswm_get_entregas_ui5_str-poscc NE abap_true.
+          screen-input = 0.
+        ELSEIF zswm_get_entregas_ui5_str-status < '30'.
+          screen-input = 0.
+
+        ENDIF.
+      WHEN 'BARCODE01'.
+        IF zswm_get_entregas_ui5_str-status < '30'
+        AND zswm_get_entregas_ui5_str-status > '10'.
+          screen-input = 0.
+        ENDIF.
+    ENDCASE.
+    MODIFY SCREEN.
+  ENDLOOP.
+
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  EXIT_0100  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE exit_0100 INPUT.
+  SET SCREEN 0. LEAVE SCREEN.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0100 INPUT.
+  CASE sy-ucomm.
+    WHEN 'REFRESCAR'.
+      CLEAR sw_selecc.
+      PERFORM get_data TABLES tt_transportes USING p_lgnum p_uname sw_selecc.
+    WHEN 'B_CLOSE_DEL'.
+      CALL METHOD alv_ent->get_selected_rows
+        IMPORTING
+          et_index_rows = DATA(t_rows).
+
+      DATA: tt_log_total TYPE bapiret2_t,
+            tt_log       TYPE bapiret2_t,
+            error        TYPE flag.
+      CLEAR tt_log_total[].
+      LOOP AT t_rows INTO DATA(l_rows).
+        READ TABLE tt_entre INTO DATA(rt_entre) INDEX l_rows-index.
+        CHECK sy-subrc EQ 0.
+
+        DATA: lv_permitir_exceso TYPE flag.
+        IF rt_entre-vbeln IS NOT INITIAL.
+          SELECT SINGLE likp~vbeln, likp~vstel, lips~posnr, lips~werks
+            INTO @DATA(ls_lips)
+            FROM likp
+            INNER JOIN lips ON likp~vbeln = lips~vbeln
+            WHERE likp~vbeln = @rt_entre-vbeln.
+          IF sy-subrc = 0.
+            SELECT SINGLE *
+              INTO @DATA(ls_toler)
+              FROM zsd_excl_tolerac
+              WHERE werks = @ls_lips-werks
+                AND ( vstel = @ls_lips-vstel OR vstel = '' ).
+            IF sy-subrc = 0.
+              lv_permitir_exceso = 'X'. "Permitimos el exceso de tolerancia
+            ENDIF.
+          ENDIF.
+        ENDIF.
+        IF rt_entre-tknum IS NOT INITIAL AND rt_entre-vbeln IS INITIAL.
+          SELECT likp~vbeln, likp~vstel, lips~posnr, lips~werks
+            INTO TABLE @DATA(lt_lips)
+            FROM vttp AS a
+            INNER JOIN likp ON a~vbeln = likp~vbeln
+            INNER JOIN lips ON likp~vbeln = lips~vbeln
+            WHERE a~tknum = @rt_entre-tknum.
+          IF sy-subrc = 0.
+            SELECT  *
+              INTO TABLE @DATA(lt_toler)
+              FROM zsd_excl_tolerac
+              FOR ALL ENTRIES IN @lt_lips
+              WHERE werks = @lt_lips-werks
+                AND ( vstel = @lt_lips-vstel OR vstel = '' ).
+            IF sy-subrc = 0.
+              lv_permitir_exceso = 'X'. "Permitimos el exceso de tolerancia
+            ENDIF.
+          ENDIF.
+        ENDIF.
+        CALL FUNCTION 'ZSWM_CLOSE_DELIVERY'
+          EXPORTING
+            tknum           = rt_entre-tknum
+            vbeln           = rt_entre-vbeln
+            permitir_exceso = lv_permitir_exceso
+          IMPORTING
+            error           = error
+            tt_log          = tt_log.
+        CHECK error EQ abap_true.
+        APPEND LINES OF tt_log TO tt_log_total.
+
+      ENDLOOP.
+      PERFORM show_log TABLES tt_log_total[].
+    WHEN 'SEL'.
+*      CLEAR sw_selecc.
+      PERFORM get_data TABLES tt_transportes USING p_lgnum p_uname sw_selecc.
+
+*      CHECK sw_selecc-tknum IS NOT INITIAL.
+*      PERFORM get_entregas USING sw_selecc-tknum p_uname CHANGING tt_head.
+*      CHECK sw_selecc-vbeln IS NOT INITIAL.
+*      PERFORM get_posicion USING sw_selecc CHANGING tt_entre tt_picking tt_stock.
+**      DESCRIBE TABLE tt_entre[] LINES DATA(n_reg).
+**      IF n_reg NE 1.
+*      CALL SCREEN 0200.
+*      ELSE.
+*        READ TABLE tt_head  INTO     DATA(rt_head) WITH KEY tknum = sw_selecc-tknum.
+*        MOVE-CORRESPONDING rt_head TO zswm_data_incl_transportes_str.
+*        READ TABLE tt_entre INTO     zswm_get_entregas_ui5_str INDEX 1.
+*        CALL SCREEN 0300.
+*      ENDIF.
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0300  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0300 INPUT.
+  CASE sy-ucomm.
+    WHEN 'REFRESCAR'.
+*      PERFORM get_posicion USING sw_selecc CHANGING tt_picking tt_stock.
+    WHEN 'B_CHANGE'.
+      CALL METHOD alv_stock->get_selected_rows
+        IMPORTING
+          et_index_rows = t_rows.
+
+
+      LOOP AT t_rows INTO l_rows.
+        READ TABLE tt_stock INTO DATA(rt_stock) INDEX l_rows-index.
+        CHECK sy-subrc EQ 0.
+        IF rt_stock-lgtyp EQ '120'
+           OR rt_stock-lgtyp EQ '200'
+           OR rt_stock-lgtyp EQ '201'
+           OR rt_stock-lgtyp EQ '230'.
+          IF rt_stock-bestq NE zswm_get_entregas_ui5_str-insmk.
+            rt_stock-lenum = |{ rt_stock-lenum ALPHA = OUT }|.
+            MESSAGE s398(00) WITH 'UA:' rt_stock-lenum ' en status distinto'.
+          ELSEIF rt_stock-sonum EQ zswm_get_entregas_ui5_str-sonum.
+            rt_stock-lenum = |{ rt_stock-lenum ALPHA = OUT }|.
+            MESSAGE s398(00) WITH 'UA:' rt_stock-lenum ' ya está cambiada'.
+          ELSE.
+            PERFORM cambiar_ua USING p_lgnum rt_stock-lgtyp rt_stock-lgpla rt_stock-lenum zswm_get_entregas_ui5_str.
+            WAIT UP TO 2 SECONDS.
+          ENDIF.
+        ELSE.
+          rt_stock-lenum = |{ rt_stock-lenum ALPHA = OUT }|.
+          MESSAGE s398(00) WITH 'UA:' rt_stock-lenum ' ubicación no permitida'.
+        ENDIF.
+      ENDLOOP.
+*      PERFORM get_posicion USING sw_selecc CHANGING tt_entre tt_picking tt_stock.
+
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  SALIR_0300  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE salir_0300 INPUT.
+  CLEAR sw_selecc-posnr.
+  SET SCREEN 0. LEAVE SCREEN.
+ENDMODULE.
+FORM show_log  TABLES   t_log STRUCTURE bapiret2.
+  CALL FUNCTION 'SUSR_DISPLAY_LOG'
+    EXPORTING
+      display_in_popup = abap_true
+**     LOG_TITLE                  =
+**     DISPLAY_IN_SUBSCREEN       =
+    TABLES
+*     IT_LOG_SPROT     =
+      it_log_bapiret2  = t_log
+    EXCEPTIONS
+      parameter_error  = 1
+      OTHERS           = 2.
+  IF sy-subrc <> 0.
+* Implement suitable error handling here
+  ENDIF.
+
+ENDFORM.

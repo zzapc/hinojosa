@@ -1,0 +1,1467 @@
+*&---------------------------------------------------------------------*
+*&  Include           YHP_SVC_SVC_DOWNLOAD_SEL
+*&---------------------------------------------------------------------*
+
+***##################################################################
+*** S T A R T - O F - S E L E C T I O N
+***##################################################################
+start-of-selection.
+
+*** Do authorization check, when Application Server is selected
+  if P_RAD2 eq ABAP_TRUE.
+
+    LF_FILE = P_FILE.
+    perform SAVE_TO_SERVER using LF_FILE
+                           changing LF_SUBRC.
+    check LF_SUBRC eq 0.
+    clear LF_FILE.
+
+  endif.
+
+*** Set number of lines to process
+  perform CALCULATE_CNT_OF_RECS.
+
+***Get SD Header data
+  select *
+    into table LT_VBAK
+    from VBAK
+    where VBELN in SO_VBELN.
+  sort LT_VBAK by VBELN descending. "load the Quotation first before inquiries
+
+  if SY-SUBRC eq 0.
+    loop at LT_VBAK into LS_VBAK.
+
+***   Get the grouping value as per quote
+      LF_GROUPING = SY-TABIX.
+
+***   Get SD Business data
+      select single *
+        from VBKD
+        into LS_VBKD
+        where VBELN eq LS_VBAK-VBELN.
+
+*** Get SD Items data
+*      select P~VBELN P~POSNR P~MATNR P~WERKS P~KWMENG A~KUNNR P~CUOBJ ~UEPOS P~ZZMATNR
+      select P~VBELN P~POSNR P~MATNR P~WERKS P~KWMENG A~KUNNR P~CUOBJ P~UEPOS
+        into table LT_ITEM
+        from VBAP as P join
+             VBPA as A on A~VBELN eq P~VBELN and
+                          A~POSNR eq '000000' and
+                          A~PARVW eq 'WE'
+        where P~VBELN eq LS_VBAK-VBELN and
+              P~POSNR in SO_POSNR      and
+              P~MATNR in SO_MATNR
+        order by P~POSNR.
+
+      if SY-SUBRC eq 0.
+
+***     Delete all Multi-Quantity line items for reference materials
+        if P_EXCLMQ is not initial.
+          delete LT_ITEM where RMATN cp '*MQ*'.
+        endif.
+
+***     Collect all valid line items in range
+        append lines of LT_ITEM to LT_ITEM_TMP.
+
+***     Start of extract logic
+        clear: LF_OBNAME,
+               LF_HDRTXT.
+*        LF_COUNTER.
+
+        LF_OBNAME = LS_VBAK-VBELN.
+
+        perform READ_TEXT using    LF_OBNAME
+                                   'ZHLG'
+                                   'VBBK'
+                          changing LF_HDRTXT .
+
+***     Start of processing
+        loop at LT_ITEM into LS_ITEM.
+
+***      Increment processed count
+          add 1 to LF_PROCNT.
+
+*        if SY-TABIX eq 1.
+*          LF_VBELN = LS_ITEM-VBELN.
+*          LF_POSNR = LS_ITEM-POSNR.
+*        endif.
+
+          LS_OUT-VBELN = LS_VBAK-VBELN.
+          LS_OUT-POSNR = LS_ITEM-POSNR.
+
+          free: LR_CUELMNT, LR_EA_RTESPV.
+          clear: LF_OBNAME,
+                 LF_ITMTXT.
+
+          concatenate LS_VBAK-VBELN LS_ITEM-POSNR into LF_OBNAME.
+          perform READ_TEXT using  LF_OBNAME
+                                   'ZILG'
+                                   'VBBP'
+                          changing LF_ITMTXT .
+
+***       Add Header fields of file (includes SDoc Header/Item fields)
+          perform ADD_HDR.
+
+          try.
+              check LS_ITEM-CUOBJ is not initial.
+
+***           Get CoreVC
+              LF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LS_ITEM-CUOBJ ).
+
+***           Update Application Environment to be the Context Sales
+              perform UPDATE_APPE using LS_VBAK-VBTYP.
+
+***           Get SmartVC API
+              LR_SVC = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = LF_GVCIN ).
+
+***           Delete Application Environment, when it is needed
+              perform DELETE_APPE using LS_VBAK-VBTYP.
+
+              free LR_SVC_ELEMENT.
+              LT_SVC_ELEMENT = LR_SVC->GET_SVC_ELEMENTS( IR_SVC_ELEMENT_PARENT = LR_SVC_ELEMENT ).
+
+              loop at LT_SVC_ELEMENT into LR_OBJECT.
+                move LR_OBJECT ?to LR_SVC_ELEMENT.
+                move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT~GET_ID( ) to LF_ID.
+
+***             Get Main Routing node
+                if LF_ID cs 'RTESPV'.
+
+***               Get EA class
+                  try.
+                      LR_EA_RTESPV ?= LR_SVC_ELEMENT->GET_CLSEA( ).
+                    catch CX_SY_MOVE_CAST_ERROR.
+                      clear LR_EA_RTESPV.
+                  endtry.
+                endif.
+*                if LF_ID ne 'SPEC'     and
+*                   LF_ID ne 'SPEC_AS'  and
+*                   LF_ID ne 'SPEC_MCH' and
+*                   LF_ID ne 'SPEC_SE'  and
+*                   LF_ID ne 'SHIPMGR'.  "and
+*                 LF_ID ne ZCL_US01_CORRM_PR_MIGR_DATA=>C_SVCID_MIGR_DATA.
+                if LF_ID ne 'SOV'.
+                  delete LT_SVC_ELEMENT.
+                endif.
+              endloop.
+
+***           Fill Migration Data Node
+*              perform MIGR_DATA using    LS_VBAK-VBELN
+*                                         LS_ITEM
+*                                         LR_EA_RTESPV
+*                                changing LT_OUT.
+
+              loop at LT_SVC_ELEMENT into LR_OBJECT.
+                move LR_OBJECT ?to LR_SVC_ELEMENT.
+                move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT~GET_ID( ) to LF_ID.
+                move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT_H~GET_CHILDREN( ) to LT_SVC_CHILDREN.
+                append lines of LT_SVC_CHILDREN to LT_SVC_ELEMENT.
+              endloop.
+
+              LR_SVC->SORT_SVC_ELEMENTS( changing CT_SVC_ELEMENT = LT_SVC_ELEMENT ).
+
+***         Output
+              loop at LT_SVC_ELEMENT into LR_OBJECT.
+                move LR_OBJECT ?to LR_SVC_ELEMENT.
+                move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT_H~GET_PARENT( ) ?to LR_SVC_ELEMENT.
+                clear: LF_ID, LF_POSID, LF_LINE, LS_OUT-PCNT.
+                if LR_SVC_ELEMENT is bound.
+                  move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT~GET_ID( ) to LF_ID.
+***             Determine parent GUIDE and beloging serial number
+                  move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT~GET_GUID( ) to LF_GUID.
+                  read table LT_GUID assigning <S_GUID> with key GUID = LF_GUID.
+                  if SY-SUBRC = 0.
+                    LS_OUT-PCNT  = <S_GUID>-CCNT.
+                  endif.
+                endif.
+
+                LS_OUT-PID = LF_ID.
+
+                move LR_OBJECT                                    ?to LR_SVC_ELEMENT.
+                move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT~GET_ID( ) to LF_ID.
+                move LR_SVC_ELEMENT->GET_POSID( )                  to LF_POSID.
+
+                LS_OUT-CID = LF_ID.
+***           Node is already added
+                LF_GUID = LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT~GET_GUID( ).
+                read table  LT_GUID assigning <S_GUID> with key GUID = LF_GUID.
+                if SY-SUBRC = 0.
+                  LF_GUID = <S_GUID>-CCNT.
+                else.
+***           If node is not added check the parents and give existing or new number
+                  perform DETERMINE_CCNT using LF_POSID
+                                               LR_SVC_ELEMENT
+                                      changing LF_COUNTER
+                                               LS_OUT-CCNT.
+
+                endif.
+                append initial line to LT_GUID assigning <S_GUID>.
+                <S_GUID>-GUID = LF_GUID.
+                <S_GUID>-CCNT = LS_OUT-CCNT .
+
+***             Leading Object
+                LS_OUT-PARTY = 'LEOKY'.
+*                LS_OUT-SETBY = 'U'.
+                clear: LS_OUT-PARID, LS_OUT-DESCR.
+                LS_LEOKY     = LR_SVC_ELEMENT->GET_LEOKY( ).
+                LS_OUT-PARID = 'LEOKY'.
+                LS_OUT-VALUE = LS_LEOKY-LEOKY.
+
+***             SetBy value based on special cases
+                case LS_OUT-CID.
+                  when 'SCORE'.
+                    LS_OUT-SETBY = LS_LEOKY-SETBY(1).
+                    try.
+                        data(LR_SVCEL_PARENT) = cast /VCXI/CL_VKSRA_SVC_ELEMENT( LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT_H~GET_PARENT( ) ).
+                        data(LS_SSCOR) = LR_SVCEL_PARENT->GET_PARAM( IF_PARID = ZCL_VCXI_P0SS_PR_SCORE_MGR=>C_PARID_SSCOR ).
+                        if LS_SSCOR-ATWRT is not initial and
+                           LS_SSCOR-ATWRT ne 'A'.
+                          LS_OUT-SETBY = 'U'.
+                        endif.
+                      catch CX_ROOT.
+                        "no action
+                    endtry.
+
+                  when 'MULTIQTY'.
+                    LS_OUT-SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_USER(1).
+
+                  when others.
+                    LS_OUT-SETBY = LS_LEOKY-SETBY(1).
+                endcase.
+                append LS_OUT to LT_OUT.
+
+***             Find Supervised Parameters
+                free: LT_PARID_PARSP.
+                clear: LF_GUID.
+                move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT~GET_GUID( ) to LF_GUID.
+                /VCXI/CL_VKSR_RUELMNT=>DECRYPT_GUID( exporting IF_GUID  = LF_GUID
+                                                     importing EF_GCELM = LF_GCELM ).
+                move LF_GCELM to LF_GUID.
+                LR_CUELMNT ?= /VCXI/CL_VKSC_CUELMNT=>/VCXI/IF_CKX_OBJECT~GET_INSTANCE( IF_GUID = LF_GUID ).
+                if LR_CUELMNT             is bound and
+                   LR_CUELMNT->R_REGELMNT is bound.
+
+                  loop at LR_CUELMNT->R_REGELMNT->/VCXI/IF_VKSC_REGELMNT_PARAM~T_REGELMNT_PARAM
+                       into LS_REGELMNT_PARAM
+                      where PARSP eq ABAP_TRUE.
+                    move LS_REGELMNT_PARAM-R_PARAM->/VCXI/IF_CKX_OBJECT~GET_ID( ) to LF_ID.
+                    append LF_ID to LT_PARID_PARSP.
+                  endloop.
+                endif.
+
+***           Parameter
+                LT_PARAM = LR_SVC_ELEMENT->GET_PARAM_ALL( ).
+                loop at LT_PARAM into LS_PARAM.
+                  move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT_H~GET_PARENT( ) ?to LR_SVC_ELEMENT.
+                  clear: LF_ID, LF_POSID, LF_LINE.
+                  if LR_SVC_ELEMENT is bound.
+                    move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT~GET_ID( ) to LF_ID.
+                    move LR_SVC_ELEMENT->GET_POSID( )                  to LF_POSID.
+                  endif.
+
+                  move LR_OBJECT                                    ?to LR_SVC_ELEMENT.
+                  move LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT~GET_ID( ) to LF_ID.
+                  move LR_SVC_ELEMENT->GET_POSID( )                  to LF_POSID.
+
+                  move LS_PARAM-PARID to LF_GUID.
+                  LR_PARAM ?= /VCXI/CL_VKSC_PARAM=>/VCXI/IF_CKX_OBJECT~GET_INSTANCE( IF_GUID = LF_GUID ).
+                  move LR_PARAM->/VCXI/IF_CKX_OBJECT~GET_DESCR( ) to LF_DESCR.
+
+***              " Do Supervised Parameter checks if applicable
+                  if P_DLALLP is initial.
+                    read table LT_PARID_PARSP with key TABLE_LINE = LS_PARAM-PARID transporting no fields.
+                    check SY-SUBRC = 0.
+                  endif.
+                  LS_OUT-PARTY = LS_PARAM-PARTY.
+                  LS_OUT-PARID = LS_PARAM-PARID.
+                  LS_OUT-DESCR = LF_DESCR.
+                  if LS_PARAM-PARID = ZCL_VCXI_PCSS_PR_BOARD=>C_PARID_MBOAR.
+                    move 'U' to LS_OUT-SETBY.
+                  else.
+                    case LS_PARAM-SETBY.
+                      when /VCXI/CL_VKSR_GATE=>C_SETBY_CALC.
+                        move 'C' to LS_OUT-SETBY.
+                      when /VCXI/CL_VKSR_GATE=>C_SETBY_USER.
+                        move 'U' to LS_OUT-SETBY.
+                      when others.
+                        clear LS_OUT-SETBY.
+                    endcase.
+
+                    case LF_ID.
+                      when 'SCORE'.
+                        LS_OUT-SETBY = LS_PARAM-SETBY(1).
+                        try.
+                            LR_SVCEL_PARENT = cast /VCXI/CL_VKSRA_SVC_ELEMENT( LR_SVC_ELEMENT->/VCXI/IF_CKX_OBJECT_H~GET_PARENT( ) ).
+                            LS_SSCOR = LR_SVCEL_PARENT->GET_PARAM( IF_PARID = ZCL_VCXI_P0SS_PR_SCORE_MGR=>C_PARID_SSCOR ).
+                            if LS_SSCOR-ATWRT is not initial and
+                               LS_SSCOR-ATWRT ne 'A'.
+                              LS_OUT-SETBY = 'U'.
+                            endif.
+                          catch CX_ROOT.
+                            "no action
+                        endtry.
+                      when others.
+                        LS_OUT-SETBY = LS_PARAM-SETBY(1).
+                    endcase.
+                  endif.
+                  clear LS_OUT-VALUE.
+                  if LS_PARAM-ATWRT is not initial.
+                    LS_OUT-VALUE = LS_PARAM-ATWRT.
+                  elseif LS_PARAM-STRNG is not initial.
+                    search LS_PARAM-STRNG for 'xml'.
+                    if SY-SUBRC ne 0.
+                      LS_OUT-VALUE = LS_PARAM-STRNG.
+                    else.
+
+***                   From XML parameters now only Dimension and Limit
+                      if LS_PARAM-PARID = 'ZVCXI_XC_DIMEN'
+                      or LS_PARAM-PARID = 'ZVCXI_XC_LIMIT'.
+                        perform CONVERT_DIMEN_AND_LIMIT_XML using    LS_PARAM-STRNG
+                                                            changing LS_OUT-VALUE.
+
+                        if LS_OUT-VALUE is initial.
+                          continue.
+                        endif.
+
+                      else.
+                        continue.
+                      endif.
+                    endif.
+                  elseif LS_PARAM-ATFLV is not initial.
+****                    types: LTY_P type P decimals 6 length 16. "99,999,999,999.000000 / 99 999 999 999,000000.
+****                    data(LF_CHAR22_P) = conv CHAR22( conv STRING( conv LTY_P( LS_PARAM-ATFLV ) ) ).
+****                    LS_OUT-VALUE = LF_CHAR22_P.
+****                    clear LF_CHAR22_P.
+
+                    call function 'FLTP_CHAR_CONVERSION'
+                      exporting
+                        DECIM = 15
+*                       EXPON = 0
+                        INPUT = LS_PARAM-ATFLV
+*                       IVALU = ' '
+*                       MASKN = ' '
+                      importing
+                        FLSTR = LF_CHAR22.
+                    shift LF_CHAR22 left deleting leading SPACE.
+                    LS_OUT-VALUE = LF_CHAR22.
+                  endif.
+*                append LF_LINE to LT_OUTPUT.
+                  append LS_OUT to LT_OUT.
+                endloop.
+              endloop.
+
+***         Exception ocurred then issue message, free instance and continue with next item
+            catch /VCXI/CX_CKX into LR_CX_CKX.
+*              LR_CX_CKX->SHOW_MESSAGE( ).
+              write:/ LS_ITEM-VBELN, LS_ITEM-POSNR no-zero, LS_ITEM-RMATN, LR_CX_CKX->GET_TEXT( ).
+          endtry.
+
+***       Free SVC instance once processing is completed
+          if LR_SVC is bound.
+            LR_SVC->DO_FREE( ).
+          endif.
+
+          if SY-BATCH is initial.
+***       Display progress indicator with messages
+            CL_PROGRESS_INDICATOR=>PROGRESS_INDICATE( I_PROCESSED          = LF_PROCNT      " Number of Objects Already Processed
+                                                      I_TOTAL              = LF_PROLIN      " Total Number of Objects to Be Processed
+                                                      I_MSGID              = 'ZUS01_MIG'
+                                                      I_MSGNO              = '010'
+                                                      I_MSGV1              = LF_PROCNT
+                                                      I_MSGV2              = LF_PROLIN
+                                                      I_MSGV3              = |{ LS_ITEM-VBELN alpha = out }|
+                                                      I_MSGV4              = |{ LS_ITEM-POSNR alpha = out }|
+                                                      I_OUTPUT_IMMEDIATELY = ABAP_TRUE ).   " X = Display Progress Immediately
+            wait up to 1 seconds.
+          else.
+            message S010(ZUS01_MIG) with LF_PROCNT LF_PROLIN |{ LS_ITEM-VBELN alpha = out }| |{ LS_ITEM-POSNR alpha = out }|.
+          endif.
+
+          if LF_PROCNT mod 50 eq 0.
+            CL_ABAP_MEMORY_UTILITIES=>DO_GARBAGE_COLLECTION( ).
+          endif.
+
+        endloop.
+      endif.
+
+    endloop.
+  endif.
+
+
+*** Set collective list of SD Items to be downloaded
+  refresh LT_ITEM.
+  LT_ITEM[] = LT_ITEM_TMP.
+  delete adjacent duplicates from LT_ITEM comparing VBELN POSNR.
+  refresh LT_ITEM_TMP.
+
+*** select distinct parameters
+  loop at LT_OUT into LS_OUT.
+    read table LT_WORK into LS_WORK with key  PID  = LS_OUT-PID
+                                              PCNT  = LS_OUT-PCNT
+                                              CID  = LS_OUT-CID
+                                              CCNT  = LS_OUT-CCNT
+                                              PARID = LS_OUT-PARID.
+    if SY-SUBRC ne 0.
+      move LS_OUT-PID to LS_WORK-PID.
+      move LS_OUT-PCNT to LS_WORK-PCNT.
+      move LS_OUT-CID to LS_WORK-CID.
+      move LS_OUT-CCNT to LS_WORK-CCNT.
+      move LS_OUT-PARID to LS_WORK-PARID.
+      append LS_WORK to LT_WORK.
+    endif.
+  endloop.
+
+  refresh LT_OUTPUT.
+
+*** create output string table
+*** LT_WORK contains all necessary rows with parameters
+*** LF_LINE contains parameters for each SD doc position
+  clear: LF_LINE, LS_VBAK, LS_OUT.
+  read table LT_VBAK into LS_VBAK index 1.
+  LF_VBELN = LS_VBAK-VBELN.
+  read table LT_OUT into LS_OUT index 1.
+  LF_POSNR = LS_OUT-POSNR.
+  loop at LT_WORK into LS_WORK.
+    clear: LS_OUT, LF_PREV_TABIX.
+    loop at LT_OUT into LS_OUT where  PID  = LS_WORK-PID  and
+                                      PCNT = LS_WORK-PCNT and
+                                      CID  = LS_WORK-CID  and
+                                      CCNT = LS_WORK-CCNT and
+                                      PARID = LS_WORK-PARID.
+      if LS_OUT-VBELN eq LF_VBELN and LS_OUT-POSNR eq LF_POSNR.
+        if LS_OUT-CID eq '                            0'.
+          if LF_LINE is initial.
+*            concatenate LS_OUT-PARID LS_OUT-DESCR ';;;;' LS_OUT-SETBY LS_OUT-VALUE into LF_LINE separated by ';'. "-->old format
+            concatenate ';;;;' LS_OUT-PARID LS_OUT-DESCR LS_OUT-SETBY LS_OUT-VALUE into LF_LINE separated by ';'.
+          else. "Add only Setby and Value parameters
+            concatenate LF_LINE LS_OUT-SETBY LS_OUT-VALUE into LF_LINE separated by ';'.
+          endif.
+        else.
+          if LF_LINE is initial.
+            concatenate LS_OUT-PID LS_OUT-PCNT LS_OUT-CID LS_OUT-CCNT LS_OUT-PARTY LS_OUT-PARID LS_OUT-DESCR LS_OUT-SETBY LS_OUT-VALUE into LF_LINE separated by ';'.
+          else. "Add only Setby and Value parameters
+            concatenate LF_LINE LS_OUT-SETBY LS_OUT-VALUE into LF_LINE separated by ';'.
+          endif.
+        endif.
+        LF_PREV_TABIX = 1.
+
+      else.
+
+**      concatenate LF_LINE LS_OUT-SETBY LS_OUT-VALUE into LF_LINE separated by ';'.
+        read table LT_ITEM transporting no fields with key VBELN = LS_OUT-VBELN
+                                                           POSNR = LS_OUT-POSNR.
+        if SY-SUBRC = 0.
+
+          if LF_LINE is initial.
+
+            LF_IND = ( SY-TABIX - 1 ) * 2.
+            clear LF_PSEP.
+            do LF_IND times.
+              concatenate LF_PSEP ';' into LF_PSEP.
+            enddo.
+
+            concatenate LS_OUT-PID ';'
+                        LS_OUT-PCNT ';'
+                        LS_OUT-CID ';'
+                        LS_OUT-CCNT ';'
+                        LS_OUT-PARTY ';'
+                        LS_OUT-PARID ';'
+                        LS_OUT-DESCR ';'
+                        LF_PSEP
+                        LS_OUT-SETBY ';'
+                        LS_OUT-VALUE into LF_LINE.
+
+          else.
+            LF_IND = ( SY-TABIX - LF_PREV_TABIX - 1 ) * 2.
+            clear LF_PSEP.
+            do LF_IND times.
+              concatenate LF_PSEP ';' into LF_PSEP.
+            enddo.
+            if LF_PSEP is not initial.
+              concatenate LF_LINE LF_PSEP into LF_LINE.
+            endif.
+            concatenate LF_LINE  LS_OUT-SETBY LS_OUT-VALUE into LF_LINE separated by ';'.
+
+          endif.
+        endif.
+        LF_PREV_TABIX = SY-TABIX.
+      endif.
+    endloop.
+    if SY-SUBRC ne 0.
+*      if LS_OUT-VBELN eq LF_VBELN and LS_OUT-POSNR eq LF_POSNR.
+*      concatenate LF_LINE LS_OUT-PID LS_OUT-PCNT LS_OUT-CID LS_OUT-CCNT LS_OUT-PARTY LS_OUT-PARID LS_OUT-DESCR LS_OUT-SETBY LS_OUT-VALUE into LF_LINE separated by ';'.
+*      else.
+      concatenate LF_LINE LS_OUT-SETBY LS_OUT-VALUE into LF_LINE separated by ';'.
+*      endif.
+    endif.
+    append LF_LINE to LT_OUTPUT.
+    add 1 to LF_IND.
+    clear LF_LINE.
+  endloop.
+
+  if LT_OUTPUT[] is not initial.
+
+    loop at LT_OUTPUT into LF_LINE.
+      concatenate LF_STR LF_LINE CL_ABAP_CHAR_UTILITIES=>CR_LF into LF_STR.
+*** To save in application server
+      append LF_LINE to LT_SFILE_TABLE.
+    endloop.
+
+    call function 'SCMS_STRING_TO_XSTRING'
+      exporting
+        TEXT   = LF_STR
+      importing
+        BUFFER = LF_XSTR.
+
+    LF_STLEN = XSTRLEN( LF_XSTR ).
+    LF_TMP = LF_STLEN / 2000.
+    LF_ITER = FLOOR( LF_TMP ).
+
+*** Set the character number to 2000
+    LF_CUT = 2000.
+
+*** Do the splitting
+    do LF_ITER times.
+
+***   Increase the character number
+      LF_SUM = LF_OFFS + 2000.
+
+***   If the calculated value bigger than the length of the string
+      if LF_SUM > LF_STLEN.
+
+***     Calculate the number of the characters
+        LF_CUT = LF_CUT - ( LF_SUM - LF_STLEN ).
+
+      endif.
+
+***   Do the cutting
+      LS_XTAB = LF_XSTR+LF_OFFS(LF_CUT).
+      LF_OFFS = SY-INDEX * 2000.
+      insert LS_XTAB into table LT_XTAB.
+
+    enddo.
+
+*** Calculate the rest of the characters
+    LF_REST = LF_STLEN - LF_OFFS.
+
+*** Do the cutting
+    if LF_REST > 0.
+      LS_XTAB = LF_XSTR+LF_OFFS(LF_REST).
+      insert LS_XTAB into table LT_XTAB.
+    endif.
+
+*** Set Filename
+    LF_FILE  = P_FILE.
+
+
+*** Print general info
+    write:/ TEXT-T01, at 10 TEXT-T02, at 18 TEXT-T07, at 59 TEXT-T08.
+    loop at LT_ITEM into LS_ITEM.
+      write:/ LS_ITEM-VBELN, LS_ITEM-POSNR no-zero, LS_ITEM-RMATN.
+    endloop.
+
+    skip.
+
+    describe table LT_ITEM lines LF_LINE.
+    write:/ TEXT-T04, ':' , LF_LINE.
+
+    describe table LT_WORK lines LF_LINE.
+    write:/ TEXT-T03, ':', LF_LINE.
+
+*** Save to presentation server
+    if P_RAD1 eq ABAP_TRUE.
+
+      call function 'GUI_DOWNLOAD'
+        exporting
+          BIN_FILESIZE              = LF_STLEN
+          FILENAME                  = LF_FILE
+          FILETYPE                  = 'BIN'
+          TRUNC_TRAILING_BLANKS_EOL = 'X'
+          TRUNC_TRAILING_BLANKS     = 'X'
+        tables
+          DATA_TAB                  = LT_XTAB.
+
+
+      if SY-SUBRC eq 0.
+        " Filename
+        write:/ TEXT-T05, ':', LF_FILE.
+
+        " No. of bytes written
+        write:/ TEXT-T06, ':', LF_STLEN left-justified.
+
+      endif.
+    elseif P_RAD2 eq ABAP_TRUE.
+
+      perform SAVE_TO_SERVER using LF_FILE
+                             changing LF_SUBRC.
+
+      " Filename
+      write:/ TEXT-T05, ':', LF_FILE.
+
+      " No. of bytes written
+      write:/ TEXT-T06, ':', LF_STLEN left-justified.
+
+    endif.
+  endif.
+
+form ADD_HDR.
+
+  clear LS_OUT.
+
+*** Set IDs and counters
+  LS_OUT-VBELN = LS_VBAK-VBELN.
+  LS_OUT-POSNR = LS_ITEM-POSNR.
+  LS_OUT-PID   = 0.
+  LS_OUT-PCNT   = 0.
+  LS_OUT-CID   = 0.
+  LS_OUT-CCNT   = 0.
+
+*** Sales Doc Type
+  LS_OUT-PARID = TEXT-H01.
+  LS_OUT-DESCR = TEXT-H51.
+  LS_OUT-VALUE = LS_VBAK-AUART.
+  append LS_OUT to LT_OUT.
+
+*** Sales Org
+  LS_OUT-PARID = TEXT-H02.
+  LS_OUT-DESCR = TEXT-H52.
+  LS_OUT-VALUE = LS_VBAK-VKORG.
+  append LS_OUT to LT_OUT.
+
+*** Dist. Channel
+  LS_OUT-PARID = TEXT-H03.
+  LS_OUT-DESCR = TEXT-H53.
+  LS_OUT-VALUE = LS_VBAK-VTWEG.
+
+*** Division
+  LS_OUT-PARID = TEXT-H04.
+  LS_OUT-DESCR = TEXT-H54.
+  LS_OUT-VALUE = LS_VBAK-SPART.
+  append LS_OUT to LT_OUT.
+
+*** Sold-To
+  LS_OUT-PARID = TEXT-H06.
+  LS_OUT-DESCR = TEXT-H56.
+  LS_OUT-VALUE = LS_VBAK-KUNNR.
+  append LS_OUT to LT_OUT.
+
+*** Ship-To
+  LS_OUT-PARID = TEXT-H07.
+  LS_OUT-DESCR = TEXT-H57.
+  LS_OUT-VALUE = LS_ITEM-KUNWE.
+  append LS_OUT to LT_OUT.
+
+*** Currency
+  LS_OUT-PARID = TEXT-H11.
+  LS_OUT-DESCR = TEXT-H61.
+  LS_OUT-VALUE = LS_VBAK-WAERK.
+  append LS_OUT to LT_OUT.
+
+*** Pricing Date
+  LS_OUT-PARID = TEXT-H12.
+  LS_OUT-DESCR = TEXT-H62.
+  LS_OUT-VALUE = LS_VBKD-PRSDT.
+  append LS_OUT to LT_OUT.
+
+*** Quotation valid to
+  LS_OUT-PARID = TEXT-H13.
+  LS_OUT-DESCR = TEXT-H63.
+  LS_OUT-VALUE = LS_VBAK-BNDDT.
+  append LS_OUT to LT_OUT.
+
+*** Grouping
+  LS_OUT-PARID = TEXT-H09.
+  LS_OUT-DESCR = TEXT-H59.
+  LS_OUT-VALUE = LS_VBAK-VBELN.
+  append LS_OUT to LT_OUT.
+
+
+**  LS_OUT-PARID = TEXT-H08.
+**  LS_OUT-DESCR = TEXT-H58.
+**  LS_OUT-VALUE = LS_VBAK-SUBMI.
+**  append LS_OUT to LT_OUT.
+
+
+**  LS_OUT-PARID = TEXT-H10.
+**  LS_OUT-DESCR = TEXT-H60.
+**  LS_OUT-VALUE = LF_HDRTXT.
+**  append LS_OUT to LT_OUT.
+
+*  LS_OUT-PARID = TEXT-I01.
+*  LS_OUT-DESCR = TEXT-I51.
+*  LS_OUT-VALUE = LF_GROUPING.
+*  append LS_OUT to LT_OUT.
+
+*** Line Item position
+  LS_OUT-PARID = TEXT-I14.
+  LS_OUT-DESCR = TEXT-I64.
+  LS_OUT-VALUE = LS_ITEM-POSNR.
+  append LS_OUT to LT_OUT.
+
+**  LS_OUT-PARID = TEXT-I15.
+**  LS_OUT-DESCR = TEXT-I65.
+**  LS_OUT-VALUE = LS_ITEM-UEPOS.
+**  append LS_OUT to LT_OUT.
+
+*** Line Item material (reference material)
+  LS_OUT-PARID = TEXT-I02.
+  LS_OUT-DESCR = TEXT-I52.
+  LS_OUT-VALUE = LS_ITEM-RMATN.
+  append LS_OUT to LT_OUT.
+
+**  LS_OUT-PARID = TEXT-I16.
+**  LS_OUT-DESCR = TEXT-I66.
+**  LS_OUT-VALUE = LF_ITMTXT.
+**  append LS_OUT to LT_OUT.
+
+**
+**  LS_OUT-PARID = TEXT-I17.
+**  LS_OUT-DESCR = TEXT-I67.
+**  LS_OUT-VALUE = ''.
+**  append LS_OUT to LT_OUT.
+
+**  LS_OUT-PARID = text-I03.
+**  LS_OUT-DESCR = text-I53.
+**  LS_OUT-VALUE = ''.
+**  append LS_OUT to LT_OUT.
+
+**  LS_OUT-PARID = text-I04.
+**  LS_OUT-DESCR = text-I54.
+**  LS_OUT-VALUE = ''.
+**  append LS_OUT to LT_OUT.
+
+*** Order Quantity
+  clear LF_CAST.
+  move LS_ITEM-KWMENG to LF_CAST.
+  LS_OUT-PARID = TEXT-I05.
+  LS_OUT-DESCR = TEXT-I55.
+  LS_OUT-VALUE = LF_CAST.
+  append LS_OUT to LT_OUT.
+
+*** Plant
+  LS_OUT-PARID = TEXT-H05.
+  LS_OUT-DESCR = TEXT-H55.
+  LS_OUT-VALUE = LS_ITEM-WERKS.
+  append LS_OUT to LT_OUT.
+
+*** Final Price
+  LS_OUT-PARID = TEXT-I70.
+  LS_OUT-DESCR = TEXT-I71.
+  LS_OUT-VALUE = ''.
+  append LS_OUT to LT_OUT.
+
+*** Upcharge assembled box
+  LS_OUT-PARID = TEXT-I72.
+  LS_OUT-DESCR = TEXT-I73.
+  LS_OUT-VALUE = ''.
+  append LS_OUT to LT_OUT.
+
+*** Legacy Material number
+  LS_OUT-PARID = TEXT-I68.
+  LS_OUT-DESCR = TEXT-I69.
+*  LS_OUT-VALUE = LS_ITEM-ZZMATNR.
+  append LS_OUT to LT_OUT.
+
+*  LS_OUT-PARID = text-I06.
+*  LS_OUT-DESCR = text-I56.
+*  LS_OUT-VALUE = ''.
+*  append LS_OUT to LT_OUT.
+*
+*  LS_OUT-PARID = text-I07.
+*  LS_OUT-DESCR = text-I57.
+*  LS_OUT-VALUE = ''.
+*  append LS_OUT to LT_OUT.
+*
+*  LS_OUT-PARID = text-I08.
+*  LS_OUT-DESCR = text-I58.
+*  LS_OUT-VALUE = ''.
+*  append LS_OUT to LT_OUT.
+*
+*  LS_OUT-PARID = text-I09.
+*  LS_OUT-DESCR = text-I59.
+*  LS_OUT-VALUE = ''.
+*  append LS_OUT to LT_OUT.
+*
+*  LS_OUT-PARID = text-I10.
+*  LS_OUT-DESCR = text-I60.
+*  LS_OUT-VALUE = ''.
+*  append LS_OUT to LT_OUT.
+*
+*  LS_OUT-PARID = text-I11.
+*  LS_OUT-DESCR = text-I61.
+*  LS_OUT-VALUE = ''.
+*  append LS_OUT to LT_OUT.
+*
+*  LS_OUT-PARID = text-I12.
+*  LS_OUT-DESCR = text-I62.
+*  LS_OUT-VALUE = ''.
+*  append LS_OUT to LT_OUT.
+*
+*  LS_OUT-PARID = text-I13.
+*  LS_OUT-DESCR = text-I63.
+*  LS_OUT-VALUE = ''.
+*  append LS_OUT to LT_OUT.
+
+endform.
+
+
+
+*&---------------------------------------------------------------------*
+*& Form READ_TEXT
+*&---------------------------------------------------------------------*
+form READ_TEXT using    UF_NAME   type TDOBNAME
+                        UF_ID     type TDID
+                        UF_OBJECT type TDOBJECT
+               changing CF_TEXT   type STRING.
+
+  data: LT_LINES type table of TLINE.
+
+  field-symbols: <S_LINES> type TLINE.
+
+
+*** Read long text
+  call function 'READ_TEXT'
+    exporting
+      ID                      = UF_ID
+      LANGUAGE                = SY-LANGU
+      NAME                    = UF_NAME
+      OBJECT                  = UF_OBJECT
+    tables
+      LINES                   = LT_LINES
+    exceptions
+      ID                      = 1
+      LANGUAGE                = 2
+      NAME                    = 3
+      NOT_FOUND               = 4
+      OBJECT                  = 5
+      REFERENCE_CHECK         = 6
+      WRONG_ACCESS_TO_ARCHIVE = 7
+      others                  = 8.
+  if SY-SUBRC ne 0.
+    exit.
+  endif.
+
+
+  loop at LT_LINES assigning <S_LINES>.
+    if CF_TEXT is not initial.
+      concatenate CF_TEXT <S_LINES>-TDLINE into CF_TEXT separated by SPACE.
+    else.
+      CF_TEXT = <S_LINES>-TDLINE.
+    endif.
+  endloop.
+
+endform.
+
+*&---------------------------------------------------------------------*
+*& Form MIGR_DATA
+*&---------------------------------------------------------------------*
+*form MIGR_DATA  using    PF_VBELN     type        VBELN
+*                         PS_ITEM      type        ZMIG_S_ITEM
+*                         PR_EA_RTESPV type ref to ZCL_VCXI_XCSR_EA_RTESPV
+*                changing PT_OUT       like        LT_OUT.
+*
+*  data: LF_MATNR       type        MATNR18,
+*        LF_PARENT_ID   type        /VCXI/CKX_ID,
+*        LF_PARENT_CNT  type        /VCXI/VKSR_POSID,
+*        LF_CURRENT_ID  type        /VCXI/CKX_ID,
+*        LF_CURRENT_CNT type        /VCXI/VKSR_POSID.
+*  data: LS_PLANTDATA type        BAPI_MARC_GA,
+*        LS_CMPRK     type        /VCXI/VKC_S_CMPRK.
+*  data: LT_OBJECT type        /VCXI/CKX_TT_OBJECT,
+**        LT_KONV   type        ZUS01_MIG_T_PRCD_ELEM.
+*        LT_KONV type table of KONV.
+*  data: LR_CUPRFL       type ref to /VCXI/CL_VKSC_CUPRFL,
+*        LR_CUELMNT      type ref to /VCXI/CL_VKSC_CUELMNT,
+*        LR_CUELMNT_MIGR type ref to /VCXI/CL_VKSC_CUELMNT,
+*        LR_OBJECT       type ref to /VCXI/IF_CKX_OBJECT.
+*  field-symbols: <LS_OUT>         type        TY_OUT.
+*
+*  LF_MATNR = PS_ITEM-RMATN.
+*
+****     Read all Data from Material
+*  call function 'BAPI_MATERIAL_GET_ALL'
+*    exporting
+*      MATERIAL  = LF_MATNR
+*      PLANT     = PS_ITEM-WERKS
+*    importing
+*      PLANTDATA = LS_PLANTDATA.
+*
+****----------------------------------------------------------------------------
+****   Identify Profile
+*  move LS_PLANTDATA-PS_CONF_MAT  to LS_CMPRK-CMATN.
+*  move LS_PLANTDATA-PS_CONF_MAT  to LS_CMPRK-PRFID.
+*  LR_CUPRFL = /VCXI/CL_VKSC_CUPRFL=>GET_INSTANCE_BY_CMPRK( IS_CMPRK = LS_CMPRK ).
+*
+*  LT_OBJECT = LR_CUPRFL->GET_REGISTERED_CUELMNT( ).
+*
+*  loop at LT_OBJECT into LR_OBJECT.
+*    move LR_OBJECT ?to LR_CUELMNT.
+*
+*    "Exit when we have found the Migration node
+*    if LR_CUELMNT->/VCXI/IF_CKX_OBJECT~GET_ID( ) eq ZCL_US01_CORRM_PR_MIGR_DATA=>C_SVCID_MIGR_DATA.
+*      move LR_CUELMNT to LR_CUELMNT_MIGR.
+*      exit.
+*    endif.
+*  endloop.
+*
+*  if LR_CUELMNT_MIGR is bound.
+*
+*    LF_PARENT_ID    = ''.
+*    LF_PARENT_CNT   = 0.
+*    LF_CURRENT_ID   = LR_CUELMNT->/VCXI/IF_CKX_OBJECT~GET_ID( ).
+*    LF_CURRENT_CNT  = 1.
+*
+*    perform GET_ZMP0_CONDITION using    PF_VBELN
+*                                        PS_ITEM-POSNR
+*                               changing LT_KONV.
+*
+*    perform COPY_NODE_WITH_CHILD using     PF_VBELN
+*                                           PS_ITEM-POSNR
+*                                           LF_PARENT_ID
+*                                           LF_PARENT_CNT
+*                                           LF_CURRENT_ID
+*                                           LF_CURRENT_CNT
+*                                           1
+*                                           LT_KONV
+*                                           LR_CUELMNT
+*                                           PR_EA_RTESPV
+*                                 changing  LT_OUT.
+*  endif.
+*
+*endform.
+*&---------------------------------------------------------------------*
+*& Form COPY_NODE_WITH_CHILD
+*&---------------------------------------------------------------------*
+form COPY_NODE_WITH_CHILD  using    PF_VBELN        type        VBELN
+                                    PF_POSNR        type        POSNR
+                                    PF_PARENT_ID    type        /VCXI/CKX_ID
+                                    PF_PARENT_CNT   type        /VCXI/VKSR_POSID
+                                    PF_CURRENT_ID   type        /VCXI/CKX_ID
+                                    PF_CURRENT_CNT  type        /VCXI/VKSR_POSID
+                                    PF_INDEX        type        SY-INDEX
+                                    PT_KONV         type        TAB_KONV
+                                    PR_CUELMNT      type ref to /VCXI/CL_VKSC_CUELMNT
+                                    PR_EA_RTESPV    type ref to ZCL_VCXI_XCSR_EA_RTESPV
+                           changing PT_OUT          like        LT_OUT.
+
+  constants: LC_SVCID_SALES_PSCALE_P type /VCXI/CKX_ID value 'SALES_PSCALE_P'.
+  data: LF_CURRENT_ID  type        /VCXI/CKX_ID,
+        LF_CURRENT_CNT type        /VCXI/VKSR_POSID              value 0,
+        LF_TIMES       type        INT4,
+        LF_PARAM_OK    type        FLAG.
+  data: LT_CUELMNT     type        /VCXI/CKX_TT_OBJECT.
+  data: LR_CUELMNT type ref to /VCXI/CL_VKSC_CUELMNT,
+        LR_BL_PRTE type ref to ZCL_VCXI_XCSR_BL_PRTE.
+  field-symbols: <LS_REGELMNT_PARAM> type        /VCXI/VKSC_S_REGELMNT_PARAM,
+                 <LS_OUT>            type        TY_OUT,
+                 <LS_KONV>           type        KONV.
+  field-symbols: <LR_OBJECT>    type ref to /VCXI/IF_CKX_OBJECT,
+                 <LR_RTE_ARBPL> type ref to /VCXI/CL_VSMR_RTE_ARBPL.
+
+  loop at PR_CUELMNT->R_REGELMNT->/VCXI/IF_VKSC_REGELMNT_PARAM~T_REGELMNT_PARAM assigning <LS_REGELMNT_PARAM>
+    where PARSP eq ABAP_TRUE.
+
+    append initial line to PT_OUT assigning <LS_OUT>.
+    <LS_OUT>-VBELN  = PF_VBELN.
+    <LS_OUT>-POSNR  = PF_POSNR.
+    <LS_OUT>-PID    = PF_PARENT_ID.
+    <LS_OUT>-PCNT   = PF_PARENT_CNT.
+    <LS_OUT>-CID    = PF_CURRENT_ID.
+    <LS_OUT>-CCNT   = PF_CURRENT_CNT.
+    <LS_OUT>-PARTY  = <LS_REGELMNT_PARAM>-PARTY.
+    <LS_OUT>-PARID  = <LS_REGELMNT_PARAM>-R_PARAM->/VCXI/IF_CKX_OBJECT~GET_ID( ).
+    <LS_OUT>-DESCR  = <LS_REGELMNT_PARAM>-R_PARAM->/VCXI/IF_CKX_OBJECT~GET_DESCR( ).
+
+    case <LS_REGELMNT_PARAM>-R_PARAM->/VCXI/IF_CKX_OBJECT~GET_ID( ).
+*      when ZCL_US01_CORRM_PR_ARBPL=>C_PARID_ARBPL.
+*        if PR_EA_RTESPV is bound.
+****       Get Selected Route
+*          LR_BL_PRTE = PR_EA_RTESPV->GET_RTESEL( ).
+*          check LR_BL_PRTE is bound.                                      "00AVICHR - MD4K921959
+*
+****       Get right Work Center by index
+*          read table LR_BL_PRTE->R_RTE_PRTE->T_RTE_ARBPL assigning <LR_RTE_ARBPL> index PF_INDEX.
+*          if SY-SUBRC is initial.
+*
+****         Fill Work Center Parameter
+*            <LS_OUT>-VALUE = <LR_RTE_ARBPL>->R_ARBPL->F_ARBPL.
+**            "<LS_OUT>-SETBY = 'C'.                                       "00AVICHR - MD4K921959
+*
+*            " Begin of change - 00AVICHR - MD4K921959
+****       Set "SETBY" value based on Routing Option (CHOSEN/AUTOMATIC)
+*            case PR_EA_RTESPV->GET_RTEOP( ).
+*              when ZCL_VCXI_XCSR_PR_RTESPV=>C_RTEOP_CHOSEN.
+*                <LS_OUT>-SETBY = 'U'.
+*              when ZCL_VCXI_XCSR_PR_RTESPV=>C_RTEOP_AUTO.
+*                <LS_OUT>-SETBY = 'C'.
+*              when others.
+*                <LS_OUT>-SETBY = 'C'.
+*            endcase.
+*            " End of change - 00AVICHR - MD4K921959
+*          endif.
+*        endif.
+*      when ZCL_US01_CORRM_PR_ARBPL=>C_PARID_WERKS.
+*        if PR_EA_RTESPV is bound.
+****       Get Selected Route
+*          LR_BL_PRTE = PR_EA_RTESPV->GET_RTESEL( ).
+*          check LR_BL_PRTE is bound.                                      "00AVICHR - MD4K921959
+*
+****       Get right Work Center by index
+*          read table LR_BL_PRTE->R_RTE_PRTE->T_RTE_ARBPL assigning <LR_RTE_ARBPL> index PF_INDEX.
+*          if SY-SUBRC is initial.
+*
+****         Fill Plant Parameter
+*            <LS_OUT>-VALUE = <LR_RTE_ARBPL>->R_ARBPL->R_WERKS->/VCXI/IF_CKX_OBJECT~GET_ID( ).
+**            "<LS_OUT>-SETBY = 'C'.                                       "00AVICHR - MD4K921959
+*
+*            " Begin of change - 00AVICHR - MD4K921959
+****       Set "SETBY" value based on Routing Option (CHOSEN/AUTOMATIC)
+*            case PR_EA_RTESPV->GET_RTEOP( ).
+*              when ZCL_VCXI_XCSR_PR_RTESPV=>C_RTEOP_CHOSEN.
+*                <LS_OUT>-SETBY = 'U'.
+*              when ZCL_VCXI_XCSR_PR_RTESPV=>C_RTEOP_AUTO.
+*                <LS_OUT>-SETBY = 'C'.
+*              when others.
+*                <LS_OUT>-SETBY = 'C'.
+*            endcase.
+*            " End of change - 00AVICHR - MD4K921959
+*          endif.
+*          free LR_BL_PRTE.  "00avichr
+*        endif.
+*      when ZCL_US01_CORRM_PR_SALE_PC_MGR=>C_PARID_PRICE_CONDREC.
+*
+****     Set Price Condition Record to ZMP0
+*        loop at PT_KONV assigning <LS_KONV>.
+*          check <LS_KONV>-KBETR is not initial.
+*          data(LF_ZMP0_EXISTS) = ABAP_TRUE.
+*          exit.
+*        endloop.
+*        check LF_ZMP0_EXISTS eq ABAP_TRUE.
+*        <LS_OUT>-VALUE = LC_KSCHA_ZMP0.
+*        <LS_OUT>-SETBY = 'U'.
+
+      when ZCL_VCXI_XCS_PR_PSCALE=>C_PARID_PRICE.
+
+***     Get right Condition value
+        read table PT_KONV assigning <LS_KONV> index PF_INDEX.
+        if SY-SUBRC is initial.
+
+***       Set Price
+          check <LS_KONV>-KBETR is not initial.
+          <LS_OUT>-VALUE = <LS_KONV>-KBETR.
+          <LS_OUT>-SETBY = 'U'.
+        endif.
+
+      when ZCL_VCXI_XCS_PR_PSCALE=>C_PARID_PRICP_P.
+
+***     Get right Condition value
+        read table PT_KONV assigning <LS_KONV> index PF_INDEX.
+        if SY-SUBRC is initial.
+
+***       Set Price Per
+          check <LS_KONV>-KBETR is not initial.
+          <LS_OUT>-VALUE = <LS_KONV>-KPEIN.
+          <LS_OUT>-SETBY = 'U'.
+        endif.
+
+      when ZCL_VCXI_XCS_PR_PSCALE=>C_PARID_PSQTY_P.
+
+***     Get right Condition value
+        read table PT_KONV assigning <LS_KONV> index PF_INDEX.
+        if SY-SUBRC is initial.
+
+***       Set Price Quantity
+          check <LS_KONV>-KBETR is not initial.
+          <LS_OUT>-VALUE = <LS_KONV>-KAWRT.
+          <LS_OUT>-SETBY = 'U'.
+        endif.
+
+    endcase.
+
+    LF_PARAM_OK = ABAP_TRUE.
+
+  endloop.
+
+***  When there wasn't parameter in the node
+  if LF_PARAM_OK eq ABAP_FALSE.
+
+    append initial line to PT_OUT assigning <LS_OUT>.
+    <LS_OUT>-VBELN  = PF_VBELN.
+    <LS_OUT>-POSNR  = PF_POSNR.
+    <LS_OUT>-PID    = PF_PARENT_ID.
+    <LS_OUT>-PCNT   = PF_PARENT_CNT.
+    <LS_OUT>-CID    = PF_CURRENT_ID.
+    <LS_OUT>-CCNT   = PF_CURRENT_CNT.
+
+  endif.
+
+  LT_CUELMNT = PR_CUELMNT->/VCXI/IF_CKX_OBJECT_H~GET_CHILDREN( ).
+
+  loop at LT_CUELMNT assigning <LR_OBJECT>.
+    move <LR_OBJECT> ?to LR_CUELMNT.
+
+    check LR_CUELMNT is bound.
+
+    case LR_CUELMNT->/VCXI/IF_CKX_OBJECT~GET_ID( ).
+      when LC_SVCID_SALES_PSCALE_P.
+
+***     Add Price Scale node as many time as ZMP0 condition we have
+        describe table PT_KONV lines LF_TIMES.
+
+*      when ZCL_US01_CORRM_PR_ARBPL=>C_SVCID_ARBPL.
+*        if PR_EA_RTESPV is bound.                   "00avichr
+*
+****       Get Selected Route
+*          LR_BL_PRTE = PR_EA_RTESPV->GET_RTESEL( ). "00avichr
+*          if LR_BL_PRTE is bound.
+*
+****       Create as many ARBPL node as workcenter we have in the selected route
+*            describe table LR_BL_PRTE->R_RTE_PRTE->T_RTE_ARBPL lines LF_TIMES.
+*          else.
+*            LF_TIMES = 1.
+*          endif.
+*        endif.
+*        free LR_BL_PRTE. "00avichr
+      when others.
+        LF_TIMES = 1.
+    endcase.
+
+    do LF_TIMES times.
+      LF_CURRENT_ID  = LR_CUELMNT->/VCXI/IF_CKX_OBJECT~GET_ID( ).
+      LF_CURRENT_CNT = LF_CURRENT_CNT + 1.
+
+      perform COPY_NODE_WITH_CHILD using     PF_VBELN
+                                             PF_POSNR
+                                             PF_CURRENT_ID
+                                             PF_CURRENT_CNT
+                                             LF_CURRENT_ID
+                                             LF_CURRENT_CNT
+                                             SY-INDEX
+                                             PT_KONV
+                                             LR_CUELMNT
+                                             PR_EA_RTESPV
+                                   changing  LT_OUT.
+    enddo.
+  endloop.
+endform.
+*&---------------------------------------------------------------------*
+*& Form CONVERT_XML_DIMEN
+*&---------------------------------------------------------------------*
+***Convert Values from XML parameter Dimension
+*      -->IS_PARAM_STRNG  XML Value
+*      -->CS_OUTVALUE     Output value
+*      -->CS_OUTPARTY     Type
+*&---------------------------------------------------------------------*
+form CONVERT_DIMEN_AND_LIMIT_XML  using    IS_PARAM_STRNG
+                                  changing CS_OUTVALUE.
+
+  constants: LC_LIMIT     type STRING             value 'LIMIT',
+             LC_DIMEN     type STRING             value 'DIMEN',
+             LC_DIMVA     type STRING             value 'DIMVA',
+             LC_DIMVA_UOM type STRING             value 'DIMVA_UOM'.
+  data: LF_CHAR32 type CHAR32,
+        LF_STRING type STRING.
+  data:           LT_VALUE      type ZVCXI_XCSU_TT_LIMIT.
+  field-symbols: <LF_VALUE>     type ANY.
+  field-symbols: <LS_VALUE>     type ANY.
+
+*** Determine Dimension or Limit from Parameter
+  try.
+      if IS_PARAM_STRNG is not initial.
+        call transformation ID
+               source xml IS_PARAM_STRNG
+               result TABLE = LT_VALUE.
+      endif.
+    catch CX_TRANSFORMATION_ERROR.
+  endtry.
+
+  loop at LT_VALUE assigning <LS_VALUE>.
+
+    clear LF_STRING.
+
+*** Add Limit to output, if it is needed
+    assign component LC_LIMIT of structure <LS_VALUE> to <LF_VALUE>.
+    if SY-SUBRC is initial and <LF_VALUE> is not initial.
+      LF_STRING = <LF_VALUE>.
+    endif.
+
+*** Add Dimension to output
+    assign component LC_DIMEN of structure <LS_VALUE> to <LF_VALUE>.
+    if SY-SUBRC is initial.
+      if LF_STRING is initial.
+        LF_STRING = <LF_VALUE>.
+      else.
+        concatenate LF_STRING <LF_VALUE> into LF_STRING separated by '-'.
+      endif.
+    endif.
+
+*** Add Dimension Value to output
+    assign component LC_DIMVA of structure <LS_VALUE> to <LF_VALUE>.
+    if SY-SUBRC is initial.
+
+      clear LF_CHAR32.
+      write <LF_VALUE> to LF_CHAR32 no-grouping.
+      concatenate LF_STRING LF_CHAR32 into LF_STRING separated by '-'.
+      condense LF_STRING no-gaps.
+
+    endif.
+
+*** Add Dimension Unit to output
+    assign component LC_DIMVA_UOM of structure <LS_VALUE> to <LF_VALUE>.
+    if SY-SUBRC is initial.
+      concatenate LF_STRING <LF_VALUE> into LF_STRING separated by '-'.
+    endif.
+
+*** Add String to Output
+    if CS_OUTVALUE is initial.
+      CS_OUTVALUE = LF_STRING.
+    else.
+      concatenate CS_OUTVALUE LF_STRING into CS_OUTVALUE separated by SPACE.
+    endif.
+
+  endloop.
+
+endform.
+*&---------------------------------------------------------------------*
+*& Form GET_ZMP0_CONDITION
+*&---------------------------------------------------------------------*
+***@TECHNICALDOCUMENTATION
+*        text
+*      -->PF_VBELN  text
+*      -->PS_ITEM_POSNR  text
+*      <--PT_KONV  text
+*& -->  p1        text
+*& <--  p2        text
+*&---------------------------------------------------------------------*
+form GET_ZMP0_CONDITION  using    PF_VBELN type VBELN
+                                  PF_POSNR type POSNR
+                         changing PT_KONV  type TAB_KONV.
+
+  data: LF_KNUMV type KNUMV.
+  data: LT_KONV type TAB_KONV,
+        LT_VBAP type standard table of VBAP.
+
+  field-symbols: <LS_KONV> type KONV,
+                 <LS_VBAP> type VBAP.
+
+  clear PT_KONV.
+
+*** Get Number of the Document Condition
+  select single KNUMV
+    from VBAK
+    into LF_KNUMV
+   where VBELN eq PF_VBELN.
+
+  if SY-SUBRC is initial.
+
+***   Get All Items from Sales Document
+    select *
+    into table LT_VBAP
+    from VBAP
+    where VBELN eq PF_VBELN.
+
+    if SY-SUBRC is initial.
+
+***     Get pricing conditions for sales document items
+      select *
+      into table LT_KONV
+      from KONV
+      where KNUMV eq LF_KNUMV.
+
+      if SY-SUBRC is initial.
+
+***       Append just the needed condition
+        loop at LT_KONV assigning <LS_KONV> where KSCHL eq LC_KSCHA_ZMP0.
+
+          if <LS_KONV>-KPOSN eq PF_POSNR.
+
+***           Reference Material
+            append <LS_KONV> to PT_KONV.
+
+          else.
+
+***           Check if it is a Multi Quantity of the Reference Material
+            read table LT_VBAP assigning <LS_VBAP> with key VBELN = PF_VBELN
+                                                            POSNR = <LS_KONV>-KPOSN.
+            if  SY-SUBRC        is initial
+            and <LS_VBAP>-UEPOS eq PF_POSNR.
+
+***             Reference Material corresponding MQ
+              append <LS_KONV> to PT_KONV.
+
+            endif.
+          endif.
+        endloop.
+      endif.
+
+***     Get Condition Records Scales in Increasing Order.
+      sort PT_KONV by KAWRT.
+
+    endif.
+  endif.
+
+endform.
+*&---------------------------------------------------------------------*
+*& Form UPDATE_APPE
+*&---------------------------------------------------------------------*
+***@TECHNICALDOCUMENTATION
+*        text
+*      -->P_LS_VBAK_VBTYP  text
+*& -->  p1        text
+*& <--  p2        text
+*&---------------------------------------------------------------------*
+form UPDATE_APPE using P_VBTYP type VBTYP.
+
+  constants: LC_APPE_QUOTATION type ZVCXI_XCS_IAPPE value 'QUOTATION',
+             LC_APPE_INQUIRY   type ZVCXI_XCS_IAPPE value 'INQUIRY'.
+
+  data: LT_APPE type ZVCXI_XCS_TT_APPE.
+  field-symbols: <LS_APPE> type ZVCXI_XCS_S_APPE.
+
+*** Check if Sales Order Type is Quote
+  if P_VBTYP eq LC_VBTYP_QUOTATION.
+
+    append initial line to LT_APPE assigning <LS_APPE>.
+    <LS_APPE>-IAPPE = LC_APPE_QUOTATION.
+
+*** ZUS01_APPE memory ID is used in ZUS01_CORR_DVC_CEXIT_QUOTE fm
+*** To default the Context to Sales
+    export APPE = LT_APPE to shared memory INDX(ST) id 'ZUS01_APPE'.
+
+  endif.
+
+*** Check if Sales Order Type is Inquiry
+  if P_VBTYP eq LC_VBTYP_INQUIRY.
+
+    append initial line to LT_APPE assigning <LS_APPE>.
+    <LS_APPE>-IAPPE = LC_APPE_INQUIRY.
+
+*** ZUS01_APPE memory ID is used in ZUS01_CORR_DVC_CEXIT_QUOTE fm
+*** To default the Context to Sales
+    export APPE = LT_APPE to shared memory INDX(ST) id 'ZUS01_APPE'.
+
+  endif.
+
+endform.
+*&---------------------------------------------------------------------*
+*& Form DELETE_APPE
+*&---------------------------------------------------------------------*
+***@TECHNICALDOCUMENTATION
+*        text
+*      -->P_LS_VBAK_VBTYP  text
+*& -->  p1        text
+*& <--  p2        text
+*&---------------------------------------------------------------------*
+form DELETE_APPE  using    P_VBTYP.
+
+  data: LT_APPE type ZVCXI_XCS_TT_APPE.
+
+** Check if Sales Order Type is Quote or Inquiry
+  if P_VBTYP eq LC_VBTYP_QUOTATION
+  or P_VBTYP eq LC_VBTYP_INQUIRY.
+
+*** ZUS01_APPE memory ID is used in ZUS01_CORR_DVC_CEXIT_QUOTE fm
+*** To default the Context to Sales
+    export APPE = LT_APPE to shared memory INDX(ST) id 'ZUS01_APPE'.
+
+  endif.
+
+endform.
+
+*Text elements
+*----------------------------------------------------------
+* BL1 Sales Document Range:
+* BL2 Download File:
+* BL3 Download Options:
+* H01 AUART
+* H02 VKORG
+* H03 VTWEG
+* H04 SPART
+* H05 WERKS
+* H06 KUNAG
+* H07 KUNWE
+* H08 VBAK-SUBMI
+* H09 VBAK-TELF1
+* H10 <Sales Document Header Text>
+* H11 VBAK-WAERK
+* H12 PRSDT
+* H13 VBAK-BNDDT
+* H51 Sales Document Type
+* H52 Sales Organization
+* H53 Distribution Channel
+* H54 Division
+* H55 Plant for Item Level
+* H56 Sold-to party
+* H57 Ship-to party
+* H58 Collective Number (Bid Number)
+* H59 Old Sales Document Number
+* H60 Sales Document Header Text
+* H61 Currency
+* H62 Pricing Date
+* H63 Date Until Which Bid/Quotation is Binding (Valid-To Date)
+* I01 GROUPING
+* I02 RMATN
+* I03 Old Mat Number 1
+* I04 Old Mat Number 2
+* I05 KWMENG
+* I06 <Pricing Condition Record>
+* I07 <Price for KWMENG>
+* I08 <Scale Qty1>
+* I09 <Scale Price1>
+* I10 <Scale Qty2>
+* I11 <Scale Price2>
+* I12 <Scale Qty3>
+* I13 <Scale Price3>
+* I14 POSNR
+* I15 UEPOS
+* I16 <Sales Item Text>
+* I17 VBKD-BSTKD_E
+* I51 Grouping number
+* I52 Material number
+* I53 Old Material Number #1
+* I54 Old Material Number #2
+* I55 Cumulative order qty
+* I56 Pricing Condition
+* I57 Price for KWMENG
+* I58 Scale Qty1
+* I59 Scale Price1
+* I60 Scale Qty2
+* I61 Scale Price2
+* I62 Scale Qty3
+* I63 Scale Price3
+* I64 Item Number
+* I65 Higher-Level Item Number
+* I66 Sales Item Text
+* I67 Legacy Sales Order Line Item Numbers
+* I68 ZZMATNR
+* I69 Legacy Material #
+* L01 Include All Parameters (Supervised & Non-Supervised)
+* T01 SD Doc.
+* T02 SD Pos.
+* T03 Number of parameters
+* T04 Number of SD doc. Positions
+* T05 Filename
+* T06 Length of file in bytes
+* T07 Material
+* T08 Message
+* T09 Number of Lines Written
+
+
+*Selection texts
+*----------------------------------------------------------
+* P_DLALLP
+* P_EXCLMQ         Exclude Multi-Qty Line Items
+* P_FILE D       .
+* P_RAD1         Presentation Server
+* P_RAD2         Application Server
+* SO_MATNR D       .
+* SO_POSNR D       .
+* SO_VBELN D       .
+
+
+*Messages
+*----------------------------------------------------------
+*
+* Message class: ZUS01_MIG
+*010   Item &1 of &2 processed: &3 / &4.
+*106   Background Job does not support option 'Presentation server'.

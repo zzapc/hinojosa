@@ -1,0 +1,649 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRMM0030
+*&
+*&---------------------------------------------------------------------*
+*& Autor: Carlos Vivó Jiménez
+*& Fecha: 10.02.2021
+*&
+*& Contexto: ticket 61188, Enrique Guerrero viene reclamando hace tiempo
+*&  un listado con las tarifas y descuentos para los papeles. Éstos se manejan
+*&  a nivel de proveedor+grup.art.+gramaje, así que utilizaremos la simluación
+*&  de la tx MEPA para un material con esas condiciones y ocultamos el ancho
+*&
+*& Consideraciones: se asume que los siguientes parámetros no son relevantes
+*&  para el precio: centro, sociedad, grupo de compras, fecha de entrega,
+*&  ind.impuestos, cantidad y UM -> asunciones de Enrique Guerrero
+*&
+*&---------------------------------------------------------------------*
+REPORT zrmm0030.
+
+TABLES: ekko, ekpo, mara.
+
+DATA: t_fieldcat TYPE lvc_t_fcat,
+      t_data     TYPE REF TO data,
+      data       TYPE REF TO data.
+
+CLASS lcl_handle_events DEFINITION.
+  PUBLIC SECTION.
+    METHODS double_click
+                FOR EVENT double_click OF cl_salv_events_table
+      IMPORTING row column.
+ENDCLASS.
+
+
+DATA gr_table TYPE REF TO cl_salv_table.
+DATA gr_events TYPE REF TO lcl_handle_events.
+DATA lr_events TYPE REF TO cl_salv_events_table.
+DATA layout_settings TYPE REF TO cl_salv_layout.
+DATA layout_key      TYPE salv_s_layout_key.
+DATA columns TYPE REF TO cl_salv_columns_table.
+DATA column2 TYPE REF TO cl_salv_column_table.
+DATA column  TYPE REF TO cl_salv_column.
+DATA not_found TYPE REF TO cx_salv_not_found.
+DATA functions TYPE REF TO cl_salv_functions_list.
+DATA display_settings TYPE REF TO cl_salv_display_settings.
+DATA color  TYPE lvc_s_colo.
+DATA t_bekpo   TYPE TABLE OF bekpo.
+
+DATA: BEGIN OF kschl,
+        kschl TYPE kscha,
+        vtext TYPE vtxtk,
+      END OF kschl.
+DATA t_kschl LIKE TABLE OF kschl.
+
+FIELD-SYMBOLS: <tdata>     TYPE STANDARD TABLE,
+               <data>, <fieldname>.
+
+
+SELECTION-SCREEN BEGIN OF BLOCK 4 WITH FRAME TITLE text-004.
+PARAMETERS: p_papel RADIOBUTTON GROUP 1 USER-COMMAND radio DEFAULT 'X',
+            p_aux   RADIOBUTTON GROUP 1.
+SELECTION-SCREEN END OF BLOCK 4.
+
+SELECTION-SCREEN BEGIN OF BLOCK 1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_lifnr FOR ekko-lifnr,
+                s_matkl FOR mara-matkl,
+                s_gram FOR mara-zzgramaje MODIF ID pap,
+                s_matnr FOR mara-matnr MODIF ID aux.
+SELECTION-SCREEN SKIP.
+SELECTION-SCREEN BEGIN OF BLOCK 2 WITH FRAME TITLE text-002.
+SELECT-OPTIONS: s_fecha FOR ekpo-prdat DEFAULT sy-datum OBLIGATORY NO-EXTENSION.
+SELECTION-SCREEN END OF BLOCK 2.
+SELECTION-SCREEN BEGIN OF BLOCK 3 WITH FRAME TITLE text-003.
+SELECT-OPTIONS: s_menge FOR ekpo-menge NO INTERVALS.
+SELECTION-SCREEN END OF BLOCK 3.
+SELECTION-SCREEN END OF BLOCK 1.
+
+AT SELECTION-SCREEN OUTPUT.
+  LOOP AT SCREEN.
+    IF screen-group1 EQ 'PAP'.
+      IF p_papel IS INITIAL.
+        screen-input = 0.
+        REFRESH: s_gram. CLEAR: s_gram.
+      ELSE.
+        screen-input = 1.
+      ENDIF.
+      MODIFY SCREEN.
+    ELSEIF screen-group1 EQ 'AUX'.
+      IF p_aux IS INITIAL.
+        screen-input = 0.
+        REFRESH: s_matnr. CLEAR: s_matnr.
+      ELSE.
+        screen-input = 1.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+
+  CLEAR sy-ucomm.
+
+AT SELECTION-SCREEN ON s_fecha.
+  IF s_fecha-option NE 'EQ' AND s_fecha-option NE 'BT'.
+    MESSAGE 'Sólo se permite valor único o rango para el campo fecha' TYPE 'E'.
+  ENDIF.
+
+START-OF-SELECTION.
+
+  DATA(stop) = CONV tims( sy-uzeit + 900 ). " pararemos a los 15 minutos, el rollback evita que salte timeout
+
+  " para obtener los registros, debemos acotar los tipos de material para el join
+  IF p_papel IS NOT INITIAL. " 67732 - si es papel, acotamos tipos de material, de lo contrario cogeremos todo
+    SELECT sign, opti AS option, low, high FROM tvarvc
+      WHERE name EQ 'ZWM_TIPO_MAT_BOBINA'
+        OR name EQ 'ZWM_TIPO_MAT_PALLET'
+      INTO TABLE @DATA(r_mtart).
+  ENDIF.
+
+  " DEL - cvivo - 66111 Ahora ya no verificamos autorización, lo saltamos mediante enhancement, así que no restringimos selección tampoco
+*  " 65709 - seleccionamos únicamente centro y grupo compras autorizado
+*  RANGES s_ekgrp FOR ekko-ekgrp.
+*
+*  SELECT * FROM t024
+*    INTO @DATA(t024).
+*
+*    AUTHORITY-CHECK OBJECT 'M_BEST_EKG'
+*      ID 'EKGRP' FIELD t024-ekgrp
+*      ID 'ACTVT' FIELD '09'.
+*
+*    IF sy-subrc EQ 0.
+*      APPEND INITIAL LINE TO s_ekgrp ASSIGNING FIELD-SYMBOL(<line>).
+*      <line>-sign = 'I'.
+*      <line>-option = 'EQ'.
+*      <line>-low = t024-ekgrp.
+*    ENDIF.
+*  ENDSELECT.
+
+  " partimos de los registros info actuales para papeles existentes
+  SELECT eina~infnr, eina~lifnr, lfa1~name1, eina~matnr, eine~werks, eine~ekgrp, mara~zzgramaje, mara~matkl, t023t~wgbez60, makt~maktx FROM eina
+    INNER JOIN mara
+      ON mara~matnr EQ eina~matnr
+    INNER JOIN eine
+      ON eine~infnr EQ eina~infnr
+    INNER JOIN t023t
+      ON t023t~matkl EQ mara~matkl
+    INNER JOIN lfa1
+      ON lfa1~lifnr EQ eina~lifnr
+    INNER JOIN makt
+      ON mara~matnr EQ makt~matnr
+     AND makt~spras EQ @sy-langu
+    WHERE mara~mtart IN @r_mtart
+      AND mara~matnr IN @s_matnr
+      AND mara~matkl IN @s_matkl
+      AND eina~lifnr IN @s_lifnr
+*      AND eine~ekgrp IN @s_ekgrp " cvivo - autorizaciones " del - cvivo - 66111 ya no verif.autoriz.
+      AND mara~zzgramaje IN @s_gram
+      AND t023t~spras EQ @sy-langu
+    INTO TABLE @DATA(t_eina).
+
+  CHECK t_eina IS NOT INITIAL.
+
+  DATA: BEGIN OF cond,
+          infnr     TYPE infnr,
+          lifnr     TYPE eina-lifnr,
+          lname     TYPE edoc_co_supplier_name,
+          matnr     TYPE eina-matnr,
+          maktx     type makt-maktx,
+          werks     TYPE eine-werks,
+          ekgrp     TYPE eine-ekgrp,
+          prdat     TYPE ekpo-prdat,
+          menge     TYPE ekpo-menge,
+          meins     TYPE ekpo-meins,
+          zzgramaje TYPE mara-zzgramaje,
+          matkl     TYPE mara-matkl,
+          wgbez60   TYPE t023t-wgbez60,
+          count     TYPE merep_azpos VALUE 1,
+          komv      TYPE TABLE OF komv.
+  DATA END OF cond.
+  DATA: t_cond LIKE TABLE OF cond.
+
+  IF p_papel IS NOT INITIAL. " 67732 - si no es papel no es necesario esto
+    SORT t_eina BY matkl zzgramaje lifnr.
+    DELETE ADJACENT DUPLICATES FROM t_eina COMPARING matkl zzgramaje lifnr.
+  ENDIF.
+
+  LOOP AT t_eina ASSIGNING FIELD-SYMBOL(<feina>) WHERE werks IS INITIAL OR ekgrp IS INITIAL.
+    SELECT SINGLE ekpo~werks ekko~ekgrp FROM ekpo
+      INNER JOIN ekko
+      ON ekpo~ebeln EQ ekko~ebeln
+      INTO ( <feina>-werks, <feina>-ekgrp )
+        WHERE matnr EQ <feina>-matnr
+        AND lifnr EQ <feina>-lifnr
+        AND werks NE space.
+  ENDLOOP.
+
+  DELETE t_eina WHERE werks IS INITIAL.
+
+  " primero cogemos todo para el primer día del periodo; a partir de las condiciones del resultado, vamos controlando en qué fecha
+  " volver a consultar al detectar un cambio en cualquiera de los registros de esa clase de condición (optimizar sin llegar a hacer un
+  " análisis exacto, que complica mucho más el filtrado)
+
+  DATA dia_ini TYPE sydatum.
+  dia_ini = s_fecha-low.
+
+  IF s_menge IS INITIAL.
+    DATA(no_menge) = 'X'.
+
+    APPEND INITIAL LINE TO s_menge.
+  ENDIF.
+
+  LOOP AT s_menge.
+    DATA(l_menge) = CONV bstmg( s_menge-low ).
+    DATA(l_meins) = CONV meins( 'KG' ).
+
+    PERFORM simulate_4day TABLES t_eina
+                                 t_cond
+                                 t_kschl
+                                 t_bekpo
+                           USING dia_ini
+                                 l_menge
+                                 l_meins.
+  ENDLOOP.
+
+  " ahora consultamos los cambios de intervalo de fechas para las clases de condición seleccionadas
+  IF s_fecha-high IS NOT INITIAL.
+    SELECT * FROM konh
+      FOR ALL ENTRIES IN @t_kschl
+      WHERE kschl EQ @t_kschl-kschl
+        AND datab IN @s_fecha " fecha de validez comprendida en el intervalo
+      INTO TABLE @DATA(t_konh).
+
+    IF sy-subrc EQ 0.
+      DELETE t_konh WHERE datab EQ dia_ini. " por si coincidiera justo una clave con el low del periodo
+      SORT t_konh BY datab.
+      DELETE ADJACENT DUPLICATES FROM t_konh COMPARING datab.
+
+      LOOP AT t_konh ASSIGNING FIELD-SYMBOL(<konh>).
+        AT NEW datab.
+          IF sy-uzeit GE stop AND sy-batch EQ abap_false.
+            MESSAGE 'TIMEOUT' TYPE 'X'.
+          ENDIF.
+        ENDAT.
+
+        LOOP AT s_menge.
+          l_menge = CONV bstmg( s_menge-low ).
+          l_meins = CONV meins( 'KG' ).
+
+          PERFORM simulate_4day TABLES  t_eina
+                                        t_cond
+                                        t_kschl
+                                        t_bekpo
+                                  USING <konh>-datab
+                                        l_menge
+                                        l_meins.
+        ENDLOOP.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+
+  APPEND INITIAL LINE TO t_fieldcat ASSIGNING FIELD-SYMBOL(<field>).
+  <field> = VALUE #( fieldname = 'WGBEZ60' scrtext_s = 'Referencia' ref_field = 'WGBEZ60' ref_table = 'T023T' ).
+  <field>-scrtext_l = <field>-scrtext_m = <field>-scrtext_s.
+  APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+  <field> = VALUE #( fieldname = 'MATKL' ref_field = 'MATKL' ref_table = 'MARA' ).
+
+  IF p_papel IS NOT INITIAL.
+    APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+    <field> = VALUE #( fieldname = 'ZZGRAMAJE' ref_field = 'ZZGRAMAJE' ref_table = 'MARA' ).
+  ENDIF.
+
+  APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+  <field> = VALUE #( fieldname = 'MATNR' ref_field = 'MATNR' ref_table = 'MARA' ).
+  APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+  <field> = VALUE #( fieldname = 'MAKTX' ref_field = 'MAKTX' ref_table = 'MAKT' ).
+
+  APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+  <field> = VALUE #( fieldname = 'LIFNR' ref_field = 'LIFNR' ref_table = 'EKKO' ).
+  APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+  <field> = VALUE #( fieldname = 'LNAME' ref_field = 'SUPPLIER_NAME' ref_table = 'EDOCOINVINC' ).
+  APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+  <field> = VALUE #( fieldname = 'PRDAT' ref_field = 'PRDAT' ref_table = 'EKPO' ).
+
+  IF no_menge IS INITIAL.
+    APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+    <field> = VALUE #( fieldname = 'MENGE' ref_field = 'MENGE' ref_table = 'EKPO' ).
+    APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+    <field> = VALUE #( fieldname = 'MEINS' ref_field = 'MEINS' ref_table = 'EKPO' ).
+  ENDIF.
+
+
+  LOOP AT t_kschl ASSIGNING FIELD-SYMBOL(<kschl>). " cargamos los campos para cada condición
+    IF <kschl>-vtext CA '@'. " si contiene un icono, hay que quitarlo
+      SPLIT <kschl>-vtext AT '@' INTO DATA(str1) DATA(str2) DATA(str3). " los iconos contienen dos @, así que la tercera cadena es la buena
+      MOVE str3 TO <kschl>-vtext.
+    ENDIF.
+
+    APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+    <field> = VALUE #( fieldname = <kschl>-kschl  scrtext_m = <kschl>-vtext datatype = 'CHAR' intlen = 22 ).
+    <field>-scrtext_l = <field>-scrtext_m." = <field>-scrtext_s.
+  ENDLOOP.
+
+  APPEND INITIAL LINE TO t_fieldcat ASSIGNING <field>.
+  <field> = VALUE #( fieldname = 'COUNT' ref_field = 'AZPOS' ref_table = 'MEREP_OUTTAB_PURCHDOC' ).
+
+  CALL METHOD cl_alv_table_create=>create_dynamic_table
+    EXPORTING
+      it_fieldcatalog  = t_fieldcat
+      i_length_in_byte = 'X'
+    IMPORTING
+      ep_table         = t_data.
+
+  ASSIGN t_data->* TO <tdata>.
+  CREATE DATA data LIKE LINE OF <tdata>.
+  ASSIGN data->* TO <data>.
+
+  LOOP AT t_cond ASSIGNING FIELD-SYMBOL(<cond>).
+    APPEND INITIAL LINE TO <tdata> ASSIGNING <data>.
+    MOVE-CORRESPONDING <cond> TO <data>.
+
+    LOOP AT <cond>-komv ASSIGNING FIELD-SYMBOL(<komv>).
+      LOOP AT <cond>-komv INTO DATA(second) FROM ( sy-tabix + 1 ) WHERE kschl EQ <komv>-kschl
+                                                                    AND kschl IS NOT INITIAL.
+        ADD second-kbetr TO <komv>-kbetr. " sumamos
+        DELETE TABLE <cond>-komv FROM second.
+      ENDLOOP.
+
+      DATA(fieldname) = COND #( WHEN <komv>-kschl IS NOT INITIAL THEN |<data>-{ <komv>-kschl }| ELSE |<data>-{ <komv>-stunr }| ).
+
+      ASSIGN (fieldname) TO <fieldname>.
+*      <fieldname> = komv-kbetr.
+      CASE <komv>-krech.
+        WHEN 'A'. " porcentaje
+          <komv>-kbetr = abs( <komv>-kbetr ).
+          <komv>-kbetr = <komv>-kbetr / 10.
+          DATA(entero) = trunc( <komv>-kbetr ).
+          IF entero = <komv>-kbetr.
+            WRITE <komv>-kbetr TO <fieldname> RIGHT-JUSTIFIED DECIMALS 0.
+          ELSE.
+            WRITE <komv>-kbetr TO <fieldname> RIGHT-JUSTIFIED DECIMALS 1.
+          ENDIF.
+          <fieldname> = |{ <fieldname>+1 }%|.
+        WHEN OTHERS.
+          <komv>-kbetr = abs( <komv>-kbetr ).
+          WRITE <komv>-kbetr TO <fieldname> RIGHT-JUSTIFIED CURRENCY 'EUR'.
+*      <fieldname> = |{ <fieldname>+2 } €|.
+      ENDCASE.
+    ENDLOOP.
+  ENDLOOP.
+
+* Instanciar ALV desde tabla interna
+  cl_salv_table=>factory( IMPORTING r_salv_table = gr_table CHANGING t_table = <tdata> ).
+
+* Disposición ALV
+  layout_settings = gr_table->get_layout( ).
+
+  DATA(l_layout_key) = |{ sy-repid }{ p_aux }|. " 67732 - asi controlo que el layout sea diferente para papel o mat.aux., si no como
+  " las columnas son dinámicas, se hace un lío
+  layout_key-report = l_layout_key.
+  layout_settings->set_key( layout_key ).
+  layout_settings->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  layout_settings->set_default( abap_true ).
+
+* Optimizar columnas
+  columns = gr_table->get_columns( ).
+*  columns->set_optimize( ).
+
+* Funciones ALV activar
+  functions = gr_table->get_functions( ).
+  functions->set_all( ).
+
+* Modificar/ocultar columnas
+  LOOP AT t_fieldcat ASSIGNING <field>.
+    TRY.
+        column = columns->get_column( <field>-fieldname ).
+        IF <field>-scrtext_m IS NOT INITIAL.
+*          column->set_short_text( <field>-scrtext_s ).
+          column->set_medium_text( <field>-scrtext_m ).
+          column->set_long_text( <field>-scrtext_l ).
+          column->set_output_length( 15 ).
+          column->set_alignment( if_salv_c_alignment=>right ).
+        ENDIF.
+      CATCH cx_salv_not_found INTO not_found.
+    ENDTRY.
+  ENDLOOP.
+
+  TRY.
+      <field> = t_fieldcat[ fieldname = 'WGBEZ60' ].
+      column = columns->get_column( 'WGBEZ60' ).
+      column->set_short_text( <field>-scrtext_s ).
+      column->set_medium_text( <field>-scrtext_m ).
+      column->set_long_text( <field>-scrtext_l ).
+      column->set_output_length( 30 ).
+      column->set_alignment( if_salv_c_alignment=>left ).
+      column = columns->get_column( 'COUNT' ).
+      column->set_output_length( 5 ).
+    CATCH cx_salv_not_found INTO not_found.
+  ENDTRY.
+
+  IF no_menge IS NOT INITIAL.
+    TRY.
+        column = columns->get_column( 'MENGE' ).
+        column->set_visible( abap_false ).
+        column = columns->get_column( 'MEINS' ).
+        column->set_visible( abap_false ).
+      CATCH cx_salv_not_found INTO not_found.
+    ENDTRY.
+  ENDIF.
+
+  color = VALUE #( int = 1 inv = 1 col = 4 ).
+  TRY.
+      column2 ?= columns->get_column( 'WGBEZ60' ).
+      column2->set_color( color ).
+      column2 ?= columns->get_column( 'MATKL' ).
+      column2->set_color( color ).
+      column2 ?= columns->get_column( 'MATNR' ).
+      column2->set_color( color ).
+      column2 ?= columns->get_column( 'MAKTX' ).
+      column2->set_color( color ).
+      column2 ?= columns->get_column( 'ZZGRAMAJE' ).
+      column2->set_color( color ). column2->set_output_length( 6 ).
+    CATCH cx_salv_not_found INTO not_found.
+  ENDTRY.
+
+  color = VALUE #( int = 0 inv = 0 col = 5 ).
+  TRY.
+      column2 ?= columns->get_column( 'LIFNR' ).
+      column2->set_color( color ).
+      column2 ?= columns->get_column( 'LNAME' ).
+      column2->set_color( color ).
+    CATCH cx_salv_not_found INTO not_found.
+  ENDTRY.
+
+  IF p_papel IS NOT INITIAL.
+    TRY.
+        column = columns->get_column( 'MATNR' ).
+        column->set_technical( abap_true ). " así no sólo la oculto sino que la elimino
+        column = columns->get_column( 'MAKTX' ).
+        column->set_technical( abap_false ).
+      CATCH cx_salv_not_found INTO not_found.
+    ENDTRY.
+  ENDIF.
+
+* Opciones generales ALV
+  display_settings = gr_table->get_display_settings( ).
+  display_settings->set_striped_pattern( if_salv_c_bool_sap=>true ).
+  display_settings->set_list_header( 'Precio por referencia y proveedor' ).
+
+  lr_events = gr_table->get_event( ).
+  CREATE OBJECT gr_events.
+  SET HANDLER gr_events->double_click FOR lr_events.
+
+  gr_table->display( ).
+
+CLASS lcl_handle_events IMPLEMENTATION.
+  METHOD double_click.
+
+    READ TABLE <tdata> REFERENCE INTO data INDEX row.
+
+    CHECK sy-subrc EQ 0.
+
+    ASSIGN data->* TO <data>.
+
+    DATA fieldname(10).
+    DATA: wgbez60  LIKE cond-wgbez60,
+          matnr    LIKE cond-matnr,
+          lifnr    LIKE cond-lifnr,
+          prdat    LIKE cond-prdat,
+          menge    LIKE cond-menge,
+          meins    LIKE cond-meins,
+          simul    TYPE simul_po,
+          lt_komv  TYPE TABLE OF komv,
+          lt_komk  TYPE TABLE OF komk,
+          lt_komp  TYPE TABLE OF komp,
+          lt_bekpo TYPE TABLE OF bekpo,
+          lt_error TYPE TABLE OF belind_err.
+
+    fieldname = 'WGBEZ60'.
+    ASSIGN COMPONENT fieldname OF STRUCTURE <data> TO FIELD-SYMBOL(<var>).
+    wgbez60 = <var>.
+    fieldname = 'MATNR'.
+    ASSIGN COMPONENT fieldname OF STRUCTURE <data> TO <var>.
+    matnr = <var>.
+    fieldname = 'LIFNR'.
+    ASSIGN COMPONENT fieldname OF STRUCTURE <data> TO <var>.
+    lifnr = <var>.
+    fieldname = 'PRDAT'.
+    ASSIGN COMPONENT fieldname OF STRUCTURE <data> TO <var>.
+    prdat = <var>.
+    fieldname = 'MENGE'.
+    ASSIGN COMPONENT fieldname OF STRUCTURE <data> TO <var>.
+    IF sy-subrc EQ 0.
+      menge = <var>.
+    ENDIF.
+    fieldname = 'MEINS'.
+    ASSIGN COMPONENT fieldname OF STRUCTURE <data> TO <var>.
+    IF sy-subrc EQ 0.
+      meins = <var>.
+    ENDIF.
+
+    DATA(cond) = t_cond[ wgbez60 = wgbez60 lifnr = lifnr prdat = prdat matnr = matnr ].
+    DATA(bsart) = COND bsart( WHEN lifnr CP 'P*' THEN 'ZINT' ELSE 'ZPE1' ).
+    simul = VALUE #( bsart = bsart lifnr = cond-lifnr matnr = cond-matnr ekorg = '1000'
+                     werks = cond-werks bedat = cond-prdat bedat_neu = cond-prdat
+                     eindt = cond-prdat ekgrp = cond-ekgrp menge = menge meins = meins ).
+
+    CALL FUNCTION 'ME_PO_PRICE_SIMULATION'
+      EXPORTING
+        i_pricing_data   = simul
+        i_print_list     = abap_false
+      TABLES
+        t_komv           = lt_komv
+        t_komk           = lt_komk
+        t_komp           = lt_komp
+        t_bekpo          = lt_bekpo
+        t_error_messages = lt_error
+      EXCEPTIONS
+        error_create_po  = 1
+        OTHERS           = 2.
+
+    CHECK lt_bekpo IS NOT INITIAL.
+
+    DATA(komk) = lt_komk[ 1 ].
+    DATA(komp) = lt_komp[ 1 ].
+
+    DATA date(10). DATA mtext TYPE maktx.
+    WRITE cond-prdat TO date DD/MM/YYYY.
+    DATA(text) = |{ cond-lname } a { date }|.
+    mtext = cond-wgbez60.
+
+    CALL FUNCTION 'PRICING_SCREEN'
+      EXPORTING
+        comm_head_i   = komk
+        comm_item_i   = komp
+        comm_text     = text
+        material_text = mtext
+      TABLES
+        tkomv         = lt_komv.
+  ENDMETHOD.
+ENDCLASS.
+*&---------------------------------------------------------------------*
+*&      Form  SIMULATE_4DAY
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_DATE  text
+*----------------------------------------------------------------------*
+FORM simulate_4day  TABLES  pt_eina LIKE t_eina
+                            pt_cond LIKE t_cond
+                            pt_kschl LIKE t_kschl
+                            pt_bekpo LIKE t_bekpo
+                   USING    p_date
+                            p_menge
+                            p_meins.
+
+  DATA: simul    TYPE simul_po,
+        lt_komv  TYPE TABLE OF komv,
+        lt_komk  TYPE TABLE OF komk,
+        lt_komp  TYPE TABLE OF komp,
+        lt_bekpo TYPE TABLE OF bekpo,
+        lt_error TYPE TABLE OF belind_err.
+
+  LOOP AT pt_eina INTO DATA(weina).
+    CLEAR: simul, lt_komv, lt_bekpo, lt_error.
+
+    DATA(bsart) = COND bsart( WHEN weina-lifnr CP 'P*' THEN 'ZINT' ELSE 'ZPE1' ).
+    simul = VALUE #( bsart = bsart lifnr = weina-lifnr matnr = weina-matnr ekorg = '1000'
+                     werks = weina-werks ekgrp = weina-ekgrp bedat = p_date bedat_neu = p_date
+                     eindt = p_date menge = p_menge meins = p_meins ).
+
+    CALL FUNCTION 'ME_PO_PRICE_SIMULATION'
+      EXPORTING
+        i_pricing_data   = simul
+        i_print_list     = abap_false
+      TABLES
+        t_komv           = lt_komv
+        t_komk           = lt_komk
+        t_komp           = lt_komp
+        t_bekpo          = lt_bekpo
+        t_error_messages = lt_error
+      EXCEPTIONS
+        error_create_po  = 1
+        OTHERS           = 2.
+
+    IF lt_bekpo IS NOT INITIAL.
+      DATA(bekpo) = lt_bekpo[ 1 ].
+
+      ASSIGN t_bekpo[ infnr = bekpo-infnr ] TO FIELD-SYMBOL(<bekpo>).
+
+      IF <bekpo> IS NOT ASSIGNED . " si es la primera fecha para el registro info la añadimos y pasamos a calcular
+        APPEND INITIAL LINE TO t_bekpo ASSIGNING <bekpo>.
+      ENDIF.
+
+      IF <bekpo>-netpr NE bekpo-netpr. " si el precio ha cambiado con respecto al último registro del infnr: calculamos
+        " nuevo precio y sobreescrimos la entrada para el infnr
+
+        <bekpo> = bekpo. " actualizamos la línea
+
+        DATA(komk) = lt_komk[ 1 ].
+        DATA(komp) = lt_komp[ 1 ].
+        DATA lt_komv_full LIKE lt_komv.
+
+        CALL FUNCTION 'PRICING_SUBSCREEN_PBO'
+          EXPORTING
+            comm_head_i = komk
+            comm_item_i = komp
+          TABLES
+            tkomv       = lt_komv
+            ykomv       = lt_komv_full.
+
+        APPEND INITIAL LINE TO pt_cond ASSIGNING FIELD-SYMBOL(<cond>).
+        MOVE-CORRESPONDING weina TO <cond>.
+        <cond>-lname = weina-name1.
+        <cond>-prdat = p_date.
+        <cond>-menge = p_menge.
+        <cond>-meins = p_meins.
+        <cond>-count = 1.
+        <cond>-komv = lt_komv_full.
+
+        SHIFT <cond>-zzgramaje LEFT DELETING LEADING '0'.
+        <cond>-wgbez60 = |{ weina-wgbez60 } { <cond>-zzgramaje }gr|.
+
+        LOOP AT lt_komv_full INTO DATA(komv).
+          DATA l_kschl LIKE LINE OF pt_kschl.
+
+          IF komv-kschl IS INITIAL. " subtotal
+            l_kschl-kschl = komv-stunr. " pintamos la clave como clase cond.
+
+            SELECT SINGLE vtext FROM t683t
+            INTO l_kschl-vtext
+            WHERE stunr EQ komv-stunr
+            AND kalsm EQ komk-kalsm
+            AND spras EQ sy-langu.
+          ELSE. "clase de condición
+            SELECT SINGLE vtext FROM t685t
+            INTO l_kschl-vtext
+            WHERE spras EQ sy-langu
+            AND kschl EQ komv-kschl.
+
+            l_kschl-kschl = komv-kschl.
+          ENDIF.
+
+          COLLECT l_kschl INTO pt_kschl. " recuperamos aquí todas las condiciones
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+
+    UNASSIGN <bekpo>.
+  ENDLOOP.
+
+ENDFORM.

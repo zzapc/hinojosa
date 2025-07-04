@@ -1,0 +1,343 @@
+FUNCTION Z_ENVIO_SPOOL_POR_MAIL.
+*"--------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(SRC_SPOOLID) TYPE  TSP01-RQIDENT
+*"     REFERENCE(USER) TYPE  SY-UNAME
+*"     REFERENCE(HEADER_MAIL)
+*"  TABLES
+*"      LT_BODY_EMAIL STRUCTURE  SOLI OPTIONAL
+*"  EXCEPTIONS
+*"      ERR_NO_ABAP_SPOOLJOB
+*"--------------------------------------------------------------------
+TABLES: tsp01.
+*-----------------------------------------------------------------------
+* INTERNAL TABLES
+*-----------------------------------------------------------------------
+  DATA: lt_rec_tab LIKE STANDARD TABLE OF soos1 WITH HEADER LINE,
+        lt_note_text   LIKE STANDARD TABLE OF soli  WITH HEADER LINE,
+        lt_attachments LIKE STANDARD TABLE OF sood5 WITH HEADER LINE.
+
+  DATA: lt_objcont LIKE STANDARD TABLE OF soli WITH HEADER LINE,
+        lt_objhead LIKE STANDARD TABLE OF soli WITH HEADER LINE.
+
+*DATA: pdf_format LIKE STANDARD TABLE OF tline WITH HEADER LINE.
+
+  TYPES: BEGIN OF y_files,
+         file(60) TYPE c,
+         END OF y_files.
+
+  DATA: lt_files TYPE STANDARD TABLE OF y_files WITH HEADER LINE.
+
+  DATA: l_objcont     LIKE soli OCCURS 0 WITH HEADER LINE.
+  DATA: l_objhead     LIKE soli OCCURS 0 WITH HEADER LINE.
+
+
+*-----------------------------------------------------------------------
+* STRUCTURES
+*-----------------------------------------------------------------------
+  DATA: folder_id      LIKE soodk,
+        object_id      LIKE soodk,
+        link_folder_id LIKE soodk,
+*      g_document     LIKE sood1,
+*      g_header_data  LIKE sood2,
+        g_folmem_data  LIKE sofm2,
+        g_header_data  LIKE sood2,
+        g_receive_data LIKE soos6,
+        g_ref_document LIKE sood4,
+        g_new_parent   LIKE soodk,
+        l_folder_id    LIKE sofdk,
+        v_email(50).
+
+
+  DATA: hd_dat  LIKE sood1.
+
+*-----------------------------------------------------------------------
+*  VARIABLES
+*-----------------------------------------------------------------------
+  DATA: client  LIKE tst01-dclient,
+        name    LIKE tst01-dname,
+        objtype LIKE rststype-type,
+        type    LIKE rststype-type.
+
+  DATA: numbytes TYPE i,
+        arc_idx LIKE toa_dara,
+        pdfspoolid LIKE tsp01-rqident,
+        jobname LIKE tbtcjob-jobname,
+        jobcount LIKE tbtcjob-jobcount,
+        is_otf.
+
+  DATA: outbox_flag LIKE sonv-flag VALUE 'X',
+        store_flag  LIKE sonv-flag,
+        delete_flag LIKE sonv-flag,
+        owner       LIKE soud-usrnam,
+        on          LIKE sonv-flag VALUE 'X',
+        sent_to_all LIKE sonv-flag,
+        g_authority LIKE sofa-usracc,
+        w_objdes    LIKE sood4-objdes,
+        object_hd_change LIKE sood1,
+        document_id LIKE soodk,
+        parent_id LIKE soodk.
+
+  DATA: c_file LIKE rlgrap-filename,
+        n_spool(6) TYPE n.
+
+  DATA: cancel.
+
+  DATA: desired_type  LIKE sood-objtp,
+        real_type LIKE sood-objtp,
+        attach_type LIKE sood-objtp,
+        otf LIKE sood-objtp VALUE 'OTF', " SAPscript Ausgabeformat
+        ali LIKE sood-objtp VALUE 'ALI'. " ABAP lists
+
+
+*-----------------------------------------------------------------------
+*  CONSTANTS
+*-----------------------------------------------------------------------
+  CONSTANTS: ou_fol LIKE sofh-folrg              VALUE 'O',
+             c_objtp    LIKE sood-objtp          VALUE 'RAW'.
+*          c_file_ext LIKE g_document-file_ext VALUE 'TXT'.
+
+
+* Fist part: Verify if the spool really exists
+  SELECT SINGLE * FROM tsp01 WHERE rqident = src_spoolid.
+  IF sy-subrc NE 0.
+    RAISE err_no_abap_spooljob. "doesn't exist
+  ELSE.
+
+    client = tsp01-rqclient.
+    name   = tsp01-rqo1name.
+
+    CALL FUNCTION 'RSTS_GET_ATTRIBUTES'
+      EXPORTING
+        authority     = 'SP01'
+        client        = client
+        name          = name
+        part          = 1
+      IMPORTING
+        type          = type
+        objtype       = objtype
+      EXCEPTIONS
+        fb_error      = 1
+        fb_rsts_other = 2
+        no_object     = 3
+        no_permission = 4
+        OTHERS        = 5.
+
+    IF objtype(3) = 'OTF'.
+      desired_type = otf.
+    ELSE.
+      desired_type = ali.
+    ENDIF.
+
+
+    CALL FUNCTION 'RSPO_RETURN_SPOOLJOB'
+      EXPORTING
+        rqident              = src_spoolid
+        desired_type         = desired_type
+      IMPORTING
+        real_type            = real_type
+      TABLES
+        buffer               = l_objcont
+      EXCEPTIONS
+        no_such_job          = 14
+        type_no_match        = 94
+        job_contains_no_data = 54
+        no_permission        = 21
+        can_not_access       = 21
+        read_error           = 54.
+
+    IF sy-subrc EQ 0.
+      attach_type = real_type.
+    ENDIF.
+
+
+    CALL FUNCTION 'SO_FOLDER_ROOT_ID_GET'
+      EXPORTING
+        owner     = sy-uname
+        region    = ou_fol
+      IMPORTING
+        folder_id = l_folder_id
+      EXCEPTIONS
+        OTHERS    = 5.
+
+
+* fill out informations about the header of the email
+*    CLEAR: g_document.
+*    g_document-foltp     = l_folder_id-foltp.
+*    g_document-folyr     = l_folder_id-folyr.
+*    g_document-folno     = l_folder_id-folno.
+*
+*    g_document-objtp     = c_objtp.
+*    g_document-objdes    = header_mail.
+*    g_document-file_ext  = c_file_ext.
+
+    object_hd_change-objla  = sy-langu.
+    object_hd_change-objnam = 'NOTA'.
+    object_hd_change-objdes = header_mail.
+    object_hd_change-objsns = 'F'.
+    object_hd_change-vmtyp  = 'T'.
+    object_hd_change-skips  = 'X'.
+    object_hd_change-acnam  = 'SP01'.
+    object_hd_change-objcp  = 'X'.
+
+    g_header_data-objdes    = header_mail.
+    parent_id-objtp = l_folder_id-foltp.
+    parent_id-objyr = l_folder_id-folyr.
+    parent_id-objno = l_folder_id-folno.
+
+    CALL FUNCTION 'SO_DOCUMENT_INSERT'
+       EXPORTING
+          parent_id                  = parent_id
+          object_hd_change           = object_hd_change
+          document_type              = c_objtp
+          owner                      = sy-uname
+     IMPORTING
+          document_id                = document_id
+*         OBJECT_HD_DISPLAY          =
+*         OBJECT_FL_DISPLAY          =
+*    TABLES
+*         objcont_text               =
+*         OBJCONT_BIN                =
+*         OBJHEAD                    =
+*         OBJPARA                    =
+*         OBJPARB                    =
+     EXCEPTIONS
+          active_user_not_exist      = 1
+          dl_name_exist              = 2
+          folder_not_exist           = 3
+          folder_no_authorization    = 4
+          object_type_not_exist      = 5
+          operation_no_authorization = 6
+          owner_not_exist            = 7
+          parameter_error            = 8
+          substitute_not_active      = 9
+          substitute_not_defined     = 10
+          x_error                    = 11
+          OTHERS                     = 12.
+
+*    CALL FUNCTION 'SO_DOCUMENT_REPOSITORY_MANAGER'
+*         EXPORTING
+*              method      = 'SAVE'
+*              office_user = sy-uname
+*         IMPORTING
+*              authority   = g_authority
+*         TABLES
+*              objcont     = lt_body_email
+*              attachments = lt_attachments
+*         CHANGING
+*              document    = g_document
+*              header_data = g_header_data
+*         EXCEPTIONS
+*              OTHERS      = 1.
+
+
+    folder_id-objtp = l_folder_id-foltp.
+    folder_id-objyr = l_folder_id-folyr.
+    folder_id-objno = l_folder_id-folno.
+
+    object_id-objtp = document_id-objtp.
+    object_id-objyr = document_id-objyr.
+    object_id-objno = document_id-objno.
+
+    link_folder_id-objtp = l_folder_id-foltp.
+    link_folder_id-objyr = l_folder_id-folyr.
+    link_folder_id-objno = l_folder_id-folno.
+
+
+    REFRESH lt_rec_tab.
+
+*    CLEAR lt_rec_tab.
+*    lt_rec_tab-sel        = 'X'.
+*    lt_rec_tab-recesc     = object_type.   "This field for FAX/MAIL
+*    lt_rec_tab-recnam     = 'U-'.
+*    lt_rec_tab-deliver    = 'X'.
+*    lt_rec_tab-not_deli   = 'X'.
+*    lt_rec_tab-read       = 'X'.
+*    lt_rec_tab-mailstatus = 'E'.
+*    lt_rec_tab-adr_name   = fax_mail_number.
+*    lt_rec_tab-sortfield  = fax_mail_number.
+*    lt_rec_tab-recextnam  = fax_mail_number.
+*    lt_rec_tab-sortclass  = '5'.
+*    APPEND lt_rec_tab.
+
+    lt_rec_tab-rcdat = sy-datum.
+    lt_rec_tab-rctim = sy-uzeit.
+    lt_rec_tab-recnam = user.
+    lt_rec_tab-rtunam = user.
+    lt_rec_tab-sndex  = 'X'.     " Express-Mail
+    APPEND lt_rec_tab.
+
+
+* begin of insertion by faianf01
+    MOVE-CORRESPONDING object_hd_change TO hd_dat.
+    hd_dat-objdes = header_mail.
+    hd_dat-objla = sy-langu.
+
+    CALL FUNCTION 'SO_ATTACHMENT_INSERT'
+      EXPORTING
+        object_id                  = object_id
+        attach_type                = attach_type
+        object_hd_change           = hd_dat
+        owner                      = sy-uname
+      TABLES
+        objcont                    = l_objcont
+        objhead                    = l_objhead
+      EXCEPTIONS
+        active_user_not_exist      = 35
+        communication_failure      = 71
+        object_type_not_exist      = 17
+        operation_no_authorization = 21
+        owner_not_exist            = 22
+        parameter_error            = 23
+        substitute_not_active      = 31
+        substitute_not_defined     = 32
+        system_failure             = 72
+        x_error                    = 1000.
+
+    IF sy-subrc > 0.
+    ENDIF.
+
+
+* end of insertion by faianf01
+
+
+
+* send email from SAPOFFICE
+    CALL FUNCTION 'SO_OBJECT_SEND'
+         EXPORTING
+              folder_id                  = folder_id
+              object_id                  = object_id
+              outbox_flag                = outbox_flag
+              link_folder_id             = link_folder_id
+              owner                      = sy-uname
+*              check_send_authority       = 'X'
+         TABLES
+              receivers                  = lt_rec_tab
+*              note_text                  = lt_note_text
+         EXCEPTIONS
+              active_user_not_exist      = 35
+              communication_failure      = 71
+              component_not_available    = 1
+              folder_no_authorization    = 5
+              folder_not_exist           = 6
+              forwarder_not_exist        = 8
+              object_no_authorization    = 13
+              object_not_exist           = 14
+              object_not_sent            = 15
+              operation_no_authorization = 21
+              owner_not_exist            = 22
+              parameter_error            = 23
+              substitute_not_active      = 31
+              substitute_not_defined     = 32
+              system_failure             = 72
+              too_much_receivers         = 73
+              user_not_exist             = 35.
+
+  ENDIF.
+
+
+
+
+
+ENDFUNCTION.

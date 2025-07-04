@@ -1,0 +1,641 @@
+FUNCTION zsdcom_traza_importe_org.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_BELNR) TYPE  BELNR_D
+*"     VALUE(I_GJAHR) TYPE  GJAHR
+*"     VALUE(I_BUKRS) TYPE  BUKRS
+*"     VALUE(I_VALUT) TYPE  VALUT
+*"     VALUE(I_IMP) TYPE  FLAG
+*"  EXPORTING
+*"     VALUE(E_IMPORTE) TYPE  WRBTR
+*"  TABLES
+*"      IT_BSEG STRUCTURE  BSEG
+*"  CHANGING
+*"     VALUE(CT_TRAZA) TYPE  ZTTSDCOM_TRAZA_OR
+*"----------------------------------------------------------------------
+
+  DATA: lti_tbsl        TYPE TABLE OF tbsl,
+        lti_bsid        TYPE TABLE OF bsid.
+
+  DATA: ls_tbsl         TYPE tbsl,
+        ls_traza        TYPE zssdcom_traza_or,
+        ls_traza_aux    TYPE zssdcom_traza_or,
+        ls_bseg         TYPE bseg,
+        ls_bseg_aux     TYPE bseg.
+
+  DATA: lv_wrbtr        TYPE wrbtr,
+        lv_comp         TYPE char1,
+        lv_imp          TYPE char1,
+        lv_cont1        TYPE int4,
+        lv_cont2        TYPE int4,
+        lv_pos          TYPE int4,
+        lv_bseg         TYPE bseg,
+        lv_bschl        TYPE bschl,
+        lv_imp_calc     TYPE wrbtr,
+        lv_imp_comp     TYPE wrbtr.
+
+  RANGES: lr_bschl_fac  FOR bseg-bschl, "facturas
+          lr_bschl_otr  FOR bseg-bschl, "otros
+          lr_bschl_efc  FOR bseg-bschl, "efectos
+          lr_bschl_imp  FOR bseg-bschl, "impagados
+          lr_bschl_ant  FOR bseg-bschl, "anticipos
+          lr_bschl_abo  FOR bseg-bschl, "abonos
+          lr_umskz_otr  FOR bseg-umskz, "otros
+          lr_umskz_efc  FOR bseg-umskz, "efectos
+          lr_umskz_imp  FOR bseg-umskz, "impagados
+          lr_umskz_ant  FOR bseg-umskz. "anticipos
+
+
+* Inicializamos el importe
+  CLEAR e_importe.
+
+* Chequeamos que nos llegan datos
+  CHECK ct_traza[] IS NOT INITIAL.
+
+* Busqueda de las claves de contabilización...
+  SELECT * INTO TABLE lti_tbsl
+      FROM tbsl.
+
+* Rellenamos los rangos para identificar los tipos de documentos
+  CALL FUNCTION 'ZSDCOM_PARAM_CLAVES_CONT_ORG'
+    EXPORTING
+      i_koart      = 'D'
+    TABLES
+      er_bschl_fac = lr_bschl_fac
+      er_bschl_otr = lr_bschl_otr
+      er_bschl_efc = lr_bschl_efc
+      er_bschl_imp = lr_bschl_imp
+      er_bschl_ant = lr_bschl_ant
+      er_bschl_abo = lr_bschl_abo
+*     ER_UMSKZ_FAC =
+      er_umskz_otr = lr_umskz_otr
+      er_umskz_efc = lr_umskz_efc
+      er_umskz_imp = lr_umskz_imp
+      er_umskz_ant = lr_umskz_ant
+*     ER_UMSKZ_ABO =
+    CHANGING
+      ct_traza     = ct_traza.
+
+* Sacamos la clave contable del documento original
+  READ TABLE ct_traza INTO ls_traza INDEX 1.
+  IF sy-subrc = 0 AND ls_traza-belnr = i_belnr.
+    lv_bschl = ls_traza-bschl.
+  ENDIF.
+
+*  Calculamos el importe en base a los documentos trazados
+  LOOP AT ct_traza INTO ls_traza WHERE belnr <> i_belnr
+                                 AND   augdt <= i_valut.
+
+*   Facturas
+*   -------------------------------------------------------------------
+    IF  ls_traza-bschl IN lr_bschl_fac.
+*     Miro si la factura ha sido compensada para tener en cuenta su importe
+      IF ls_traza-augbl IS NOT INITIAL.
+        SELECT SINGLE belnr INTO ls_traza-augbl
+            FROM  bseg
+            WHERE bukrs = ls_traza-bukrs
+            AND   belnr = ls_traza-augbl
+            AND   gjahr = ls_traza-augdt(4)
+            AND   buzei = ls_traza-buzei
+            AND   augbl <> ''
+            AND   umskz <> 'A'.
+        IF sy-subrc = 0.
+          e_importe = e_importe - ls_traza-wrbtr.
+        ELSEIF sy-subrc <> 0 AND ls_traza-rebzg IS INITIAL.
+          e_importe = e_importe - ls_traza-wrbtr.
+        ENDIF.
+
+        SELECT SINGLE belnr INTO ls_traza-augbl
+            FROM  bseg
+            WHERE bukrs = ls_traza-bukrs
+            AND   belnr = ls_traza-augbl
+            AND   gjahr = ls_traza-augdt(4)
+            AND   augbl <> ''
+            AND   umskz = 'A'.
+        IF sy-subrc = 0 AND ls_traza-rebzg IS INITIAL.
+          e_importe = e_importe - ls_traza-wrbtr.
+        ENDIF.
+      ELSE.
+        e_importe = e_importe - ls_traza-wrbtr.
+      ENDIF.
+
+
+*   Abonos
+*   -------------------------------------------------------------------
+    ELSEIF ls_traza-bschl IN lr_bschl_abo.
+      IF ls_traza-augbl IS NOT INITIAL.
+        SELECT SINGLE belnr INTO ls_traza-augbl
+          FROM  bseg
+          WHERE bukrs = ls_traza-bukrs
+          AND   belnr = ls_traza-augbl
+          AND   gjahr = ls_traza-augdt(4)
+          AND   buzei = ls_traza-buzei
+          AND   augbl <> ''
+          AND   umskz <> 'A'.
+        IF sy-subrc = 0.
+          SELECT SINGLE belnr INTO ls_traza-augbl
+             FROM  bseg
+             WHERE bukrs = ls_traza-bukrs
+             AND   belnr = ls_traza-augbl
+             AND   gjahr = ls_traza-augdt(4)
+             AND   augbl <> ''
+             AND   umskz = 'A'.
+          IF sy-subrc = 0 AND ls_traza-rebzg IS INITIAL.
+            e_importe = e_importe - ls_traza-wrbtr.
+          ENDIF.
+        ELSEIF sy-subrc <> 0 AND ls_traza-rebzg IS INITIAL.
+          e_importe = e_importe - ls_traza-wrbtr.
+        ENDIF.
+      ELSE.
+        e_importe = e_importe - ls_traza-wrbtr.
+      ENDIF.
+
+
+*   Efectos
+*   -------------------------------------------------------------------
+    ELSEIF ls_traza-bschl IN lr_bschl_efc AND
+           ls_traza-umskz IN lr_umskz_efc.
+
+
+*   Impagados
+*   -------------------------------------------------------------------
+    ELSEIF ls_traza-bschl IN lr_bschl_imp AND
+           ls_traza-umskz IN lr_umskz_imp.
+      e_importe = e_importe - ls_traza-wrbtr.
+
+
+*   Anticipos
+*   -------------------------------------------------------------------
+    ELSEIF ls_traza-bschl IN lr_bschl_ant AND
+           ls_traza-umskz IN lr_umskz_ant.
+      e_importe = e_importe - ls_traza-wrbtr.
+
+
+*   Efecto/Impagado/Anticipo
+*   -------------------------------------------------------------------
+    ELSEIF ls_traza-bschl IN lr_bschl_efc OR
+           ls_traza-bschl IN lr_bschl_imp OR
+           ls_traza-bschl IN lr_bschl_ant.
+*      Leemos la clave contable
+      READ TABLE lti_tbsl INTO ls_tbsl WITH KEY bschl = ls_traza-bschl
+                                                koart = ls_traza-koart.
+*      Dependiendo del signo, sumamos o restamos
+      CASE ls_tbsl-shkzg.
+        WHEN 'H'.
+          e_importe = e_importe - ls_traza-wrbtr.
+        WHEN 'S'.
+          e_importe = e_importe + ls_traza-wrbtr.
+      ENDCASE.
+
+
+*   Otros
+*   -------------------------------------------------------------------
+    ELSEIF ls_traza-bschl IN lr_bschl_otr AND
+           ls_traza-umskz IN lr_umskz_otr.
+      SELECT SINGLE belnr INTO ls_traza-belnr
+          FROM  bseg
+          WHERE bukrs  = ls_traza-bukrs
+          AND   gjahr  = ls_traza-gjahr
+          AND   belnr  = ls_traza-belnr
+          AND   buzei  = ls_traza-buzei
+          AND   augbl <> ls_traza-belnr
+          AND   rebzj  = i_gjahr
+          AND   rebzg  = i_belnr.
+      CHECK sy-subrc <> 0.
+
+*     Si el documento se ha llevado al cobro no lo tenemos en cuenta para importe...
+      READ TABLE it_bseg WITH KEY disbn = ls_traza-belnr
+                                  disbj = ls_traza-gjahr
+                                  disbz = ls_traza-buzei.
+*     No es un abono el Doc. de partida
+      IF sy-subrc <> 0 AND lv_bschl NOT IN lr_bschl_abo.
+        READ TABLE lti_tbsl INTO ls_tbsl WITH KEY bschl = ls_traza-bschl
+                                                  koart = ls_traza-koart.
+*       Dependiendo del signo, sumamos o restamos
+        CASE ls_tbsl-shkzg.
+          WHEN 'H'.
+            e_importe = e_importe - ls_traza-wrbtr.
+          WHEN 'S'.
+            e_importe = e_importe + ls_traza-wrbtr.
+        ENDCASE.
+      ENDIF.
+
+
+*   Resto de casos
+*   -------------------------------------------------------------------
+    ELSE.
+*     Si el documento se ha llevado al cobro no lo tenemos en cuenta para importe
+      READ TABLE it_bseg INTO ls_bseg WITH KEY disbn = ls_traza-belnr
+                                               disbj = ls_traza-gjahr
+                                               disbz = ls_traza-buzei.
+      CHECK sy-subrc <> 0.
+
+*     Si hay Efectos que se compensan con el mismo doc
+      LOOP AT it_bseg INTO ls_bseg WHERE augbl  = ls_traza-augbl
+                                   AND   belnr <> ls_traza-belnr
+                                   AND   rebzg IS INITIAL
+                                   AND   disbn IS NOT INITIAL
+                                   AND   bschl IN lr_bschl_efc
+                                   AND   umskz IN lr_umskz_efc.
+
+*       Comprobamos que la línea es de compensación
+        READ TABLE it_bseg INTO ls_bseg_aux WITH KEY augbl = ls_bseg-belnr.
+        CHECK sy-subrc = 0.
+
+        IF ls_traza-wrbtr >= ls_bseg-wrbtr.
+*         Sacamos el signo
+          READ TABLE lti_tbsl INTO ls_tbsl WITH KEY bschl = ls_traza-bschl
+                                                    koart = ls_traza-koart.
+          CASE ls_tbsl-shkzg.
+            WHEN 'H'.
+              e_importe = e_importe - ls_bseg-wrbtr.
+            WHEN 'S'.
+              e_importe = e_importe + ls_bseg-wrbtr.
+          ENDCASE.
+        ENDIF.
+      ENDLOOP.
+
+*     Si no hay efectos
+      IF sy-subrc <> 0.
+*       Sacamos el signo
+        READ TABLE lti_tbsl INTO ls_tbsl WITH KEY bschl = ls_traza-bschl
+                                                  koart = ls_traza-koart.
+        CASE ls_tbsl-shkzg.
+          WHEN 'H'.
+            e_importe = e_importe - ls_traza-wrbtr.
+          WHEN 'S'.
+            e_importe = e_importe + ls_traza-wrbtr.
+        ENDCASE.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+*  Sacamos el importe total de la factura/abono
+  CLEAR: lv_wrbtr.
+  SELECT * INTO ls_bseg
+      FROM  bseg
+      WHERE bukrs  = i_bukrs
+      AND   gjahr  = i_gjahr
+      AND   belnr  = i_belnr
+      AND   augbl <> i_belnr
+      AND   augbl <> ''
+      AND   koart <> 'S'
+      AND   augdt <= i_valut.
+
+*    Dependiendo del signo: sumamos o restamos
+    CASE ls_bseg-shkzg.
+      WHEN 'H'.
+        lv_wrbtr = lv_wrbtr - ls_bseg-wrbtr.
+      WHEN 'S'.
+        lv_wrbtr = lv_wrbtr + ls_bseg-wrbtr.
+    ENDCASE.
+
+    lv_pos = lv_pos + 1.
+  ENDSELECT.
+
+*  Realizamos un chequeo para que el importe calculado nunca se mayor que el de la factura
+  IF sy-subrc = 0 AND (  lv_wrbtr < e_importe AND ls_bseg-bschl IN lr_bschl_fac OR "factura
+                         lv_wrbtr > e_importe AND ls_bseg-bschl IN lr_bschl_abo ). "abono
+
+*    Nos quedamos con el importe que habíamos calculado
+    lv_imp_calc = e_importe.
+
+*    Chequeamos los documentos "OTROS"
+    e_importe = lv_wrbtr.
+    LOOP AT ct_traza INTO ls_traza WHERE bschl IN lr_bschl_otr.
+*      Chequeamos el documento
+      SELECT SINGLE belnr INTO ls_traza-belnr
+          FROM   bseg
+          WHERE bukrs  = ls_traza-bukrs
+          AND   gjahr  = ls_traza-gjahr
+          AND   belnr  = ls_traza-belnr
+          AND   buzei  = ls_traza-buzei
+          AND   augbl <> ls_traza-belnr
+          AND   rebzj  = i_gjahr
+          AND   rebzg  = i_belnr.
+      CHECK sy-subrc = 0.
+
+*     Si el documento se ha llevado al cobro no lo tenemos en cuenta para importe...
+      READ TABLE it_bseg INTO ls_bseg WITH KEY disbn = ls_traza-belnr
+                                               disbj = ls_traza-gjahr
+                                               disbz = ls_traza-buzei.
+      CHECK sy-subrc <> 0.
+      IF lv_bschl NOT IN lr_bschl_abo. "No es un abono el Doc. de partida
+        READ TABLE lti_tbsl INTO ls_tbsl WITH KEY bschl = ls_traza-bschl
+                                                  koart = ls_traza-koart.
+        CASE ls_tbsl-shkzg.
+          WHEN 'H'.
+            e_importe = e_importe + ls_traza-wrbtr.
+          WHEN 'S'.
+            e_importe = e_importe - ls_traza-wrbtr.
+        ENDCASE.
+      ENDIF.
+    ENDLOOP.
+
+*   Le quito al importe calculado, el importe sacado ahora
+    lv_imp_calc = lv_imp_calc - e_importe.
+*   Si el importe calculado > que el de la factura: ponemos cobrado toda la factura
+    IF lv_imp_calc >= lv_wrbtr.
+      e_importe = lv_wrbtr.
+    ENDIF.
+
+*   Miramos impagados
+    LOOP AT ct_traza INTO ls_traza WHERE augbl IS INITIAL
+                                   AND   augdt <= i_valut
+                                   AND   umskz IN lr_umskz_imp
+                                   AND   bschl IN lr_bschl_imp.
+      IF ls_traza-wrbtr >= lv_wrbtr.
+        CLEAR e_importe.
+        lv_imp = 'X'. "Esta impagada
+      ELSE.
+        e_importe = e_importe - lv_wrbtr.
+        IF ls_bseg-bschl IN lr_bschl_fac AND e_importe < 0. "factura impagada
+          CLEAR e_importe.
+          lv_imp = 'X'.
+        ELSEIF ls_bseg-bschl IN lr_bschl_abo AND e_importe > 0."abono impagado
+          CLEAR e_importe.
+          lv_imp = 'X'.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    IF sy-subrc <> 0.
+      LOOP AT ct_traza INTO ls_traza WHERE augbl IS NOT INITIAL
+                                     AND   augdt <= i_valut
+                                     AND   umskz IN lr_umskz_imp
+                                     AND   bschl IN lr_bschl_imp. "impagados
+        LOOP AT ct_traza INTO ls_traza_aux WHERE belnr  = ls_traza-augbl
+                                           AND   augbl IS INITIAL
+                                           AND   augdt <= i_valut.
+          IF ls_traza_aux-wrbtr >= lv_wrbtr.
+            CLEAR e_importe.
+            lv_imp = 'X'. "Esta impagada
+          ELSE.
+            e_importe = e_importe - lv_wrbtr.
+            IF ls_bseg-bschl IN lr_bschl_fac AND e_importe < 0. "factura impagada
+              CLEAR e_importe.
+              lv_imp = 'X'.
+            ELSEIF ls_bseg-bschl IN lr_bschl_abo AND e_importe > 0.   "abono impagado
+              CLEAR e_importe.
+              lv_imp = 'X'.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDLOOP.
+    ENDIF.
+
+* Si hay algun impagado pendiente el importe es 0 no puede ser negativo en facturas ni positivo en abonos
+  ELSEIF ( e_importe < 0 AND ls_bseg-bschl IN lr_bschl_fac ) OR "facturas
+         ( e_importe > 0 AND ls_bseg-bschl IN lr_bschl_abo ). "abonos
+
+    LOOP AT ct_traza INTO ls_traza WHERE augbl IS INITIAL
+                                   AND   umskz IN lr_umskz_imp
+                                   AND   bschl IN lr_bschl_imp
+                                   AND   augdt <= i_valut. "impagados
+      IF ls_traza-wrbtr >= lv_wrbtr.
+        CLEAR e_importe.
+        lv_imp = 'X'. "Esta impagada
+      ELSE.
+        e_importe = e_importe - lv_wrbtr.
+        IF ls_bseg-bschl IN lr_bschl_fac AND e_importe < 0. "factura impagada
+          CLEAR e_importe.
+          lv_imp = 'X'.
+        ELSEIF ls_bseg-bschl IN lr_bschl_abo AND e_importe > 0."abono impagado
+          CLEAR e_importe.
+          lv_imp = 'X'.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    IF sy-subrc <> 0.
+      LOOP AT ct_traza INTO ls_traza WHERE augbl IS NOT INITIAL
+                                     AND   umskz IN lr_umskz_imp
+                                     AND   bschl IN lr_bschl_imp
+                                     AND   augdt <= i_valut. "impagados
+        LOOP AT ct_traza INTO ls_traza_aux WHERE belnr = ls_traza-augbl
+                                           AND   augbl IS INITIAL
+                                           AND   augdt <= i_valut.
+          IF ls_traza_aux-wrbtr >= lv_wrbtr.
+            CLEAR e_importe.
+            lv_imp = 'X'. "Esta impagada
+          ELSE.
+            e_importe = e_importe - lv_wrbtr.
+            IF ls_bseg-bschl IN lr_bschl_fac AND e_importe < 0. "factura impagada
+              CLEAR e_importe.
+              lv_imp = 'X'.
+            ELSEIF ls_bseg-bschl IN lr_bschl_abo AND e_importe > 0."abono impagado
+              CLEAR e_importe.
+              lv_imp = 'X'.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDLOOP.
+    ENDIF.
+
+*  Si no queda nada pendiente es que esta todo compensado y cobrado
+  ELSEIF i_imp IS NOT INITIAL AND
+         e_importe > 0        AND
+         ls_bseg-bschl IN lr_bschl_fac. "factura
+    SELECT * FROM bseg
+        WHERE belnr = i_belnr
+        AND   gjahr = i_gjahr
+        AND   bukrs = i_bukrs
+        AND   koart = 'D'.
+
+      SELECT * INTO TABLE lti_bsid
+          FROM  bsid
+          WHERE bukrs  = i_bukrs
+          AND   umskz IN lr_umskz_imp "Impagados
+          AND   kunnr  = ls_bseg-kunnr.
+      IF lti_bsid[] IS NOT INITIAL.
+        EXIT.
+      ENDIF.
+    ENDSELECT.
+
+    IF lti_bsid[] IS INITIAL.
+      e_importe = lv_wrbtr.
+    ENDIF.
+  ENDIF.
+
+
+  CHECK lv_imp IS INITIAL. "Si esta impagada terminamos importe cobrado 0.
+
+* Si todas las posiciones son facturas/abonos y estan todas compensadas se ha cobrado todo
+  LOOP AT ct_traza INTO ls_traza WHERE augbl IS INITIAL
+                                 OR    augdt  > i_valut.
+    IF ls_traza-belnr <> i_belnr.
+      LOOP AT ct_traza INTO ls_traza_aux WHERE belnr  = ls_traza-belnr
+                                         AND   gjahr  = ls_traza-gjahr
+                                         AND   buzei <> ls_traza-buzei
+                                         AND ( augbl  = '' OR augdt > i_valut ).
+      ENDLOOP.
+      IF sy-subrc = 0.
+        lv_comp = 'N'.
+      ELSEIF lv_comp IS INITIAL.
+        lv_comp = 'S'.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+*  Si esta compensada totalmente
+  IF lv_comp = 'S'.
+    CLEAR: lv_cont1, lv_cont2.
+    LOOP AT ct_traza INTO ls_traza WHERE belnr <> i_belnr
+                                   AND ( augbl IS INITIAL OR augdt > i_valut ).
+      lv_cont1 = lv_cont1 + 1.
+      IF ls_traza-bschl IN lr_bschl_otr. " otros
+        IF ls_traza-rebzg = i_belnr.
+          CASE ls_traza-shkzg.
+            WHEN 'H'.
+              lv_wrbtr = lv_wrbtr + ls_traza-wrbtr.
+            WHEN 'S'.
+              lv_wrbtr = lv_wrbtr - ls_traza-wrbtr.
+          ENDCASE.
+        ENDIF.
+
+
+      ELSEIF ls_traza-bschl IN lr_bschl_efc OR ls_traza-bschl IN lr_bschl_imp. " efecto / impagado
+        IF ls_traza-umskz IN lr_umskz_efc."efecto
+*          Si el efecto es por el total de la factura no lo tenemos en cuenta como cobrado
+*          Sacamos el sumatorio de los importes de la factura que está compensando el efecto
+          CLEAR lv_imp_comp.
+          LOOP AT ct_traza INTO ls_traza_aux WHERE doc_t = 'FACTURA'
+                                             AND   augbl = ls_traza-belnr.
+            lv_imp_comp = lv_imp_comp + ls_traza_aux-wrbtr.
+          ENDLOOP.
+          IF lv_imp_comp = ls_traza-wrbtr.
+            lv_cont2 = lv_cont2 + 1.
+          ELSE.
+            IF lv_wrbtr >= ls_traza-wrbtr.
+              lv_wrbtr = lv_wrbtr - ls_traza-wrbtr.
+            ENDIF.
+          ENDIF.
+*
+        ELSEIF ls_traza-umskz IN lr_umskz_imp AND  "impagado
+               ls_traza-wrbtr >= lv_wrbtr.
+          CLEAR lv_wrbtr.
+        ELSEIF ls_traza-umskz IN lr_umskz_imp
+               AND lv_pos > 1.
+          lv_wrbtr = lv_wrbtr / lv_pos.
+          IF ls_traza-wrbtr >= lv_wrbtr.
+            CLEAR lv_wrbtr.
+          ELSE.
+            lv_wrbtr = lv_wrbtr * lv_pos.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+    IF lv_cont1 <> lv_cont2.
+      e_importe = lv_wrbtr.
+    ENDIF.
+
+*  Si no esta compensanda totalmente
+  ELSEIF ( e_importe < lv_wrbtr  AND ( ls_bseg-bschl IN lr_bschl_fac ) ) OR "factura
+         ( e_importe > lv_wrbtr  AND ( ls_bseg-bschl IN lr_bschl_abo ) ).   "abono
+    LOOP AT ct_traza INTO ls_traza_aux WHERE belnr     <> ls_bseg-augbl
+                                       AND   bschl NOT IN lr_bschl_fac
+                                       AND   bschl NOT IN lr_bschl_otr
+                                       AND   bschl NOT IN lr_bschl_abo
+                                       AND   augdt     <= i_valut.
+    ENDLOOP.
+    CHECK sy-subrc <> 0.
+
+    e_importe = lv_wrbtr.
+    LOOP AT ct_traza INTO ls_traza WHERE augdt <= i_valut.
+      IF ls_traza-bschl IN lr_bschl_otr. "otros
+        SELECT SINGLE belnr INTO ls_traza-belnr
+            FROM  bseg
+            WHERE bukrs  = ls_traza-bukrs
+            AND   gjahr  = ls_traza-gjahr
+            AND   belnr  = ls_traza-belnr
+            AND   buzei  = ls_traza-buzei
+            AND   augbl <> ls_traza-belnr
+            AND   rebzj  = i_gjahr
+            AND   rebzg  = i_belnr.
+        CHECK sy-subrc = 0.
+
+*       Si el documento se ha llevado al cobro no lo tenemos en cuenta para importe...
+        READ TABLE it_bseg INTO ls_bseg WITH KEY disbn = ls_traza-belnr
+                                                 disbj = ls_traza-gjahr
+                                                 disbz = ls_traza-buzei.
+        CHECK sy-subrc <> 0.
+*       Sumamos o restamos dependiendo del signo
+        READ TABLE lti_tbsl INTO ls_tbsl WITH KEY bschl = ls_traza-bschl
+                                                  koart = ls_traza-koart.
+        CASE ls_tbsl-shkzg.
+          WHEN 'H'.
+            e_importe = e_importe + ls_traza-wrbtr.
+          WHEN 'S'.
+            e_importe = e_importe - ls_traza-wrbtr.
+        ENDCASE.
+
+      ELSEIF  ls_traza-bschl IN lr_bschl_efc OR
+              ls_traza-bschl IN lr_bschl_imp OR
+              ls_traza-bschl IN lr_bschl_ant. "efecto / impagado / anticipo
+
+        IF ls_traza-augbl IS INITIAL.
+          CLEAR e_importe.
+        ELSEIF ls_traza-umskz IN lr_umskz_efc. "efecto
+          e_importe = e_importe - ls_traza-wrbtr.
+        ELSEIF ls_traza-umskz IN lr_umskz_imp. "impagado
+          e_importe = e_importe - ls_traza-wrbtr.
+        ELSEIF ls_traza-umskz IN lr_umskz_ant. "anticipo
+          e_importe = e_importe - ls_traza-wrbtr.
+        ELSE.
+          READ TABLE lti_tbsl INTO ls_tbsl WITH KEY bschl = ls_traza-bschl
+                                                    koart = ls_traza-koart.
+          CASE ls_tbsl-shkzg.
+            WHEN 'H'.
+              e_importe = e_importe - ls_traza-wrbtr.
+            WHEN 'S'.
+              e_importe = e_importe + ls_traza-wrbtr.
+          ENDCASE.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+*   Compruebo de nuevo si esta impagada
+    IF ( e_importe < 0 AND ls_bseg-bschl IN  lr_bschl_fac ) OR "factura
+       ( e_importe > 0 AND ls_bseg-bschl IN  lr_bschl_abo ).   "abono
+      LOOP AT ct_traza INTO ls_traza WHERE augbl IS INITIAL
+                                     AND   augdt <= i_valut
+                                     AND ( bschl IN lr_bschl_efc AND umskz IN lr_umskz_efc ) "efecto
+                                     OR  ( bschl IN lr_bschl_imp AND umskz IN lr_umskz_imp )."impagado
+      ENDLOOP.
+      IF sy-subrc = 0.
+        CLEAR e_importe.
+      ELSE.
+        LOOP AT ct_traza INTO ls_traza WHERE augbl IS NOT INITIAL
+                                       AND   bschl IN lr_bschl_imp
+                                        AND   umskz IN lr_umskz_imp
+                                        AND   augdt <= i_valut.
+          LOOP AT ct_traza INTO ls_traza_aux WHERE belnr = ls_traza-augbl
+                                             AND ( augbl IS INITIAL OR augdt > i_valut ).
+          ENDLOOP.
+          IF sy-subrc = 0.
+            CLEAR e_importe.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+
+* Tenemos en cuenta facturas con efectos no compensados
+  ELSEIF e_importe = lv_wrbtr.
+*   Recorremos las líneas NO COMPENSADAS
+    LOOP AT ct_traza INTO ls_traza WHERE augbl = space
+                                   OR    augdt > i_valut.
+*     Chequeamos que es un EFECTO
+      CHECK ls_traza-bschl IN lr_bschl_efc.
+      CHECK ls_traza-umskz IN lr_umskz_efc.
+*     Comprobamos si el efecto está compensando alguna factura
+      READ TABLE ct_traza INTO ls_traza_aux WITH KEY augbl = ls_traza-belnr.
+*     Si el efecto (que no está compensado) está compensando alguna factura,
+*     quitamos el importe de la factura al cobrado
+      IF sy-subrc = 0 AND ls_traza_aux-bschl IN lr_bschl_fac.
+        e_importe = e_importe - ls_traza_aux-wrbtr.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFUNCTION.

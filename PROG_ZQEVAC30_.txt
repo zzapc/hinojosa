@@ -1,0 +1,186 @@
+*&---------------------------------------------------------------------*
+*& Report  ZQEVAC30
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*& Title: Report to set satus 'stockposting completed'                 *
+*&---------------------------------------------------------------------*
+REPORT ZQEVAC30 LINE-SIZE 90 NO STANDARD PAGE HEADING.
+*----------------------------------------------------------------------*
+* Check programm: compare inspection lot quantity via Q-stock quantity *
+*----------------------------------------------------------------------*
+TABLES: MDQM,
+        MARA,
+        QMAT,
+        QALS.
+*----------------------------------------------------------------------*
+INCLUDE <ICON>.
+CONSTANTS:
+  C_Q_BEST          LIKE QALS-INSMK      VALUE 'X',
+  C_KREUZ           LIKE QM00-QKZ        VALUE 'X'.
+*----------------------------------------------------------------------*
+SELECT-OPTIONS MATERIAL FOR QMAT-MATNR MATCHCODE OBJECT MARA.
+SELECT-OPTIONS WERK FOR QMAT-WERKS.
+*----------------------------------------------------------------------*
+
+DATA:
+* Table of inspection lots
+  BEGIN OF G_LOSETAB OCCURS 0,
+    PRUEFLOS   LIKE QALS-PRUEFLOS,
+    MATNR      LIKE QALS-MATNR,
+    WERKS      LIKE QALS-WERKVORG,
+    CHARG      LIKE QALS-CHARG,
+    LGORT      LIKE QALS-LAGORTVORG,
+    LMENGEZUB  LIKE QALS-LMENGEZUB,
+    OK         LIKE QM00-QKZ,
+  END OF G_LOSETAB,
+*
+  G_FIELD(30),
+  G_NEW_ICON       LIKE ICON_CHECKED  VALUE  ICON_CHECKED,
+  G_OK             LIKE QM00-QKZ,
+  G_DATA_AVAILABLE LIKE QM00-QKZ,
+*
+  G_LISTI          LIKE SY-LISTI,
+  G_LILLI          LIKE SY-LILLI,
+*
+  END_OF_DATA.
+*----------------------------------------------------------------------*
+************************************************************************
+
+START-OF-SELECTION.
+*----------------------------------------------------------------------*
+*   selection of inspection lots with missing status (posting completed)
+    PERFORM LOSE_LESEN.
+*   evaluate lots
+    LOOP AT G_LOSETAB.
+      WRITE:/(3) ICON_CHANGE AS ICON HOTSPOT,
+             4 G_LOSETAB-PRUEFLOS,
+            17 G_LOSETAB-MATNR,
+            36 G_LOSETAB-WERKS,
+            41 G_LOSETAB-CHARG,
+            52 G_LOSETAB-LGORT.
+      HIDE: G_LOSETAB.
+    ENDLOOP.
+
+* Initialize workarea
+
+************************************************************************
+END-OF-SELECTION.
+  IF G_DATA_AVAILABLE IS INITIAL.
+  SKIP 2.
+    WRITE: /20 ICON_CHECKED AS ICON,
+               'No inspection lots with missing status found !'.
+  ENDIF.
+************************************************************************
+TOP-OF-PAGE.
+  ULINE.
+  WRITE: / '   Insp.lot     Material           Plnt Batch      SLoc'.
+  ULINE.
+  MOVE C_KREUZ TO G_DATA_AVAILABLE.
+
+************************************************************************
+AT LINE-SELECTION.
+  MOVE: SY-LISTI TO G_LISTI,
+        SY-LILLI TO G_LILLI.
+  GET CURSOR FIELD G_FIELD.
+  CHECK G_FIELD EQ 'ICON_CHANGE'.
+
+  PERFORM LOSSTATUS_SETZEN CHANGING G_LOSETAB-OK.
+*
+    READ LINE G_LILLI INDEX G_LISTI.
+    MODIFY LINE G_LILLI INDEX G_LISTI
+           FIELD VALUE G_LOSETAB-OK FROM G_LOSETAB-OK.
+*   change Icon to ok
+    TRANSLATE G_NEW_ICON USING '@ '.
+    CONDENSE  G_NEW_ICON NO-GAPS.     .
+    MODIFY LINE G_LILLI INDEX G_LISTI
+           FIELD VALUE ICON_CHANGE FROM G_NEW_ICON.
+
+
+************************************************************************
+*&---------------------------------------------------------------------*
+*&      Form  LOSE_LESEN
+*&---------------------------------------------------------------------*
+*    get the lots
+*----------------------------------------------------------------------*
+FORM LOSE_LESEN.
+
+  SELECT PRUEFLOS MATNR WERKVORG CHARG LAGORTVORG LMENGEZUB
+      INTO (G_LOSETAB-PRUEFLOS,G_LOSETAB-MATNR,G_LOSETAB-WERKS,
+            G_LOSETAB-CHARG,G_LOSETAB-LGORT,G_LOSETAB-LMENGEZUB)
+      FROM MDQM
+          WHERE  MATNR       IN MATERIAL
+          AND    WERKVORG    IN WERK
+          AND    INSMK       EQ C_KREUZ
+          AND    LMENGEZUB   EQ 0
+          AND    STAT34      = ' '.
+    APPEND G_LOSETAB.
+  ENDSELECT.
+*
+
+ENDFORM.                               " LOSE_LESEN
+
+*&---------------------------------------------------------------------*
+*&      Form  LOSSTATUS_SETZEN
+*&---------------------------------------------------------------------*
+*       Set lot status for 'stockposting completed'
+*----------------------------------------------------------------------*
+*  <--  ok : update proceeded
+*----------------------------------------------------------------------*
+FORM LOSSTATUS_SETZEN USING P_OK LIKE QM00-QKZ.
+
+* lokale Tabelle fuer Statusfortschreibung
+  DATA: BEGIN OF L_STATTAB OCCURS 0.
+          INCLUDE STRUCTURE JSTAT.
+  DATA  END OF L_STATTAB.
+  DATA  L_QALS_NEW LIKE QALS.
+
+*-- Prüflos sperren !
+      CALL FUNCTION 'ENQUEUE_EQQALS1'
+           EXPORTING
+                PRUEFLOS       = G_LOSETAB-PRUEFLOS
+           EXCEPTIONS
+                FOREIGN_LOCK   = 1
+                SYSTEM_FAILURE = 1.
+*
+  IF NOT SY-SUBRC IS INITIAL.
+    MESSAGE ID SY-MSGID TYPE 'I' NUMBER SY-MSGNO
+            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    EXIT.
+  ENDIF.
+
+  CALL FUNCTION 'QPSE_LOT_READ'
+       EXPORTING
+            I_PRUEFLOS = G_LOSETAB-PRUEFLOS
+       IMPORTING
+            E_QALS     = L_QALS_NEW.
+
+    MOVE C_KREUZ TO L_QALS_NEW-STAT34.
+
+*-- set status : in german 'BEND'; in english 'SPCO'.
+      MOVE 'I0220' TO L_STATTAB-STAT.  " Status BEND setzen !
+      MOVE SPACE   TO L_STATTAB-INACT.
+      APPEND L_STATTAB.
+
+      CALL FUNCTION 'STATUS_CHANGE_INTERN'
+           EXPORTING
+                CHECK_ONLY = SPACE
+                OBJNR      = L_QALS_NEW-OBJNR
+           TABLES
+                STATUS     = L_STATTAB.
+
+
+*-- Verbuchungsaufruf
+    CALL FUNCTION 'QPBU_LOT_UPDATE' IN UPDATE TASK
+         EXPORTING
+              QALS_NEW = L_QALS_NEW.
+
+*    o.k.  ->  save !
+    COMMIT WORK.
+    MOVE C_KREUZ TO P_OK.
+
+ENDFORM.                    " LOSSTATUS_SETZEN

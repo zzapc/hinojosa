@@ -1,0 +1,502 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRPP0087
+*& Ticket 78381 Informe para stocks de caja montada y sus semis
+*&---------------------------------------------------------------------*
+*& Informe para stocks de caja montada y sus semis
+*&  Autor: Javier Calás Blasco
+*&  Fecha: 20.07.23
+*&---------------------------------------------------------------------*
+REPORT zrpp0087.
+TABLES: marc.
+
+
+""""""""""""""""""""""
+" Constantes y Variables globales
+""""""""""""""""""""""
+
+CONSTANTS: cg_arbpl_montaje_1 TYPE arbpl VALUE '2003_420',
+           cg_arbpl_montaje_2 TYPE arbpl VALUE '2003_421'.
+
+CONSTANTS: cg_status_liberado    TYPE jest-stat VALUE 'I0002',
+           cg_status_pet_borrado TYPE jest-stat VALUE 'I0076'.
+
+
+DATA: it_alv              TYPE zrpp0087_t_alv,
+      tg_arbpl_montaje_rg TYPE RANGE OF crhd-arbpl.
+
+""""""""""""""""""""""
+" Pantalla de selección
+""""""""""""""""""""""
+PARAMETERS     p_werks  TYPE marc-werks OBLIGATORY.
+SELECT-OPTIONS s_pterm  FOR marc-matnr.
+SELECT-OPTIONS s_semi   FOR marc-matnr.
+
+
+
+""""""""""""""""""""""
+" Eventos
+""""""""""""""""""""""
+
+INITIALIZATION.
+  PERFORM f_initialization.
+
+
+START-OF-SELECTION.
+  PERFORM f_start_of_selection.
+
+
+
+END-OF-SELECTION.
+  PERFORM f_end_of_selection.
+
+
+  """"""""""""""""""""""
+  " Rutinas
+  """"""""""""""""""""""
+
+*&---------------------------------------------------------------------*
+*&      Form  F_INITIALIZATION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_initialization .
+  tg_arbpl_montaje_rg = VALUE #( sign = 'I' option = 'EQ' ( low = cg_arbpl_montaje_1 )
+                                                            ( low = cg_arbpl_montaje_2 ) ).
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_START_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_start_of_selection.
+
+  TYPES: BEGIN OF st_producto,
+           werks           TYPE marc-werks,
+           matnr           TYPE marc-matnr,
+           cuobj           TYPE yhp_idx_td310-cuobj,
+           cself           TYPE yhp_idx_td310-cself,
+           arbpl_coper_1   TYPE yhp_idx_td310-arbpl,
+           arbpl_coper_2   TYPE yhp_idx_td310-arbpl,
+           arbid_coper_1   TYPE crhd-objid,
+           arbid_coper_2   TYPE crhd-objid,
+           es_caja_montada TYPE xfeld,
+         END OF st_producto.
+  DATA: tl_productos TYPE TABLE OF st_producto.
+
+  "Datos centro
+  SELECT SINGLE werks, name1
+    INTO @DATA(wl_t001w)
+    FROM t001w
+    WHERE werks = @p_werks.
+  CHECK sy-subrc = 0.
+
+*APC20250228 Si sólo filtran por SEMIS, como el informe está orientado a buscar primero PTs, busco PTS del semi
+  IF NOT s_semi[] IS INITIAL.
+    DATA: r_matnr     TYPE RANGE OF matnr,
+          i_mat_cuobj TYPE zhcl_mm_core=>tt_mat_cuobj.
+    SELECT * FROM marc
+      INTO CORRESPONDING FIELDS OF TABLE i_mat_cuobj
+     WHERE matnr IN s_semi.
+*       AND werks = p_werks.
+    NEW zhcl_mm_core( )->get_semis_pt( EXPORTING i_mat = i_mat_cuobj
+                                    IMPORTING pts = DATA(pts) ).
+    LOOP AT pts ASSIGNING FIELD-SYMBOL(<pts>).
+      APPEND VALUE #( option = 'EQ' sign = 'I' low = <pts>-matnr_pt ) TO r_matnr.
+    ENDLOOP.
+    IF sy-subrc NE 0.
+      MESSAGE 'No hay PTs asociado al semi' TYPE 'I'.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+  "Datos de productos
+  SELECT marc~werks, marc~matnr, yhp_idx_td310~cuobj, MAX( yhp_idx_td310~cself ) AS cself
+    INTO CORRESPONDING FIELDS OF TABLE @tl_productos
+    FROM yhp_idx_td310 INNER JOIN marc ON marc~cuobj = yhp_idx_td310~cuobj
+    WHERE marc~werks          =  @p_werks AND
+          marc~matnr          IN @s_pterm AND
+          marc~matnr          IN @r_matnr AND "APC20250228
+          yhp_idx_td310~werks =  @p_werks AND
+          yhp_idx_td310~arbpl IN @tg_arbpl_montaje_rg
+    GROUP BY marc~werks, marc~matnr, yhp_idx_td310~cuobj.
+  CHECK sy-subrc = 0.
+
+  "Detalle de productos seleccionados
+  SELECT yhp_idx_td310~cuobj, yhp_idx_td310~cself, yhp_idx_td310~coper, yhp_idx_td310~arbpl, crhd~objid AS arbid
+    INTO TABLE @DATA(tl_td310)
+    FROM yhp_idx_td310 INNER JOIN crhd ON crhd~werks = yhp_idx_td310~werks AND
+                                          crhd~arbpl = yhp_idx_td310~arbpl
+    FOR ALL ENTRIES IN @tl_productos
+    WHERE yhp_idx_td310~cuobj = @tl_productos-cuobj AND
+          yhp_idx_td310~cself = @tl_productos-cself.
+  CHECK sy-subrc = 0.
+
+  SORT tl_td310 BY cuobj cself coper.
+
+
+
+
+  "Buscamos sus puestos de trabajo por operación
+  LOOP AT tl_td310 ASSIGNING FIELD-SYMBOL(<fs_td310>).
+    READ TABLE tl_productos ASSIGNING FIELD-SYMBOL(<fs_productos>) WITH KEY cuobj = <fs_td310>-cuobj.
+    CHECK sy-subrc = 0.
+
+    CASE <fs_td310>-coper.
+      WHEN '0000000001'.
+        <fs_productos>-arbpl_coper_1 = <fs_td310>-arbpl.
+        <fs_productos>-arbid_coper_1 = <fs_td310>-arbid.
+        IF <fs_productos>-arbpl_coper_1 IN tg_arbpl_montaje_rg.
+          <fs_productos>-es_caja_montada = 'X'.
+        ENDIF.
+
+      WHEN '0000000002'.
+        <fs_productos>-arbpl_coper_2 = <fs_td310>-arbpl.
+        <fs_productos>-arbid_coper_2 = <fs_td310>-arbid.
+    ENDCASE.
+  ENDLOOP.
+
+  "Borramos si no tienen puesto de montaje
+  DELETE tl_productos WHERE arbpl_coper_1 NOT IN tg_arbpl_montaje_rg AND
+                            arbpl_coper_2 NOT IN tg_arbpl_montaje_rg.
+  CHECK tl_productos IS NOT INITIAL.
+
+  "Buscamos semiterminados
+  SELECT cuobj, cself, p_matnr, makt~maktx
+    INTO TABLE @DATA(tl_td110)
+    FROM yhp_idx_td110 LEFT OUTER JOIN makt ON makt~matnr = yhp_idx_td110~p_matnr AND
+                                               makt~spras = @sy-langu
+    FOR ALL ENTRIES IN @tl_productos
+    WHERE cuobj = @tl_productos-cuobj AND
+          cself = '0000000001'
+    AND p_matnr IN @s_semi. "APC20250228
+
+
+
+
+  "Rellenamos el ALV
+  LOOP AT tl_productos ASSIGNING <fs_productos>.
+    READ TABLE tl_td110 ASSIGNING FIELD-SYMBOL(<fs_td110>) WITH KEY cuobj = <fs_productos>-cuobj.
+    CHECK sy-subrc = 0.
+
+    APPEND INITIAL LINE TO it_alv ASSIGNING FIELD-SYMBOL(<fs_alv>).
+    <fs_alv>-werks      = <fs_productos>-werks.
+    <fs_alv>-name1      = wl_t001w-name1.
+    <fs_alv>-matnr_pt   = <fs_productos>-matnr.
+    <fs_alv>-matnr_semi = <fs_td110>-p_matnr.
+    <fs_alv>-maktx_semi = <fs_td110>-maktx.
+  ENDLOOP.
+  CHECK it_alv IS NOT INITIAL.
+
+
+  "Stock producto terminado y semi
+  SELECT matnr, werks, lgort, labst
+    INTO TABLE @DATA(tl_mard_pt)
+    FROM mard
+    FOR ALL ENTRIES IN @it_alv
+    WHERE matnr = @it_alv-matnr_pt AND
+          werks = @it_alv-werks.
+
+  SELECT matnr, werks, lgort, labst
+    INTO TABLE @DATA(tl_mard_semi)
+    FROM mard
+    FOR ALL ENTRIES IN @it_alv
+    WHERE matnr = @it_alv-matnr_semi AND
+          werks = @it_alv-werks.
+
+  "Unidad y descripción del terminado
+  SELECT mara~matnr, mara~meins, makt~maktx
+    INTO TABLE @DATA(tl_mara_pt)
+    FROM mara LEFT OUTER JOIN makt ON makt~matnr = mara~matnr AND
+                                      makt~spras = @sy-langu
+    FOR ALL ENTRIES IN @it_alv
+    WHERE mara~matnr = @it_alv-matnr_pt.
+
+
+  "Ordenes liberadas y no borradas
+  SELECT caufv~aufnr, caufv~plnbez, caufv~werks, caufv~gamng, caufv~gmein, afpo~charg
+    INTO TABLE @DATA(tl_caufv)
+    FROM caufv INNER JOIN afpo ON afpo~aufnr = caufv~aufnr AND
+                                  afpo~matnr = caufv~plnbez
+    FOR ALL ENTRIES IN @it_alv
+    WHERE caufv~werks  = @it_alv-werks    AND
+          caufv~plnbez = @it_alv-matnr_pt AND
+         EXISTS ( SELECT * FROM jest WHERE jest~objnr = caufv~objnr         AND
+                                           jest~stat  = @cg_status_liberado AND
+                                           jest~inact = @space ) AND
+         NOT EXISTS ( SELECT * FROM jest WHERE jest~objnr = caufv~objnr            AND
+                                               jest~stat  = @cg_status_pet_borrado AND
+                                               jest~inact = @space ).
+
+**NLC.19.11.2024.Modificamos select porque estaba eliminando duplicados para el campo gmnga.
+  IF tl_caufv IS NOT INITIAL.
+    SELECT aufnr, arbid, gmnga, gmein, rueck, rmzhl
+      INTO TABLE @DATA(tl_afru)
+      FROM afru
+      FOR ALL ENTRIES IN @tl_caufv
+      WHERE aufnr = @tl_caufv-aufnr.
+**FIN.NLC.19.11.2024.Modificamos select porque estaba eliminando duplicados para el campo gmnga.
+
+    SELECT aufnr, matnr, menge, meins, shkzg
+      INTO TABLE @DATA(tl_mseg)
+      FROM mseg
+      FOR ALL ENTRIES IN @tl_caufv
+      WHERE aufnr = @tl_caufv-aufnr   AND
+            matnr = @tl_caufv-plnbez  AND
+            charg = @tl_caufv-charg   AND
+            bwart BETWEEN '600' AND '699'.
+  ENDIF.
+
+
+  "Posiciones de pedido no tratadas completamente
+*** CODIGO NO S4
+  SELECT vbap~vbeln, vbap~posnr, vbap~kwmeng, vbap~werks, vbap~matnr,
+         vbep~etenr, vbep~bmeng, vbep~vrkme,  vbep~edatu
+    INTO TABLE @DATA(tl_vbep)
+    FROM vbep INNER JOIN vbup ON vbup~vbeln = vbep~vbeln AND
+                                 vbup~posnr = vbep~posnr
+              INNER JOIN vbap ON vbap~vbeln = vbep~vbeln AND
+                                 vbap~posnr = vbep~posnr
+              INNER JOIN vbak ON vbak~vbeln = vbep~vbeln
+    FOR ALL ENTRIES IN @it_alv
+    WHERE vbak~auart = 'ZTA2'           AND
+          vbap~matnr = @it_alv-matnr_pt AND
+          vbap~werks = @it_alv-werks    AND
+          vbup~lfsta IN ('A', 'B').
+
+
+**** CODIGO S4
+*  "Posiciones de pedido no tratadas completamente
+*  SELECT vbap~vbeln, vbap~posnr, vbap~kwmeng, vbap~werks, vbap~matnr,
+*         vbep~etenr, vbep~bmeng, vbep~vrkme,  vbep~edatu
+*    INTO TABLE @DATA(tl_vbep)
+*    FROM vbep
+**    INNER JOIN vbup ON vbup~vbeln = vbep~vbeln AND
+**                                 vbup~posnr = vbep~posnr
+*              INNER JOIN vbap ON vbap~vbeln = vbep~vbeln AND
+*                                 vbap~posnr = vbep~posnr
+*              INNER JOIN vbak ON vbak~vbeln = vbep~vbeln
+*    FOR ALL ENTRIES IN @it_alv
+*    WHERE vbak~auart = 'ZTA2'           AND
+*          vbap~matnr = @it_alv-matnr_pt AND
+*          vbap~werks = @it_alv-werks    AND
+*          lfsta IN ('A', 'B').
+
+
+  "Rangos semanas
+  DATA: tl_semana1_rg TYPE RANGE OF dats,
+        tl_semana2_rg TYPE RANGE OF dats,
+        tl_semana3_rg TYPE RANGE OF dats,
+        tl_semana4_rg TYPE RANGE OF dats.
+
+  DATA: vl_dia_semana_ini TYPE dats,
+        vl_dia_semana_fin TYPE dats.
+
+  CALL FUNCTION 'GET_WEEK_INFO_BASED_ON_DATE'
+    EXPORTING
+      date   = sy-datum
+    IMPORTING
+      monday = vl_dia_semana_ini.
+  vl_dia_semana_fin = vl_dia_semana_ini + 6.
+  tl_semana1_rg = VALUE #( ( sign = 'I' option = 'BT' low = vl_dia_semana_ini high = vl_dia_semana_fin ) ).
+
+  ADD 7 TO: vl_dia_semana_ini, vl_dia_semana_fin.
+  tl_semana2_rg = VALUE #( ( sign = 'I' option = 'BT' low = vl_dia_semana_ini high = vl_dia_semana_fin ) ).
+
+  ADD 7 TO: vl_dia_semana_ini, vl_dia_semana_fin.
+  tl_semana3_rg = VALUE #( ( sign = 'I' option = 'BT' low = vl_dia_semana_ini high = vl_dia_semana_fin ) ).
+
+  ADD 7 TO: vl_dia_semana_ini, vl_dia_semana_fin.
+  tl_semana4_rg = VALUE #( ( sign = 'I' option = 'BT' low = vl_dia_semana_ini high = vl_dia_semana_fin ) ).
+
+
+  "Rellenamos el ALV
+  LOOP AT it_alv ASSIGNING <fs_alv>.
+    READ TABLE tl_productos ASSIGNING <fs_productos> WITH KEY werks = <fs_alv>-werks
+                                                              matnr = <fs_alv>-matnr_pt.
+    CHECK sy-subrc = 0.
+
+    READ TABLE tl_mara_pt ASSIGNING FIELD-SYMBOL(<fs_mara_pt>) WITH KEY matnr = <fs_alv>-matnr_pt.
+    IF sy-subrc = 0.
+      <fs_alv>-maktx_pt = <fs_mara_pt>-maktx.
+      <fs_alv>-meins    = <fs_mara_pt>-meins.
+    ENDIF.
+
+    LOOP AT tl_caufv ASSIGNING FIELD-SYMBOL(<fs_caufv>) WHERE werks   = <fs_alv>-werks AND
+                                                              plnbez  = <fs_alv>-matnr_pt.
+      IF <fs_caufv>-gmein <> <fs_alv>-meins.
+        CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+          EXPORTING
+            i_matnr              = <fs_caufv>-plnbez
+            i_in_me              = <fs_caufv>-gmein
+            i_out_me             = <fs_alv>-meins
+            i_menge              = <fs_caufv>-gamng
+          IMPORTING
+            e_menge              = <fs_caufv>-gamng
+          EXCEPTIONS
+            error_in_application = 1
+            error                = 2
+            OTHERS               = 3.
+        IF sy-subrc = 0.
+          <fs_caufv>-gmein = <fs_alv>-meins.
+        ELSE.
+          CLEAR <fs_caufv>-gamng.
+        ENDIF.
+      ENDIF.
+      ADD <fs_caufv>-gamng TO <fs_alv>-cantidad_orden.
+    ENDLOOP.
+
+    "Stock caja montada
+    READ TABLE tl_mard_pt ASSIGNING FIELD-SYMBOL(<fs_mard_pt>) WITH KEY werks = <fs_alv>-werks
+                                                                        matnr = <fs_alv>-matnr_pt.
+    IF sy-subrc = 0.
+      ADD <fs_mard_pt>-labst TO <fs_alv>-stock_caja_montada.
+    ENDIF.
+
+    IF <fs_productos>-es_caja_montada = 'X'.
+      READ TABLE tl_mard_semi ASSIGNING FIELD-SYMBOL(<fs_mard_semi>) WITH KEY werks = <fs_alv>-werks
+                                                                              matnr = <fs_alv>-matnr_semi.
+      IF sy-subrc = 0.
+        ADD <fs_mard_semi>-labst TO <fs_alv>-stock_caja_troquelada.
+      ENDIF.
+
+    ELSE.
+      "No es caja montada. Buscamos el stock del semi de las notificaciones en AFRU
+      LOOP AT tl_caufv ASSIGNING <fs_caufv> WHERE werks   = <fs_alv>-werks AND
+                                                  plnbez  = <fs_alv>-matnr_pt.
+
+        LOOP AT tl_afru ASSIGNING FIELD-SYMBOL(<fs_afru>) WHERE aufnr = <fs_caufv>-aufnr.
+          IF <fs_afru>-gmein <> <fs_alv>-meins.
+            CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+              EXPORTING
+                i_matnr              = <fs_caufv>-plnbez
+                i_in_me              = <fs_afru>-gmein
+                i_out_me             = <fs_alv>-meins
+                i_menge              = <fs_afru>-gmnga
+              IMPORTING
+                e_menge              = <fs_afru>-gmnga
+              EXCEPTIONS
+                error_in_application = 1
+                error                = 2
+                OTHERS               = 3.
+            IF sy-subrc = 0.
+              <fs_afru>-gmein = <fs_alv>-meins.
+            ELSE.
+              CLEAR <fs_afru>-gmnga.
+            ENDIF.
+          ENDIF.
+
+          CASE <fs_afru>-arbid.
+            WHEN <fs_productos>-arbid_coper_1.
+              ADD <fs_afru>-gmnga TO <fs_alv>-stock_caja_troquelada.
+            WHEN <fs_productos>-arbid_coper_2.
+              SUBTRACT <fs_afru>-gmnga FROM <fs_alv>-stock_caja_troquelada.
+          ENDCASE.
+        ENDLOOP.
+
+        LOOP AT tl_mseg ASSIGNING FIELD-SYMBOL(<fs_mseg>) WHERE aufnr = <fs_caufv>-aufnr.
+          IF <fs_mseg>-meins <> <fs_alv>-meins.
+            CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+              EXPORTING
+                i_matnr              = <fs_mseg>-matnr
+                i_in_me              = <fs_mseg>-meins
+                i_out_me             = <fs_alv>-meins
+                i_menge              = <fs_mseg>-menge
+              IMPORTING
+                e_menge              = <fs_mseg>-menge
+              EXCEPTIONS
+                error_in_application = 1
+                error                = 2
+                OTHERS               = 3.
+            IF sy-subrc = 0.
+              <fs_mseg>-meins = <fs_alv>-meins.
+            ELSE.
+              CLEAR <fs_mseg>-menge.
+            ENDIF.
+          ENDIF.
+
+          CASE <fs_mseg>-shkzg.
+            WHEN 'H'.
+              ADD <fs_mseg>-menge TO <fs_alv>-stock_caja_expedida.
+            WHEN 'S'.
+              SUBTRACT <fs_mseg>-menge FROM <fs_alv>-stock_caja_expedida.
+          ENDCASE.
+        ENDLOOP.
+      ENDLOOP.
+    ENDIF.
+
+
+    LOOP AT tl_vbep ASSIGNING FIELD-SYMBOL(<fs_vbep>) WHERE werks = <fs_alv>-werks AND
+                                                            matnr = <fs_alv>-matnr_pt.
+      IF <fs_vbep>-vrkme <> <fs_alv>-meins.
+        CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+          EXPORTING
+            i_matnr              = <fs_vbep>-matnr
+            i_in_me              = <fs_vbep>-vrkme
+            i_out_me             = <fs_alv>-meins
+            i_menge              = <fs_vbep>-bmeng
+          IMPORTING
+            e_menge              = <fs_vbep>-bmeng
+          EXCEPTIONS
+            error_in_application = 1
+            error                = 2
+            OTHERS               = 3.
+        IF sy-subrc = 0.
+          <fs_vbep>-vrkme = <fs_alv>-meins.
+        ELSE.
+          CLEAR <fs_vbep>-bmeng.
+        ENDIF.
+      ENDIF.
+
+      ADD <fs_vbep>-bmeng TO <fs_alv>-cantidad_prevista.
+      IF <fs_vbep>-edatu IN tl_semana1_rg. ADD <fs_vbep>-bmeng TO <fs_alv>-cantidad_prevista_sem1. ENDIF.
+      IF <fs_vbep>-edatu IN tl_semana2_rg. ADD <fs_vbep>-bmeng TO <fs_alv>-cantidad_prevista_sem2. ENDIF.
+      IF <fs_vbep>-edatu IN tl_semana3_rg. ADD <fs_vbep>-bmeng TO <fs_alv>-cantidad_prevista_sem3. ENDIF.
+      IF <fs_vbep>-edatu IN tl_semana4_rg. ADD <fs_vbep>-bmeng TO <fs_alv>-cantidad_prevista_sem4. ENDIF.
+
+    ENDLOOP.
+  ENDLOOP.
+
+
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_END_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_end_of_selection .
+
+  IF it_alv IS INITIAL.
+    MESSAGE 'No se han encontrado datos' TYPE 'S' DISPLAY LIKE 'W'.
+    RETURN.
+  ENDIF.
+
+
+  TRY.
+      cl_salv_table=>factory( IMPORTING r_salv_table = DATA(rl_alv)
+                              CHANGING  t_table      = it_alv ).
+    CATCH cx_salv_msg.
+      RETURN.
+  ENDTRY.
+
+  DATA(wl_key) = VALUE salv_s_layout_key( report = sy-repid ).
+
+  rl_alv->get_layout( )->set_key( wl_key ).
+  rl_alv->get_layout( )->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  rl_alv->get_layout( )->set_default( abap_true ).
+  rl_alv->get_functions( )->set_all( 'X' ).
+  rl_alv->get_columns( )->set_optimize( ).
+  rl_alv->display( ).
+ENDFORM.

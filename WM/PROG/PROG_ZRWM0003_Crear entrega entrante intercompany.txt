@@ -1,0 +1,139 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRWM0003
+*&
+*&---------------------------------------------------------------------*
+*& Proyecto:  WM Xàtiva
+*& Fecha:     15/01/2019
+*& Autor:     Carlos Vivó Jiménez
+*&
+*& Funcionalidad: las EM para los pedidos de papel deben hacerse mediante
+*&    entregas por el control de confirmación de los pedidos. Para entrar
+*&    stock entonces en el almacén e.g. 1001, no se puede hacer por RF,
+*&    ni por MIGO. Surge la necesidad de hacerlo por EEnt, y para ello
+*&    es conveniente facilitar su creación desde la ESalida de las
+*&    papeleras.
+*&
+*&---------------------------------------------------------------------*
+REPORT zrwm0003.
+
+INCLUDE zrwm0003_top.
+
+SELECTION-SCREEN BEGIN OF BLOCK b0 WITH FRAME TITLE text-s00.
+SELECTION-SCREEN SKIP.
+PARAMETERS p_vbeln LIKE likp-vbeln OBLIGATORY.
+PARAMETERS p_lgort LIKE lips-lgort OBLIGATORY.
+SELECTION-SCREEN SKIP.
+PARAMETERS p_fecha TYPE lfdat_la DEFAULT sy-datum.
+SELECTION-SCREEN END OF BLOCK b0.
+
+AT SELECTION-SCREEN ON p_vbeln.
+  SELECT SINGLE @abap_true FROM vbuk
+    WHERE vbeln EQ @p_vbeln
+      AND wbstk NE 'C'
+    INTO @DATA(check).
+
+  IF sy-subrc EQ 0.
+    MESSAGE 'La entrega introducida no existe o no está finalizada' TYPE 'E'.
+  ENDIF.
+
+AT SELECTION-SCREEN ON p_lgort.
+  IF p_vbeln IS NOT INITIAL AND p_lgort IS NOT INITIAL.
+    SELECT SINGLE @abap_true FROM lips INNER JOIN ekpo
+      ON ekpo~ebeln EQ lips~vgbel
+      INNER JOIN t320
+      ON t320~werks EQ ekpo~werks
+      WHERE lips~vbeln EQ @p_vbeln
+        AND t320~lgort EQ @p_lgort
+      INTO @DATA(result).
+
+    IF sy-subrc EQ 0. " el almacén es WM
+      MESSAGE 'El almacén introducido está gestionado por WM, se debe contabilizar por RF' TYPE 'E'.
+    ENDIF.
+  ENDIF.
+
+START-OF-SELECTION.
+  SELECT * FROM lips
+    WHERE vbeln EQ p_vbeln
+      AND charg NE space.
+
+    CLEAR komdlgn.
+    ADD 1 TO rfpos.
+
+    komdlgn-lfdat = p_fecha.
+    komdlgn-rfpos = rfpos.
+    komdlgn-verur = lips-vbeln.
+
+    SELECT SINGLE lifnr INTO komdlgn-lifnr
+      FROM ekko
+      WHERE ebeln EQ lips-vgbel.
+
+    SELECT SINGLE maktx INTO komdlgn-arktx
+      FROM makt
+      WHERE matnr EQ lips-matnr
+        AND spras EQ sy-langu.
+
+    komdlgn-matnr = lips-matnr.
+    komdlgn-charg = lips-charg.
+    komdlgn-lfart = 'EL'.
+
+    SELECT SINGLE * FROM ekpo
+       WHERE ebeln = lips-vgbel
+         AND ebelp = lips-vgpos.
+
+    komdlgn-uebtk = ekpo-uebtk.
+    komdlgn-uebto = ekpo-uebto.
+    komdlgn-untto = ekpo-untto.
+    komdlgn-werks = ekpo-werks.
+    komdlgn-lgort = p_lgort.
+
+    komdlgn-lfimg = lips-lfimg.
+    komdlgn-nopck = 'X'. " no picking
+    komdlgn-vrkme = ekpo-meins.
+    komdlgn-meins = ekpo-lmein.
+    komdlgn-umvkz = ekpo-umrez.
+    komdlgn-umvkn = ekpo-umren.
+    komdlgn-vgbel = ekpo-ebeln.
+    komdlgn-vgpos = ekpo-ebelp.
+    komdlgn-vgtyp = 'V'.
+    komdlgn-kzazu = 'X'.
+
+    APPEND komdlgn TO t_komdlgn.
+  ENDSELECT.
+
+  vbsk-mandt = sy-mandt.
+  vbsk-ernam = sy-uname.
+  vbsk-erdat = sy-datum.
+  vbsk-uzeit = sy-uzeit.
+  vbsk-smart = 'L'.
+
+  CALL FUNCTION 'GN_DELIVERY_CREATE'
+    EXPORTING
+      vbsk_i   = vbsk
+    IMPORTING
+      vbsk_e   = vbsk
+    TABLES
+      xkomdlgn = t_komdlgn
+      xvbfs    = t_vbfs
+      xvbls    = t_vbls
+    EXCEPTIONS
+      OTHERS   = 1.
+
+*** Error Handling
+  READ TABLE t_vbfs INTO DATA(vbfs) WITH KEY msgty = 'E'.
+  IF sy-subrc IS INITIAL.
+    ROLLBACK WORK.
+    MESSAGE ID vbfs-msgid TYPE vbfs-msgty NUMBER vbfs-msgno
+              WITH vbfs-msgv1
+                   vbfs-msgv2
+                   vbfs-msgv3
+                   vbfs-msgv4.
+  ELSE.
+    COMMIT WORK AND WAIT.
+    READ TABLE t_vbls INTO DATA(vbls) INDEX 1.
+  ENDIF.
+
+END-OF-SELECTION.
+  IF vbls-vbeln_lif IS NOT INITIAL.
+    SET PARAMETER ID 'VL' FIELD vbls-vbeln_lif.
+    CALL TRANSACTION 'VL32N' AND SKIP FIRST SCREEN.
+  ENDIF.

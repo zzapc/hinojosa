@@ -1,0 +1,183 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZALV_MAIL_FORMS                                  *
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  call_report
+*&---------------------------------------------------------------------*
+*       Call any ALV REPORT
+*----------------------------------------------------------------------*
+FORM call_report .
+*SUBMIT ALV GRID REPORT  TO SPOOL AND RETURN
+  SUBMIT (p_repid)  TO SAP-SPOOL
+  USING SELECTION-SET p_varnt
+        WITHOUT SPOOL DYNPRO
+        DESTINATION space
+*                    COVER TEXT ''
+        NEW LIST IDENTIFICATION 'X'
+        IMMEDIATELY space
+        AND RETURN.
+
+ENDFORM.                    " call_report
+*&---------------------------------------------------------------------*
+*&      Form  get_spool_number
+*&---------------------------------------------------------------------*
+*    GET THE SPOOL REQUEST  NO rq2name FROM TABLE TSP01
+*----------------------------------------------------------------------*
+FORM get_spool_number USING: f_repid
+      f_uname
+  CHANGING f_rqident.
+  DATA: l_spool_c LIKE tsp01_sp0r-rqid_char.
+  DATA: lc_rq2name LIKE tsp01-rq2name.
+
+  GET PARAMETER ID 'SPI' FIELD l_spool_c. " recuperamos el SPOOL de memoria
+  IF sy-subrc EQ 0.
+    MOVE l_spool_c TO f_rqident.
+
+    SELECT SINGLE * FROM tsp01
+      WHERE rqident EQ f_rqident.
+  ELSE.
+    CONCATENATE f_repid                                      "+0(8)
+                f_uname+0(3)
+    INTO lc_rq2name SEPARATED BY '_'.
+
+    SELECT * FROM tsp01 WHERE  rq2name = lc_rq2name
+      ORDER BY rqcretime DESCENDING.
+      f_rqident = tsp01-rqident.
+      EXIT.
+    ENDSELECT.
+  ENDIF.
+
+  IF p_vacio IS NOT INITIAL. " para quitar las vacías verificarmos si más de 1000 bytes (orientativo)
+    SELECT SINGLE @abap_true FROM tst01
+      WHERE dname EQ @tsp01-rqo1name
+        AND dsize GT 1000
+        INTO @DATA(check).
+
+    IF sy-subrc NE 0.
+      WRITE: 'No se encuentra SPOOL mayor a 1000 bytes'.
+      MOVE abap_true TO error.
+    ENDIF.
+  ENDIF.
+
+  IF f_rqident IS INITIAL AND error IS INITIAL.
+    WRITE: 'No se ha encontrado lista SPOOL'.
+    MOVE abap_true TO error.
+  ENDIF.
+ENDFORM." get_spool_number
+*&---------------------------------------------------------------------*
+*&      Form  spool_to_html
+*&---------------------------------------------------------------------*
+FORM spool_to_html .
+ENDFORM.                    " spool_to_html
+*&---------------------------------------------------------------------*
+*&      Form  GET_DATA_MAIL
+*&---------------------------------------------------------------------*
+FORM get_data_mail .
+  DATA: mem_tab LIKE abaplist OCCURS 10.
+*GET DATA FRM SPOOL AND EXPORT AS LIST TO MEMORY
+  SUBMIT rspolist EXPORTING LIST TO MEMORY AND RETURN
+    WITH rqident = mi_rqident
+    WITH first = '1'
+    WITH last = '0'.
+  CALL FUNCTION 'LIST_FROM_MEMORY'
+    TABLES
+      listobject = mem_tab
+    EXCEPTIONS
+      not_found  = 1
+      OTHERS     = 2.
+*COMPRESS LIST TO TABLE
+  CALL FUNCTION 'TABLE_COMPRESS'
+*     IMPORTING
+*       COMPRESSED_SIZE       =
+    TABLES
+      in     = mem_tab
+      out    = objbin
+    EXCEPTIONS
+      OTHERS = 1.
+  IF sy-subrc <> 0.
+    MESSAGE ID '61' TYPE 'E' NUMBER '731'
+    WITH 'TABLE_COMPRESS'.
+  ENDIF.
+** NOTE: Creation of attachment is finished yet.
+**   For your report, the attachment should be placed into table
+**     objtxt for plain text or
+**     objbin for binary content.
+**   Now create the message and send the document.'recipients!'.
+** Create Message Body
+**   Title and Description
+  docdata-obj_name  = 'Royal Enfield'.
+  docdata-obj_descr = p_title.
+**   Main Text
+  objtxt = p_body.
+  APPEND objtxt.
+*
+**   Write Packing List (Main)
+*
+  DESCRIBE TABLE objtxt LINES tab_lines.
+  READ     TABLE objtxt INDEX tab_lines.
+  docdata-doc_size = ( tab_lines - 1 ) * 255 + strlen( objtxt ).
+  CLEAR objpack-transf_bin.
+  objpack-head_start = 1.
+  objpack-head_num   = 0.
+  objpack-body_start = 1.
+  objpack-body_num   = tab_lines.
+  objpack-doc_type   = 'RAW'.
+  APPEND objpack.
+** Create Message Attachment
+
+**   Write Packing List (Attachment)
+*
+  att_type = 'ALI'.
+  DESCRIBE TABLE objbin LINES tab_lines.
+  READ     TABLE objbin INDEX tab_lines.
+  objpack-doc_size = ( tab_lines - 1 ) * 255 + strlen( objbin ).
+  objpack-transf_bin = 'X'.
+  objpack-head_start = 1.
+  objpack-head_num   = 0.
+  objpack-body_start = 1.
+  objpack-body_num   = tab_lines.
+  objpack-doc_type   = att_type.
+  objpack-obj_name   = 'ATTACHMENT'.
+  objpack-obj_descr  = p_attnam.
+  APPEND objpack.
+*
+** Create receiver list
+  reclist-receiver = p_lista.
+  reclist-rec_type = 'C'. " lista
+  APPEND reclist.
+** Send Message
+*
+  CALL FUNCTION 'SO_NEW_DOCUMENT_ATT_SEND_API1'
+    EXPORTING
+      document_data = docdata
+      put_in_outbox = 'X'
+      commit_work   = 'X'     "used from rel.6.10
+    TABLES
+      packing_list  = objpack
+      object_header = objhead
+      contents_txt  = objtxt
+      contents_bin  = objbin
+*     contents_hex  = objhex
+      receivers     = reclist.
+*      ADDED BY HARIKRISHNAN-HBS:06.05.2011
+*      REASON:  "reclist" IF NOT CLEARED THE MAIL WILL BE REPEATEDLY
+*               SENT TO SAME  ADDRESS
+  CLEAR     reclist.
+*      END OF ADDITION BY HARIKRISHNAN-HBS:06.05.2011
+  IF sy-subrc <> 0.
+*RELEASE AND SEND MESSAGES IN QUEUE
+    CALL FUNCTION 'SO_DEQUEUE_UPDATE_LOCKS'
+      EXCEPTIONS
+        communication_failure = 1
+        system_failure        = 2
+        OTHERS                = 3.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+      WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    SUBMIT rsconn01 WITH mode = 'INT'
+    WITH output = ' '
+    AND RETURN.
+  ENDIF.
+ENDFORM.                    " GET_DATA_MAIL

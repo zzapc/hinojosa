@@ -1,0 +1,420 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZSFII308_BTC
+*&---------------------------------------------------------------------*
+TABLES: t100.
+
+* Valores BOOLEANs
+DATA: cierto      VALUE 'X',
+      falso       VALUE ' '.
+
+* Tabla de BATCH-INPUTs
+DATA BEGIN OF bdc_tab OCCURS 100.
+        INCLUDE STRUCTURE bdcdata.
+DATA END OF bdc_tab.
+* TABLA DE MENSAJES
+DATA BEGIN OF itab OCCURS 10.
+        INCLUDE STRUCTURE bdcmsgcoll.
+DATA END OF itab.
+
+* BOOLEAN que indica si un batch input es online o no.
+DATA: online      VALUE 'X',
+      debug       VALUE ' '.                " Cuando un batch se ejecuta con
+" DEBUG == CIERTO, se hace un
+" CALL TRANSACTION en modo 'A'.
+
+*---------------------------------------------------------------------*
+*       FORM FECHA_FIN_MES                                            *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  <-->  FECHA                                                         *
+*---------------------------------------------------------------------*
+FORM fecha_fin_mes USING fecha.
+
+  DATA fec TYPE d.
+
+  fec = fecha.
+  fec+6(2) = '01'.                     " Dia 1 del mes actual.
+  fec = fec + 32.                      " Cualquier dia del mes siguiente
+  fec+6(2) = '01'.                     " Dia 1 del mes siguiente
+  fec = fec - 1.                       " Ultimo dia del mes actual
+  fecha = fec.
+
+ENDFORM.                               " FECHA_FIN_MES
+
+*---------------------------------------------------------------------*
+*       FORM FECHA_SUMA_MES                                           *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  FECHA                                                         *
+*  -->  VALUE(MESES)                                                  *
+*---------------------------------------------------------------------*
+FORM fecha_suma_mes USING fecha VALUE(meses).
+
+  DATA: fecha1 TYPE d,
+        fecha2 TYPE d.
+
+  fecha2 = fecha1 = fecha.
+  fecha2+6(2) = '01'.                  " Día 1 del mes origen
+  WHILE meses >= 12.                   " Cuando se sumen más de un año
+    ADD 1 TO fecha2+0(4).              " Añado uno al año (12 meses)
+    SUBTRACT 12 FROM meses.
+  ENDWHILE.
+  fecha2+4(2) = fecha2+4(2) + meses.   " Sumo los meses
+  IF fecha2+4(2) > 12.
+    SUBTRACT 12 FROM fecha2+4(2).
+    ADD 1 TO fecha2+0(4).
+  ENDIF.
+  PERFORM fecha_fin_mes USING fecha2.
+  IF fecha1+6(2) < fecha2+6(2).        " Si el día origen es menor
+    fecha2+6(2) = fecha1+6(2).         " que el último día del mes
+  ENDIF.                               " destino, lo ponemos.
+  fecha = fecha2.
+ENDFORM.                               " FECHA_SUMA_MES
+
+*---------------------------------------------------------------------*
+*       FORM DYNPRO                                                   *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VALUE(DYNBEGIN)                                               *
+*  -->  VALUE(NAME)                                                   *
+*  -->  VALUE(VALUE)                                                  *
+*---------------------------------------------------------------------*
+FORM dynpro USING VALUE(dynbegin) VALUE(name) VALUE(value).
+
+  CLEAR bdc_tab.
+  IF dynbegin = 'X'.
+    bdc_tab-program  = name.
+    bdc_tab-dynpro   = value.
+    bdc_tab-dynbegin = 'X'.
+  ELSE .
+    bdc_tab-fnam = name.
+    bdc_tab-fval = value.
+  ENDIF.
+  APPEND bdc_tab.
+  CLEAR bdc_tab.
+
+ENDFORM.                               " DYNPRO
+*----------------------------------------------------------------------*
+*        Start new screen                                              *
+*----------------------------------------------------------------------*
+FORM bdc_dynpro USING program dynpro.
+  CLEAR bdc_tab.
+  bdc_tab-program  = program.
+  bdc_tab-dynpro   = dynpro.
+  bdc_tab-dynbegin = 'X'.
+  APPEND bdc_tab.
+ENDFORM.
+
+*----------------------------------------------------------------------*
+*        Insert field                                                  *
+*----------------------------------------------------------------------*
+FORM bdc_field USING fnam fval.
+  CLEAR bdc_tab.
+  bdc_tab-fnam = fnam.
+  bdc_tab-fval = fval.
+  APPEND bdc_tab.
+ENDFORM.
+
+*si-------------------------------------------------------------------*
+*       FORM BDC_OPEN                                                 *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  GROUP                                                         *
+*---------------------------------------------------------------------*
+FORM bdc_open USING group.
+  online = cierto.
+  IF NOT group IS INITIAL AND debug = falso.
+    CALL FUNCTION 'BDC_OPEN_GROUP'
+      EXPORTING
+        client              = sy-mandt
+        group               = group
+        user                = sy-uname
+        keep                = 'X'
+      EXCEPTIONS
+        client_invalid      = 1
+        destination_invalid = 2
+        group_invalid       = 3
+        holddate_invalid    = 4
+        internal_error      = 5
+        queue_error         = 6
+        running             = 7
+        user_invalid        = 8.
+    IF sy-subrc = 0. " Si se ha podido abrir, OFFLINE; si no, ONLINE
+      online = falso.
+    ENDIF.
+  ENDIF.
+ENDFORM.                               " BDC_OPEN
+
+*---------------------------------------------------------------------*
+*       FORM BDC_INSERT                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  TCODE                                                         *
+*---------------------------------------------------------------------*
+FORM bdc_insert USING tcode.
+  IF online IS INITIAL AND debug = falso.
+    CALL FUNCTION 'BDC_INSERT'
+      EXPORTING
+        tcode          = tcode
+      TABLES
+        dynprotab      = bdc_tab
+      EXCEPTIONS
+        internal_error = 1
+        not_open       = 2
+        queue_error    = 3
+        tcode_invalid  = 4.
+  ELSEIF debug = cierto.
+    CALL TRANSACTION tcode USING bdc_tab MODE 'A'.
+  ELSE.
+    CALL TRANSACTION tcode USING bdc_tab MODE 'N'.
+  ENDIF.
+  REFRESH bdc_tab.
+ENDFORM.                               " BDC_INSERT
+
+*---------------------------------------------------------------------*
+*       FORM BDC_CLOSE                                                *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM bdc_close.
+  IF online = falso AND debug = falso.
+    CALL FUNCTION 'BDC_CLOSE_GROUP'
+      EXCEPTIONS
+        not_open    = 1
+        queue_error = 2.
+    online = cierto.
+  ENDIF.
+ENDFORM.                               " BDC_CLOSE
+
+
+
+*si--------------------------------------------------------------------*
+*       FORM LOAD                                                     *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  DATA_TAB                                                      *
+*  -->  VALUE(FROM)                                                   *
+*  -->  FILE                                                          *
+*---------------------------------------------------------------------*
+FORM load TABLES data_tab USING VALUE(from) file.
+
+  TRANSLATE from TO UPPER CASE.
+  IF from = 'UNIX'.                    " FILE CS '/'.
+    OPEN DATASET file FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+    IF sy-subrc <> 0. sy-subrc = 2. EXIT. ENDIF.
+    DO.
+      READ DATASET file INTO data_tab.
+      IF sy-subrc <> 0.
+        EXIT.
+      ENDIF.
+      APPEND data_tab.
+    ENDDO.
+    IF sy-subrc = 8. sy-subrc = 3. EXIT. ENDIF.
+    CLOSE DATASET file.
+  ELSE.
+    CALL FUNCTION 'WS_UPLOAD'
+      EXPORTING
+        codepage            = 'IBM'
+        filename            = file
+        filetype            = 'ASC'
+        headlen             = space
+        line_exit           = space
+        trunclen            = space
+        user_form           = space
+        user_prog           = space
+      TABLES
+        data_tab            = data_tab
+      EXCEPTIONS
+        conversion_error    = 1
+        file_open_error     = 2
+        file_read_error     = 3
+        invalid_table_width = 4
+        invalid_type        = 5
+        no_batch            = 6
+        unknown_error       = 7.
+    IF sy-subrc NE 0.
+      MESSAGE s003(ZSFI308) WITH file.      "Error en apertura de fichero
+
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM SAVE                                                     *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  DATA_TAB                                                      *
+*  -->  VALUE(DEST)                                                   *
+*  -->  FILE                                                          *
+*---------------------------------------------------------------------*
+FORM save TABLES data_tab USING VALUE(dest) file.
+
+  TRANSLATE dest TO UPPER CASE.
+  IF dest = 'UNIX'.                    " FILE CS '/'.
+    OPEN DATASET file FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+    IF sy-subrc <> 0. sy-subrc = 2. EXIT. ENDIF.
+    LOOP AT data_tab.
+      TRANSFER data_tab TO file.
+      IF sy-subrc <> 0. EXIT. ENDIF.
+    ENDLOOP.
+    IF sy-subrc = 8. sy-subrc = 3. EXIT. ENDIF.
+    CLOSE DATASET file.
+  ELSE.
+    CALL FUNCTION 'WS_DOWNLOAD'
+      EXPORTING
+        codepage            = 'IBM'
+        filename            = file
+        filetype            = 'ASC'
+      TABLES
+        data_tab            = data_tab
+      EXCEPTIONS
+        file_open_error     = 1
+        file_write_error    = 2
+        invalid_filesize    = 3
+        invalid_table_width = 4
+        invalid_type        = 5
+        no_batch            = 6
+        unknown_error       = 7.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  OBTEN_AYUDA_FICHERO
+*&---------------------------------------------------------------------*
+*       M¢dulo de ayuda para b£squeda de fichero                       *
+*----------------------------------------------------------------------*
+FORM obten_ayuda_fichero USING p_file p_title .
+  DATA: l_aux_filename LIKE rlgrap-filename .
+
+* M¢dulo de funci¢n para obtener fichero
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_filename     = ''
+      def_path         = 'C:\'
+      mask             = ',*.*,*.*.'
+      mode             = '0'
+      title            = p_title
+    IMPORTING
+      filename         = l_aux_filename
+*     rc               =
+    EXCEPTIONS
+      inv_winsys       = 1
+      no_batch         = 2
+      selection_cancel = 3
+      selection_error  = 4
+      OTHERS           = 5.
+  IF sy-subrc EQ 0.
+    p_file = l_aux_filename .
+  ENDIF.
+
+ENDFORM.                               " OBTEN_AYUDA_FICHERO
+*---------------------------------------------------------------------*
+*       FORM PROCESA_BI                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VALUE(BI_NAME)                                                *
+*---------------------------------------------------------------------*
+FORM procesa_bi USING VALUE(bi_name).
+
+  TABLES: apqi.                        " Maestro de Batch-input's
+  DATA: jobcount LIKE tbtcjob-jobcount,
+        jobname  LIKE tbtcjob-jobname.
+
+  jobname = bi_name.
+  SELECT * FROM apqi WHERE destsys = '        '
+                       AND destapp = '        '
+                       AND datatyp = 'BDC'
+                       AND mandant = sy-mandt
+                       AND groupid = bi_name
+                       AND progid  = '        '
+                       AND qattrib = ' '
+                       AND qstate  = ' '.
+    EXIT.
+  ENDSELECT.
+
+  IF sy-subrc = 0.
+    CALL FUNCTION 'JOB_OPEN'
+      EXPORTING
+        jobgroup = 'BATCH-INPUT'
+        jobname  = jobname
+      IMPORTING
+        jobcount = jobcount.
+
+    SUBMIT rsbdcbtc USER sy-uname
+          VIA JOB jobname NUMBER jobcount
+          WITH queue-id EQ apqi-qid
+          WITH mappe    EQ apqi-groupid
+          WITH modus    EQ 'N'
+          AND RETURN.
+
+    CALL FUNCTION 'JOB_CLOSE'
+      EXPORTING
+        jobcount  = jobcount
+        jobname   = jobname
+        strtimmed = 'X'.
+
+  ENDIF.
+
+ENDFORM.                               " PROCESA_BI
+*&---------------------------------------------------------------------*
+*&      Form  SELEC_MESSAGE
+*&---------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM selec_message USING mess_id
+                         mess_type
+                         mess_number
+                         mess_text1 mess_text2 mess_text3 mess_text4
+                   CHANGING   mensaje.
+
+  DATA: textoa(20),
+        textob(10),
+        textoc(20),
+        textod(20),
+        long       TYPE i.
+
+  CLEAR: textoa, textob, textoc, textod.
+  textoa = mess_text1.
+  textob = mess_text2.
+  textoc = mess_text3.
+  textod = mess_text4.
+
+  SELECT SINGLE       * FROM  t100
+         WHERE  sprsl       = 'S'
+         AND    arbgb       = mess_id
+         AND    msgnr       = mess_number .
+  IF sy-subrc EQ 0.
+    IF NOT textoa IS INITIAL.
+      long = strlen( textoa ).
+      REPLACE '&' WITH textoa INTO t100-text.
+    ENDIF.
+    IF NOT textob IS INITIAL.
+      CLEAR long.
+      long = strlen( textob ).
+      REPLACE '&' WITH textob LENGTH long INTO t100-text.
+    ENDIF.
+    IF NOT textoc IS INITIAL.
+      CLEAR long.
+      long = strlen( textoc ).
+      REPLACE '&' WITH textoc LENGTH long INTO t100-text.
+    ENDIF.
+    IF NOT textod IS INITIAL.
+      CLEAR long.
+      long = strlen( textod ).
+      REPLACE '&' WITH textod LENGTH long INTO t100-text.
+    ENDIF.
+    mensaje  =  t100-text.
+  ENDIF.
+
+ENDFORM.                               " SELEC_MESSAGE

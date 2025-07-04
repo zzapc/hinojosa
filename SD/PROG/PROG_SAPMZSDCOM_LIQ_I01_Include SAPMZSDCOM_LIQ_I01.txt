@@ -1,0 +1,288 @@
+*&---------------------------------------------------------------------*
+*&  Include           SAPMZSDCOM_LIQ_I01
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Module  EXIT_100  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE exit_100 INPUT.
+
+  SET SCREEN 0.
+  LEAVE SCREEN.
+
+ENDMODULE.                 " EXIT_100  INPUT
+
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0100 INPUT.
+
+  CASE gv_okcode.
+*   Visualizar
+    WHEN 'VISU'.
+      CLEAR gv_okcode.
+      gs_cab = zssdcom_prliqcab.
+      PERFORM cargar_propuesta USING 'V'.
+
+*   Visualizar
+    WHEN 'MOD'.
+      CLEAR gv_okcode.
+      gs_cab = zssdcom_prliqcab.
+      PERFORM cargar_propuesta USING 'M'.
+
+*   Visualizar
+    WHEN 'CREAR'.
+      CLEAR gv_okcode.
+      gs_cab = zssdcom_prliqcab.
+      PERFORM crear_propuesta_ini.
+
+*   Actualizar status
+    WHEN 'REFRESH'.
+      CLEAR gv_okcode.
+      PERFORM actualizar_status.
+
+*   En otros casos actualizamos el status
+    WHEN OTHERS.
+      CLEAR gv_okcode.
+      PERFORM actualizar_status.
+
+  ENDCASE.
+
+ENDMODULE.                 " USER_COMMAND_0100  INPUT
+
+
+*&---------------------------------------------------------------------*
+*&      Module  EXIT_200  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE exit_200 INPUT.
+
+  SET SCREEN 0.
+  LEAVE SCREEN.
+
+ENDMODULE.                 " EXIT_200  INPUT
+
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0200  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0200 INPUT.
+
+  CASE gv_okcode.
+*   Anular liquidación
+    WHEN 'ANULARDOC'.
+      DATA gt_anular TYPE TABLE OF zssdcomliq001_grid WITH HEADER LINE.
+      DATA lti_comis TYPE zssdcomliq001_grid.
+      DATA et_index_rows TYPE lvc_t_row WITH HEADER LINE.
+      CLEAR et_index_rows[].
+      CALL METHOD g_grid_com->get_selected_rows
+        IMPORTING
+          et_index_rows = et_index_rows[].
+      DELETE et_index_rows WHERE rowtype IS NOT INITIAL.
+      CLEAR gt_anular[].
+      LOOP AT et_index_rows.
+        READ TABLE gti_comis INTO lti_comis INDEX et_index_rows-index.
+        IF sy-subrc = 0 AND lti_comis-belnr_liq IS NOT INITIAL.
+          APPEND lti_comis TO gt_anular.
+        ENDIF.
+      ENDLOOP.
+      IF gt_anular[] IS NOT INITIAL.
+        CLEAR v_stgrd.
+        CLEAR f_budat.
+        f_budat = sy-datum.
+        CALL SCREEN 5000 STARTING AT 5 5.
+        IF sy-ucomm = 'OK5000'.
+          DATA mensajes TYPE TABLE OF bapiret2 WITH HEADER LINE.
+          DATA return TYPE TABLE OF bapiret2 WITH HEADER LINE.
+          DATA reversal TYPE bapiacrev.
+          DATA l_bkpf TYPE bkpf.
+
+          CLEAR mensajes[].
+
+          SORT gt_anular BY bukrs gjahr_liq belnr_liq.
+          DELETE ADJACENT DUPLICATES FROM gt_anular COMPARING bukrs gjahr_liq belnr_liq.
+
+          LOOP AT gt_anular.
+
+            CLEAR: reversal, return[], l_bkpf.
+            SELECT SINGLE * INTO l_bkpf FROM bkpf
+              WHERE bukrs = gt_anular-bukrs
+                AND gjahr = gt_anular-gjahr_liq
+                AND belnr = gt_anular-belnr_liq.
+
+            mensajes-type = 'W'.
+            mensajes-id = '00'.
+            mensajes-number = 398.
+            mensajes-message_v1 = 'Anular Fact:'.
+            mensajes-message_v2 = l_bkpf-awkey.
+            APPEND mensajes. CLEAR mensajes.
+
+            reversal-obj_type = l_bkpf-awtyp.
+            reversal-obj_key = l_bkpf-awkey.
+            reversal-obj_key_r = l_bkpf-awkey.
+            reversal-reason_rev = v_stgrd.
+            reversal-pstng_date = f_budat.
+
+            CALL FUNCTION 'BAPI_ACC_DOCUMENT_REV_POST'
+              EXPORTING
+                reversal = reversal
+                bus_act  = 'RFBU'
+              TABLES
+                return   = return[].
+            READ TABLE return WITH KEY type = 'E'.
+            IF sy-subrc = 0.
+              APPEND LINES OF return TO mensajes.
+            ELSE.
+              CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                EXPORTING
+                  wait = 'X'.
+
+              mensajes-type = 'S'.
+              mensajes-id = '00'.
+              mensajes-number = 398.
+              mensajes-message_v1 = 'Anulado Correctamente'.
+              APPEND mensajes. CLEAR mensajes.
+
+              DATA comis LIKE sy-tabix.
+              LOOP AT gti_comis INTO lti_comis
+                WHERE belnr_liq = l_bkpf-belnr AND gjahr_liq = l_bkpf-gjahr.
+                comis = sy-tabix.
+                lti_comis-belnr_liq = space.
+                lti_comis-gjahr_liq = space.
+                lti_comis-zstat_pos_liq = space.
+                MODIFY gti_comis FROM lti_comis INDEX comis.
+              ENDLOOP.
+
+              UPDATE ztsdcom_prliqpos SET belnr_liq = space
+                                          gjahr_liq = space
+                                          zstat_pos_liq = space
+                                          WHERE belnr_liq = l_bkpf-belnr
+                                            AND gjahr_liq = l_bkpf-gjahr
+                                            AND bukrs = l_bkpf-bukrs
+                                            AND laufd = ztsdcom_prliqcab-laufd
+                                            AND laufi = ztsdcom_prliqcab-laufi.
+              COMMIT WORK AND WAIT.
+
+            ENDIF.
+          ENDLOOP.
+
+          IF mensajes[] IS NOT INITIAL.
+            READ TABLE mensajes WITH KEY type = 'E'.
+            IF sy-subrc <> 0.
+
+              DATA l_com TYPE ztsdcom_prliqpos.
+              SELECT SINGLE * INTO l_com FROM ztsdcom_prliqpos
+                                          WHERE belnr_liq <> space
+                                            AND bukrs = l_bkpf-bukrs
+                                            AND laufd = ztsdcom_prliqcab-laufd
+                                            AND laufi = ztsdcom_prliqcab-laufi.
+              IF sy-subrc <> 0.
+                UPDATE ztsdcom_prliqcab SET zstat_liq = '01'
+                WHERE laufd = zssdcom_prliqcab-laufd
+                AND   laufi = zssdcom_prliqcab-laufi
+                AND   bukrs = zssdcom_prliqcab-bukrs.
+                COMMIT WORK AND WAIT.
+                gs_cab-zstat_liq = '01'.
+              ENDIF.
+
+              CALL FUNCTION 'ZSBC_VENTANA_LOGSBAPI'
+                EXPORTING
+                  mensajes = mensajes[].
+              CLEAR gv_okcode.
+              PERFORM back_200.
+            ELSE.
+              CALL FUNCTION 'ZSBC_VENTANA_LOGSBAPI'
+                EXPORTING
+                  mensajes = mensajes[].
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+*   Volver
+    WHEN 'BACK'.
+      CLEAR gv_okcode.
+      PERFORM back_200.
+
+*   Seleccionar comisiones nuevas
+    WHEN 'SEL'.
+      CLEAR gv_okcode.
+      PERFORM seleccionar_fact_pdtes.
+
+*   Guardar propuesta
+    WHEN 'SAVE_PR'.
+      CLEAR gv_okcode.
+*     Si estamos en modo CREACIÓN lanzamos la selección/grabación en fondo
+      IF gv_modo = 'C'.
+        PERFORM crear_propuesta_fondo.
+*     Sino, grabamos la propuesta con las modificaciones
+      ELSE.
+        PERFORM grabar_propuesta USING ' '.
+      ENDIF.
+
+*   Eliminar propuesta
+    WHEN 'ELIMINAR'.
+      CLEAR gv_okcode.
+      PERFORM eliminar_propuesta USING 'X'.
+
+*   Seleccionar comisiones: BOTÓN para ir de nuevo a la pantalla de
+*   selección de facturas y añadir nuevas facturas a la propuesta
+    WHEN 'SELFACT'.
+*     Inicializamos los campos de selección de facturas
+      CLEAR: so_basli, so_lifnr, p_datum.
+      REFRESH: so_basli, so_lifnr.
+**      p_datum = sy-datum.
+**      bot_sel = 'Seleccionar'(b02). " Ponemos el texto del botón
+*     Cargamos la pantalla de selección
+      gv_dyncon = gc_dynsel.
+
+*   Contabilizar liquidación
+    WHEN 'CONT_LIQ'.
+      CLEAR gv_okcode.
+      PERFORM grabar_propuesta USING 'X'.
+      PERFORM contabilizar_liquidacion.
+      PERFORM cargar_propuesta USING 'M'. "ASC 15.07.2021 Refrescar ALV tras contabilizar
+
+*   Imprimir propuesta de liquidación
+    WHEN 'PRINT'.
+      CLEAR gv_okcode.
+      PERFORM enviar_propuesta USING ' '.
+*      PERFORM imprimir_propuesta.
+
+*   Enviar propuesta de liquidación
+    WHEN 'MAIL'.
+      CLEAR gv_okcode.
+      PERFORM enviar_propuesta USING 'X'.
+  ENDCASE.
+
+ENDMODULE.                 " USER_COMMAND_0200  INPUT
+
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_5000  OUTPUT
+*&---------------------------------------------------------------------*
+MODULE status_5000 OUTPUT.
+  SET PF-STATUS '5000'.
+  SET TITLEBAR  '5000'.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_5000  INPUT
+*&---------------------------------------------------------------------*
+MODULE user_command_5000 INPUT.
+  CASE sy-ucomm.
+    WHEN 'CA5000'. LEAVE TO SCREEN 0.
+    WHEN 'OK5000'.
+      IF v_stgrd IS INITIAL OR f_budat IS INITIAL.
+        MESSAGE s368(00) WITH 'Rellene todos los campos'.
+      ELSE.
+        LEAVE TO SCREEN 0.
+      ENDIF.
+  ENDCASE.
+ENDMODULE.

@@ -1,0 +1,1490 @@
+*&---------------------------------------------------------------------*
+*& Report  ZARBCIS_NAST_TRIGGER_POST
+*&
+*&---------------------------------------------------------------------*
+*& Nombre del Programa : ZARBCIS_NAST_TRIGGER_POST
+*& Autor del Programa  : Jesús Sánchez
+*& Fecha de creacion   : 14/04/2023
+*& Solicitante         : Marcos Dios
+*& Numero de version   : 1
+*&
+*& Descripción         : Programa realiza llamada por httpclient ariba
+*&
+*&---------------------------------------------------------------------*
+REPORT zarbcis_nast_trigger_post.
+
+INCLUDE zarbcis_nast_tri_top.  " Declaraciones
+
+PERFORM send_document USING l_returncode
+                            l_screen.
+
+*&---------------------------------------------------------------------*
+*&      Form  send_document
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->IV_RETURNCODE: Success, Error Return code
+*      -->IV_SCREEN    : Screen parameter
+*----------------------------------------------------------------------*
+FORM send_document USING iv_returncode TYPE any
+                         iv_screen     TYPE any.
+
+  DATA: lv_url            TYPE        string,
+        lv_response       TYPE        string,
+        lv_request_length TYPE        i,
+        lv_request        TYPE        string,
+        lv_err_string     TYPE        string,
+        lv_ret_code       TYPE        sy-subrc,
+        l_username        TYPE        string,
+        wl_date           TYPE        datum,
+        wl_time           TYPE        uzeit,
+        wl_zone           TYPE        tznzone,
+        wl_purpose        TYPE        string,
+        wl_operation      TYPE        string,
+        wl_itaxline       TYPE        string,
+        wl_dos(16)        TYPE        p DECIMALS 2,
+        wl_dos2(16)       TYPE        p DECIMALS 2,
+        wl_posnn          TYPE        posnr_nach,
+        wl_posnv          TYPE        posnr_nach,
+        wl_name_post      TYPE        string,
+        wl_aux            TYPE        string,
+        wl_ped            TYPE        string,
+        wl_void           TYPE        string,
+        wl_memo           TYPE        c,
+        wl_char2_dec(2)   TYPE        c,
+        wal_um_custo      TYPE        ztarbcis_um,
+        wl_post_code      TYPE        ad_pstcd1,
+        wl_vbeln_aux      TYPE        vbeln,
+        l_password        TYPE        string,
+        lo_http_client    TYPE REF TO if_http_client,
+        l_message         TYPE        arbcis_invc_req_msg,
+        wl_billtoadd      TYPE        zarbcis_billto_id,
+        lv_xml_request    TYPE        string.
+
+  DATA: lv_msg_id TYPE sy-msgid,
+        lv_msg_nr TYPE sy-msgno,
+        lv_msg_ty TYPE sy-msgty,
+        lv_msg_v1 TYPE sy-msgv1,
+        lv_msg_v2 TYPE sy-msgv2,
+        lv_msg_v3 TYPE sy-msgv3,
+        lv_msg_v4 TYPE sy-msgv4.
+
+
+  DATA: wl_price_unit TYPE arbcis_amnt_cnt.         "SEIDOR JPM 02.02.2023  Plástico
+
+  DATA:
+*Local Variables
+    lv_name(120)           TYPE c,
+    lv_doc_type            TYPE arbcis_document_type_code,
+    lv_impl_class          TYPE arbcis_impl_cls,
+    lv_msg1                TYPE sy-msgv1,
+    lv_message             TYPE string,
+    lv_is_relevant         TYPE flag,
+    lv_doc_number          TYPE vbeln,
+*Local Structures
+    ls_log_header          TYPE bal_s_log,
+    ls_nast                TYPE nast,
+    ls_return              TYPE bapiret2,
+    ls_so_vers             TYPE arbcis_so_vers,
+    ls_message_header      TYPE arbcis_bus_doc_msg_hdr,
+*Local Internal Tables
+    lt_return              TYPE bapirettab,
+*Local Objects
+    lo_impl_cls            TYPE REF TO object,
+    lo_create_object_error TYPE REF TO cx_sy_create_object_error,
+    lo_arbcis_appl         TYPE REF TO cx_arbcis_appl,
+    lo_arbcis_common_util  TYPE REF TO zcl_arbcis_common_util.
+
+  DATA: rg_vbtyp TYPE RANGE OF vbfa-vbtyp_v.
+  DATA: rwa_vbtyp LIKE LINE OF rg_vbtyp.
+
+  rwa_vbtyp-sign = 'I'.
+  rwa_vbtyp-option = 'EQ'.
+  rwa_vbtyp-low = 'C'.
+  APPEND rwa_vbtyp TO rg_vbtyp.
+
+  rwa_vbtyp-sign = 'I'.
+  rwa_vbtyp-option = 'EQ'.
+  rwa_vbtyp-low = 'H'.
+  APPEND rwa_vbtyp TO rg_vbtyp.
+
+  rwa_vbtyp-sign = 'I'.
+  rwa_vbtyp-option = 'EQ'.
+  rwa_vbtyp-low = 'L'.
+  APPEND rwa_vbtyp TO rg_vbtyp.
+
+  rwa_vbtyp-sign = 'I'.
+  rwa_vbtyp-option = 'EQ'.
+  rwa_vbtyp-low = 'K'.
+  APPEND rwa_vbtyp TO rg_vbtyp.
+
+* tell the calling program that the call was OK
+  CLEAR: iv_returncode,lv_doc_type,lv_impl_class,
+         ls_nast,ls_log_header,ls_so_vers,lt_return, wl_memo.
+
+* define field symbols
+  FIELD-SYMBOLS: <fs_nast> TYPE any.
+
+* get NAST information via global assign from calling program
+  CONCATENATE '(RSNAST00)' 'NAST' INTO lv_name.
+  ASSIGN (lv_name) TO <fs_nast>.
+  IF <fs_nast> IS ASSIGNED.
+    MOVE-CORRESPONDING <fs_nast> TO ls_nast.
+  ENDIF.
+
+  IF ls_nast IS NOT INITIAL.
+    TRY.
+        CALL METHOD zcl_arbcis_common_util=>authorization_check
+          EXPORTING
+            object               = sy-repid
+            authorization_object = 'ARBCIS_PRG'.
+
+        IF sy-subrc IS INITIAL.
+          IF ls_nast-kappl IS NOT INITIAL.
+            SELECT doc_type impl_class
+                   UP TO 1 ROWS
+                   FROM arbcis_if_master
+                   INTO (lv_doc_type, lv_impl_class)
+                   WHERE direction   = 1            "Outbound
+                     AND application = ls_nast-kappl.
+            ENDSELECT.
+          ENDIF.
+          CREATE OBJECT lo_arbcis_common_util.
+          IF lo_arbcis_common_util IS BOUND.
+            CALL METHOD lo_arbcis_common_util->check_for_relevance
+              EXPORTING
+                document_number = ls_nast-objky+0(10)
+                document_type   = lv_doc_type
+              IMPORTING
+                ev_is_relevant  = lv_is_relevant
+                es_so_vers      = ls_so_vers.
+            IF lv_is_relevant EQ abap_true.
+              CALL METHOD lo_arbcis_common_util->fill_message_header
+                EXPORTING
+                  iv_date           = ls_nast-erdat
+                  iv_time           = ls_nast-eruhr
+                IMPORTING
+                  es_message_header = ls_message_header.
+            ELSE.
+*Log a message for Ariba irrelevant Documents
+              iv_returncode = '996'.
+              CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+                EXPORTING
+                  input  = ls_nast-objky+0(10)
+                IMPORTING
+                  output = lv_doc_number.
+
+              PERFORM nast_update
+                          USING
+                             '009'
+                             'ARBCIS_MESSAGE'
+                             'W'
+                             lv_doc_number
+                             ' '
+                             ' '
+                             ' '.
+              RETURN.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+      CATCH cx_arbcis_appl INTO lo_arbcis_appl.
+*Handle the exception for Authorization check failure
+        lo_arbcis_appl->get_message(
+                RECEIVING
+                  rs_message = ls_return ).
+
+        iv_returncode = '996'.
+        PERFORM nast_update
+                    USING
+                       ls_return-number
+                       ls_return-id
+                       'W'
+                       ls_return-message_v1
+                       ls_return-message_v2
+                       ls_return-message_v3
+                       ls_return-message_v4.
+        RETURN.
+    ENDTRY.
+
+    IF lv_impl_class IS NOT INITIAL.
+      TRY.
+          CREATE OBJECT lo_impl_cls TYPE zcl_arbcis_invoice_detail_out.
+          IF lo_impl_cls IS BOUND AND ls_message_header IS NOT INITIAL.
+            CLEAR: iv_returncode, ls_return, lt_return.
+            CALL METHOD lo_impl_cls->('PROCESS')
+              EXPORTING
+                is_nast           = ls_nast
+                is_message_header = ls_message_header
+                is_so_history     = ls_so_vers
+              IMPORTING
+                e_message         = l_message
+                et_message        = lt_return
+                ev_return_code    = iv_returncode.
+
+            IF lt_return IS NOT INITIAL.
+*Application error from the process methods of the implementation class
+              READ TABLE lt_return INTO ls_return INDEX 1.
+              IF ls_return IS NOT INITIAL.
+                PERFORM nast_update
+                                     USING
+                                        ls_return-number
+                                        ls_return-id
+                                        ls_return-type
+                                        ls_return-message_v1
+                                        ls_return-message_v2
+                                        ls_return-message_v3
+                                        ls_return-message_v4.
+              ENDIF.
+              RETURN.
+            ENDIF.
+          ENDIF.
+        CATCH cx_sy_create_object_error INTO lo_create_object_error  .
+**Handle the exception
+**Object creation for the implementation class failed
+*          lo_create_object_error->if_message~get_text(
+*                  RECEIVING
+*                    result = lv_message ).
+*          iv_returncode = '996'. "error code for the calling program
+*          PERFORM nast_update
+*                      USING
+*                         '022'
+*                         'ARBCIS_MESSAGE'
+*                         'E'
+*                         lv_impl_class
+*                         ' '
+*                         ' '
+*                         ' '.
+*          RETURN.
+      ENDTRY.
+    ELSE.
+*Log a message if the implementation class is not found
+      iv_returncode = '996'. "error code for the calling program
+      PERFORM nast_update
+                  USING
+                     '000'
+                     'ARBCIS_MESSAGE'
+                     'E'
+                     ls_nast-kappl
+                     ' '
+                     ' '
+                     ' '.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+  SELECT SINGLE *
+    FROM ztarbcis_url
+    INTO @DATA(wal_url)
+    WHERE sysid    EQ @sy-sysid
+      AND servicio EQ 'ZARBCIS_NAST_TRIGGER_POST'.
+
+  IF sy-subrc = 0.
+    TYPES: BEGIN OF ty_item_ids,
+             posnn TYPE vbfa-posnn,
+           END OF ty_item_ids.
+    TYPES: BEGIN OF ty_item_relation_ids,
+             id     TYPE vbfa-posnn,
+             parent TYPE vbfa-posnn,
+           END OF ty_item_relation_ids.
+    DATA: lt_item_ids       TYPE TABLE OF ty_item_ids,
+          insert_index      TYPE i,
+          old_uecha         TYPE lips-uecha,
+          delivery_count    TYPE i,
+          original_quantity TYPE arbcis_quan_cnt,
+          ls_item           TYPE arbcis_invc_req_invc_itm,
+          ls_item_old       TYPE arbcis_invc_req_invc_itm,
+          old_vbeln         TYPE lips-vbeln,
+          lt_relation_ids   TYPE TABLE OF ty_item_relation_ids.
+
+
+
+    FIELD-SYMBOLS: <product_tax> TYPE arbcis_product_tax.
+
+    LOOP AT l_message-invoice-item INTO DATA(ls_item_aux).
+      APPEND INITIAL LINE TO lt_item_ids ASSIGNING FIELD-SYMBOL(<item_id>).
+      <item_id>-posnn = ls_item_aux-id.
+    ENDLOOP.
+
+    SELECT vbfa~posnn, lips~vbeln, lips~posnr, lips~lfimg, lips~uecha
+    FROM vbfa
+    JOIN lips ON  vbfa~posnv = lips~uecha
+              AND vbfa~vbelv = lips~vbeln
+    INTO TABLE @DATA(lt_batches)
+    FOR ALL ENTRIES IN @lt_item_ids
+    WHERE vbfa~vbeln = @l_message-invoice-id-content
+      AND vbfa~posnn = @lt_item_ids-posnn
+      AND ( vbfa~vbtyp_v = 'J' OR vbfa~vbtyp_v = 'T' )
+      AND vbfa~stufe = ''
+      AND uecha <> @space.
+
+    DELETE ADJACENT DUPLICATES FROM lt_batches COMPARING vbeln posnr.
+    SORT lt_batches BY vbeln uecha.
+    LOOP AT lt_batches ASSIGNING FIELD-SYMBOL(<batch>).
+      AT NEW vbeln.
+        delivery_count = delivery_count + 1.
+      ENDAT.
+      IF old_uecha <> <batch>-uecha OR old_vbeln <> <batch>-vbeln.
+        old_uecha = <batch>-uecha.
+        old_vbeln = <batch>-vbeln.
+        READ TABLE l_message-invoice-item WITH KEY id = |{ <batch>-posnn ALPHA = OUT }| ASSIGNING FIELD-SYMBOL(<item>).
+        IF <item> IS ASSIGNED.
+          CLEAR: insert_index, original_quantity, ls_item_old.
+          ls_item_old = <item>.
+          insert_index = sy-tabix + 1.
+          original_quantity = <item>-quantity-content.
+          <item>-quantity-content = <batch>-lfimg.
+          <item>-price-tax_amount-content = ( <item>-price-tax_amount-content * <item>-quantity-content ) / original_quantity.
+          <item>-price-base_amount-content = ( <item>-price-base_amount-content * <item>-quantity-content ) / original_quantity.
+          <item>-price-gross_amount-content = ( <item>-price-gross_amount-content * <item>-quantity-content ) / original_quantity.
+          <item>-price-net_amount-content = <item>-price-gross_amount-content.
+
+          LOOP AT <item>-product_tax ASSIGNING <product_tax>.
+            <product_tax>-amount-content = ( <product_tax>-amount-content * <item>-quantity-content ) / original_quantity.
+            <product_tax>-base_amount-content = ( <product_tax>-base_amount-content * <item>-quantity-content ) / original_quantity.
+          ENDLOOP.
+        ENDIF.
+      ELSE.
+*        READ TABLE l_message-invoice-item WITH KEY id = |{ <batch>-posnn ALPHA = OUT }| INTO DATA(ls_item).
+        IF ls_item_old IS NOT INITIAL.
+          ls_item = ls_item_old.
+          ls_item-id = <batch>-posnr.
+          ls_item-id+1(1) = delivery_count.
+
+          APPEND INITIAL LINE TO lt_relation_ids ASSIGNING FIELD-SYMBOL(<relation_id>).
+          <relation_id>-id = ls_item-id.
+          <relation_id>-parent = ls_item_old-id.
+
+          ls_item-quantity-content = <batch>-lfimg.
+          ls_item-price-base_amount-content = ( ls_item-price-base_amount-content * ls_item-quantity-content ) / original_quantity.
+          ls_item-price-gross_amount-content = ( ls_item-price-gross_amount-content * ls_item-quantity-content ) / original_quantity.
+          ls_item-price-tax_amount-content = ( ls_item-price-tax_amount-content * ls_item-quantity-content ) / original_quantity.
+          ls_item-price-net_amount-content = ls_item-price-gross_amount-content.
+          LOOP AT ls_item-product_tax ASSIGNING <product_tax>.
+            <product_tax>-amount-content = ( <product_tax>-amount-content * ls_item-quantity-content ) / original_quantity.
+            <product_tax>-base_amount-content = ( <product_tax>-base_amount-content * ls_item-quantity-content ) / original_quantity.
+          ENDLOOP.
+          INSERT ls_item INTO l_message-invoice-item INDEX insert_index.
+          insert_index = insert_index + 1.
+          CLEAR ls_item.
+        ENDIF.
+      ENDIF.
+
+    ENDLOOP.
+
+
+    lv_url = wal_url-url.
+
+    CALL METHOD cl_http_client=>create_by_url
+      EXPORTING
+        url                = lv_url
+*       ssl_id             = 'HTTPS'
+      IMPORTING
+        client             = lo_http_client
+      EXCEPTIONS
+        argument_not_found = 1
+        plugin_not_active  = 2
+        internal_error     = 3
+        OTHERS             = 4.
+
+    CALL METHOD lo_http_client->request->set_method(
+      if_http_request=>co_request_method_post ).
+
+    lo_http_client->propertytype_logon_popup = lo_http_client->co_disabled.
+
+    CALL METHOD lo_http_client->request->set_header_field
+      EXPORTING
+        name  = 'Content-Type'
+        value = 'application/xml'.
+
+    l_username = wal_url-username.
+    l_password = wal_url-password.
+
+*    CALL METHOD lo_http_client->authenticate
+*      EXPORTING
+*        username = l_username
+*        password = l_password.
+
+    CALL METHOD lo_http_client->request->set_header_field
+      EXPORTING
+        name  = '~request_protocol'
+        value = 'HTTPS/1.1'.
+
+    lv_xml_request = '<?xml version="1.0" encoding="utf-8"?><!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.051/InvoiceDetail.dtd">'.
+
+    CONVERT TIME STAMP l_message-message_header-creation_date_time
+           TIME ZONE wl_zone
+           INTO DATE wl_date
+                TIME wl_time.
+
+    CONCATENATE: lv_xml_request '<cXML payloadID="' l_message-message_header-id-content '" timestamp="' wl_date(4) '-' wl_date+4(2) '-' wl_date+6(2) 'T' wl_time(2) ':' wl_time+2(2) ':' wl_time+4(2) 'Z">' INTO lv_xml_request.
+
+    CONCATENATE lv_xml_request '<Header><From><Credential domain="NetworkID"><Identity>'  l_message-message_header-ariba_network_id-supplier_ariba_network_id '</Identity></Credential></From>' INTO lv_xml_request.
+
+    CONCATENATE lv_xml_request '<To><Credential domain="NetworkID"><Identity>' l_message-message_header-ariba_network_id-buyer_ariba_network_id '</Identity></Credential></To>' INTO lv_xml_request.
+
+*Identity??
+    CONCATENATE lv_xml_request '<Sender><Credential domain="NetworkID"><Identity>' l_message-message_header-ariba_network_id-supplier_ariba_network_id '</Identity>' INTO lv_xml_request.
+
+    CONCATENATE lv_xml_request '<SharedSecret>' l_password '</SharedSecret></Credential><UserAgent>' 'Ariba Supplier' '</UserAgent></Sender></Header>' INTO lv_xml_request.
+
+    CLEAR: wl_purpose, wl_operation.
+
+    CASE l_message-invoice-type_code.
+      WHEN 'STD'.
+        wl_purpose = 'standard'.
+        wl_memo = abap_false.
+      WHEN OTHERS.
+        wl_purpose = 'lineLevelCreditMemo'.
+        wl_memo = abap_true.
+    ENDCASE.
+
+    IF l_message-invoice-cancellation_invoice_indicator EQ abap_true.
+      wl_operation = 'delete'.
+    ELSE.
+      wl_operation = 'new'.
+    ENDIF.
+
+    CONCATENATE lv_xml_request '<Request deploymentMode="' wal_url-deploymentmode '"><InvoiceDetailRequest><InvoiceDetailRequestHeader invoiceID="' l_message-invoice-id-content '" purpose="' wl_purpose '" operation="' wl_operation INTO lv_xml_request.
+
+    CLEAR: wl_zone, wl_date, wl_time.
+
+    CONVERT TIME STAMP l_message-invoice-date_time-content
+           TIME ZONE wl_zone
+           INTO DATE wl_date
+                TIME wl_time.
+
+    CONCATENATE lv_xml_request '" invoiceDate="' wl_date(4) '-' wl_date+4(2) '-' wl_date+6(2) 'T' wl_time(2) ':' wl_time+2(2) ':' wl_time+4(2) '+00:00" invoiceOrigin="supplier">'
+    INTO lv_xml_request.
+
+    CLEAR: wl_itaxline.
+
+
+    IF l_message-invoice-price-tax_amount IS NOT INITIAL.
+      wl_itaxline = ' isTaxInLine="yes"'.
+    ELSE.
+      CLEAR wl_itaxline .
+    ENDIF.
+
+    IF wl_itaxline IS INITIAL.
+      LOOP AT l_message-invoice-price-charges ASSIGNING FIELD-SYMBOL(<fs_charges>).
+        IF <fs_charges>-condition_type IS NOT INITIAL.
+          wl_itaxline = ' isTaxInLine="yes"'.
+          EXIT.
+        ELSE.
+          CLEAR wl_itaxline .
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+    IF wl_itaxline IS INITIAL.
+      LOOP AT l_message-invoice-price-charges ASSIGNING <fs_charges>.
+        IF <fs_charges>-amount IS NOT INITIAL.
+          wl_itaxline = ' isTaxInLine="yes"'.
+          EXIT.
+        ELSE.
+          CLEAR wl_itaxline.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+    CONCATENATE lv_xml_request '<InvoiceDetailHeaderIndicator/><InvoiceDetailLineIndicator ' wl_itaxline '/>' INTO lv_xml_request.
+    CONCATENATE lv_xml_request '<InvoicePartner>' INTO lv_xml_request.
+
+    LOOP AT l_message-invoice-bill_from_party-contact_person ASSIGNING FIELD-SYMBOL(<fs_bill_from>).
+
+*      CONCATENATE lv_xml_request '<Contact role="remitTo" addressID="' l_message-invoice-bill_from_party-internal_id-scheme_id '" addressIDDomain="billToID">' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<Contact role="remitTo">' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<Name xml:lang="' l_message-invoice-bill_from_party-address-organisation_form_of_address-name-language_code '">' INTO lv_xml_request.
+      CONCATENATE lv_xml_request l_message-invoice-bill_from_party-address-organisation_form_of_address-name-content '</Name>' INTO lv_xml_request.
+
+      CLEAR wl_name_post.
+      IF <fs_bill_from>-address-organisation_form_of_address-name-content IS INITIAL.
+        wl_name_post = 'default'.
+      ELSE.
+        wl_name_post = <fs_bill_from>-address-organisation_form_of_address-name-content.
+      ENDIF.
+
+      CONCATENATE lv_xml_request '<PostalAddress name="' wl_name_post '"><Street>' <fs_bill_from>-address-physical_address-street_name '</Street>' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<City>' <fs_bill_from>-address-physical_address-city_name '</City>' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<State isoStateCode="' <fs_bill_from>-address-physical_address-region_code-content '">' <fs_bill_from>-address-physical_address-region_name '</State>' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<PostalCode>' <fs_bill_from>-address-physical_address-pobox_postal_code '</PostalCode>' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<Country isoCountryCode="' <fs_bill_from>-address-physical_address-country_code '">' <fs_bill_from>-address-physical_address-country_name-content '</Country></PostalAddress>' INTO lv_xml_request.
+
+      LOOP AT <fs_bill_from>-address-communication-telephone ASSIGNING FIELD-SYMBOL(<fs_bill_from_telef>).
+        CONCATENATE lv_xml_request '<Phone><TelephoneNumber><CountryCode isoCountryCode="' <fs_bill_from>-address-physical_address-country_code '">' <fs_bill_from_telef>-number-country_code '</CountryCode>' INTO lv_xml_request.
+        CONCATENATE lv_xml_request '<AreaOrCityCode/><Number>' <fs_bill_from_telef>-number-subscriber_id '</Number><Extension>' <fs_bill_from_telef>-number-extension_id '</Extension></TelephoneNumber></Phone>' INTO lv_xml_request.
+      ENDLOOP.
+
+      LOOP AT <fs_bill_from>-address-communication-facsimile ASSIGNING FIELD-SYMBOL(<fs_bill_from_fax>).
+        CONCATENATE lv_xml_request '<Fax><TelephoneNumber><CountryCode isoCountryCode="' <fs_bill_from>-address-physical_address-country_code '">' <fs_bill_from_fax>-number-country_code '</CountryCode>' INTO lv_xml_request.
+        CONCATENATE lv_xml_request '<AreaOrCityCode/><Number>' <fs_bill_from_fax>-number-subscriber_id '</Number><Extension>' <fs_bill_from_fax>-number-extension_id '</Extension></TelephoneNumber></Fax>' INTO lv_xml_request.
+      ENDLOOP.
+
+      CONCATENATE lv_xml_request '</Contact>' INTO lv_xml_request.
+
+    ENDLOOP.
+
+    CONCATENATE lv_xml_request '<IdReference domain="vatID" identifier="' l_message-invoice-bill_from_party-vat_id '"/></InvoicePartner>'INTO lv_xml_request.
+
+**************************************************** FROM ***************************   CONCATENATE lv_xml_request '<InvoicePartner>' INTO lv_xml_request.
+    CONCATENATE lv_xml_request '<InvoicePartner>' INTO lv_xml_request.
+    LOOP AT l_message-invoice-bill_from_party-contact_person ASSIGNING <fs_bill_from>.
+
+*      CONCATENATE lv_xml_request '<Contact role="from" addressID="' l_message-invoice-bill_from_party-internal_id-scheme_id '" addressIDDomain="billToID">' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<Contact role="from">' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<Name xml:lang="' l_message-invoice-bill_from_party-address-organisation_form_of_address-name-language_code '">' INTO lv_xml_request.
+      CONCATENATE lv_xml_request l_message-invoice-bill_from_party-address-organisation_form_of_address-name-content '</Name>' INTO lv_xml_request.
+
+      CLEAR wl_name_post.
+      IF <fs_bill_from>-address-organisation_form_of_address-name-content IS INITIAL.
+        wl_name_post = 'default'.
+      ELSE.
+        wl_name_post = <fs_bill_from>-address-organisation_form_of_address-name-content.
+      ENDIF.
+
+      CONCATENATE lv_xml_request '<PostalAddress name="' wl_name_post '"><Street>' <fs_bill_from>-address-physical_address-street_name '</Street>' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<City>' <fs_bill_from>-address-physical_address-city_name '</City>' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<State isoStateCode="' <fs_bill_from>-address-physical_address-region_code-content '">' <fs_bill_from>-address-physical_address-region_name '</State>' INTO lv_xml_request.
+
+      IF <fs_bill_from>-address-physical_address-pobox_postal_code IS INITIAL.
+        CLEAR: wl_post_code.
+        wl_vbeln_aux = l_message-invoice-id-content.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wl_vbeln_aux
+          IMPORTING
+            output = wl_vbeln_aux.
+
+        SELECT SINGLE bukrs
+          FROM vbrk
+          INTO @DATA(wl_bukrs)
+          WHERE vbeln = @wl_vbeln_aux.
+        IF sy-subrc EQ 0.
+          SELECT SINGLE adrnr
+            FROM t001
+            INTO @DATA(wl_adrnr)
+            WHERE bukrs EQ @wl_bukrs.
+          IF sy-subrc EQ 0.
+            SELECT SINGLE post_code1
+              FROM adrc
+              INTO wl_post_code
+              WHERE addrnumber EQ wl_adrnr.
+          ENDIF.
+        ENDIF.
+        CONCATENATE lv_xml_request '<PostalCode>' wl_post_code '</PostalCode>' INTO lv_xml_request.
+      ELSE.
+        CONCATENATE lv_xml_request '<PostalCode>' <fs_bill_from>-address-physical_address-pobox_postal_code '</PostalCode>' INTO lv_xml_request.
+      ENDIF.
+
+      CONCATENATE lv_xml_request '<Country isoCountryCode="' <fs_bill_from>-address-physical_address-country_code '">' <fs_bill_from>-address-physical_address-country_name-content '</Country></PostalAddress>' INTO lv_xml_request.
+
+      LOOP AT <fs_bill_from>-address-communication-telephone ASSIGNING <fs_bill_from_telef>.
+        CONCATENATE lv_xml_request '<Phone><TelephoneNumber><CountryCode isoCountryCode="' <fs_bill_from>-address-physical_address-country_code '">' <fs_bill_from_telef>-number-country_code '</CountryCode>' INTO lv_xml_request.
+        CONCATENATE lv_xml_request '<AreaOrCityCode/><Number>' <fs_bill_from_telef>-number-subscriber_id '</Number><Extension>' <fs_bill_from_telef>-number-extension_id '</Extension></TelephoneNumber></Phone>' INTO lv_xml_request.
+      ENDLOOP.
+
+      LOOP AT <fs_bill_from>-address-communication-facsimile ASSIGNING <fs_bill_from_fax>.
+        CONCATENATE lv_xml_request '<Fax><TelephoneNumber><CountryCode isoCountryCode="' <fs_bill_from>-address-physical_address-country_code '">' <fs_bill_from_fax>-number-country_code '</CountryCode>' INTO lv_xml_request.
+        CONCATENATE lv_xml_request '<AreaOrCityCode/><Number>' <fs_bill_from_fax>-number-subscriber_id '</Number><Extension>' <fs_bill_from_fax>-number-extension_id '</Extension></TelephoneNumber></Fax>' INTO lv_xml_request.
+      ENDLOOP.
+
+      CONCATENATE lv_xml_request '</Contact>' INTO lv_xml_request.
+
+    ENDLOOP.
+
+    CONCATENATE lv_xml_request '<IdReference domain="vatID" identifier="' l_message-invoice-bill_from_party-vat_id '"/></InvoicePartner>'INTO lv_xml_request.
+
+**************************************************** FROM **********************************************************************
+**************************************************** BILL TO *******************************************************************
+    CONCATENATE lv_xml_request '<InvoicePartner>' INTO lv_xml_request.
+
+    LOOP AT l_message-invoice-bill_to_party-contact_person ASSIGNING FIELD-SYMBOL(<fs_bill_to>).
+      wl_vbeln_aux = l_message-invoice-id-content.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wl_vbeln_aux
+        IMPORTING
+          output = wl_vbeln_aux.
+
+      SELECT SINGLE kunrg, bukrs
+        FROM vbrk
+        INTO @DATA(wal_vbrk)
+        WHERE vbeln = @wl_vbeln_aux.
+      IF sy-subrc EQ 0.
+        SELECT SINGLE billto_address_id
+          FROM ztarbci_vers_rel
+          INTO wl_billtoadd
+          WHERE kunnr = wal_vbrk-kunrg
+            AND bukrs = wal_vbrk-bukrs.
+      ENDIF.
+*      CONCATENATE lv_xml_request '<Contact role="billTo" addressID="' l_message-invoice-bill_to_party-internal_id-scheme_id '" addressIDDomain="billToID">' INTO lv_xml_request.
+*      CONCATENATE lv_xml_request '<Contact role="billTo" addressID="' wl_billtoadd '" addressIDDomain="billToID">' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<Contact role="billTo" addressID="' wl_billtoadd '">' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<Name xml:lang="' l_message-invoice-bill_to_party-address-organisation_form_of_address-name-language_code '">' INTO lv_xml_request.
+      CONCATENATE lv_xml_request l_message-invoice-bill_to_party-address-organisation_form_of_address-name-content '</Name>' INTO lv_xml_request.
+
+      CLEAR wl_name_post.
+      IF <fs_bill_to>-address-organisation_form_of_address-name-content IS INITIAL.
+        wl_name_post = 'default'.
+      ELSE.
+        wl_name_post = <fs_bill_to>-address-organisation_form_of_address-name-content.
+      ENDIF.
+
+*      CONCATENATE lv_xml_request '<PostalAddress name="' wl_name_post '"><Street>' <fs_bill_to>-address-physical_address-street_name '</Street>' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<PostalAddress><Street>' <fs_bill_to>-address-physical_address-street_name '</Street>' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<City>' <fs_bill_to>-address-physical_address-city_name '</City>' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<State isoStateCode="' <fs_bill_to>-address-physical_address-region_code-content '">' <fs_bill_to>-address-physical_address-region_name '</State>' INTO lv_xml_request.
+
+      IF <fs_bill_to>-address-physical_address-pobox_postal_code IS INITIAL.
+        CLEAR: wl_post_code.
+        wl_vbeln_aux = l_message-invoice-id-content.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wl_vbeln_aux
+          IMPORTING
+            output = wl_vbeln_aux.
+
+        SELECT SINGLE kunrg
+          FROM vbrk
+          INTO @DATA(wl_kunrg)
+          WHERE vbeln = @wl_vbeln_aux.
+        IF sy-subrc EQ 0.
+          SELECT SINGLE adrnr
+            FROM kna1
+            INTO wl_adrnr
+            WHERE kunnr EQ wl_kunrg.
+          IF sy-subrc EQ 0.
+            SELECT SINGLE post_code1
+              FROM adrc
+              INTO wl_post_code
+              WHERE addrnumber EQ wl_adrnr.
+          ENDIF.
+        ENDIF.
+        CONCATENATE lv_xml_request '<PostalCode>' wl_post_code '</PostalCode>' INTO lv_xml_request.
+      ELSE.
+        CONCATENATE lv_xml_request '<PostalCode>' <fs_bill_to>-address-physical_address-pobox_postal_code '</PostalCode>' INTO lv_xml_request.
+      ENDIF.
+
+      CONCATENATE lv_xml_request '<Country isoCountryCode="' <fs_bill_to>-address-physical_address-country_code '">' <fs_bill_to>-address-physical_address-country_name-content '</Country></PostalAddress>' INTO lv_xml_request.
+
+      LOOP AT <fs_bill_to>-address-communication-email  ASSIGNING FIELD-SYMBOL(<fs_bill_to_email>).
+        CONCATENATE lv_xml_request '<Email>' <fs_bill_to_email>-uri-content '</Email>' INTO lv_xml_request.
+      ENDLOOP.
+
+      LOOP AT <fs_bill_to>-address-communication-telephone ASSIGNING FIELD-SYMBOL(<fs_bill_to_telef>).
+        CONCATENATE lv_xml_request '<Phone><TelephoneNumber><CountryCode isoCountryCode="' <fs_bill_to>-address-physical_address-country_code '">' <fs_bill_to_telef>-number-country_code '</CountryCode>' INTO lv_xml_request.
+        CONCATENATE lv_xml_request '<AreaOrCityCode/><Number>' <fs_bill_to_telef>-number-subscriber_id '</Number><Extension>' <fs_bill_to_telef>-number-extension_id '</Extension></TelephoneNumber></Phone>' INTO lv_xml_request.
+      ENDLOOP.
+
+      LOOP AT <fs_bill_to>-address-communication-facsimile ASSIGNING FIELD-SYMBOL(<fs_bill_to_fax>).
+        CONCATENATE lv_xml_request '<Fax><TelephoneNumber><CountryCode isoCountryCode="' <fs_bill_to>-address-physical_address-country_code '">' <fs_bill_to_fax>-number-country_code '</CountryCode>' INTO lv_xml_request.
+        CONCATENATE lv_xml_request '<AreaOrCityCode/><Number>' <fs_bill_to_fax>-number-subscriber_id '</Number><Extension>' <fs_bill_to_fax>-number-extension_id '</Extension></TelephoneNumber></Fax>' INTO lv_xml_request.
+      ENDLOOP.
+
+      CONCATENATE lv_xml_request '</Contact>' INTO lv_xml_request.
+
+    ENDLOOP.
+
+    CONCATENATE lv_xml_request '<IdReference domain="vatID" identifier="' l_message-invoice-bill_to_party-vat_id '"/></InvoicePartner>'INTO lv_xml_request.
+**************************************************** BILL TO *******************************************************************
+**************************************************** SOLD TO *******************************************************************
+    CONCATENATE lv_xml_request '<InvoicePartner>' INTO lv_xml_request.
+
+    LOOP AT l_message-invoice-bill_to_party-contact_person ASSIGNING <fs_bill_to>.
+      wl_vbeln_aux = l_message-invoice-id-content.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wl_vbeln_aux
+        IMPORTING
+          output = wl_vbeln_aux.
+
+      SELECT SINGLE kunrg, bukrs
+        FROM vbrk
+        INTO @wal_vbrk
+        WHERE vbeln = @wl_vbeln_aux.
+
+      IF sy-subrc EQ 0.
+        SELECT SINGLE billto_address_id
+          FROM ztarbci_vers_rel
+          INTO wl_billtoadd
+          WHERE kunnr = wal_vbrk-kunrg
+            AND bukrs = wal_vbrk-bukrs.
+      ENDIF.
+*      CONCATENATE lv_xml_request '<Contact role="billTo" addressID="' l_message-invoice-bill_to_party-internal_id-scheme_id '" addressIDDomain="billToID">' INTO lv_xml_request.
+*      CONCATENATE lv_xml_request '<Contact role="billTo" addressID="' wl_billtoadd '" addressIDDomain="billToID">' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<Contact role="soldTo" addressID="' wl_billtoadd '">' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<Name xml:lang="' l_message-invoice-bill_to_party-address-organisation_form_of_address-name-language_code '">' INTO lv_xml_request.
+      CONCATENATE lv_xml_request l_message-invoice-bill_to_party-address-organisation_form_of_address-name-content '</Name>' INTO lv_xml_request.
+
+      CLEAR wl_name_post.
+      IF <fs_bill_to>-address-organisation_form_of_address-name-content IS INITIAL.
+        wl_name_post = 'default'.
+      ELSE.
+        wl_name_post = <fs_bill_to>-address-organisation_form_of_address-name-content.
+      ENDIF.
+
+*      CONCATENATE lv_xml_request '<PostalAddress name="' wl_name_post '"><Street>' <fs_bill_to>-address-physical_address-street_name '</Street>' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<PostalAddress><Street>' <fs_bill_to>-address-physical_address-street_name '</Street>' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<City>' <fs_bill_to>-address-physical_address-city_name '</City>' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<State isoStateCode="' <fs_bill_to>-address-physical_address-region_code-content '">' <fs_bill_to>-address-physical_address-region_name '</State>' INTO lv_xml_request.
+
+      IF <fs_bill_to>-address-physical_address-pobox_postal_code IS INITIAL.
+        CLEAR: wl_post_code.
+        wl_vbeln_aux = l_message-invoice-id-content.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wl_vbeln_aux
+          IMPORTING
+            output = wl_vbeln_aux.
+
+        SELECT SINGLE kunrg
+          FROM vbrk
+          INTO @wl_kunrg
+          WHERE vbeln = @wl_vbeln_aux.
+
+        IF sy-subrc EQ 0.
+          SELECT SINGLE adrnr
+            FROM kna1
+            INTO wl_adrnr
+            WHERE kunnr EQ wl_kunrg.
+          IF sy-subrc EQ 0.
+            SELECT SINGLE post_code1
+              FROM adrc
+              INTO wl_post_code
+              WHERE addrnumber EQ wl_adrnr.
+          ENDIF.
+        ENDIF.
+        CONCATENATE lv_xml_request '<PostalCode>' wl_post_code '</PostalCode>' INTO lv_xml_request.
+      ELSE.
+        CONCATENATE lv_xml_request '<PostalCode>' <fs_bill_to>-address-physical_address-pobox_postal_code '</PostalCode>' INTO lv_xml_request.
+      ENDIF.
+
+      CONCATENATE lv_xml_request '<Country isoCountryCode="' <fs_bill_to>-address-physical_address-country_code '">' <fs_bill_to>-address-physical_address-country_name-content '</Country></PostalAddress>' INTO lv_xml_request.
+
+      LOOP AT <fs_bill_to>-address-communication-email  ASSIGNING <fs_bill_to_email>.
+        CONCATENATE lv_xml_request '<Email>' <fs_bill_to_email>-uri-content '</Email>' INTO lv_xml_request.
+      ENDLOOP.
+
+      LOOP AT <fs_bill_to>-address-communication-telephone ASSIGNING <fs_bill_to_telef>.
+        CONCATENATE lv_xml_request '<Phone><TelephoneNumber><CountryCode isoCountryCode="' <fs_bill_to>-address-physical_address-country_code '">' <fs_bill_to_telef>-number-country_code '</CountryCode>' INTO lv_xml_request.
+        CONCATENATE lv_xml_request '<AreaOrCityCode/><Number>' <fs_bill_to_telef>-number-subscriber_id '</Number><Extension>' <fs_bill_to_telef>-number-extension_id '</Extension></TelephoneNumber></Phone>' INTO lv_xml_request.
+      ENDLOOP.
+
+      LOOP AT <fs_bill_to>-address-communication-facsimile ASSIGNING <fs_bill_to_fax>.
+        CONCATENATE lv_xml_request '<Fax><TelephoneNumber><CountryCode isoCountryCode="' <fs_bill_to>-address-physical_address-country_code '">' <fs_bill_to_fax>-number-country_code '</CountryCode>' INTO lv_xml_request.
+        CONCATENATE lv_xml_request '<AreaOrCityCode/><Number>' <fs_bill_to_fax>-number-subscriber_id '</Number><Extension>' <fs_bill_to_fax>-number-extension_id '</Extension></TelephoneNumber></Fax>' INTO lv_xml_request.
+      ENDLOOP.
+
+      CONCATENATE lv_xml_request '</Contact>' INTO lv_xml_request.
+
+    ENDLOOP.
+
+    CONCATENATE lv_xml_request '<IdReference domain="vatID" identifier="' l_message-invoice-bill_to_party-vat_id '"/></InvoicePartner>'INTO lv_xml_request.
+**************************************************** SOLD TO *******************************************************************
+    CONCATENATE lv_xml_request '<InvoicePartner>' INTO lv_xml_request.
+
+    LOOP AT l_message-invoice-bank ASSIGNING FIELD-SYMBOL(<fs_bank>).
+      CONCATENATE lv_xml_request '<Contact role="wireReceivingBank"><Name xml:lang="' l_message-invoice-bill_to_party-address-organisation_form_of_address-name-language_code '">' <fs_bank>-bank_name '</Name></Contact>' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<IdReference domain="bankName" identifier="' <fs_bank>-bank_name '"/>' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<IdReference domain="swiftID" identifier="' <fs_bank>-branch_name '"/>' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<IdReference domain="ibanID" identifier="' <fs_bank>-iban_id '"/>'  INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<IdReference domain="accountName" identifier="' <fs_bank>-account_name '"/>' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<IdReference domain="accountID" identifier="' <fs_bank>-account_id '"/>' INTO lv_xml_request.
+    ENDLOOP.
+
+    CONCATENATE lv_xml_request '</InvoicePartner>' INTO lv_xml_request.
+    IF wl_memo EQ abap_true.
+      wl_vbeln_aux = l_message-invoice-id-content.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wl_vbeln_aux
+        IMPORTING
+          output = wl_vbeln_aux.
+
+      SELECT vbelv, stufe
+        FROM vbfa
+        INTO TABLE @DATA(tl_vbelv_m)
+        WHERE vbeln = @wl_vbeln_aux
+          AND vbtyp_v = 'M'.
+
+      IF sy-subrc EQ 0.
+        SORT tl_vbelv_m BY stufe DESCENDING.
+        READ TABLE tl_vbelv_m ASSIGNING FIELD-SYMBOL(<fs_vbelv>) INDEX 1.
+        IF sy-subrc EQ 0.
+          CONCATENATE lv_xml_request '<DocumentReference payloadID = ""/>' INTO lv_xml_request.
+          CONCATENATE lv_xml_request '<InvoiceIDInfo invoiceDate = "" invoiceID = "' <fs_vbelv>-vbelv '"/>' INTO lv_xml_request.
+        ENDIF.
+
+      ENDIF.
+    ENDIF.
+*    IF wl_memo EQ abap_false.
+    CONCATENATE lv_xml_request '<InvoiceDetailShipping>' INTO lv_xml_request.
+
+    wl_vbeln_aux = l_message-invoice-id-content.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = wl_vbeln_aux
+      IMPORTING
+        output = wl_vbeln_aux.
+
+    SELECT SINGLE vbelv
+      FROM vbfa
+      INTO @DATA(wl_vbelv)
+      WHERE vbeln = @wl_vbeln_aux
+        AND ( vbtyp_v = 'C' OR vbtyp_v = 'H' ).
+
+    IF sy-subrc EQ 0.
+      SELECT SINGLE werks
+        FROM vbap
+        INTO @DATA(wl_werks)
+        WHERE vbeln = @wl_vbelv.
+      IF sy-subrc EQ 0.
+        SELECT SINGLE *
+          FROM t001w
+          INTO @DATA(wal_shipfrom)
+          WHERE werks EQ @wl_werks.
+        IF sy-subrc EQ 0.
+          CONCATENATE lv_xml_request '<Contact role="shipFrom"><Name xml:lang="en-US">' wal_shipfrom-name1 '</Name>' INTO lv_xml_request.
+          CONCATENATE lv_xml_request '<PostalAddress><DeliverTo/><Street>'wal_shipfrom-stras'</Street><Street/>' INTO lv_xml_request.
+          CONCATENATE lv_xml_request '<City>' wal_shipfrom-ort01 '</City><State isoStateCode="ES-C">' wal_shipfrom-regio '</State>' INTO lv_xml_request.
+          CONCATENATE lv_xml_request '<PostalCode>' wal_shipfrom-pstlz '</PostalCode><Country isoCountryCode="ES">' wal_shipfrom-land1 '</Country></PostalAddress></Contact>' INTO lv_xml_request.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    CONCATENATE lv_xml_request '<Contact addressID="' l_message-invoice-ship_to_location-internal_id-content '" role="shipTo">' INTO lv_xml_request.
+    CONCATENATE lv_xml_request '<Name xml:lang="ES">' l_message-invoice-ship_to_location-address-organisation_form_of_address-name-content '</Name>' INTO lv_xml_request.
+    CONCATENATE lv_xml_request '<PostalAddress name="default"><DeliverTo/><Street>' l_message-invoice-ship_to_location-address-physical_address-street_name '</Street>'  INTO lv_xml_request.
+    CONCATENATE lv_xml_request '<City>' l_message-invoice-ship_to_location-address-physical_address-city_name '</City>' INTO lv_xml_request.
+    CONCATENATE lv_xml_request '<State>' l_message-invoice-ship_to_location-address-physical_address-region_code-content '</State><PostalCode>' l_message-invoice-ship_to_location-address-physical_address-pobox_postal_code '</PostalCode>'
+    INTO lv_xml_request.
+    CONCATENATE lv_xml_request '<Country isoCountryCode="ES">' l_message-invoice-ship_to_location-address-physical_address-country_code '</Country></PostalAddress></Contact>' INTO lv_xml_request.
+
+    CONCATENATE lv_xml_request '</InvoiceDetailShipping>' INTO lv_xml_request.
+*    ENDIF.
+*    LOOP AT l_message-invoice-CASH_DISCOUNT_TERMS ASSIGNING FIELD-SYMBOL(<fs_cash>).
+*    wl_aux = l_message-invoice-cash_discount_terms-maximum_cash_discount-days_value.
+*    convert_value wl_aux. CONDENSE wl_aux.
+*    CONCATENATE lv_xml_request '<PaymentTerm payInNumberOfDays="' wl_aux '"><Discount><DiscountPercent percent="' INTO lv_xml_request.
+*    wl_dos = l_message-invoice-cash_discount_terms-maximum_cash_discount-percent.
+*    wl_aux = wl_dos.
+*    convert_value wl_aux. CONDENSE wl_aux.
+*    CONCATENATE lv_xml_request  wl_aux '"/>'  INTO lv_xml_request.
+*    CONCATENATE lv_xml_request '</Discount></PaymentTerm>' INTO lv_xml_request.
+*    ENDLOOP.
+
+    LOOP AT l_message-invoice-comments ASSIGNING FIELD-SYMBOL(<fs_comments>).
+      LOOP AT <fs_comments>-comment ASSIGNING FIELD-SYMBOL(<fs_comment>).
+        CONCATENATE lv_xml_request '<Comments xml:lang="'<fs_comment>-language_code '">' <fs_comment>-content '</Comments>' INTO lv_xml_request.
+      ENDLOOP.
+    ENDLOOP.
+
+    CONCATENATE lv_xml_request '<Extrinsic name="invoiceSourceDocument">PurchaseOrder</Extrinsic>' INTO lv_xml_request.
+    CONCATENATE lv_xml_request '<Extrinsic name="invoiceSubmissionMethod">cXML</Extrinsic>'  INTO lv_xml_request.
+    CONCATENATE lv_xml_request '<Extrinsic name="buyerVatID">' l_message-invoice-bill_to_party-vat_id '</Extrinsic>' INTO lv_xml_request.
+    CONCATENATE lv_xml_request '<Extrinsic name="supplierVatID">' l_message-invoice-bill_from_party-vat_id '</Extrinsic>' INTO lv_xml_request.
+
+    CONCATENATE lv_xml_request '</InvoiceDetailRequestHeader>' INTO lv_xml_request.
+
+    wl_vbeln_aux = l_message-invoice-id-content.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = wl_vbeln_aux
+      IMPORTING
+        output = wl_vbeln_aux.
+
+    LOOP AT l_message-invoice-item ASSIGNING FIELD-SYMBOL(<fs_item>).
+
+      CLEAR wl_posnn.
+      wl_posnn = <fs_item>-id.
+      DATA(wl_posnn_aux) = VALUE #( lt_relation_ids[ id = <fs_item>-id ]-parent DEFAULT <fs_item>-id ).
+
+      SELECT SINGLE COUNT(*)
+       FROM vbfa
+       WHERE vbeln = @wl_vbeln_aux
+         AND posnn = @wl_posnn_aux
+         AND vbtyp_v = 'T'
+         AND stufe = ''.
+
+      IF sy-subrc = 0.
+
+        DATA(wl_return) = | reason="return"|.
+
+      ENDIF.
+
+      CLEAR wl_posnn_aux.
+
+      CONCATENATE lv_xml_request '<InvoiceDetailOrder>' INTO lv_xml_request.
+      CLEAR wl_posnn.
+      CLEAR wl_posnv.
+
+      wl_posnn = <fs_item>-id.
+
+      wl_posnn_aux = VALUE #( lt_relation_ids[ id = <fs_item>-id ]-parent DEFAULT <fs_item>-id ).
+
+      SELECT vbelv, stufe, posnv "posnn
+        FROM vbfa
+        INTO TABLE @DATA(tl_vbelv_p)
+        WHERE vbeln = @wl_vbeln_aux
+          AND vbtyp_v IN @rg_vbtyp
+          AND posnn EQ @wl_posnn_aux.
+
+      IF sy-subrc EQ 0.
+        CLEAR: wl_ped, wl_void.
+        SORT tl_vbelv_p BY stufe. "DESCENDING.
+        READ TABLE tl_vbelv_p ASSIGNING FIELD-SYMBOL(<fs_vbelv_p>) INDEX 1.
+        IF sy-subrc EQ 0.
+          SELECT SINGLE bstkd
+            FROM vbkd
+            INTO @DATA(wl_id)
+            WHERE vbeln EQ @<fs_vbelv_p>-vbelv.
+          IF sy-subrc EQ 0.
+            SPLIT wl_id AT '/' INTO wl_ped wl_void.
+          ENDIF.
+          SELECT SINGLE vbeln, posex
+            FROM vbap
+            INTO @DATA(wal_rel_pos)
+            WHERE vbeln EQ @<fs_vbelv_p>-vbelv
+              AND posnr EQ @<fs_vbelv_p>-posnv.
+          IF sy-subrc EQ 0 AND wal_rel_pos-posex IS NOT INITIAL.
+            wl_posnv = wal_rel_pos-posex.
+          ELSE.
+            wl_posnv = <fs_vbelv_p>-posnv.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      CLEAR wl_posnn_aux.
+
+      LOOP AT <fs_item>-purchase_order_reference ASSIGNING FIELD-SYMBOL(<fs_purchase>).
+        IF wl_ped IS NOT INITIAL.
+          CONCATENATE lv_xml_request '<InvoiceDetailOrderInfo><OrderIDInfo orderID="' wl_ped '"/></InvoiceDetailOrderInfo>' INTO lv_xml_request.
+        ELSE.
+          CONCATENATE lv_xml_request '<InvoiceDetailOrderInfo><OrderIDInfo orderID="' <fs_purchase>-id '"/></InvoiceDetailOrderInfo>' INTO lv_xml_request.
+        ENDIF.
+*        CONCATENATE lv_xml_request '<InvoiceDetailOrderInfo><OrderIDInfo orderID="' <fs_purchase>-id '"/></InvoiceDetailOrderInfo>' INTO lv_xml_request.
+      ENDLOOP.
+
+      CLEAR: wl_aux, wl_dos.
+      wl_dos = <fs_item>-quantity-content.
+      IF wl_dos < 0.
+        wl_aux = abs( wl_dos ).
+        CONCATENATE '-' wl_aux INTO wl_aux.
+      ELSE.
+        wl_aux = wl_dos.
+      ENDIF.
+      convert_value wl_aux. CONDENSE wl_aux.
+
+      SELECT SINGLE *
+        FROM ztarbcis_um
+        INTO wal_um_custo
+        WHERE kunnr EQ ls_nast-parnr
+          AND umsup EQ <fs_item>-quantity-unit_code.
+
+      IF sy-subrc EQ 0.
+
+*        concatenate lv_xml_request '<InvoiceDetailItem invoiceLineNumber="' <fs_item>-id '" quantity="' wl_aux '"><UnitOfMeasure>' wal_um_custo-umcust '</UnitOfMeasure><UnitPrice>'  into lv_xml_request.
+        CONCATENATE lv_xml_request '<InvoiceDetailItem invoiceLineNumber="' wl_posnn '" quantity="' wl_aux '"' wl_return '><UnitOfMeasure>' wal_um_custo-umcust '</UnitOfMeasure><UnitPrice>'  INTO lv_xml_request.
+      ELSE.
+*        CONCATENATE lv_xml_request '<InvoiceDetailItem invoiceLineNumber="' <fs_item>-id '" quantity="' wl_aux '"><UnitOfMeasure>' <fs_item>-quantity-unit_code '</UnitOfMeasure><UnitPrice>'  INTO lv_xml_request.
+        CONCATENATE lv_xml_request '<InvoiceDetailItem invoiceLineNumber="' wl_posnn '" quantity="' wl_aux '"' wl_return '><UnitOfMeasure>' <fs_item>-quantity-unit_code '</UnitOfMeasure><UnitPrice>'  INTO lv_xml_request.
+      ENDIF.
+
+
+* INI/MOD/JPM SEIDOR 02.02.2023 ***************************************
+* Impuesto Plástico
+
+*      CLEAR: wl_aux, wl_dos.
+**      wl_dos = <fs_item>-price-unit_price-amount-content.
+*      IF <fs_item>-price-unit_price-amount-content < 0.
+*        wl_aux = abs( <fs_item>-price-unit_price-amount-content ).
+*        CONCATENATE '-' wl_aux INTO wl_aux.
+*      ELSE.
+*        wl_aux = <fs_item>-price-unit_price-amount-content.
+*      ENDIF.
+
+      wl_price_unit = ( <fs_item>-price-net_amount-content - <fs_item>-price-tax_amount-content ) / <fs_item>-quantity-content.
+
+      CLEAR: wl_aux, wl_dos.
+      wl_aux = wl_price_unit.
+* FIN/MOD/JPM SEIDOR 02.02.2023 ***************************************
+
+      SPLIT wl_aux AT '.' INTO wl_aux wl_char2_dec.
+      CONCATENATE wl_aux wl_char2_dec INTO wl_aux SEPARATED BY '.'.
+*      wl_dos = trunc( <fs_item>-price-unit_price-amount-content ).
+      wl_dos = wl_aux.
+      wl_aux = wl_dos.
+      convert_value wl_aux. CONDENSE wl_aux.
+*      wl_aux = <fs_item>-price-unit_price-amount-content.
+      CONCATENATE lv_xml_request '<Money currency="' <fs_item>-price-unit_price-amount-currency_code '">' wl_aux '</Money></UnitPrice>' INTO lv_xml_request.
+*
+*      CONCATENATE lv_xml_request '<InvoiceDetailItemReference lineNumber="' <fs_item>-id '"><ItemID><SupplierPartID>' <fs_item>-product-seller_id '</SupplierPartID></ItemID>' INTO lv_xml_request.
+      CONCATENATE lv_xml_request '<InvoiceDetailItemReference lineNumber="' wl_posnv '"><ItemID><SupplierPartID>' <fs_item>-product-seller_id '</SupplierPartID></ItemID>' INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '<Description xml:lang="' <fs_item>-description-language_code '">' <fs_item>-description-content '</Description>' INTO lv_xml_request.
+
+      CLEAR: wl_aux, wl_dos.
+
+      CLEAR: wl_aux, wl_dos.
+      wl_dos = <fs_item>-price-base_amount-content.
+      wl_aux = wl_dos.
+      convert_value wl_aux. CONDENSE wl_aux.
+      CONCATENATE lv_xml_request '</InvoiceDetailItemReference><SubtotalAmount><Money currency="' <fs_item>-price-base_amount-currency_code '">' wl_aux INTO lv_xml_request.
+
+      CONCATENATE lv_xml_request '</Money></SubtotalAmount>' INTO lv_xml_request.
+
+      CLEAR: wl_aux, wl_dos.
+      wl_dos = <fs_item>-price-tax_amount-content.
+      wl_aux = wl_dos.
+      convert_value wl_aux. CONDENSE wl_aux.
+      CONCATENATE lv_xml_request '<Tax><Money currency="' <fs_item>-price-tax_amount-currency_code '">' wl_aux '</Money>' INTO lv_xml_request.
+
+
+      CONCATENATE lv_xml_request '<Description xml:lang="' l_message-invoice-description-language_code '"></Description>' INTO lv_xml_request.
+
+      CLEAR: wl_zone, wl_date, wl_time.
+
+      CONVERT TIME STAMP l_message-invoice-date_time-content
+             TIME ZONE wl_zone
+             INTO DATE wl_date
+                  TIME wl_time.
+
+      LOOP AT <fs_item>-product_tax ASSIGNING FIELD-SYMBOL(<fs_tax>).
+
+        CLEAR: wl_aux, wl_dos.
+        wl_dos = <fs_tax>-rate-decimal_value.
+        wl_aux = wl_dos.
+        convert_value wl_aux. CONDENSE wl_aux.
+        IF <fs_tax>-rate-decimal_value = 0.
+          CONCATENATE lv_xml_request '<TaxDetail category="' <fs_tax>-type_code-list_id '" percentageRate="' wl_aux '" exemptDetail="zeroRated' INTO lv_xml_request.
+          CONCATENATE lv_xml_request'" taxPointDate="' wl_date(4) '-' wl_date+4(2) '-' wl_date+6(2) 'T' wl_time(2) ':' wl_time+2(2) ':' wl_time+4(2) '+00:00+00:00">' INTO lv_xml_request.
+        ELSE.
+          CONCATENATE lv_xml_request '<TaxDetail category="' <fs_tax>-type_code-list_id '" percentageRate="' wl_aux '" taxPointDate="' wl_date(4) '-' wl_date+4(2) '-' wl_date+6(2) 'T' wl_time(2) ':' wl_time+2(2) ':' wl_time+4(2) '+00:00+00:00">'
+          INTO lv_xml_request.
+        ENDIF.
+
+        CLEAR: wl_aux, wl_dos.
+        wl_dos = <fs_tax>-base_amount-content.
+        wl_aux = wl_dos.
+        convert_value wl_aux. CONDENSE wl_aux.
+        CONCATENATE lv_xml_request '<TaxableAmount><Money currency="' <fs_tax>-base_amount-currency_code '">' wl_aux '</Money></TaxableAmount>' INTO lv_xml_request.
+
+        CLEAR: wl_aux, wl_dos.
+        wl_dos = <fs_tax>-amount-content.
+        wl_aux = wl_dos.
+        convert_value wl_aux. CONDENSE wl_aux.
+        CONCATENATE  lv_xml_request '<TaxAmount><Money currency="' <fs_tax>-amount-currency_code '">' wl_aux '</Money></TaxAmount>' INTO lv_xml_request.
+        IF <fs_tax>-rate-decimal_value = 0.
+          CONCATENATE lv_xml_request '<Description xml:lang="' l_message-invoice-description-language_code '">' INTO lv_xml_request.
+          CONCATENATE lv_xml_request 'zeroRated</Description></TaxDetail>' INTO lv_xml_request.
+        ELSE.
+          CONCATENATE lv_xml_request '<Description xml:lang="' l_message-invoice-description-language_code '">' INTO lv_xml_request.
+          CONCATENATE lv_xml_request  <fs_tax>-type_code-list_agency_id '</Description></TaxDetail>' INTO lv_xml_request.
+        ENDIF.
+
+      ENDLOOP.
+
+      CONCATENATE lv_xml_request '</Tax>' INTO lv_xml_request.
+
+      wl_vbeln_aux = l_message-invoice-id-content.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wl_vbeln_aux
+        IMPORTING
+          output = wl_vbeln_aux.
+
+      CLEAR wl_posnn.
+
+      wl_posnn = <fs_item>-id.
+      wl_posnn_aux = VALUE #( lt_relation_ids[ id = <fs_item>-id ]-parent DEFAULT <fs_item>-id ).
+
+      SELECT SINGLE vbelv
+        FROM vbfa
+        INTO @DATA(wl_vbelv1)
+        WHERE vbeln = @wl_vbeln_aux
+          AND posnn = @wl_posnn_aux
+          AND ( vbtyp_v = 'J' OR vbtyp_v = 'T' )
+          AND stufe = ''.
+
+      IF sy-subrc EQ 0.
+        wl_vbelv1 = |{ wl_vbelv1 ALPHA = OUT }|.
+        CONCATENATE lv_xml_request '<ShipNoticeIDInfo shipNoticeID=""><IdReference domain="deliveryNoteID" identifier="' wl_vbelv1 '"></IdReference></ShipNoticeIDInfo>' INTO lv_xml_request.
+
+      ENDIF.
+
+      CLEAR wl_posnn_aux.
+
+      CLEAR: wl_aux, wl_dos.
+      wl_dos = <fs_item>-price-gross_amount-content.
+      wl_aux = wl_dos.
+      convert_value wl_aux. CONDENSE wl_aux.
+      CONCATENATE lv_xml_request '<GrossAmount><Money currency="' <fs_item>-price-gross_amount-currency_code '">' wl_aux '</Money></GrossAmount>' INTO lv_xml_request.
+      CLEAR: wl_aux, wl_dos.
+      wl_dos = <fs_item>-price-net_amount-content.
+      wl_aux = wl_dos.
+      convert_value wl_aux. CONDENSE wl_aux.
+      CONCATENATE lv_xml_request '<NetAmount><Money currency="' <fs_item>-price-net_amount-currency_code '">' wl_aux '</Money></NetAmount>' INTO lv_xml_request.
+
+      LOOP AT <fs_item>-comments ASSIGNING <fs_comments>.
+        LOOP AT <fs_comments>-comment ASSIGNING <fs_comment>.
+          CONCATENATE lv_xml_request '<Comments xml:lang="' <fs_comment>-language_code '" type="Invoice Item">' <fs_comment>-content '</Comments>' INTO lv_xml_request.
+        ENDLOOP.
+      ENDLOOP.
+
+      CONCATENATE lv_xml_request '</InvoiceDetailItem></InvoiceDetailOrder>'  INTO lv_xml_request.
+    ENDLOOP.
+
+    CLEAR: wl_aux, wl_dos.
+    wl_dos = l_message-invoice-price-net_amount-content - l_message-invoice-price-tax_amount-content.
+    wl_aux = wl_dos.
+    convert_value wl_aux. CONDENSE wl_aux.
+    CONCATENATE lv_xml_request '<InvoiceDetailSummary><SubtotalAmount><Money currency="' l_message-invoice-price-base_amount-currency_code '">' wl_aux '</Money></SubtotalAmount>' INTO lv_xml_request.
+    CLEAR: wl_aux, wl_dos.
+    wl_dos = l_message-invoice-price-tax_amount-content.
+    wl_aux = wl_dos.
+    convert_value wl_aux. CONDENSE wl_aux.
+    CONCATENATE lv_xml_request '<Tax><Money currency="' l_message-invoice-price-tax_amount-currency_code '">' wl_aux '</Money>' INTO lv_xml_request.
+
+    CONCATENATE lv_xml_request '<Description xml:lang="en"/>' INTO lv_xml_request.
+    LOOP AT l_message-invoice-product_tax ASSIGNING FIELD-SYMBOL(<fs_p_tax>).
+      CLEAR: wl_aux, wl_dos.
+      wl_dos =  <fs_p_tax>-rate-decimal_value.
+      wl_aux = wl_dos.
+      convert_value wl_aux. CONDENSE wl_aux.
+      IF <fs_p_tax>-rate-decimal_value EQ 0.
+        CONCATENATE lv_xml_request '<TaxDetail category="' <fs_p_tax>-type_code-list_id '" percentageRate="' wl_aux '" exemptDetail="zeroRated' INTO lv_xml_request.
+        CONCATENATE lv_xml_request '" taxPointDate="' wl_date(4) '-' wl_date+4(2) '-' wl_date+6(2) 'T' wl_time(2) ':' wl_time+2(2) ':' wl_time+4(2) '+00:00">' INTO lv_xml_request.
+      ELSE.
+        CONCATENATE lv_xml_request '<TaxDetail category="' <fs_p_tax>-type_code-list_id '" percentageRate="' wl_aux  INTO lv_xml_request.
+        CONCATENATE lv_xml_request '" taxPointDate="' wl_date(4) '-' wl_date+4(2) '-' wl_date+6(2) 'T' wl_time(2) ':' wl_time+2(2) ':' wl_time+4(2) '+00:00">' INTO lv_xml_request.
+      ENDIF.
+      CLEAR: wl_aux, wl_dos.
+      wl_dos =  <fs_p_tax>-base_amount-content.
+      wl_aux = wl_dos.
+      convert_value wl_aux. CONDENSE wl_aux.
+      CONCATENATE lv_xml_request '<TaxableAmount><Money currency="' <fs_p_tax>-base_amount-currency_code '">' wl_aux '</Money></TaxableAmount>' INTO lv_xml_request.
+      CLEAR: wl_aux, wl_dos.
+      wl_dos = <fs_p_tax>-amount-content.
+      wl_aux = wl_dos.
+      convert_value wl_aux. CONDENSE wl_aux.
+      CONCATENATE lv_xml_request '<TaxAmount><Money currency="' <fs_p_tax>-amount-currency_code '">' wl_aux '</Money></TaxAmount>' INTO lv_xml_request.
+
+      IF <fs_p_tax>-rate-decimal_value EQ 0.
+        CONCATENATE lv_xml_request '<Description xml:lang="' l_message-invoice-description-language_code '">zeroRated</Description></TaxDetail>'
+        INTO lv_xml_request.
+      ELSE.
+        CONCATENATE lv_xml_request '<Description xml:lang="' l_message-invoice-description-language_code '">' <fs_p_tax>-type_code-list_agency_id '</Description></TaxDetail>' INTO lv_xml_request.
+      ENDIF.
+    ENDLOOP.
+
+    CONCATENATE lv_xml_request '</Tax>'  INTO lv_xml_request.
+    CLEAR: wl_aux, wl_dos.
+    wl_dos = l_message-invoice-price-gross_amount-content.
+    wl_aux = wl_dos.
+    convert_value wl_aux. CONDENSE wl_aux.
+    CONCATENATE lv_xml_request '<GrossAmount><Money currency="' l_message-invoice-price-gross_amount-currency_code '">' wl_aux '</Money></GrossAmount>' INTO lv_xml_request.
+*INI MDIOS 13/07/2023 añadir <TotalAmountWithoutTax>
+    CLEAR: wl_aux, wl_dos.
+    wl_dos = l_message-invoice-price-gross_amount-content - l_message-invoice-price-tax_amount-content.
+    wl_aux = wl_dos.
+    convert_value wl_aux. CONDENSE wl_aux.
+    CONCATENATE lv_xml_request '<TotalAmountWithoutTax><Money currency="' l_message-invoice-price-gross_amount-currency_code '">' wl_aux '</Money></TotalAmountWithoutTax>' INTO lv_xml_request.
+*FIN MDIOS 13/07/2023 añadir <TotalAmountWithoutTax>
+    CLEAR: wl_aux, wl_dos.
+    wl_dos = l_message-invoice-price-net_amount-content.
+    wl_aux = wl_dos.
+    convert_value wl_aux. CONDENSE wl_aux.
+    CONCATENATE lv_xml_request '<NetAmount><Money currency="' l_message-invoice-price-net_amount-currency_code '">' wl_aux '</Money></NetAmount>' INTO lv_xml_request.
+*INI MDIOS 13/07/2023 añadir <DueAmount>
+    CLEAR: wl_aux, wl_dos.
+    wl_dos = l_message-invoice-price-gross_amount-content.
+    wl_aux = wl_dos.
+    convert_value wl_aux. CONDENSE wl_aux.
+    CONCATENATE lv_xml_request '<DueAmount><Money currency="' l_message-invoice-price-gross_amount-currency_code '">' wl_aux '</Money></DueAmount></InvoiceDetailSummary>' INTO lv_xml_request.
+*FIN MDIOS 13/07/2023 añadir <DueAmount>
+
+    CONCATENATE lv_xml_request '</InvoiceDetailRequest></Request></cXML>' INTO lv_xml_request.
+
+    lv_request_length = strlen( lv_xml_request ).
+
+    CALL METHOD lo_http_client->request->append_cdata(
+        data   = lv_xml_request
+        length = lv_request_length ).
+
+    lv_request =  lo_http_client->request->get_cdata( ).
+
+    lo_http_client->send(
+      EXCEPTIONS
+         http_communication_failure = 1
+          http_invalid_state         = 2 ).
+
+    lo_http_client->receive(
+      EXCEPTIONS
+         http_communication_failure = 1
+         http_invalid_state         = 2
+         http_processing_failed     = 3 ).
+
+    IF sy-subrc <> 0.
+
+      lo_http_client->response->get_status(
+        IMPORTING
+          code   = lv_ret_code
+          reason = lv_err_string
+      ).
+*  return-message = lv_err_string.
+*      lv_message = text-e01.
+      CONCATENATE text-e01 ': ' lv_err_string INTO lv_message.
+
+      iv_returncode = '996'.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = ls_nast-objky+0(10)
+        IMPORTING
+          output = lv_doc_number.
+
+      PERFORM nast_update
+                  USING
+                     '007'
+                     'ARBCIS_MESSAGE'
+                     'W'
+                     lv_message
+                     ' '
+                     ' '
+                     ' '.
+      RETURN.
+    ELSE.
+
+      lv_response = lo_http_client->response->get_cdata( ).
+
+      IF lv_response IS NOT INITIAL.
+        SEARCH  lv_response FOR c_ackowledged.
+        IF sy-subrc EQ 0.
+          lv_message = text-s01.
+          PERFORM nast_update
+            USING
+               '007'
+               'ARBCIS_MESSAGE'
+               'S'
+               lv_message
+               l_message-message_header-id-content
+               ' '
+               ' '.
+        ELSE.
+*          Parsing tag status
+          PERFORM parsing_xml USING 'Status'
+                                    lv_response
+                           CHANGING lv_message.
+
+          CONCATENATE text-e01 ': ' lv_message INTO lv_message.
+
+          iv_returncode = '996'.
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+            EXPORTING
+              input  = ls_nast-objky+0(10)
+            IMPORTING
+              output = lv_doc_number.
+
+          PERFORM nast_update
+                      USING
+                         '007'
+                         'ARBCIS_MESSAGE'
+                         'W'
+                         lv_message
+                         ' '
+                         ' '
+                         ' '.
+          RETURN.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  nast_update
+*&---------------------------------------------------------------------*
+* Nast Update with the messages
+*----------------------------------------------------------------------*
+*      -->IV_MSG_NO    text
+*      -->IV_MSG_ID    text
+*      -->IV_MSG_TYPE  text
+*      -->IV_MSG_V1    text
+*      -->IV_MSG_V2    text
+*      -->IV_MSG_V3    text
+*      -->IV_MSG_V4    text
+*----------------------------------------------------------------------*
+FORM nast_update USING iv_msg_no   TYPE any
+                       iv_msg_id   TYPE any
+                       iv_msg_type TYPE any
+                       iv_msg_v1   TYPE any
+                       iv_msg_v2   TYPE any
+                       iv_msg_v3   TYPE any
+                       iv_msg_v4   TYPE any.
+
+  DATA: lv_msg_id TYPE sy-msgid,
+        lv_msg_nr TYPE sy-msgno,
+        lv_msg_ty TYPE sy-msgty,
+        lv_msg_v1 TYPE sy-msgv1,
+        lv_msg_v2 TYPE sy-msgv2,
+        lv_msg_v3 TYPE sy-msgv3,
+        lv_msg_v4 TYPE sy-msgv4.
+
+  lv_msg_id = iv_msg_id.
+  lv_msg_nr = iv_msg_no.
+  lv_msg_ty = iv_msg_type.
+  lv_msg_v1 = iv_msg_v1.
+  lv_msg_v2 = iv_msg_v2.
+  lv_msg_v3 = iv_msg_v3.
+  lv_msg_v4 = iv_msg_v4.
+
+  CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+    EXPORTING
+      msg_arbgb              = lv_msg_id
+      msg_nr                 = lv_msg_nr
+      msg_ty                 = lv_msg_ty
+      msg_v1                 = lv_msg_v1
+      msg_v2                 = lv_msg_v2
+      msg_v3                 = lv_msg_v3
+      msg_v4                 = lv_msg_v4
+    EXCEPTIONS
+      message_type_not_valid = 1
+      no_sy_message          = 2
+      OTHERS                 = 3.
+ENDFORM.                    "nast_error_update
+*&---------------------------------------------------------------------*
+*&      Form  PARSING_XML
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_2388   text
+*      <--P_LV_MESSAGE  text
+*----------------------------------------------------------------------*
+FORM parsing_xml  USING    p_tag   TYPE string
+                           p_xml   TYPE string
+                  CHANGING p_message TYPE string.
+
+  DATA: node             TYPE REF TO if_ixml_node,
+        node_list        TYPE REF TO if_ixml_node,
+        collection_nodes TYPE REF TO if_ixml_node_collection,
+        iterator         TYPE REF TO if_ixml_node_iterator,
+        iterator_nodes   TYPE REF TO if_ixml_node_iterator,
+        value            TYPE string,
+        wl_aux1          TYPE string,
+        wl_aux2          TYPE string,
+        wl_aux3          TYPE string,
+        wl_aux4          TYPE string,
+        wl_xml           TYPE string.
+
+
+  PERFORM prepar_nodos_xml USING p_xml
+                                 p_tag
+                        CHANGING collection_nodes
+                                 iterator_nodes
+                                 node_list.
+
+  WHILE NOT node_list IS INITIAL.
+
+    node = node_list.
+
+    CHECK NOT node IS INITIAL.
+
+    IF node IS INITIAL.
+      EXIT.
+    ENDIF.
+
+    iterator  = node->create_iterator( ).
+    node      = iterator->get_next( ).
+
+    WHILE NOT node IS INITIAL.
+
+      CASE node->get_type( ).
+
+        WHEN if_ixml_node=>co_node_text OR
+             if_ixml_node=>co_node_cdata_section.
+
+          value  = node->get_value( ).
+
+          IF value IS NOT INITIAL.
+            p_message = value.
+          ENDIF.
+
+      ENDCASE.
+
+      node = iterator->get_next( ).
+
+    ENDWHILE.
+
+    node_list = iterator_nodes->get_next( ).
+
+  ENDWHILE.
+
+  IF p_message IS INITIAL.
+    SPLIT p_xml AT p_tag INTO wl_aux1 wl_aux2 wl_aux3.
+    IF sy-subrc EQ 0.
+      p_message = wl_aux2.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PREPAR_NODOS_XML
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_XML  text
+*      -->P_P_TAG  text
+*      <--P_COLLECTION_NODES  text
+*      <--P_ITERATOR_NODES  text
+*      <--P_NODE_LIST  text
+*----------------------------------------------------------------------*
+FORM prepar_nodos_xml  USING    p_xml              TYPE string
+                                p_tag              TYPE string
+                       CHANGING p_collection_nodes TYPE REF TO if_ixml_node_collection
+                                p_iterator_nodes   TYPE REF TO if_ixml_node_iterator
+                                p_node_list        TYPE REF TO if_ixml_node.
+
+  DATA:
+    l_ixml          TYPE REF TO if_ixml,
+    l_streamfactory TYPE REF TO if_ixml_stream_factory,
+    l_parser        TYPE REF TO if_ixml_parser,
+    l_istream       TYPE REF TO if_ixml_istream,
+    l_document      TYPE REF TO if_ixml_document,
+    nodes           TYPE REF TO if_ixml_node_list.
+
+* Parsear XML
+  FREE: l_parser, l_ixml, l_streamfactory, l_document.
+
+  l_ixml          = cl_ixml=>create( ).
+  l_streamfactory = l_ixml->create_stream_factory( ).
+  l_istream       = l_streamfactory->create_istream_string(
+                                      string = p_xml
+                                                      ).
+  l_document      = l_ixml->create_document( ).
+  l_parser        = l_ixml->create_parser(
+                                      stream_factory = l_streamfactory
+                                      istream        = l_istream
+                                      document       = l_document
+                                                                  ).
+  IF l_parser->parse( ) = 0.
+    p_collection_nodes = l_document->get_elements_by_tag_name( name = p_tag ).
+    p_iterator_nodes   = p_collection_nodes->create_iterator( ).
+    p_node_list        = p_iterator_nodes->get_next( ).
+  ENDIF.
+
+ENDFORM.

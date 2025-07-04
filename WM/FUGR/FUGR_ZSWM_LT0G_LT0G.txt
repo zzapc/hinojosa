@@ -1,0 +1,360 @@
+FUNCTION zswm_lt0g.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(VBELN) TYPE  VBELN
+*"     REFERENCE(WAIT) TYPE  FLAG DEFAULT 'X'
+*"  EXPORTING
+*"     REFERENCE(ERROR) TYPE  FLAG
+*"     REFERENCE(TT_LOG) TYPE  BAPIRET2_TT
+*"----------------------------------------------------------------------
+  DATA sw_hay_particion TYPE flag.
+  SELECT SINGLE * INTO @DATA(r_vbuk) FROM vbuk WHERE vbeln EQ @vbeln.
+  IF sy-subrc NE 0.
+    MOVE abap_true TO error.
+    PERFORM mensaje USING 'E' 'ZSWM_UI5' '010' vbeln space space space CHANGING tt_log[].
+  ELSEIF r_vbuk-wbstk EQ 'C'.
+    MOVE abap_true TO error.
+    PERFORM mensaje USING 'E' 'ZSWM_UI5' '173' vbeln space space space CHANGING tt_log[].
+  ELSEIF r_vbuk-lvstk EQ ' '.
+    MOVE abap_true TO error.
+    PERFORM mensaje USING 'E' 'ZSWM_UI5' '174' vbeln space space space CHANGING tt_log[].
+*  ELSEIF r_vbuk-lfstk NE 'C'.
+*    MOVE abap_true TO error.
+*    PERFORM mensaje USING 'E' 'ZSWM_UI5' '175' vbeln space space space CHANGING tt_log[].
+  ELSE.
+    SELECT SINGLE lgnum INTO @DATA(lgnum) FROM likp WHERE vbeln EQ @vbeln.
+    SELECT * INTO TABLE @DATA(tt_lqua) FROM lqua WHERE lgnum EQ @lgnum
+                                                   AND lgpla EQ @vbeln
+                                                   AND lgtyp EQ '916'.
+    SELECT * INTO TABLE @DATA(tt_pick) FROM zswm_ui5_pick WHERE vbeln EQ @vbeln
+                                                            AND lvorm NE @abap_true.
+    IF sy-subrc NE 0.
+      MOVE abap_true TO error.
+      PERFORM mensaje USING 'E' 'ZSWM_UI5' '176' vbeln space space space CHANGING tt_log[].
+    ELSEIF r_vbuk-pkstk EQ 'B' OR r_vbuk-pkstk EQ 'C'.
+      MOVE abap_true TO error.
+      PERFORM mensaje USING 'E' 'ZSWM_UI5' '178' vbeln space space space CHANGING tt_log[].
+
+    ELSE.
+      DATA: verme_total TYPE lqua-verme,
+            menge_total TYPE menge_d.
+      CLEAR: verme_total,
+             menge_total.
+      LOOP AT tt_lqua INTO DATA(rt_lqua).
+        ADD rt_lqua-verme TO verme_total.
+      ENDLOOP.
+      LOOP AT tt_pick INTO DATA(rt_pick).
+        ADD rt_pick-menge TO menge_total.
+      ENDLOOP.
+      IF verme_total NE menge_total.
+        MOVE abap_true TO error.
+        PERFORM mensaje USING 'E' 'ZSWM_UI5' '177' vbeln space space space CHANGING tt_log[].
+      ELSE.
+        CHECK error NE abap_true.
+*          AND ( all   EQ abap_true
+*             OR unpost EQ abap_true ).
+        CALL FUNCTION 'ENQUEUE_EVVBLKE'
+          EXPORTING
+            vbeln          = vbeln
+          EXCEPTIONS
+            foreign_lock   = 2
+            system_failure = 3.
+        IF sy-subrc NE 0.
+          MOVE abap_true TO error.
+          PERFORM mensaje USING sy-msgty sy-msgid sy-msgno sy-msgv1  sy-msgv2 sy-msgv3 sy-msgv4 CHANGING tt_log[].
+        ENDIF.
+        CHECK error NE abap_true.
+        DATA: ltap_creat LIKE ltap_creat     OCCURS 0 WITH HEADER LINE.
+        DATA hlp_tanum TYPE ltak-tanum.
+        CLEAR: ltap_creat[], hlp_tanum.
+
+        LOOP AT tt_pick INTO rt_pick.
+          DATA(sw_tabix) = sy-tabix.
+          DATA lenum TYPE lein-lenum.
+          lenum = rt_pick-exidv.
+          CALL FUNCTION 'ENQUEUE_ELLEINE'
+            EXPORTING
+              lenum          = lenum
+            EXCEPTIONS
+              foreign_lock   = 1
+              system_failure = 2.
+          IF sy-subrc NE 0.
+            MOVE abap_true TO error.
+            PERFORM mensaje USING sy-msgty sy-msgid sy-msgno sy-msgv1  sy-msgv2 sy-msgv3 sy-msgv4 CHANGING tt_log[].
+            CALL FUNCTION 'DEQUEUE_EVVBLKE'
+              EXPORTING
+*               MODE_LIKP       = 'E'
+*               MANDT = SY-MANDT
+                vbeln = vbeln
+*               X_VBELN         = ' '
+*               _SCOPE          = '3'
+*               _SYNCHRON       = ' '
+*               _COLLECT        = ' '
+              .
+            EXIT.
+          ENDIF.
+          CLEAR ltap_creat.
+          ltap_creat-vltyp = '916'.
+          ltap_creat-vlpla = vbeln.
+          MOVE: rt_pick-werks  TO ltap_creat-werks, " VON-Daten
+          rt_pick-lgort  TO ltap_creat-lgort,
+          rt_pick-matnr  TO ltap_creat-matnr,
+          rt_pick-charg  TO ltap_creat-charg,
+*          itab-sgt_scat TO ltap_creat-sgt_scat,
+          rt_pick-bestq  TO ltap_creat-bestq.
+*         cambiar jtm 16.05.2023 En la tabla ZSWM_UI5_PICK está la asignación original al stock y no la transformada
+*         en la LT0G debe estar la asignacion de la entrega y no del stock orginal
+          SELECT SINGLE sobkz sonum INTO (rt_pick-sobkz, rt_pick-sonum) FROM lips WHERE vbeln EQ rt_pick-vbeln
+                                                                                    AND posnr EQ rt_pick-posnr.
+          MOVE:
+*         fin de cambiar jtm 16.05.2023
+          rt_pick-sobkz  TO ltap_creat-sobkz,
+          rt_pick-sonum  TO ltap_creat-sonum,
+*          rt_pick-menge  TO ltap_creat-anfme,
+*          itab-meins  TO ltap_creat-altme,
+*          itab-lqnum  TO ltap_creat-vlqnr,
+*          itab-lenum  TO ltap_creat-vlenr,
+          vbeln  TO ltap_creat-nlpla, " NACH-Daten
+*          nach_plpos  TO ltap_creat-nppos,
+          'MUE'  TO ltap_creat-nltyp,
+          rt_pick-exidv TO ltap_creat-nlenr,
+          sw_tabix      TO ltap_creat-itab_index.
+          SELECT SINGLE posnr letyp altme nista INTO (ltap_creat-posnr, ltap_creat-letyp, ltap_creat-altme, ltap_creat-anfme) FROM ltap WHERE lgnum EQ lgnum
+                                                                AND tanum EQ rt_pick-tanum_clos
+                                                                AND tapos EQ rt_pick-tapos_clos.
+
+*          nach_lgber  TO ltap_creat-nlber,
+*          rldru-ldest TO ltap_creat-ldest,
+*          rl03t-squit TO ltap_creat-squit,
+*          itab-posnr  TO ltap_creat-posnr. " Lieferposi
+*           m
+          SELECT * INTO TABLE @DATA(tt_lips) FROM lips WHERE vbeln EQ @vbeln
+                                                         AND uecha EQ @rt_pick-posnr
+                                                         AND charg EQ @rt_pick-charg.
+          IF sy-subrc EQ 0.
+            READ TABLE tt_lips INTO DATA(rt_lips) INDEX 1.
+            ltap_creat-posnr = rt_lips-posnr.
+            sw_hay_particion = abap_true.
+          ENDIF.
+          APPEND ltap_creat.
+        ENDLOOP.
+        CHECK error NE abap_true.
+        DATA rldru TYPE rldru.
+        CALL FUNCTION 'L_TO_SET_SPECIAL'
+          EXPORTING
+            i_spezi        = 'B'
+            i_vbeln        = vbeln
+          EXCEPTIONS
+            call_forbidden = 1
+            input_wrong    = 2
+            OTHERS         = 3.
+
+        IF sy-subrc NE 0.
+          MOVE abap_true TO error.
+          PERFORM mensaje USING sy-msgty sy-msgid sy-msgno sy-msgv1  sy-msgv2 sy-msgv3 sy-msgv4 CHANGING tt_log[].
+          CALL FUNCTION 'DEQUEUE_EVVBLKE'
+            EXPORTING
+*             MODE_LIKP       = 'E'
+*             MANDT = SY-MANDT
+              vbeln = vbeln
+*             X_VBELN         = ' '
+*             _SCOPE          = '3'
+*             _SYNCHRON       = ' '
+*             _COLLECT        = ' '
+            .
+
+        ENDIF.
+        CHECK error NE abap_true.
+
+
+        CALL FUNCTION 'L_TO_CREATE_MULTIPLE'
+          EXPORTING
+            i_lgnum                = lgnum
+            i_bwlvs                = '998'
+*           I_BETYP                = ' '
+*           I_BENUM                = ' '
+*           I_LZNUM                = ' '
+            i_nidru                = rldru-proto
+            i_drukz                = rldru-drukz
+*           I_UPDATE_TASK          = ' '
+            i_commit_work          = 'X'
+*           I_BNAME                = SY-UNAME
+*           I_KOMPL                = 'X'
+*           I_SOLEX                = 0
+*           I_PERNR                = 0
+*           I_MINWM                = ' '
+          IMPORTING
+            e_tanum                = hlp_tanum
+          TABLES
+            t_ltap_creat           = ltap_creat[]
+          EXCEPTIONS
+            no_to_created          = 1
+            bwlvs_wrong            = 2
+            betyp_wrong            = 3
+            benum_missing          = 4
+            betyp_missing          = 5
+            foreign_lock           = 6
+            vltyp_wrong            = 7
+            vlpla_wrong            = 8
+            vltyp_missing          = 9
+            nltyp_wrong            = 10
+            nlpla_wrong            = 11
+            nltyp_missing          = 12
+            rltyp_wrong            = 13
+            rlpla_wrong            = 14
+            rltyp_missing          = 15
+            squit_forbidden        = 16
+            manual_to_forbidden    = 17
+            letyp_wrong            = 18
+            vlpla_missing          = 19
+            nlpla_missing          = 20
+            sobkz_wrong            = 21
+            sobkz_missing          = 22
+            sonum_missing          = 23
+            bestq_wrong            = 24
+            lgber_wrong            = 25
+            xfeld_wrong            = 26
+            date_wrong             = 27
+            drukz_wrong            = 28
+            ldest_wrong            = 29
+            update_without_commit  = 30
+            no_authority           = 31
+            material_not_found     = 32
+            lenum_wrong            = 33
+            matnr_missing          = 34
+            werks_missing          = 35
+            anfme_missing          = 36
+            altme_missing          = 37
+            lgort_wrong_or_missing = 38
+            error_message          = 99.
+        IF sy-subrc NE 0.
+          MOVE abap_true TO error.
+          PERFORM mensaje USING sy-msgty sy-msgid sy-msgno sy-msgv1  sy-msgv2 sy-msgv3 sy-msgv4 CHANGING tt_log[].
+          CALL FUNCTION 'DEQUEUE_EVVBLKE'
+            EXPORTING
+*             MODE_LIKP       = 'E'
+*             MANDT = SY-MANDT
+              vbeln = vbeln
+*             X_VBELN         = ' '
+*             _SCOPE          = '3'
+*             _SYNCHRON       = ' '
+*             _COLLECT        = ' '
+            .
+        ELSE.
+          LOOP AT tt_pick INTO rt_pick.
+*           add jtm 30.05.2023 En la tabla ZSWM_UI5_PICK está la asignación original al stock y no la transformada
+*           en la LT0G debe estar la asignacion de la entrega y no del stock orginal. En este caso al deshacer debemos
+*           o bien llevar el stock a la asignación inicial o bien adaptar la tabla al stock tal y como está, dejandlo transformado
+*           en caso de haberlo hecho. Me decanto por la segunda.
+            DATA rt_real_pick TYPE zswm_ui5_pick.
+            SELECT SINGLE sobkz sonum INTO (rt_real_pick-sobkz, rt_real_pick-sonum) FROM lips WHERE vbeln EQ rt_pick-vbeln
+                                                                                                AND posnr EQ rt_pick-posnr.
+            IF sy-subrc EQ 0 AND ( rt_pick-sobkz NE rt_real_pick-sobkz OR rt_pick-sonum NE rt_real_pick-sonum ).
+              UPDATE zswm_ui5_pick   SET tanum_clos = space
+                                         tapos_clos = space
+                                         pquit_clos = space
+                                         sonum      = rT_real_pick-sonum
+                                         sobkz      = rT_real_pick-sobkz
+                             WHERE lgnum EQ rt_pick-lgnum
+                               AND nlenr EQ rt_pick-nlenr
+                               AND vbeln EQ rt_pick-vbeln.
+            ELSE.
+*           fin de add jtm 30.05.2023
+              UPDATE zswm_ui5_pick   SET tanum_clos = space
+                                         tapos_clos = space
+                                         pquit_clos = space
+                             WHERE lgnum EQ rt_pick-lgnum
+                               AND nlenr EQ rt_pick-nlenr
+                               AND vbeln EQ rt_pick-vbeln.
+*
+            ENDIF. " add jtm 30.05.2023
+          ENDLOOP.
+          COMMIT WORK AND WAIT.
+          CALL FUNCTION 'DEQUEUE_ALL'
+*           EXPORTING
+*             _SYNCHRON       = ' '
+            .
+          CALL FUNCTION 'L_TO_RESET_SPECIAL'.
+          CALL FUNCTION 'DEQUEUE_EVVBLKE'
+            EXPORTING
+*             MODE_LIKP       = 'E'
+*             MANDT = SY-MANDT
+              vbeln = vbeln
+*             X_VBELN         = ' '
+*             _SCOPE          = '3'
+*             _SYNCHRON       = ' '
+*             _COLLECT        = ' '
+            .
+          IF wait EQ abap_true.
+            DO 5 TIMES.
+              DATA sw_bloqueo TYPE flag.
+              WAIT UP TO 1 SECONDS.
+*            DATA sw_bloqueo TYPE flag.
+              CALL FUNCTION 'ZSWM_BLOQUEOS'
+                EXPORTING
+*                 GNAME   =
+*                 GUNAME  =
+                  vbeln   = vbeln
+*                 LGNUM   =
+*                 TANUM   =
+*                 EXIDV   =
+                IMPORTING
+                  bloqueo = sw_bloqueo
+*               TABLES
+*                 T_BLOQUEOS       =
+                .
+              CHECK sw_bloqueo NE abap_true.
+              EXIT.
+            ENDDO.
+          ENDIF.
+        ENDIF.
+
+      ENDIF.
+    ENDIF.
+  ENDIF.
+**   Si hago picking LT03+LT12 y luego LT0G ==> aparece una línea por cada UA/posición de entrega
+**   Si hago picking LT03+LT12+POST y luego VL09+LT0G ==> aparecen las líneas por posición de entrega aculumadas.
+*    data t_pick   like zswm_ui5_pick occurs 0 WITH HEADER LINE.
+*    data t_list_c like RL034         occurs 0 WITH HEADER LINE.
+*    data t_list_n like RL034         occurs 0 WITH HEADER LINE.
+**   Miramos si el picking de ha hecho desde UI5
+*    loop at t_list where ikone ne 'H'
+*                     and vltyp eq 'MUE'.
+*        read TABLE t_pick with key vbeln = t_list-vbeln TRANSPORTING NO FIELDS.
+*        check sy-subrc ne 0.
+*      select * APPENDING table T_pick from zswm_ui5_pick
+*        where vbeln eq t_list-vbeln
+*          and lvorm ne abap_true.
+*    endloop.
+*    check t_pick[] is not INITIAL.
+**   el picking se ha hecho desde UI5
+**    t_list_c[] = t_list[].
+*    clear: t_list_n[].
+*    loop at t_list where ikone ne 'H'.
+*       data(SW_tabix_list) = sy-tabix.
+*       data uecha type lips-uecha.
+*       select single uecha into uecha from lips where vbeln eq t_list-vbeln
+*                                                  and posnr eq t_list-posnr.
+*       if uecha is INITIAL
+*       or uecha eq space.
+*          uecha = t_list-posnr.
+*       endif.
+*       read TABLE t_pick with key exidv = t_list-vlenr
+*                                  vbeln = T_list-vbeln
+*                                  posnr = uecha
+*                                  into data(rT_pick).
+*
+*       check sy-subrc eq 0."  and rT_pick-menge < t_list-verme.
+*       data(Sw_Tabix_pick) = sy-tabix.
+*       delete t_pick index Sw_Tabix_pick .
+*       check rT_pick-menge < T_list-verme.
+*       t_list-verme =
+*       t_list-gesme = rT_pick-menge.
+*       modify t_list index SW_tabix_list.
+*       T_lisT_c = t_list. append T_list_c.
+*    endloop.
+**    loop at t_pick.
+**        read TABLE t_list_c
+**    endloop.
+ENDFUNCTION.

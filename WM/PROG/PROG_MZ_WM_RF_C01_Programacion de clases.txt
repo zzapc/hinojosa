@@ -1,0 +1,1301 @@
+*&---------------------------------------------------------------------*
+*&  Include  MZ_WM_RF_C01
+*&---------------------------------------------------------------------*
+" cvivo - 06.05.2020 - Simplificar y robustecer código mediante objetos: el código
+"     no es homogéneo entre los tres proyectos
+CLASS zzdescarga DEFINITION FINAL.
+
+  PUBLIC SECTION.
+
+    TYPES: t_zst_rf_em TYPE TABLE OF zst_rf_em.
+
+    DATA paper TYPE TABLE OF zst_rf_em .
+    DATA descarga_multi TYPE TABLE OF zst_rf_em .
+    DATA descarga TYPE TABLE OF zst_rf_em .
+    DATA parametros TYPE zwm_param .
+    DATA lrfmd TYPE lrf_wkqu .
+    DATA t_func TYPE TABLE OF zwm_rf_func .
+    DATA segunda TYPE xflag .
+    DATA log_handle TYPE balloghndl .
+    DATA lgnum TYPE lgnum .
+    DATA werks TYPE werks_d .
+    DATA dc TYPE TABLE OF char4.
+    DATA lifnr TYPE elifn.
+    DATA vttk TYPE vttk.
+
+    METHODS refresh.
+    METHODS get_parametros .
+    METHODS get_paper
+      IMPORTING
+        !vbeln TYPE vbeln_vl .
+    METHODS set_mensaje
+      IMPORTING
+        !number TYPE msgnr
+        !id     TYPE msgid DEFAULT 'ZWM_RF'
+        !type   TYPE syst_msgty
+        !msgv1  TYPE symsgv OPTIONAL
+        !msgv2  TYPE symsgv OPTIONAL
+        !msgv3  TYPE symsgv OPTIONAL
+        !msgv4  TYPE symsgv OPTIONAL .
+    METHODS check_funcionalidad
+      IMPORTING
+        !func TYPE rvari_vnam
+      EXCEPTIONS
+        inactive .
+    METHODS get_entrega_paper
+      IMPORTING
+        !vgbel TYPE vgbel.
+    METHODS update_linea
+      CHANGING
+        !i_descarga TYPE zst_rf_em.
+    METHODS enter_bobina_paper
+      IMPORTING
+        VALUE(bobina) TYPE lenum.
+    METHODS create_dlv_paper.
+    METHODS leidos_paper.
+    METHODS fin_descarga_paper.
+    METHODS contabilizar.
+    METHODS bloquear_segundas
+      IMPORTING
+        !t_descarga TYPE t_zst_rf_em.
+    METHODS ubicar_en_descarga IMPORTING iv_bobina TYPE lenum.
+
+ENDCLASS.
+
+DATA oo_descarga TYPE REF TO zzdescarga.
+
+CLASS zzdescarga IMPLEMENTATION.
+
+  METHOD refresh. " refrescamos todo salvo los parámetros y el transporte
+    REFRESH: paper, descarga, descarga_multi, dc.
+    CLEAR: lifnr, segunda.
+
+  ENDMETHOD.
+
+  METHOD get_parametros.
+
+    DATA: l_condition TYPE char20,
+          l_log       TYPE bal_s_log.
+
+    CHECK parametros IS INITIAL AND lrfmd IS INITIAL AND t_func IS INITIAL. " para no repetir la selección cada vez
+
+    SELECT SINGLE * FROM lrf_wkqu INTO lrfmd " 11.03.2019 - cvivo - WM CB
+    WHERE bname EQ sy-uname
+    AND statu NE space.
+
+    lgnum = lrfmd-lgnum. " 11.03.2019 - cvivo - WM CB
+
+    SELECT SINGLE werks FROM t320 " 11.03.2019 - cvivo - WM CB
+    INTO werks
+    WHERE lgnum EQ lgnum.
+
+    SELECT SINGLE * FROM zwm_param INTO parametros
+    WHERE tcode = sy-tcode
+    AND lgnum = lgnum.    " 11.03.2019 - cvivo - WM CB
+
+    SELECT SINGLE bukrs FROM t001k " cvivo - 65163
+      INTO parametros-bukrs
+      WHERE bwkey EQ werks.
+
+    " cvivo 58105 - Incluir log
+    CONCATENATE 'ZWM_' lgnum INTO l_log-object.
+    l_log-subobject = 'ITS'.
+    l_log-aldate     = sy-datum.
+    l_log-altime     = sy-uzeit.
+    l_log-aluser     = sy-uname.
+    l_log-alprog     = sy-repid.
+    l_log-altcode    = sy-tcode.
+
+    CALL FUNCTION 'BAL_LOG_CREATE'
+      EXPORTING
+        i_s_log                 = l_log
+      IMPORTING
+        e_log_handle            = log_handle
+      EXCEPTIONS
+        log_header_inconsistent = 1
+        OTHERS                  = 2.
+
+    CONCATENATE 'LG' lgnum ' NE space'  INTO l_condition.
+
+    IF lgnum IS NOT INITIAL.
+      SELECT * FROM zwm_rf_func INTO TABLE t_func " 11.03.2019 - cvivo - WM CB
+      WHERE (l_condition).
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD get_paper.
+
+    SELECT SINGLE wbstk INTO @DATA(l_sm)
+          FROM vbuk
+          WHERE vbeln = @vbeln.
+
+    IF l_sm <> 'C'.
+*No se ha contabilizado la salida de mercancias para el albarán &.
+      CLEAR vttk.
+      WRITE vbeln TO sy-msgv1 NO-ZERO.
+      PERFORM mensajes IN PROGRAM sapmz_wm_rf USING 'ZWM_RF' 'E' '004' sy-msgv1 space space space.
+    ELSE.
+*El albarán & no contiene bobinas pendientes de descargar
+      SELECT * APPENDING CORRESPONDING FIELDS OF TABLE paper
+      FROM lips
+      WHERE vbeln = gs_likp-vbeln AND
+      charg <> space.
+
+      LOOP AT paper ASSIGNING FIELD-SYMBOL(<paper>).
+        CALL METHOD update_linea( CHANGING i_descarga = <paper> ).
+      ENDLOOP.
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD set_mensaje.
+
+    DATA: l_msg         TYPE bal_s_msg,
+          lt_log_handle TYPE bal_t_logh.
+
+    l_msg-msgty = type.
+    l_msg-msgid = id.
+    l_msg-msgno = number.
+    l_msg-msgv1 = msgv1.
+    l_msg-msgv2 = msgv2.
+    l_msg-msgv3 = msgv3.
+    l_msg-msgv4 = msgv4.
+
+    CALL FUNCTION 'BAL_LOG_MSG_ADD'
+      EXPORTING
+        i_log_handle     = log_handle
+        i_s_msg          = l_msg
+      EXCEPTIONS
+        log_not_found    = 1
+        msg_inconsistent = 2
+        log_is_full      = 3
+        OTHERS           = 4.
+
+    CLEAR l_msg.
+    APPEND log_handle TO lt_log_handle.
+
+    CALL FUNCTION 'BAL_DB_SAVE'
+      EXPORTING
+        i_t_log_handle   = lt_log_handle
+      EXCEPTIONS
+        log_not_found    = 1
+        save_not_allowed = 2
+        numbering_error  = 3
+        OTHERS           = 4.
+
+    REFRESH: lt_log_handle.
+  ENDMETHOD.
+  METHOD check_funcionalidad.
+
+    READ TABLE t_func WITH KEY func = func TRANSPORTING NO FIELDS.
+
+    IF sy-subrc NE 0.
+      RAISE inactive.
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD get_entrega_paper.
+
+    check_funcionalidad( EXPORTING func = 'NO_TRANSPORTE' EXCEPTIONS inactive = 1 ).
+
+    IF sy-subrc EQ 0. " sin transporte
+      SELECT *
+      INTO CORRESPONDING FIELDS OF TABLE @descarga
+      FROM lips
+      INNER JOIN vbup
+      ON lips~vbeln EQ vbup~vbeln
+      AND lips~posnr EQ vbup~posnr
+      FOR ALL ENTRIES IN @paper
+      WHERE lips~charg EQ @paper-charg
+      AND lips~vgbel EQ @paper-vgbel
+      AND lips~werks EQ @werks.
+    ELSE. " con transporte
+      SELECT *
+      INTO CORRESPONDING FIELDS OF TABLE descarga " seleccionamos la actual
+      FROM lips
+      INNER JOIN vbup
+      ON lips~vbeln EQ vbup~vbeln
+      AND lips~posnr EQ vbup~posnr
+      INNER JOIN vttp
+      ON vttp~vbeln EQ lips~vbeln
+      FOR ALL ENTRIES IN paper
+      WHERE vttp~tknum = vttk-tknum
+      AND lips~charg = paper-charg
+      AND lips~werks EQ werks.
+
+      READ TABLE descarga INTO DATA(ls_descarga) INDEX 1.
+
+      SELECT *
+      INTO CORRESPONDING FIELDS OF TABLE descarga_multi " seleccionamos el resto
+      FROM lips
+      INNER JOIN vbup
+      ON lips~vbeln EQ vbup~vbeln
+      AND lips~posnr EQ vbup~posnr
+      INNER JOIN vttp
+      ON vttp~vbeln EQ lips~vbeln
+      WHERE vttp~tknum = vttk-tknum
+      AND lips~vbeln NE ls_descarga-vbeln " vale incluso si falla el read table porque estaría vacío
+      AND lips~werks EQ werks.
+    ENDIF.
+
+    LOOP AT descarga ASSIGNING FIELD-SYMBOL(<descarga>).
+      CALL METHOD update_linea( CHANGING i_descarga = <descarga> ).
+    ENDLOOP.
+    LOOP AT descarga_multi ASSIGNING <descarga>.
+      CALL METHOD update_linea( CHANGING i_descarga = <descarga> ).
+    ENDLOOP.
+
+    " recuperamos el dígito de control aquí
+    SELECT SINGLE lifnr INTO lifnr FROM ekko WHERE ebeln = vgbel.
+
+    SELECT * INTO TABLE @DATA(lt_tvarvc) FROM tvarvc WHERE name = 'ZWM_DC'.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = lifnr
+      IMPORTING
+        output = lifnr.
+
+    LOOP AT lt_tvarvc INTO DATA(ls_tvarvc) WHERE low = lifnr.
+      APPEND ls_tvarvc-high TO dc.
+    ENDLOOP.
+
+
+  ENDMETHOD.
+  METHOD update_linea.
+    DATA lt_lips TYPE STANDARD TABLE OF lips.
+    DATA lt_mseg TYPE TABLE OF mseg.
+    DATA lt_ekes TYPE STANDARD TABLE OF ekes.
+    DATA l_menge TYPE menge_d.
+
+    IF i_descarga-lvsta EQ 'C'.
+      i_descarga-read = 'X'. " si status WM completado, cuenta como leída
+
+*** --> INI FCARDONA 18.10.2023 - Errores descarga papelera
+
+    ELSE.
+
+      "Si está en tabla de lecturas...
+      SELECT COUNT(*) UP TO 1 ROWS
+        FROM zwm_rf_em_lect
+       WHERE tknum      EQ me->vttk-tknum
+*         AND verur      EQ i_descarga-vbeln "FCC 30.11.2023 VBELN no es el VERUR en papeleras.
+         AND ebeln      EQ i_descarga-vgbel
+         AND ebelp      EQ i_descarga-vgpos
+         AND bobina     NE space
+         AND matnr      EQ i_descarga-matnr
+         AND charg      EQ i_descarga-charg
+         AND finalizado EQ space.
+
+      IF ( sy-subrc EQ 0 ).
+        i_descarga-read = 'X'.
+      ENDIF.
+
+*** --> FIN FCARDONA 18.10.2023 - Errores descarga papelera
+
+    ENDIF.
+
+      SELECT * FROM mseg
+      INTO TABLE lt_mseg
+      WHERE charg EQ i_descarga-charg
+*      AND werks EQ i_descarga-werks "FCC 04.09.2023 - Error en descarga papeleras
+      AND werks EQ werks "FCC 04.09.2023 - Error en descarga papeleras
+      AND ebeln NE space
+      AND bwart LIKE '1%'. " movimientos de compras
+
+* restamos y sumamos las entradas y anulaciones de mercancia
+      LOOP AT lt_mseg INTO DATA(ls_mseg).
+        IF ls_mseg-shkzg EQ 'S'. " entrada
+          l_menge = l_menge + ls_mseg-menge.
+        ELSE. " salida
+          l_menge = l_menge - ls_mseg-menge.
+        ENDIF.
+      ENDLOOP.
+
+      IF l_menge IS NOT INITIAL AND lt_mseg[] IS NOT INITIAL.
+        i_descarga-descargada = abap_true.
+      ENDIF.
+      CLEAR l_menge.
+
+      IF werks EQ i_descarga-werks. " es entrega entrante
+        SELECT * FROM ltap
+        INTO TABLE @DATA(lt_ltap)
+              WHERE charg EQ @i_descarga-charg
+              AND lgnum EQ @lgnum
+              AND ( vltyp EQ '902' OR nltyp EQ '902') " origen o destino 902: confirmación o anulación
+              AND vbeln EQ @i_descarga-vbeln.
+      ELSE. " es albarán de proveedor intercompany: en ese caso validamos si en el centro se ha descargado indep. de la entrega
+        SELECT * FROM ltap
+        INTO TABLE lt_ltap
+              WHERE charg EQ i_descarga-charg
+              AND lgnum EQ lgnum
+              AND ( vltyp EQ '902' OR nltyp EQ '902'). " origen o destino 902: confirmación o anulación.
+      ENDIF.
+
+      LOOP AT lt_ltap INTO DATA(ls_ltap).
+        IF ls_ltap-vltyp EQ '902'. " confirmación
+          l_menge = l_menge + ls_ltap-vista.
+        ELSE. " anulación
+          l_menge = l_menge - ls_ltap-vista.
+        ENDIF.
+      ENDLOOP.
+
+      IF l_menge IS NOT INITIAL AND lt_ltap[] IS NOT INITIAL.
+        i_descarga-read = abap_true.
+      ENDIF.
+      CLEAR l_menge.
+
+      SELECT SINGLE maktx INTO i_descarga-maktx
+      FROM makt
+      WHERE matnr = i_descarga-matnr
+      AND spras = sy-langu.
+      ENDMETHOD.
+      METHOD enter_bobina_paper.
+        DATA: l_error.
+        DATA l_tanum TYPE tanum.
+        DATA lt_items TYPE TABLE OF l03b_delit.
+        DATA ls_item TYPE l03b_delit.
+        DATA ls_header_action TYPE bapishipmentheaderaction.
+        DATA lt_dlv_inb TYPE TABLE OF lips.
+        DATA ls_dlv_inb TYPE lips.
+        DATA lr_dlv_inb LIKE LINE OF gr_dlv_inb.
+        DATA l_add_tr.
+        DATA l_vcode TYPE qvcode.
+        DATA l_memoria(30).
+        DATA l_nlenr TYPE lenum. "fcardona 31.03.2021
+** ADDED AMT_NR - RF
+        DATA: lt_rf_mat TYPE TABLE OF zwm_rf_mat_alm,
+              ls_rf_mat TYPE zwm_rf_mat_alm.
+** ADDED AMT_NR - RF.
+
+        CHECK bobina IS NOT INITIAL.
+
+*** --> INI FCARDONA 18.10.2023 - Errores descarga papelera
+
+* "Comento por nueva lógica
+*
+** Chequeamos si el albaran esta en la entrega
+*        READ TABLE: descarga ASSIGNING FIELD-SYMBOL(<descarga>) WITH KEY charg = bobina," en papeleras la E.Ent se crea directamente con los lotes
+*                    paper INTO DATA(ls_paper) WITH KEY charg = bobina.
+
+
+* Chequeamos si el albaran esta en la entrega
+        READ TABLE: descarga ASSIGNING FIELD-SYMBOL(<descarga>) WITH KEY charg = bobina(10)," en papeleras la E.Ent se crea directamente con los lotes
+                    paper INTO DATA(ls_paper) WITH KEY charg = bobina(10).
+
+*** <-- FIN FCARDONA 18.10.2023 - Errores descarga papelera
+
+        IF ls_paper IS INITIAL.
+          CLEAR bobina.
+
+*La bobina leida no se encuentra en el albarán &.
+          l_error = 'X'.
+          g_message_number = '007'.
+          g_message_type = 'A'. " así al confirmar el mensaje vuelve a la pantalla actual
+          g_msgv1 = gs_likp-vbeln.
+          PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+        ELSEIF <descarga> IS ASSIGNED. " si está en PAPER y no en DESCARGA es porque hace falta crear una nueva entrega
+          IF ls_paper-lvsta EQ 'C' OR ls_paper-descargada IS NOT INITIAL OR ls_paper-read IS NOT INITIAL.
+            l_error = 'X'.
+            g_message_type = 'A'.
+            IF descarga IS NOT INITIAL.
+              g_message_number = '010'.
+            ELSE.
+              g_message_number = '086'.
+            ENDIF.
+            g_msgv1 = bobina.
+            PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+          ELSEIF descarga IS NOT INITIAL.
+
+*** --> INI FCARDONA 18.10.2023 - Errores descarga papelera
+
+*            IF <descarga>-lvsta = 'C'. "Comento
+
+            IF ( <descarga>-lvsta = 'C' OR <descarga>-read EQ abap_true ).
+
+*** <-- FIN FCARDONA 18.10.2023 - Errores descarga papelera
+
+              l_error = 'X'.
+              g_message_type = 'A'.
+              g_message_number = '010'.
+              g_msgv1 = <descarga>-charg.
+              PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+            ELSE.
+*chequeamos si la bobina se ha descargado ya
+              IF <descarga>-descargada = abap_true
+              AND <descarga>-read = abap_true. " se ha leído en este transporte
+
+                l_error = 'X'.
+                g_message_type = 'A'.
+                g_message_number = '065'.
+                g_msgv1 = g_bobina.
+                PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+              ELSEIF <descarga>-descargada = abap_true
+                AND <descarga>-read NE abap_true. " se ha leído en otro transporte
+
+                l_error = 'X'.
+                g_message_type = 'A'.
+                g_message_number = '079'.
+                g_msgv1 = g_bobina.
+                PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+              ELSE.
+* marcamos la posicion como leida ymostramos la info en pantalla
+                <descarga>-read = abap_true.
+                CLEAR bobina.
+              ENDIF.
+            ENDIF.
+          ELSEIF descarga IS NOT INITIAL.
+            READ TABLE descarga ASSIGNING <descarga> INDEX 1.
+
+            l_error = 'X'.
+            g_message_number = '007'.
+            g_message_type = 'A'.
+            g_msgv1 = <descarga>.
+            PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+          ENDIF.
+        ELSEIF <descarga> IS NOT ASSIGNED. " si no está asignada es porque hay que crear nueva entrega o la primera entrega
+          CALL METHOD create_dlv_paper.
+          READ TABLE descarga ASSIGNING <descarga> WITH KEY charg = bobina.
+
+          check_funcionalidad( EXPORTING func = 'NO_TRANSPORTE' EXCEPTIONS inactive = 1 ).
+          IF sy-subrc NE 0.
+            l_add_tr = abap_true.
+          ENDIF.
+        ENDIF.
+
+        CHECK l_error IS INITIAL.
+
+        IF <descarga> IS ASSIGNED.
+          lr_dlv_inb = 'IEQ'.
+          lr_dlv_inb-low = <descarga>-vbeln.
+          COLLECT lr_dlv_inb INTO gr_dlv_inb.
+
+          ls_item-posnr = <descarga>-posnr.
+          ls_item-anfme = <descarga>-lgmng.
+          ls_item-altme = <descarga>-meins.
+          ls_item-charg = <descarga>-charg.
+          IF NOT dc IS INITIAL.
+            READ TABLE dc INTO DATA(l_dc) INDEX 1.
+            CONCATENATE <descarga>-charg l_dc INTO ls_item-nlenr.
+          ELSE.
+            ls_item-nlenr = <descarga>-charg.
+          ENDIF.
+
+          SELECT SINGLE @abap_true FROM mara
+          WHERE matnr EQ @<descarga>-matnr
+          AND zzlargo GT 0
+          INTO @DATA(check).
+
+            IF sy-subrc EQ 0.
+              ls_item-letyp =  'PL'.
+            ELSE.
+              ls_item-letyp =  'BB'.
+            ENDIF.
+
+            PERFORM caract_lote USING <descarga>-matnr
+                                      ls_item-charg
+                             CHANGING l_vcode.
+            "
+            " SEIS 03.06.22 La parte de WM lo dejamos para cuando hagamos la EM.
+            "
+*      clear l_memoria.
+*      concatenate 'CERTIFICADO' ls_item-charg into l_memoria.
+*
+*      if l_vcode eq 'DE R'.
+*        segunda = 'X'.
+*        export p1 = 'SEGUNDA' to memory id l_memoria.
+*      endif.
+*
+*      append ls_item to lt_items.
+*
+*      perform create_ot_dn tables lt_items
+*                            using <descarga>-vbeln
+*                                  l_add_tr
+*                         changing l_tanum.
+            "
+            " SEIS 03.06.22 FIN.
+            "
+
+            IF l_add_tr = abap_true.
+              PERFORM add_dlv_to_tr USING gs_vttk-tknum
+                                          "oo_descarga->vttk-tknum - fcardona - Incidencia transporte vacio
+                                          "vttk-tknum  - cvivo - Incidencia transporte vacío
+                                          <descarga>-vbeln.
+            ENDIF.
+            "
+            " SEIS 03.06.22 Sustituimos por una nueva funcion para preguntar la ubicación destino y la guardamos..
+            "
+*      IF l_tanum IS NOT INITIAL.
+*        MOVE-CORRESPONDING <descarga> TO gs_dlv.
+*
+*        <descarga>-read = 'X'.
+*        <descarga>-lvsta = 'C'.
+
+            "FCARDONA 31.03.2021 Ubicar directamente en EM
+*        SELECT SINGLE nlenr
+*          INTO @l_nlenr
+*          FROM ltap
+*         WHERE lgnum EQ @me->lgnum
+*           AND tanum EQ @l_tanum
+*           AND tapos EQ '0001'.
+*        me->ubicar_en_descarga( iv_bobina = l_nlenr ).
+*
+*        message s085(zwm_rf).
+
+
+
+
+*      ELSE.
+** ADDED AMT_NR - Begin RF
+            MOVE-CORRESPONDING <descarga> TO gs_dlv.
+
+            <descarga>-read = 'X'.
+            <descarga>-lvsta = 'C'.
+
+            DATA: vl_nlpla  TYPE lgpla,
+                  vl_bobina TYPE lenum.
+            PERFORM get_ubicacion_en_interco USING me->lgnum CHANGING vl_nlpla.
+            vl_bobina = ls_item-nlenr.
+            CALL FUNCTION 'Z_WM_RF_NUEVA_LECTURA_INTERCO'
+              EXPORTING
+                p_dlv    = gs_dlv
+                p_vttk   = gs_vttk
+                p_lgnum  = me->lgnum
+                p_nlpla  = vl_nlpla
+                p_bobina = vl_bobina.
+
+            PERFORM save_pos_mat USING <descarga>
+                                       ls_rf_mat.
+** ADDED AMT_NR - End RF
+            IF ls_rf_mat IS NOT INITIAL.
+              MOVE-CORRESPONDING <descarga> TO gs_dlv.
+            ELSE.
+              CLEAR gs_dlv.
+            ENDIF.
+*      ENDIF.
+            "
+            " SEIS 03.06.22 FIN.
+            "
+          ENDIF.
+
+        ENDMETHOD.
+        METHOD create_dlv_paper.
+          DATA lt_vbeln TYPE TABLE OF range_vbeln.
+          DATA ls_vbeln TYPE range_vbeln.
+          DATA l_lifnr TYPE lifnr.
+          DATA l_rfpos TYPE rfpos_vl.
+*** Local itabs
+          DATA lt_komdlgn TYPE TABLE OF komdlgn.
+          DATA lt_vbfs TYPE TABLE OF vbfs.
+          DATA lt_vbls TYPE TABLE OF vbls.
+***Local structures
+          DATA ls_vbsk TYPE vbsk.
+          DATA ls_komdlgn TYPE komdlgn.
+          DATA ls_vbfs TYPE  vbfs.
+          DATA ls_vbls TYPE vbls.
+          DATA ls_ekpo TYPE ekpo..
+
+          CLEAR l_rfpos.
+
+          LOOP AT paper INTO DATA(ls_dlv) WHERE descargada = abap_false.
+
+            ADD 1 TO l_rfpos.
+            IF l_lifnr IS INITIAL.
+              SELECT SINGLE lifnr INTO l_lifnr FROM ekko WHERE ebeln = ls_dlv-vgbel.
+              ENDIF.
+              ls_komdlgn-lfdat = sy-datum.
+              ls_komdlgn-rfpos = l_rfpos.
+
+              ls_komdlgn-lifnr = l_lifnr.
+              ls_komdlgn-verur = ls_dlv-vbeln.
+              ls_komdlgn-lifex = ls_dlv-vbeln. " añadir posición externa a posiciones - CVIVO 11.06.19
+              ls_komdlgn-arktx = ls_dlv-maktx.
+              ls_komdlgn-matnr = ls_dlv-matnr.
+              ls_komdlgn-charg = ls_dlv-charg.
+              ls_komdlgn-lfart = 'EL'.
+
+* buscamos la info de conversion del pedido de compras
+              SELECT SINGLE * INTO ls_ekpo
+              FROM ekpo
+              WHERE ebeln = ls_dlv-vgbel AND
+              ebelp = ls_dlv-vgpos.
+
+* Quantity and Unit from Delivery
+                ls_komdlgn-uebtk = ls_ekpo-uebtk.
+                ls_komdlgn-uebto = ls_ekpo-uebto.
+                ls_komdlgn-untto = ls_ekpo-untto.
+                ls_komdlgn-werks = ls_ekpo-werks.
+                ls_komdlgn-lgort = ls_ekpo-lgort.
+*    ls_komdlgn-lfimg = ls_dlv-lfimg +
+*                      ls_dlv-lfimg * .
+
+                ls_komdlgn-lfimg = ls_dlv-lfimg.
+                ls_komdlgn-vrkme = ls_ekpo-meins.
+                ls_komdlgn-meins = ls_ekpo-lmein.
+                ls_komdlgn-umvkz = ls_ekpo-umrez.
+                ls_komdlgn-umvkn = ls_ekpo-umren.
+                ls_komdlgn-vgbel = ls_ekpo-ebeln.
+                ls_komdlgn-vgpos = ls_ekpo-ebelp.
+                ls_komdlgn-vgtyp = 'V'.
+                ls_komdlgn-kzazu = 'X'.
+                APPEND ls_komdlgn TO lt_komdlgn.
+                CLEAR ls_komdlgn.
+              ENDLOOP.
+
+* Sammelgangsnummer vergeben
+              ls_vbsk-mandt = sy-mandt.
+              ls_vbsk-ernam = sy-uname.
+              ls_vbsk-erdat = sy-datum.
+              ls_vbsk-uzeit = sy-uzeit.
+              ls_vbsk-smart = 'L'.
+
+**** Call Core Function GN_DELIVERY_CREATE.
+              CALL FUNCTION 'GN_DELIVERY_CREATE'
+                EXPORTING
+                  vbsk_i   = ls_vbsk
+                IMPORTING
+                  vbsk_e   = ls_vbsk
+                TABLES
+                  xkomdlgn = lt_komdlgn
+                  xvbfs    = lt_vbfs
+                  xvbls    = lt_vbls
+                EXCEPTIONS
+                  OTHERS   = 1.
+*** Error Handling
+              READ TABLE lt_vbfs INTO ls_vbfs WITH KEY msgty = 'E'.
+              IF sy-subrc IS INITIAL.
+                ROLLBACK WORK.
+                MESSAGE ID ls_vbfs-msgid TYPE ls_vbfs-msgty NUMBER ls_vbfs-msgno
+                WITH ls_vbfs-msgv1
+                ls_vbfs-msgv2
+                ls_vbfs-msgv3
+                ls_vbfs-msgv4.
+              ELSE.
+                COMMIT WORK AND WAIT.
+                READ TABLE lt_vbls INTO ls_vbls INDEX 1.
+
+                SELECT *
+                  APPENDING CORRESPONDING FIELDS OF TABLE descarga
+                FROM lips
+                WHERE vbeln = ls_vbls-vbeln_lif.
+
+                  LOOP AT descarga ASSIGNING FIELD-SYMBOL(<descarga>).
+                    CALL METHOD update_linea( CHANGING i_descarga = <descarga> ). " actualizamos status y maktx
+                  ENDLOOP.
+                ENDIF.
+              ENDMETHOD.
+              METHOD leidos_paper.
+                DATA l_ctd_char TYPE char18.
+                DATA: ls_sel_list_final LIKE LINE OF gt_sel_list_final.
+
+                CLEAR: gt_select_list[],gt_select_list.
+                REFRESH: gt_sel_list_final.
+
+                REFRESH: gt_dlv_multi.
+                APPEND LINES OF: descarga TO gt_dlv_multi,
+                                 descarga_multi TO gt_dlv_multi.
+                "
+                " RMM 26.07.22
+                " Actualizo el campo READ de la tabla DESCARGA y DESCARGA_MULTI si están en la tabla
+                "
+                LOOP AT gt_dlv_multi ASSIGNING FIELD-SYMBOL(<fs_dlv_upd>) WHERE read = abap_false.
+                  SELECT SINGLE *
+                    FROM zwm_rf_em_lect
+                    INTO @DATA(wl_zwm_rf_em_lect)
+                    WHERE charg = @<fs_dlv_upd>-charg AND
+                          ebeln = @<fs_dlv_upd>-vgbel AND
+                          ebelp = @<fs_dlv_upd>-vgpos AND
+                          finalizado = ''.
+                    IF sy-subrc = 0.
+                      <fs_dlv_upd>-read = abap_true.
+                    ENDIF.
+                  ENDLOOP.
+
+                  LOOP AT gt_dlv_multi INTO DATA(ls_dlv) WHERE read = abap_true.
+                    gt_select_list-cod = 'ST'.
+                    gt_select_list-obj_number = sy-tabix.
+                    gt_select_list-obj_numberc = ls_dlv-charg.
+                    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+                      EXPORTING
+                        input  = gt_select_list-obj_numberc
+                      IMPORTING
+                        output = gt_select_list-obj_numberc.
+                    WRITE ls_dlv-lfimg TO l_ctd_char DECIMALS 0.
+                    CONDENSE l_ctd_char.
+                    CONCATENATE l_ctd_char ls_dlv-meins INTO gt_select_list-obj_number_alt SEPARATED BY space.
+
+                    gt_select_list-zzpeso_alb = ls_dlv-lfimg.
+                    gt_select_list-dtmeg = ls_dlv-vrkme.
+                    gt_select_list-matnr = ls_dlv-matnr.
+
+
+*        Se añaden estos campos, para preparar listado cuando se finaliza
+                    CLEAR: ls_sel_list_final.
+                    MOVE-CORRESPONDING gt_select_list TO ls_sel_list_final.
+                    ls_sel_list_final-tknum = vttk-tknum.
+                    ls_sel_list_final-codigo_bobina = gt_select_list-obj_numberc.
+
+                    CONDENSE ls_sel_list_final-codigo_bobina.
+                    SELECT SINGLE zeugn INTO gt_select_list-zeugn
+                    FROM lqua
+                    WHERE lgnum EQ gs_param-lgnum
+                    AND matnr EQ ls_dlv-matnr
+                    AND charg EQ ls_dlv-charg.
+
+                      ls_sel_list_final-zeugn = gt_select_list-zeugn.
+
+                      APPEND ls_sel_list_final TO gt_sel_list_final.
+                      APPEND gt_select_list TO gt_select_list.
+                    ENDLOOP.
+
+** KYVOR(AG) - INI - 01.09.2019
+                    IF g_nuevas_func_segunda IS NOT INITIAL. " cvivo - lo muevo aquí porque en el otro mòdulo desordenaba al hacerlo cada vez
+                      SORT gt_select_list BY zeugn DESCENDING.
+                    ENDIF.
+** KYVOR(AG) - FIM - 01.09.2019
+
+                    CLEAR g_partial_list.
+                    CLEAR g_partial_list_0086.
+                    CLEAR g_partial_list_0091.
+
+                    check_funcionalidad( EXPORTING func = 'CAMBIA_LIST_BULTOS_LEIDOS' EXCEPTIONS inactive = 1 ).
+                    IF sy-subrc = 0.
+                      IF sy-ucomm = 'FIN' OR sy-ucomm = 'NEXT'.
+                        CALL SCREEN 9989. "-->  CON GRID " sustituye a la 0085, incluye el certificado
+                      ELSE.
+                        CALL SCREEN 9985.  "-->  CON GRID " sustituye a la 0085, incluye el certificado
+                      ENDIF.
+                    ELSE.
+                      CALL SCREEN 9997.
+                    ENDIF.
+                  ENDMETHOD.
+                  METHOD fin_descarga_paper.
+
+                    check_funcionalidad( EXPORTING func = 'CAMBIA_ACCION_FINALIZAR' EXCEPTIONS inactive = 1 ).
+
+                    IF sy-subrc = 0 AND ( sy-ucomm = 'LEIDOS' OR sy-ucomm = 'FIN' OR sy-ucomm = 'NEXT' ) OR segunda IS NOT INITIAL.
+                      " Añadido next para cuando aparezca aviso de bobinas, y se pulsa en SI.
+                      CALL METHOD leidos_paper.
+                    ELSE.
+                      CALL METHOD contabilizar.
+                    ENDIF.
+                  ENDMETHOD.
+                  METHOD contabilizar.
+                    DATA: lt_total LIKE descarga.
+                    TYPES: BEGIN OF ty_vbeln,
+                             vbeln TYPE vbeln,
+                             wm(1) TYPE c,
+                           END OF ty_vbeln.
+                    DATA ls_mess TYPE prott.
+                    DATA lt_mess TYPE TABLE OF prott.
+                    DATA ls_vbkok TYPE vbkok .
+                    DATA lt_vbpok TYPE TABLE OF vbpok.
+                    DATA ls_vbpok TYPE vbpok.
+                    DATA l_error TYPE flag.
+                    DATA ls_return TYPE bapiret2.
+                    DATA lt_return TYPE TABLE OF bapiret2.
+                    DATA ls_header TYPE bapishipmentheader.
+                    DATA ls_header_action TYPE bapishipmentheaderaction .
+                    DATA lt_vbeln TYPE TABLE OF ty_vbeln.
+                    DATA ls_vbeln TYPE ty_vbeln.
+                    DATA lr_dlv_inb LIKE LINE OF gr_dlv_inb.
+
+                    DATA: tl_zwm_rf_em_lect        TYPE TABLE OF zwm_rf_em_lect.
+
+                    IF descarga IS INITIAL AND descarga_multi IS INITIAL.
+                      " cvivo - 12.03.2019
+*Error al seleccionar entrega, contacte con Sistemas
+                      g_message_type = 'E'.
+                      g_message_number = '069'.
+                      PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+                    ENDIF.
+
+                    CHECK NOT ( descarga IS INITIAL AND descarga_multi IS INITIAL ).
+
+                    APPEND LINES OF: descarga TO lt_total,
+                    descarga_multi TO lt_total. "contabilizamos todas las entregas del transporte
+
+                    SORT lt_total BY vbeln.
+                    DELETE lt_total WHERE descargada IS NOT INITIAL.
+                    DELETE ADJACENT DUPLICATES FROM lt_total COMPARING vbeln.
+
+                    LOOP AT lt_total ASSIGNING FIELD-SYMBOL(<descarga>).
+                      ls_vbkok-wadat_ist = sy-datum.
+                      ls_vbkok-vbeln_vl = <descarga>-vbeln.
+                      ls_vbkok-komue = 'X'.
+                      ls_vbkok-wabuc = 'X'.
+* borramos posiciones que no tengan picking
+                      CLEAR lt_vbpok.
+
+                      SELECT vbeln posnr
+                      INTO (ls_vbpok-vbeln_vl, ls_vbpok-posnr_vl)
+                      FROM vbup
+                      WHERE vbup~vbeln = <descarga>-vbeln
+                      AND vbup~lvsta = 'A'.
+*chequeamos que no sea posicion princial
+                        SELECT SINGLE vbeln
+                        INTO ls_vbpok-vbeln_vl
+                        FROM lips
+                        WHERE vbeln = <descarga>-vbeln
+                        AND uecha = ls_vbpok-posnr_vl.
+
+                          IF NOT sy-subrc IS INITIAL.
+                            ls_vbpok-lips_del = abap_true.
+                            APPEND ls_vbpok TO lt_vbpok.
+                          ENDIF.
+                        ENDSELECT.
+
+                        CALL FUNCTION 'HU_PACKING_REFRESH'.
+                        CALL FUNCTION 'LE_DELIVERY_REFRESH_BUFFER'
+                          EXCEPTIONS
+                            no_key_specified = 0
+                            OTHERS           = 0.
+                        CALL FUNCTION 'WS_DELIVERY_UPDATE_2'
+                          EXPORTING
+                            vbkok_wa       = ls_vbkok
+                            delivery       = <descarga>-vbeln
+                            update_picking = 'X'
+                          IMPORTING
+                            ef_error_any   = l_error
+                          TABLES
+                            vbpok_tab      = lt_vbpok
+                            prot           = lt_mess.
+                        READ TABLE lt_mess INTO ls_mess WITH KEY msgty = 'E'.
+                        IF sy-subrc IS INITIAL.
+                          PERFORM crear_mensaje_sistema USING ls_mess-msgid
+                                ls_mess-msgno
+                                ls_mess-msgv1
+                                ls_mess-msgv2
+                                ls_mess-msgv3
+                                ls_mess-msgv4
+                          CHANGING g_msgv1
+                            g_msgv2
+                            g_msgv3
+                            g_msgv4.
+
+                          g_message_type = 'E'.
+                          g_message_number = '000'.
+                          PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+                        ELSE.
+
+                          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                            EXPORTING
+                              wait = 'X'.
+
+***--> INI FCARDONA 27.09.2023 - 77768 - No se cierran entregas sin transporte
+
+                          "TODO
+
+*        IF g_no_transporte IS INITIAL.
+*
+*          UPDATE zwm_rf_em_lect
+*             SET finalizado = abap_true
+*           WHERE tknum EQ vttk-tknum
+*             AND charg EQ <descarga>-charg
+*             AND finalizado EQ space.
+*
+*        ELSE.
+*
+*          UPDATE zwm_rf_em_lect
+*             SET finalizado = abap_true
+*           WHERE vbeln EQ <descarga>-vbeln
+*             AND charg EQ <descarga>-charg
+*             AND finalizado EQ space.
+*
+*        ENDIF.
+*
+*
+*        COMMIT WORK AND WAIT.
+
+***<--> FIN FCARDONA 27.09.2023 - 77768 - No se cierran entregas sin transporte
+
+
+                        ENDIF.
+                        "
+                        " SEIS 13.06.22 Realizar para WM. Ubicamos.
+                        "
+                        DATA vl_vbeln TYPE vbeln_vl.
+                        vl_vbeln = <descarga>-vbeln.
+                        CALL FUNCTION 'Z_WM_RF_EM_UBICAR_INTERCO'
+                          EXPORTING
+                            vp_vbeln         = vl_vbeln
+                          EXCEPTIONS
+                            error            = 1
+                            conf_ubic_cancel = 2
+                            to_not_created   = 3
+                            OTHERS           = 4.
+                        IF sy-subrc <> 0.
+                          PERFORM crear_mensaje_sistema USING sy-msgid
+                                                              sy-msgno
+                                                              sy-msgv1
+                                                              sy-msgv2
+                                                              sy-msgv3
+                                                              sy-msgv4
+                                                     CHANGING g_msgv1
+                                                              g_msgv2
+                                                              g_msgv3
+                                                              g_msgv4.
+
+                          g_message_type = 'E'.
+                          g_message_number = '000'.
+                          PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+                        ELSE.
+                          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                            EXPORTING
+                              wait = 'X'.
+                        ENDIF.
+
+****** --> INI FCARDONA - 75951 - Problemas RF
+*
+
+*"""""" Comento para cambiar la lógica
+*
+** impresion de las etiquetas de las bobinas.
+** buscamos en las UAs de la entrega
+*                        IF sy-tcode <> 'ZWM_RF_004' AND
+*                        sy-tcode <> 'ZWM_RF_001'.
+** para SAICA y descargas grupo no se imprime etiqueta.
+*                          SELECT DISTINCT vbeln
+*                            FROM vbfa
+*                            INTO TABLE @DATA(tl_vbfa)
+*                            WHERE vbelv = @<descarga>-vbeln AND
+*                                  vbtyp_n = 'R'.
+*                            SELECT * INTO TABLE @DATA(lt_lqua)
+*                                     FROM lqua FOR ALL ENTRIES IN @tl_vbfa
+*                                     WHERE lgnum = @gs_param-lgnum AND
+*                                           wenum = @tl_vbfa-vbeln.
+**        SELECT * INTO TABLE @DATA(lt_lqua)
+**              FROM lqua
+**              WHERE lgnum = @lgnum AND
+**              vbeln = @<descarga>-vbeln.
+*                              IF sy-subrc IS INITIAL.
+*                                LOOP AT lt_lqua INTO DATA(ls_lqua).
+*                                  DATA(lv_impresion) = 'X'.
+*                                  PERFORM imprimir_etiqueta USING  ls_lqua-lenum.
+*                                ENDLOOP.
+*                              ENDIF.
+** ini - cvivo - Imprimir etiquetas proveedores FSC MIX sin etiqueta correcta
+*                            ELSEIF sy-tcode EQ 'ZWM_RF_004'.
+*                              SELECT SINGLE * FROM tvarvc
+*                              WHERE name EQ 'ZMM_ETIQUETA_FSC_EM'
+*                              AND low EQ @lifnr
+*                              INTO @DATA(resultado).
+*
+*                                IF sy-subrc EQ 0 AND ( resultado-high IS INITIAL OR resultado-high EQ lgnum ).
+*                                  SELECT * INTO TABLE lt_lqua
+*                                  FROM lqua
+*                                  WHERE lgnum = lgnum AND
+*                                  vbeln = <descarga>-vbeln.
+*
+*                                    LOOP AT lt_lqua INTO ls_lqua.
+*                                      lv_impresion = 'X'.
+*                                      PERFORM imprimir_etiqueta USING  ls_lqua-lenum.
+*                                    ENDLOOP.
+*                                  ENDIF.
+** fin - cvivo - Imprimir etiquetas proveedores FSC MIX sin etiqueta correcta
+*                                ENDIF.
+
+                      "impresion de las etiquetas de las bobinas.
+                      "buscamos en las UAs de la entrega
+                      "para SAICA y descargas grupo no se imprime etiqueta
+                      IF ( sy-tcode <> 'ZWM_RF_004' AND sy-tcode <> 'ZWM_RF_001' ).
+
+                        SELECT DISTINCT vbeln
+                          FROM vbfa
+                          INTO TABLE @DATA(tl_vbfa)
+                         WHERE vbelv = @<descarga>-vbeln
+                           AND vbtyp_n = 'R'.
+
+                        SELECT * INTO TABLE @DATA(lt_lqua)
+                          FROM lqua FOR ALL ENTRIES IN @tl_vbfa
+                         WHERE lgnum = @gs_param-lgnum
+                           AND wenum = @tl_vbfa-vbeln.
+
+                        IF sy-subrc IS INITIAL.
+                          LOOP AT lt_lqua INTO DATA(ls_lqua).
+                            DATA(lv_impresion) = 'X'.
+                            PERFORM imprimir_etiqueta USING  ls_lqua-lenum.
+                          ENDLOOP.
+                        ENDIF.
+
+                      ELSE. "Excepciones SAICA y papelera
+
+                        IF ( sy-tcode EQ 'ZWM_RF_004' OR ( sy-tcode EQ 'ZWM_RF_001' AND lgnum EQ '240' ) ). "Añado esto para imprimir papelera solo de CB
+
+                          SELECT SINGLE * FROM tvarvc
+                            WHERE name EQ 'ZMM_ETIQUETA_FSC_EM'
+                              AND low EQ @lifnr
+                             INTO @DATA(resultado).
+
+                          IF ( sy-subrc EQ 0 AND ( resultado-high IS INITIAL OR resultado-high EQ lgnum ) ).
+
+                            SELECT * INTO TABLE lt_lqua
+                              FROM lqua
+                             WHERE lgnum = lgnum
+                               AND vbeln = <descarga>-vbeln.
+
+                            LOOP AT lt_lqua INTO ls_lqua.
+                              lv_impresion = 'X'.
+                              PERFORM imprimir_etiqueta USING  ls_lqua-lenum.
+                            ENDLOOP.
+
+                          ENDIF.
+
+
+                        ENDIF.
+
+                      ENDIF.
+
+****** <-- FIN FCARDONA - 75951 - Problemas RF
+
+                    ENDLOOP.
+
+* ini - cvivo - WM CB Imprimir etiqueta en segundas
+                              IF sy-tcode EQ 'ZWM_RF_001' AND segunda IS NOT INITIAL.
+                                SELECT DISTINCT vbeln
+                                    INTO TABLE tl_vbfa
+                                    FROM vbfa FOR ALL ENTRIES IN lt_total
+                                    WHERE vbelv = lt_total-vbeln AND
+                                          vbtyp_n = 'R'.
+                                  SELECT * INTO TABLE lt_lqua
+                                    FROM lqua FOR ALL ENTRIES IN tl_vbfa
+                                    WHERE lgnum = gs_param-lgnum AND
+                                          wenum = tl_vbfa-vbeln AND
+                                          zeugn = 'SEGUNDA'.
+
+*      SELECT * INTO TABLE lt_lqua
+*      FROM lqua
+*      FOR ALL ENTRIES IN lt_total
+*      WHERE lgnum = lgnum
+*      AND vbeln = lt_total-vbeln
+*      AND zeugn = 'SEGUNDA'.
+                                    IF sy-subrc IS INITIAL.
+                                      LOOP AT lt_lqua INTO ls_lqua.
+                                        lv_impresion = 'X'.
+                                        PERFORM imprimir_etiqueta USING  ls_lqua-lenum.
+                                      ENDLOOP.
+                                    ENDIF.
+                                  ENDIF.
+* fin - cvivo - WM CB Imprimir etiqueta en segundas
+
+                                  check_funcionalidad( EXPORTING func = 'TRASPASO_BLOQUEADO_SEGUNDAS' EXCEPTIONS inactive = 1 ).
+
+                                  IF sy-subrc EQ 0 AND segunda IS NOT INITIAL.
+                                    CALL METHOD bloquear_segundas( descarga ).
+                                  ENDIF.
+
+                                  IF vttk-tknum IS NOT INITIAL.
+                                    IF sy-ucomm NE 'FINALB'. " cvivo - 56911 - Gestionar >1 albarán por transporte
+
+* modificamos estatus de transporte.
+                                      ls_header-shipment_num = vttk-tknum.
+                                      ls_header-status_plan = 'X'.
+                                      ls_header_action-status_plan = 'C'.
+                                      ls_header-status_load_end = 'X'.
+                                      ls_header_action-status_load_end = 'C'.
+
+                                      CALL FUNCTION 'BAPI_SHIPMENT_CHANGE'
+                                        EXPORTING
+                                          headerdata       = ls_header
+                                          headerdataaction = ls_header_action
+                                        TABLES
+                                          return           = lt_return.
+
+                                      READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+                                      IF sy-subrc IS INITIAL.
+                                        ROLLBACK WORK.
+                                        PERFORM crear_mensaje_sistema USING ls_return-id
+                                              ls_return-number
+                                              ls_return-message_v1
+                                              ls_return-message_v1
+                                              ls_return-message_v1
+                                              ls_return-message_v1
+                                        CHANGING g_msgv1
+                                          g_msgv2
+                                          g_msgv3
+                                          g_msgv4.
+
+                                        g_message_type = 'E'.
+                                        g_message_number = '000'.
+                                        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+                                      ELSE.
+                                        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                                          EXPORTING
+                                            wait = 'X'.
+
+*** --> INI FCARDONA 27.09.2023 - 77768 - No se cierran entregas sin transporte
+
+                                        IF g_no_transporte IS INITIAL.
+
+                                          UPDATE zwm_rf_em_lect
+                                             SET finalizado = abap_true
+                                           WHERE tknum EQ vttk-tknum
+                                             AND finalizado EQ space.
+
+                                        ELSE.
+
+                                          UPDATE zwm_rf_em_lect
+                                             SET finalizado = abap_true
+                                           WHERE tknum EQ space
+                                             AND vbeln EQ ls_vbkok-vbeln
+                                             AND finalizado EQ space.
+
+                                        ENDIF.
+
+***<--> FIN FCARDONA 27.09.2023 - 77768 - No se cierran entregas sin transporte
+
+                                        COMMIT WORK AND WAIT.
+
+                                        g_message_number = '011'.
+                                        g_message_type = 'A'.
+                                        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+                                        LEAVE TO TRANSACTION 'LM01'.
+                                      ENDIF.
+
+                                    ELSE.
+                                      MESSAGE s087(zwm_rf).
+                                      LEAVE TO SCREEN '0011'.
+                                    ENDIF.
+                                  ELSE.
+
+*** --> INI FCARDONA 27.09.2023 - 77768 - No se cierran entregas sin transporte
+
+                                    IF g_no_transporte IS INITIAL.
+
+                                      UPDATE zwm_rf_em_lect
+                                         SET finalizado = abap_true
+                                       WHERE tknum EQ vttk-tknum
+                                         AND finalizado EQ space.
+
+                                    ELSE.
+
+                                      UPDATE zwm_rf_em_lect
+                                         SET finalizado = abap_true
+                                       WHERE tknum EQ space
+                                         AND vbeln EQ ls_vbkok-vbeln
+                                         AND finalizado EQ space.
+
+                                    ENDIF.
+
+***<--> FIN FCARDONA 27.09.2023 - 77768 - No se cierran entregas sin transporte
+
+
+                                    IF lv_impresion IS INITIAL.
+                                      g_message_number = '011'.
+                                    ELSE.
+                                      g_message_number = '083'.
+                                    ENDIF.
+
+                                    g_message_type = 'A'.
+                                    CLEAR g_msgid. " Kyvor - 20190925 - RDM
+                                    PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+
+                                    LEAVE TO TRANSACTION 'LM01'.
+                                  ENDIF.
+** KYVOR(AG) - 29.07.2019 - FIM
+                                ENDMETHOD.
+                                METHOD bloquear_segundas.
+                                  DATA lt_lqua TYPE TABLE OF lqua.
+
+*    SELECT * INTO TABLE lt_lqua
+*    FROM lqua
+*    FOR ALL ENTRIES IN t_descarga
+*    WHERE lgnum = lgnum
+*    AND vbeln = t_descarga-vbeln
+*    AND zeugn = 'SEGUNDA'.
+
+                                  SELECT DISTINCT vbeln
+                                      INTO TABLE @DATA(tl_vbfa)
+                                      FROM vbfa FOR ALL ENTRIES IN @t_descarga
+                                      WHERE lgnum = @lgnum AND
+                                            vbelv = @t_descarga-vbeln AND
+                                            vbtyp_n = 'R'.
+                                    SELECT * INTO TABLE lt_lqua
+                                      FROM lqua FOR ALL ENTRIES IN tl_vbfa
+                                      WHERE lgnum = gs_param-lgnum AND
+                                            wenum = tl_vbfa-vbeln AND
+                                            zeugn = 'SEGUNDA'.
+
+                                      LOOP AT lt_lqua INTO DATA(ls_lqua).
+                                        "        DATA(lv_tabix) = COND #( WHEN lv_fin_seg = abap_false THEN sy-tabix ELSE 2 ). " KYV/RDM - 20191122
+                                        PERFORM transf_stock USING space " Message before output
+                                              lgnum
+                                              ls_lqua-lgtyp
+                                              gc_bwlvs-bloq
+                                              ls_lqua-lenum.
+                                      ENDLOOP.
+                                      IF g_msgid <> '00' OR g_message_number <> '398'. " KYV/RDM - 20191118
+                                        PERFORM mensajes USING 'ZWM_RF' g_message_type g_message_number g_msgv1 g_msgv2 g_msgv3 g_msgv4.
+                                      ENDIF. " KYV/RDM - 20191118
+                                    ENDMETHOD.
+
+                                    METHOD ubicar_en_descarga.
+
+                                      DATA: lt_bdcdata     TYPE TABLE OF bdcdata,
+                                            ls_bdcdata     LIKE LINE OF lt_bdcdata,
+                                            ls_options     TYPE ctu_params,
+                                            lv_tvarvc_name TYPE tvarvc-name.
+
+                                      "Chequeo funcionalidad
+                                      me->check_funcionalidad( EXPORTING func = 'RF_UBICAR_EN_DESCARGA' EXCEPTIONS inactive = 1 ).
+
+                                      CHECK sy-subrc = 0.
+
+                                      "Chequeo UA
+                                      CHECK iv_bobina IS NOT INITIAL.
+
+                                      SELECT SINGLE lgnum, lenum, zeugn
+                                        FROM lqua
+                                       WHERE lgnum EQ @me->lgnum
+                                         AND bdatu EQ @sy-datum
+                                         AND lenum EQ @iv_bobina
+                                        INTO @DATA(ls_lqua).
+
+                                        CHECK sy-subrc EQ 0.
+
+                                        CONCATENATE 'ZWM_RF_UBICAR_EN_DESCARGA_' me->lgnum INTO lv_tvarvc_name.
+
+                                        "Controlamos excepciones en la tabla tvarvc
+                                        SELECT SINGLE *
+                                          FROM tvarvc
+                                          WHERE name EQ @lv_tvarvc_name
+                                            AND low  EQ @sy-tcode
+                                            INTO @DATA(tvarvc).
+
+                                          "Si la tcode está en la tabla
+                                          IF ( sy-subrc EQ 0 ).
+
+                                            "Si el valor high viene informado --> SEGUNDAS
+                                            "Se hace por papeleras
+                                            IF ( tvarvc-high IS NOT INITIAL AND tvarvc-high = 'SEGUNDA' ).
+                                              IF ( ls_lqua-zeugn IS NOT INITIAL AND ls_lqua-zeugn = 'SEGUNDA' ).
+                                                EXIT.
+                                              ENDIF.
+                                            ELSE.
+                                              EXIT.
+                                            ENDIF.
+
+                                          ENDIF.
+
+                                          CLEAR ls_bdcdata.
+                                          ls_bdcdata-program  = 'SAPMZ_WM_RF'.
+                                          ls_bdcdata-dynpro   = '0020'.
+                                          ls_bdcdata-dynbegin = 'X'.
+                                          APPEND ls_bdcdata TO lt_bdcdata.
+
+                                          CLEAR ls_bdcdata.
+                                          ls_bdcdata-fnam = 'BDC_CURSOR'.
+                                          ls_bdcdata-fval = 'G_LENUM'.
+                                          APPEND ls_bdcdata TO lt_bdcdata.
+
+                                          CLEAR ls_bdcdata.
+                                          ls_bdcdata-fnam = 'G_LENUM'.
+                                          ls_bdcdata-fval = iv_bobina.
+                                          APPEND ls_bdcdata TO lt_bdcdata.
+
+                                          ls_options-dismode = 'E'.
+
+                                          CALL TRANSACTION 'ZWM_RF_003' USING lt_bdcdata OPTIONS FROM ls_options.
+
+                                        ENDMETHOD.
+
+ENDCLASS.

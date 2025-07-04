@@ -1,0 +1,1053 @@
+*&---------------------------------------------------------------------*
+*& Report  ZIMPRESION_UA
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*& Program Name:
+*& Author: uDefine
+*& Creation Date: 02/10/2018
+*&
+*&=====================================================================*
+*& Change History Log
+*&---------------------------------------------------------------------*
+*& Date | Change ID | Name | Description | Initials
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+REPORT zimpresion_ua.
+TABLES: lein.
+
+
+DATA lt_lsperr LIKE lein  OCCURS 20 WITH HEADER LINE.
+DATA lt_qsperr LIKE lqua  OCCURS 20 WITH HEADER LINE.
+DATA g_codigo TYPE lenum.
+DATA g_gramaje TYPE zzgramaje.
+DATA g_ancho TYPE zancho.
+DATA g_largo TYPE i.
+DATA g_fecha TYPE char10.
+DATA g_hora TYPE char10.
+DATA g_texto_material TYPE maktx.
+DATA g_usnam TYPE usnam.
+DATA g_proveedor TYPE char40.
+DATA g_tipo_producto TYPE char40.
+DATA g_cantidad TYPE char20.
+DATA g_peso TYPE char7.
+DATA g_material TYPE char18.
+DATA g_lote TYPE charg_d.
+DATA: lv_tipo_object TYPE tadir-object.
+***********************************************************
+* PARAMETROS DE SELECCION
+***********************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+PARAMETERS p_lgnum LIKE lqua-lgnum OBLIGATORY MEMORY ID lgn.
+SELECT-OPTIONS: s_lenum FOR lein-lenum.
+*PARAMETERS p_tddest TYPE tddest MATCHCODE OBJECT prin.
+SELECTION-SCREEN END OF BLOCK b1.
+
+INITIALIZATION.
+
+START-OF-SELECTION.
+
+  PERFORM seleccion_datos TABLES lt_lsperr lt_qsperr.
+
+  PERFORM imprimir_etiqueta  TABLES lt_lsperr lt_qsperr.
+*&---------------------------------------------------------------------*
+*&      Form  IMPRIMIR_ETIQUETA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM imprimir_etiqueta  TABLES lt_lsperr STRUCTURE lein
+                                lt_qsperr STRUCTURE lqua.
+  DATA ls_itcpo TYPE itcpo.
+  DATA l_element TYPE string.
+  DATA l_form TYPE zwm_param-fname. "TYPE char20. KYVOR - RDM - 20190812
+  DATA ls_mara TYPE mara.
+  DATA ls_lein TYPE lein.
+  DATA ls_lqua TYPE lqua.
+  DATA ls_lqua_902 TYPE lqua.
+  DATA l_dialog.
+  DATA l_tddest TYPE rspopname.
+  DATA  ls_itcpp TYPE   itcpp.
+* NAC -> GAP WM19 - etiqueta materia prima.
+  DATA:  ls_eti TYPE  zswm0001.
+  DATA: l_fm_form TYPE rs38l_fnam.
+  DATA: lv_form TYPE tdsfname.
+* NAC <- GAP WM19 - etiqueta materia prima.
+  DATA: lv_vengo_inter_consumo TYPE xfeld,
+        lv_cod_maq_portabo     TYPE zwm_param-maquina.
+
+  LOOP AT lt_lsperr INTO ls_lein.
+    READ TABLE lt_qsperr INTO ls_lqua WITH KEY lenum = ls_lein-lenum.
+    g_codigo = ls_lein-lenum.
+    g_lote = ls_lqua-charg.
+* chequeamos si el numero de documento de IM viene informado
+    IF ls_lqua-wenum IS INITIAL.
+* es una impresion desde la migo, leemos la lqua del tipo de almacen intermedio,
+*ahi esta el numero de documento
+      READ TABLE lt_qsperr INTO ls_lqua_902 WITH KEY lgtyp = '902'.
+      ls_lqua-wenum = ls_lqua_902-wenum.
+      ls_lqua-wdatu = ls_lqua_902-wdatu.
+    ENDIF.
+* Buscamos la fecha de entrada
+    SELECT SINGLE cpudt, cputm, usnam INTO @DATA(ls_fecha_hora)
+           FROM mkpf WHERE mblnr = @ls_lqua-wenum AND
+    mjahr = @ls_lqua-wdatu(4).
+    " KYV/RDM - 20191121  BEG
+    IF sy-subrc NE 0. " fetch data from OT
+      SELECT SINGLE bdatu AS cpudt,bzeit AS cputm,bname AS usnam FROM ltak
+        INTO @ls_fecha_hora
+        WHERE lgnum = @p_lgnum
+        AND tanum = @ls_lqua-wenum.
+    ENDIF.
+    " KYV/RDM - 20191121 END
+    WRITE ls_fecha_hora-cpudt TO g_fecha DD/MM/YYYY.
+    WRITE ls_fecha_hora-cputm TO g_hora.
+    WRITE ls_fecha_hora-usnam TO g_usnam.
+* buscamos el texto del material
+    SELECT SINGLE * INTO ls_mara FROM mara WHERE matnr = ls_lqua-matnr.
+    SELECT SINGLE  maktx INTO g_texto_material
+           FROM makt
+           WHERE matnr = ls_lqua-matnr AND
+    spras = sy-langu.
+
+***********INI RGUILLOT GAP WM18 Bernabeu 22-4-19*********************
+
+
+*          Se importa de memoria estas variables para no tocar
+*          pantalla selección de este programa de impresión
+*          El export se hace en el método
+*          ZII_SI_BHS_CONSUM_BOB_MAT_PRIM~SI_BHS_CONSUM_BOB_MAT_PRIMA_IN
+*          de la clase ZCL_SI_BHS_CONSUM_BOB_MAT_PRIM
+
+    IMPORT lv_vengo_inter_consumo FROM MEMORY ID 'VENGO_CONSUMO' .
+
+    IF lv_vengo_inter_consumo = 'X'.
+      "AND p_lgnum = '240'.  " Bernabeu. " KYV/RDM - 20191202
+
+      IMPORT lv_cod_maq_portabo FROM MEMORY ID 'MAQUINA' .
+
+      SELECT SINGLE * FROM zwm_param
+              WHERE tcode EQ 'ZIMPRESION_PICO'
+                AND lgnum EQ @p_lgnum
+                AND maquina EQ @lv_cod_maq_portabo
+              INTO @DATA(zwm_rf_param).
+
+    ELSE.
+*  LO QUE HACÍA ANTES DE BERNABEU WM18 - INTERFASE CONSUMO
+
+* ini 20.03.2019 - cvivo - Proyecto CB WM
+      " buscamos parámetros de impresión en ZWM_RF_PARAM
+      " buscamos por secuencia de más restrictiva a menos:
+      " 1. grupo artículos
+      " 2. tipo material
+
+      SELECT SINGLE * FROM zwm_param
+        WHERE tcode EQ 'ZIMPRESION_UA'
+          AND lgnum EQ @p_lgnum
+          AND letyp EQ @ls_lqua-letyp
+          AND matkl EQ @ls_mara-matkl
+***********INI RGUILLOT GAP WM18 Bernabeu 22-4-19*********************
+*        INTO @DATA(zwm_rf_param).
+        INTO @zwm_rf_param.
+***********FIN RGUILLOT GAP WM18 Bernabeu 22-4-19*********************
+
+      IF sy-subrc NE 0.
+        SELECT SINGLE * FROM zwm_param
+          INTO zwm_rf_param
+          WHERE tcode EQ 'ZIMPRESION_UA'
+            AND lgnum EQ p_lgnum
+            AND letyp EQ ls_lqua-letyp
+            AND mtart EQ ls_mara-mtart.
+
+        IF sy-subrc NE 0.
+          SELECT SINGLE * FROM zwm_param
+            INTO zwm_rf_param
+            WHERE tcode EQ 'ZIMPRESION_UA'
+              AND lgnum EQ p_lgnum
+              AND letyp EQ ls_lqua-letyp
+              AND mtart EQ space
+              AND matkl EQ space.
+          IF sy-subrc NE 0.
+            MESSAGE 'No se han encontrado parámetros de impresión para la unidad de almacén' TYPE 'E'.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+    ENDIF.
+
+***********FIN RGUILLOT GAP WM18 Bernabeu 22-4-19*********************
+
+*************INI RGUILLOT 29-5-19************************
+
+*Dependiendo desde donde se llama a este programa, se modifica los
+* siguientes campos: Si se llama desde RF se aceptan los datos recuperados
+* en la select a la tabla ZWF_RF_PARAM y sino, se fijan los campos.
+    l_element = zwm_rf_param-tdevent.
+    l_form = zwm_rf_param-fname.
+
+    IF sy-tcode NE 'ZWM2003' AND
+      sy-tcode NE 'SE38'.
+
+      l_tddest = zwm_rf_param-tddest.
+
+    ELSE.
+*      CLEAR l_tddest.
+
+*************FIN RGUILLOT 29-5-19************************
+
+    ENDIF.
+* fin 20.03.2019 - cvivo - Proyecto CB WM
+
+
+
+    IF ls_lqua-letyp = 'BB'.
+*      SELECT SINGLE low INTO  l_tddest FROM tvarvc
+*       WHERE name = 'ZLTDES_ETIQUETA_MP'.
+      g_ancho = ls_mara-zzancho.
+      g_gramaje = ls_mara-zzgramaje+1.
+      WRITE ls_lqua-verme TO g_peso DECIMALS 0.
+      PERFORM convertir_uni USING ls_lqua-matnr
+                            CHANGING ls_lqua-verme ls_lqua-meins .
+      g_largo = ls_lqua-verme.
+*      l_element = 'ETIQUETA_MP'.
+*      l_form = 'ZETIQUETA_MP'.
+
+      " cvivo - 65978 - proveedor
+      SELECT SINGLE lfa1~lifnr, name1 FROM lfa1
+        INNER JOIN mch1
+        ON mch1~lifnr EQ lfa1~lifnr
+        WHERE mch1~charg EQ @ls_lqua-charg
+          AND mch1~matnr EQ @ls_lqua-matnr
+        INTO @DATA(ls_proveedor).
+
+      IF sy-subrc EQ 0.
+        DATA: str1 TYPE char10.
+
+        WRITE ls_proveedor-lifnr TO str1 NO-ZERO.
+
+        CONCATENATE str1 '-'
+                    ls_proveedor-name1
+        INTO g_proveedor SEPARATED BY space.
+      ENDIF.
+
+    ELSE.
+
+* seleccionamos el proveedor
+      SELECT SINGLE lifnr INTO @DATA(l_lifnr)
+             FROM mseg
+             WHERE mblnr = @ls_lqua-wenum AND
+                   mjahr = @ls_lqua-wdatu(4).
+      SELECT SINGLE * INTO @DATA(ls_lfa1)
+             FROM lfa1
+      WHERE lifnr = @l_lifnr.
+      CONCATENATE ls_lfa1-lifnr '-'
+                  ls_lfa1-name1
+                  INTO g_proveedor SEPARATED BY space.
+*      l_element = 'ETIQUETA_AUX'.
+*      l_form = 'ZETIQUETA_AUX'.
+      IF ls_lqua-verme IS INITIAL.
+        WRITE ls_lqua-einme TO g_cantidad UNIT ls_lqua-meins.
+      ELSE.
+        WRITE ls_lqua-verme TO g_cantidad UNIT ls_lqua-meins.
+      ENDIF.
+      CONDENSE g_cantidad.
+      CONCATENATE g_cantidad
+                  ls_lqua-meins
+                  INTO g_cantidad  SEPARATED BY space.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = ls_mara-matnr
+        IMPORTING
+          output = g_material.
+      SELECT SINGLE wgbez INTO g_tipo_producto
+             FROM t023t
+             WHERE spras = sy-langu AND
+      matkl = ls_mara-matkl.
+    ENDIF.
+
+    IF l_tddest IS INITIAL.
+      l_dialog = abap_true.
+    ELSE.
+      ls_itcpo-tddest = l_tddest.
+      l_dialog =  abap_false.
+    ENDIF.
+    ls_itcpo-tdimmed = abap_true.
+
+
+* NAC -> GAP WM19 - etiqueta materia prima
+    CLEAR : l_fm_form, lv_form.
+    MOVE l_form TO lv_form.
+
+
+*
+*********************INI RGUILLOT 28-5-19****************************
+
+    SELECT SINGLE pgmid, object, obj_name
+    INTO @DATA(ls_tadir_red)
+    FROM tadir
+    WHERE obj_name = @lv_form.
+
+
+    CASE ls_tadir_red-object.
+      WHEN 'FORM'.
+*        Sapscript
+
+
+        CALL FUNCTION 'OPEN_FORM'
+          EXPORTING
+            dialog                      = l_dialog
+            form                        = l_form
+            options                     = ls_itcpo
+          EXCEPTIONS
+            canceled                    = 1
+            device                      = 2
+            form                        = 3
+            options                     = 4
+            unclosed                    = 5
+            mail_options                = 6
+            archive_error               = 7
+            invalid_fax_number          = 8
+            more_params_needed_in_batch = 9
+            spool_error                 = 10
+            codepage                    = 11
+            OTHERS                      = 12.
+
+        IF sy-subrc IS INITIAL.
+
+          CALL FUNCTION 'WRITE_FORM'
+            EXPORTING
+              type                     = 'BODY'
+              window                   = 'MAIN'
+              element                  = l_element
+            EXCEPTIONS
+              element                  = 1
+              function                 = 2
+              type                     = 3
+              unopened                 = 4
+              unstarted                = 5
+              window                   = 6
+              bad_pageformat_for_print = 7
+              spool_error              = 8
+              codepage                 = 9
+              OTHERS                   = 10.
+
+
+          CALL FUNCTION 'CLOSE_FORM'
+            IMPORTING
+              result                   = ls_itcpp
+            EXCEPTIONS
+              unopened                 = 1
+              bad_pageformat_for_print = 2
+              send_error               = 3
+              spool_error              = 4
+              codepage                 = 5
+              OTHERS                   = 6.
+          IF ls_itcpo-tddest IS INITIAL.
+            MOVE-CORRESPONDING ls_itcpp TO ls_itcpo.
+            l_tddest = ls_itcpp-tddest.
+            l_dialog = abap_false.
+          ENDIF.
+
+        ENDIF.
+
+
+      WHEN 'SFPF'.
+*        Adobe
+
+
+        PERFORM relleno_datos_etiqueta_mp USING ls_lqua ls_lein ls_mara lv_form lv_vengo_inter_consumo zwm_rf_param-maquina
+                                                    CHANGING ls_eti
+                                                             l_tddest .
+
+      WHEN 'SSFO'.
+*        Smartform
+
+        CALL FUNCTION 'SSF_FUNCTION_MODULE_NAME'
+          EXPORTING
+            formname           = lv_form
+*           VARIANT            = ' '
+*           DIRECT_CALL        = ' '
+          IMPORTING
+            fm_name            = l_fm_form
+          EXCEPTIONS
+            no_form            = 1
+            no_function_module = 2
+            OTHERS             = 3.
+
+        CALL FUNCTION 'OPEN_FORM'
+          EXPORTING
+            dialog                      = l_dialog
+            form                        = l_form
+            options                     = ls_itcpo
+          EXCEPTIONS
+            canceled                    = 1
+            device                      = 2
+            form                        = 3
+            options                     = 4
+            unclosed                    = 5
+            mail_options                = 6
+            archive_error               = 7
+            invalid_fax_number          = 8
+            more_params_needed_in_batch = 9
+            spool_error                 = 10
+            codepage                    = 11
+            OTHERS                      = 12.
+        IF sy-subrc IS INITIAL.
+
+          CALL FUNCTION 'WRITE_FORM'
+            EXPORTING
+              type                     = 'BODY'
+              window                   = 'MAIN'
+              element                  = l_element
+            EXCEPTIONS
+              element                  = 1
+              function                 = 2
+              type                     = 3
+              unopened                 = 4
+              unstarted                = 5
+              window                   = 6
+              bad_pageformat_for_print = 7
+              spool_error              = 8
+              codepage                 = 9
+              OTHERS                   = 10.
+        ENDIF.
+
+        CALL FUNCTION 'CLOSE_FORM'
+          IMPORTING
+            result                   = ls_itcpp
+          EXCEPTIONS
+            unopened                 = 1
+            bad_pageformat_for_print = 2
+            send_error               = 3
+            spool_error              = 4
+            codepage                 = 5
+            OTHERS                   = 6.
+        IF ls_itcpo-tddest IS INITIAL.
+          MOVE-CORRESPONDING ls_itcpp TO ls_itcpo.
+          l_tddest = ls_itcpp-tddest.
+          l_dialog = abap_false.
+        ENDIF.
+
+    ENDCASE.
+
+
+*
+*********************FIN RGUILLOT 28-5-19****************************
+  ENDLOOP.
+
+
+*      Una vez ya se ha utilizado, se puede borrar su contenido
+  FREE MEMORY ID 'MAQUINA'.
+  FREE MEMORY ID 'VENGO_CONSUMO'.
+
+
+
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  SELECCION_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM seleccion_datos TABLES lsperr STRUCTURE lein
+                            qsperr STRUCTURE lqua.
+
+  IF NOT s_lenum[] IS INITIAL.
+    SELECT * INTO TABLE lt_lsperr FROM lein WHERE lenum IN s_lenum.
+
+    IF sy-subrc IS INITIAL.
+      SELECT  * INTO TABLE lt_qsperr
+               FROM lqua FOR ALL ENTRIES IN lt_lsperr
+               WHERE lgnum = p_lgnum  AND
+                     lenum = lt_lsperr-lenum.
+    ENDIF.
+  ELSE.
+* IMPORTAMOS DE MEMORIA LOS DATOS DE IMPRESION
+    IMPORT qsperr
+           lsperr FROM MEMORY ID 'LVSDRUCK'.
+  ENDIF.
+ENDFORM.
+FORM convertir_uni  USING    p_matnr
+                    CHANGING p_verme
+                             p_meins.
+
+  DATA ls_mlgn TYPE mlgn.
+  DATA l_menge_in TYPE bstmg.
+  DATA l_menge_out TYPE bstmg.
+
+  l_menge_in = p_verme.
+  CLEAR l_menge_out.
+
+  SELECT SINGLE * INTO CORRESPONDING FIELDS OF ls_mlgn
+    FROM mlgn
+    WHERE  matnr = p_matnr AND
+  lgnum = p_lgnum.
+
+  CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+    EXPORTING
+      i_matnr              = p_matnr
+      i_in_me              = p_meins
+      i_out_me             = ls_mlgn-lvsme
+      i_menge              = l_menge_in
+    IMPORTING
+      e_menge              = l_menge_out
+    EXCEPTIONS
+      error_in_application = 1
+      error                = 2
+      OTHERS               = 3.
+  IF sy-subrc IS INITIAL.
+    p_verme = l_menge_out.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  RELLENO_DATOS_INTERFACE_ADOBE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_ETI  text
+*----------------------------------------------------------------------*
+FORM relleno_datos_etiqueta_mp USING ls_lqua TYPE lqua
+                                         ls_lein TYPE lein
+                                         ls_mara TYPE mara
+                                         lv_form TYPE na_fname
+                                    lv_vengo_inter_consumo  TYPE xfeld
+                                    maquina TYPE zmaq_nemesis
+                                   CHANGING p_eti TYPE zswm0001
+                                            p_tddest TYPE rspopname.
+
+*************** Inicio Kyvor - DFelix 29.07.2019 >> print form with LGNUM 201
+  "DATA:  ls_eti201 TYPE  zswm0001201.
+************ Fim Kyvor - DFelix 29.07.2019 >> print form with LGNUM 201
+
+
+  DATA: lv_menge_out       TYPE ekpo-menge,
+        lv_object          TYPE objnum,
+        lt_object_data     TYPE TABLE OF clobjdat,
+        lv_fecha_c(10)     TYPE c,
+        lv_fm_name         TYPE        rs38l_fnam,
+        ls_fp_outputparams TYPE  sfpoutputparams.
+
+  DATA: lv_w_cx_root      TYPE REF TO cx_root,
+        lv_mesg           TYPE        string,
+        lv_interface_type TYPE        fpinterfacetype,
+        lv_fp_docparams   TYPE        sfpdocparams,
+        ls_pdf_file       TYPE fpformoutput,
+        lt_t_class        TYPE TABLE OF sclass.
+
+  CLEAR p_eti.
+
+  "  1) Unidad de Almacén (UA)  ************************
+  p_eti-lenum = ls_lein-lenum.
+
+  "  2) Papel  ************************
+  " Recupera nº almacen usuario de R.F.
+  SELECT SINGLE lgnum, bname
+    FROM lrf_wkqu
+    WHERE bname = @sy-uname AND
+           statu = @abap_true
+    INTO (@DATA(lv_lgnum_usuario_rf)
+         ,@DATA(lv_usuario)).
+
+  SELECT SINGLE wgbez60
+    FROM t023t
+    WHERE matkl = @ls_mara-matkl
+      AND spras = @sy-langu
+    INTO @DATA(lv_wgbez60).
+
+
+  IF sy-subrc NE 0.
+    SELECT SINGLE wgbez60
+      FROM t023t
+      WHERE matkl = @ls_mara-matkl
+      AND spras = 'S'
+      INTO @lv_wgbez60.
+  ENDIF.
+
+* ini - cvivo - 52926 26.03.2020 Lote proveedor en UA para mat.sin lote
+  IF ls_lqua-letyp EQ 'GR'.
+    p_eti-licha = ls_lqua-zeugn.
+  ENDIF.
+* fin - cvivo - 52926 26.03.2020 Lote proveedor en UA para mat.sin lote
+
+
+* Concatena (MAKTL) con MAKTX en el campo Papel.
+  CONCATENATE '('ls_mara-matkl')' INTO p_eti-matnr.
+  CONCATENATE p_eti-matnr lv_wgbez60 INTO p_eti-matnr SEPARATED BY space.
+
+  "  3) Gramaje  ************************
+
+  p_eti-zzgramaje = ls_mara-zzgramaje.
+  SHIFT p_eti-zzgramaje LEFT DELETING LEADING '0'.
+
+  "  4) Ancho  ************************
+  p_eti-zzancho = ls_mara-zzancho.
+  SHIFT p_eti-zzancho LEFT DELETING LEADING '0'.
+
+
+  "  5) Largo  ************************
+  p_eti-zzlargo = ls_mara-zzlargo.
+  SHIFT p_eti-zzlargo LEFT DELETING LEADING '0'.
+
+  "  6) Kilos  ************************
+
+  p_eti-gesme = ceil( ls_lqua-gesme ).
+
+
+  "  7) Metros/Hojas  ************************
+  SELECT meinh
+    INTO TABLE @DATA(lt_meinh)
+    FROM marm
+    WHERE matnr = @ls_lqua-matnr.
+
+* Texto para el campo Metros/Hojas dependiendo
+* si es M o UN el campo MEINH.
+
+  READ TABLE lt_meinh INTO DATA(ls_meinh) WITH KEY
+      meinh = 'M'.
+  IF sy-subrc EQ 0.
+    p_eti-unidad = text-t01.
+  ELSE.
+    READ TABLE lt_meinh INTO ls_meinh WITH KEY
+      meinh = 'ST'.
+    p_eti-unidad = text-t02.
+  ENDIF.
+
+
+* Convierte la cantidad a mostrar en el campo Metros/Hojas.
+  CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+    EXPORTING
+      i_matnr              = ls_lqua-matnr
+      i_in_me              = ls_lqua-meins
+      i_out_me             = ls_meinh-meinh
+      i_menge              = ls_lqua-gesme
+    IMPORTING
+      e_menge              = lv_menge_out
+    EXCEPTIONS
+      error_in_application = 1
+      error                = 2
+      OTHERS               = 3.
+  IF sy-subrc IS INITIAL.
+
+    p_eti-menge = ceil( lv_menge_out ).
+*      SHIFT p_eti-menge LEFT DELETING LEADING '0'.
+  ELSEIF sy-subrc <> 0.
+*      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+
+
+  "  8) Proveedor  ************************
+  DATA: lv_lifnr TYPE lifnr.
+
+  IF ls_lqua-charg IS NOT INITIAL.
+    SELECT SINGLE lifnr licha
+      FROM mch1
+      INTO (lv_lifnr, p_eti-licha)
+      WHERE matnr = ls_lqua-matnr AND
+            charg = ls_lqua-charg.
+  ELSE.
+    SELECT SINGLE lifnr FROM mseg
+      INTO lv_lifnr
+    WHERE mblnr EQ ls_lqua-wenum
+      AND matnr EQ ls_lqua-matnr
+      AND werks EQ ls_lqua-werks.
+  ENDIF.
+
+  IF sy-subrc EQ 0.
+    SELECT SINGLE  name1
+      FROM lfa1
+      INTO p_eti-name
+      WHERE lifnr = lv_lifnr.
+  ENDIF.
+
+
+  "  9) Entrada  ************************
+
+* Si no vengo de consumos.
+  IF lv_vengo_inter_consumo IS INITIAL.
+
+    SELECT usuario, fecha, hora, lgnum, operario
+      INTO TABLE @DATA(lt_zwm_rf_login)
+      FROM zwm_rf_login
+      WHERE fecha = @ls_lqua-wdatu
+        AND usuario = @lv_usuario
+        AND lgnum = @lv_lgnum_usuario_rf.
+
+    IF sy-subrc EQ 0.
+      SORT lt_zwm_rf_login BY fecha DESCENDING hora DESCENDING.
+      READ TABLE lt_zwm_rf_login INTO DATA(ls_zwm_rf_login) INDEX 1.
+
+      SELECT SINGLE nombre
+        FROM zwm_rf_oper
+        INTO @DATA(lv_nombre_operario)
+        WHERE lgnum = @lv_lgnum_usuario_rf AND
+              operario = @ls_zwm_rf_login-operario.
+    ELSE.
+      SELECT SINGLE name_textc FROM user_addr " cvivo - 02.10.2019 - WM Pacs
+        WHERE bname EQ @g_usnam
+        INTO @DATA(name_text).
+
+      WRITE name_text TO lv_nombre_operario.
+    ENDIF.
+
+    CONCATENATE ls_lqua-wdatu+6(2)'/'ls_lqua-wdatu+4(2)'/'ls_lqua-wdatu+0(4) INTO lv_fecha_c.
+*    SHIFT ls_zwm_rf_login-operario LEFT DELETING LEADING '0'.
+    WRITE ls_zwm_rf_login-operario TO ls_zwm_rf_login-operario NO-ZERO.
+    CONDENSE ls_zwm_rf_login-operario.
+    CONCATENATE lv_fecha_c '-' ls_zwm_rf_login-operario
+    lv_nombre_operario INTO p_eti-entrada SEPARATED BY space.
+
+  ELSE. "" SI vengo de consumo.
+
+    IF lv_vengo_inter_consumo EQ 'A'. " cvivo - 58678 - Viene de alta UA UI5
+      SELECT cod_etiqueta, cod_operario, fecha, hora
+      INTO TABLE @DATA(lt_zwm_intf_bhs_red)
+            FROM zwm_intf_bhs
+            WHERE ua_producida IN @s_lenum
+              AND lgnum EQ @p_lgnum.
+    ELSE.
+* Recupera código operario y nombre.
+      SELECT cod_etiqueta cod_operario fecha hora
+      INTO TABLE lt_zwm_intf_bhs_red
+      FROM zwm_intf_bhs
+      WHERE cod_etiqueta IN s_lenum
+        AND lgnum EQ p_lgnum.
+    ENDIF.
+
+    IF sy-subrc = 0.
+      SORT lt_zwm_intf_bhs_red BY fecha DESCENDING hora DESCENDING.
+
+      READ TABLE lt_zwm_intf_bhs_red INTO DATA(ls_zwm_intf_bhs_red)
+      INDEX 1.
+
+      IF sy-subrc = 0.
+        SELECT SINGLE * INTO @DATA(ls_zwm_rf_oper)
+        FROM zwm_rf_oper
+        WHERE lgnum = @p_lgnum AND operario = @ls_zwm_intf_bhs_red-cod_operario.
+
+        IF sy-subrc NE 0.
+          SELECT SINGLE name_textc FROM user_addr " cvivo - 02.10.2019 - WM Pacs
+            INTO name_text
+            WHERE bname EQ g_usnam.
+
+          WRITE name_text TO ls_zwm_rf_oper-nombre.
+        ENDIF.
+
+        CONCATENATE ls_lqua-wdatu+6(2)'/'ls_lqua-wdatu+4(2)'/'ls_lqua-wdatu+0(4) INTO lv_fecha_c.
+*        SHIFT ls_zwm_rf_oper LEFT DELETING LEADING '0'.
+        WRITE ls_zwm_rf_oper-operario TO ls_zwm_rf_oper-operario NO-ZERO.
+        CONDENSE ls_zwm_rf_oper-operario.
+        CONCATENATE lv_fecha_c '-' ls_zwm_rf_oper-operario
+        ls_zwm_rf_oper-nombre INTO p_eti-entrada SEPARATED BY space.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+*  " cvivo - 61969 - En algunos casos generar un 0 a la izquierda en la etiqueta
+  SELECT SINGLE @abap_true FROM tvarvc
+  WHERE name EQ 'ZWM_ETIQ_CERO_IZQ'
+  AND low EQ @lv_lifnr
+  AND high EQ @p_lgnum
+  INTO @DATA(result).
+
+  IF sy-subrc EQ 0.
+    WRITE p_eti-lenum TO p_eti-etiqueta NO-ZERO.
+    CONCATENATE '0' p_eti-etiqueta INTO p_eti-etiqueta.
+  ELSE.
+    WRITE p_eti-lenum TO p_eti-etiqueta NO-ZERO.
+  ENDIF.
+
+
+
+  "  10) Observaciones  ************************
+  IF ls_lqua-charg IS NOT INITIAL.
+    CONCATENATE ls_lqua-matnr ls_lqua-charg INTO lv_object.
+    CALL FUNCTION 'CLAF_CLASSIFICATION_OF_OBJECTS'
+      EXPORTING
+        class              = text-tbb
+        classtext          = 'X'
+        classtype          = '023'
+        clint              = 0000000000
+        features           = 'X'
+        language           = sy-langu
+        object             = lv_object
+        objecttable        = text-tot
+        initial_charact    = 'X'
+        change_service_clf = 'X'
+        inherited_char     = ' '
+        change_number      = ' '
+      TABLES
+        t_class            = lt_t_class
+        t_objectdata       = lt_object_data
+      EXCEPTIONS
+        no_classification  = 1
+        no_classtypes      = 2
+        invalid_class_type = 3
+        OTHERS             = 4.
+    IF sy-subrc = 0.
+      SORT lt_object_data BY atnam DESCENDING.
+
+      READ TABLE lt_object_data INTO DATA(ls_object_data)
+      WITH KEY atnam = text-ta1.
+      IF ls_object_data-ausp1+0(2) EQ 'DE' AND
+             ls_object_data-ausp1+9(1) EQ 'R' AND
+             sy-subrc EQ 0.
+        p_eti-observaciones = text-t03.
+
+
+        READ TABLE lt_object_data INTO ls_object_data
+        WITH KEY atnam = text-ta2.
+        IF ( ls_object_data-ausp1 IS NOT INITIAL
+          AND ls_object_data-ausp1 NE '?') AND
+           sy-subrc EQ 0.
+          p_eti-observaciones1 = ls_object_data-ausp1.
+        ELSE.
+          READ TABLE lt_object_data INTO ls_object_data
+          WITH KEY atnam = text-do1.
+          IF sy-subrc EQ 0.
+            p_eti-observaciones1 = ls_object_data-ausp1.
+          ENDIF.
+
+          READ TABLE lt_object_data INTO ls_object_data
+          WITH KEY atnam = text-do2.
+          IF sy-subrc EQ 0.
+            p_eti-observaciones2 = ls_object_data-ausp1.
+          ENDIF.
+
+          READ TABLE lt_object_data INTO ls_object_data
+          WITH KEY atnam = text-do3.
+          IF sy-subrc EQ 0.
+            p_eti-observaciones3 = ls_object_data-ausp1.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  "  11) Descripción ************************
+  IF ls_lqua-vbeln IS NOT INITIAL.
+    SELECT SINGLE arktx
+      FROM lips
+      INTO p_eti-descripcion
+      WHERE vbeln = ls_lqua-vbeln
+        AND matnr = ls_lqua-matnr
+        AND charg = ls_lqua-charg.
+  ELSE.
+    p_eti-descripcion =   g_texto_material.
+  ENDIF.
+
+  WRITE ls_lqua-matnr TO p_eti-text_material NO-ZERO.
+  CONCATENATE '(' p_eti-text_material ')' INTO p_eti-text_material.
+  CONCATENATE p_eti-text_material p_eti-descripcion INTO p_eti-text_material SEPARATED BY space.
+
+
+************ Inicio Kyvor - DFelix 29.07.2019 >> print form with LGNUM 201
+  " 12 - Diametro
+  IF ls_lqua-letyp EQ 'BB'. " cvivo - Diámetro aplica sólo a bobinas
+    PERFORM get_diametro
+    USING ls_lqua
+    CHANGING p_eti-zdiametro.
+  ENDIF.
+***************Fim Kyvor - DFelix 29.07.2019 >> print form with LGNUM 201
+
+  " 13) Cantidad en texto
+  IF ls_lqua-gesme GT 0. " reimprimir
+    sy-tabix = frac( ls_lqua-gesme ).
+    IF sy-tabix GT 0.
+      WRITE ls_lqua-gesme TO p_eti-text_cantidad LEFT-JUSTIFIED DECIMALS 1.
+    ELSE.
+      WRITE ls_lqua-gesme TO p_eti-text_cantidad LEFT-JUSTIFIED DECIMALS 0.
+    ENDIF.
+  ELSE. " imprimir
+    sy-tabix = frac( ls_lqua-einme ).
+    IF sy-tabix GT 0.
+      WRITE ls_lqua-einme TO p_eti-text_cantidad LEFT-JUSTIFIED DECIMALS 1.
+    ELSE.
+      WRITE ls_lqua-einme TO p_eti-text_cantidad LEFT-JUSTIFIED DECIMALS 0.
+    ENDIF.
+  ENDIF.
+
+  CONCATENATE p_eti-text_cantidad ls_lqua-meins INTO p_eti-text_cantidad SEPARATED BY space.
+
+  " 14) Lote
+  p_eti-charg = ls_lqua-charg.
+
+* ini 23.12.2019 - cvivo - 53744 Gestión FSC papel
+  " Si el papel está certificado FSC Mix, lo informamos en etiqueta
+  SELECT * FROM mseg
+    INTO TABLE @DATA(t_101)
+    WHERE charg EQ @ls_lqua-charg
+      AND bwart EQ '101'
+      AND werks EQ @ls_lqua-werks
+      AND vgart_mkpf EQ 'WE'
+    ORDER BY mblnr DESCENDING.
+
+  READ TABLE t_101 INTO DATA(ls_101) INDEX 1. "cogemos el último doc. por si hubiera anulaciones
+  IF sy-subrc EQ 0.
+    SELECT SINGLE * FROM ekpo
+      INTO @DATA(ls_ekpo)
+      WHERE ebeln EQ @ls_101-ebeln
+        AND ebelp EQ @ls_101-ebelp.
+
+    IF sy-subrc EQ 0.
+      IF ls_ekpo-zzdecla_fsc EQ 'M' OR ls_ekpo-zzdecla_fsc EQ 'MC'.
+        p_eti-fsc = 'FSC Mix'.
+      ELSEIF ls_ekpo-zzdecla_fsc EQ 'R' OR ls_ekpo-zzdecla_fsc EQ 'RC'.
+        p_eti-fsc = 'FSC Recycled'.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+* fin 23.12.2019 - cvivo - 53744 Gestión FSC papel
+
+
+******************************************
+* IMPRESION ******************************
+  ls_fp_outputparams-device = 'PRINTER'.
+  ls_fp_outputparams-getpdf = ' '.
+
+
+*   NAC -> Dependiendo desde donde se llama a este programa, se modifica los
+* siguientes campos: Si se llama desde RF se aceptan los datos recuperados
+* en la select a la tabla ZWF_RF_PARAM y sino, se fijan los campos.
+
+  IF sy-tcode NE 'ZWM2003' AND
+    sy-tcode NE 'SE38'.
+    ls_fp_outputparams-nodialog = 'X'.
+  ELSE.
+    IF p_tddest IS INITIAL.
+      ls_fp_outputparams-nodialog = ' '.
+    ELSE.
+      ls_fp_outputparams-nodialog = 'X'.
+    ENDIF.
+
+  ENDIF.
+
+  ls_fp_outputparams-reqnew = 'X'.
+  ls_fp_outputparams-reqimm = 'X'.
+* Destino impresora que se recupera de la tabla ZWM_PARAM.
+  ls_fp_outputparams-dest =  p_tddest.
+
+
+* open form
+  CALL FUNCTION 'FP_JOB_OPEN'
+    CHANGING
+      ie_outputparams = ls_fp_outputparams
+    EXCEPTIONS
+      cancel          = 1
+      usage_error     = 2
+      system_error    = 3
+      internal_error  = 4
+      OTHERS          = 5.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  TRY.
+      p_tddest = ls_fp_outputparams-dest.
+* Function to find the FM name.
+      CALL FUNCTION 'FP_FUNCTION_MODULE_NAME'
+        EXPORTING
+          i_name           = lv_form
+        IMPORTING
+          e_funcname       = lv_fm_name
+          e_interface_type = lv_interface_type.
+
+    CATCH cx_root INTO lv_w_cx_root.
+      lv_mesg = lv_w_cx_root->get_text( ).
+      MESSAGE lv_mesg TYPE 'E'.
+
+  ENDTRY.
+  SET COUNTRY 'ES'.
+
+
+
+  lv_fp_docparams-langu     = sy-langu.
+  lv_fp_docparams-country   = 'ES'.
+
+
+  CALL FUNCTION lv_fm_name
+    EXPORTING
+      /1bcdwb/docparams  = lv_fp_docparams
+      ls_eti             = p_eti
+    IMPORTING                                             "EHP5
+      /1bcdwb/formoutput = ls_pdf_file                    "EHP5
+    EXCEPTIONS
+      usage_error        = 1
+      system_error       = 2
+      internal_error     = 3
+      OTHERS             = 4.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+  CALL FUNCTION 'FP_JOB_CLOSE'
+    EXCEPTIONS
+      usage_error    = 1
+      system_error   = 2
+      internal_error = 3
+      OTHERS         = 4.
+
+  IF sy-subrc EQ 0.
+    MESSAGE text-iok TYPE 'S'.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  GET_DIAMETRO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_ETI201_ZDIAMETRO  text
+*----------------------------------------------------------------------*
+FORM get_diametro  USING is_lqua STRUCTURE lqua CHANGING p_diametro.
+  CONSTANTS: gc_meins_dia TYPE marm-meinh VALUE 'DIA'.
+  DATA lv_diametro TYPE bstmg.
+
+  CLEAR p_diametro.
+
+  IF is_lqua-gesme GT 0. " cvivo - Error división por 0 en mat.aux
+*    zcl_wm_nt_generic=>conv_mat_diametro(
+*      EXPORTING
+*        iv_matnr          = is_lqua-matnr    " Número de material
+*        iv_qty            = is_lqua-gesme    " Cantidad de pedido
+*        iv_meins          = is_lqua-meins    " DIA/KG
+*        iv_dest_meins     =  zcl_wm_nt_generic=>gc_meins_dia  " Unidad de medida base
+*        iv_werks          = is_lqua-werks
+*      RECEIVING
+*        rv_qty            = lv_diametro    " Cantidad de pedido
+*      EXCEPTIONS
+*        um_no_valid       = 1
+*        missing_constants = 2
+*        missing_matnr     = 3
+*        no_base_calc      = 4
+*        OTHERS            = 5
+*    ).
+
+    zcl_wm_nt_generic=>calc_diam_con_kg(
+      EXPORTING
+        iv_matnr          = is_lqua-matnr    " Número de material
+        iv_werks          =  is_lqua-werks   " Centro
+        iv_kg             = is_lqua-gesme    " Cantidad en kilogramos
+      IMPORTING
+        ev_dia            = lv_diametro    " Cantidad en diámetro (cm)
+      EXCEPTIONS
+        um_no_valid       = 1
+        missing_constants = 2
+        missing_matnr     = 3
+        OTHERS            = 4
+    ).
+
+  ENDIF.
+
+  CHECK sy-subrc = 0 AND lv_diametro IS NOT INITIAL.
+  p_diametro = CONV int4( lv_diametro ).
+
+ENDFORM.

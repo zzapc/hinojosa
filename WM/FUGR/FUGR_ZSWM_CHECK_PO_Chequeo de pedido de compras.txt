@@ -1,0 +1,687 @@
+FUNCTION zswm_check_po.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(EBELN) TYPE  BARCODE
+*"     VALUE(EBELP) TYPE  EBELP OPTIONAL
+*"     VALUE(TKNUM) TYPE  TKNUM OPTIONAL
+*"     VALUE(TCODE) TYPE  TCODE
+*"     VALUE(UNAME) TYPE  SY-UNAME DEFAULT SY-UNAME
+*"  EXPORTING
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_TT
+*"     VALUE(DATA_DELIVERY) TYPE  ZSWM_CHECK_PO_UI5_STR
+*"     VALUE(DATA_OF) TYPE  ZSWM_CHECK_OFS_UI5_STR
+*"----------------------------------------------------------------------
+  DATA fname TYPE rs38l_fnam VALUE 'ZSWM_CHECK_PO'.
+  PERFORM break USING fname.
+  DATA: r_entrega_posiciones TYPE RANGE OF vbeln_vl.
+
+  DATA: ebeln_aux         TYPE ebeln,
+        data_user         TYPE  zswm_data_ui5_eeeoo_str,
+        r_funcionalidades TYPE  zswm_data_ui5_func_str,
+        r_ebelp           TYPE RANGE OF ebelp.
+
+  CLEAR: error, tt_log[], data_delivery, data_delivery-tt_bultos[],
+         data_delivery_total, data_delivery_total-tt_bultos[],
+         data_of. " add jtm 01.07.2022
+
+  CALL FUNCTION 'ZSWM_GET_DATA_USER_UI5'
+    EXPORTING
+      uname      = uname
+      statu      = 'X'
+      no_gen_log = abap_true
+    IMPORTING
+      data_user  = data_user.
+
+  CASE tcode.
+    WHEN 'ZWM_RF_UI5_ENT_006'. "--------------------------------------->Entrada subcontratación Pedido
+      CHECK ebeln IS NOT INITIAL.
+      WHILE ebeln+0(1) EQ space.
+        ebeln = ebeln+1.
+      ENDWHILE.
+      IF NOT  tknum CO '0123456789 '.
+        CLEAR tknum.
+      ENDIF.
+
+      PERFORM es_pedido_sub_delivery USING ebeln data_user CHANGING data_of error tt_log.
+      CHECK error IS INITIAL.
+      MOVE-CORRESPONDING data_of TO data_delivery.
+
+      IF ebelp IS NOT INITIAL.
+        r_ebelp = VALUE #( ( sign = 'I' option = 'EQ' low = ebelp ) ).
+      ENDIF.
+
+      SELECT a~ebeln, a~ebelp, ( a~menge - c~wemng )  AS menge, a~matnr, b~maktx, c~charg, 0 AS menge_pick, a~meins FROM ekpo AS a
+        INNER JOIN makt AS b ON b~matnr = a~matnr AND b~spras = @sy-langu
+        LEFT JOIN eket AS c ON c~ebeln = a~ebeln AND c~ebelp = a~ebelp
+        INTO TABLE @DATA(lt_posiciones)
+        WHERE a~ebeln = @data_of-ebeln
+        AND a~ebelp IN @r_ebelp
+        AND a~loekz = @space
+        ORDER BY a~ebeln, a~ebelp.
+      IF sy-subrc = 0.
+        DELETE lt_posiciones WHERE menge = 0.
+        MOVE-CORRESPONDING lt_posiciones TO  data_delivery-tt_pedidos.
+      ENDIF.
+
+    WHEN 'ZWM_RF_UI5_ENT_005'. "--------------------------------------->Entrada subcontratación
+      CHECK ebeln IS NOT INITIAL.
+      WHILE ebeln+0(1) EQ space.
+        ebeln = ebeln+1.
+      ENDWHILE.
+      PERFORM es_pedido_of_delivery USING ebeln data_user CHANGING data_of error tt_log.
+      data_of-barcode = ebeln.  " del jtm 19.10.2022
+
+*   fin de add jtm subcontratación
+    WHEN 'ZWM_RF_UI5_ENT_001'. "--------------------------------------->Entrada plancha grupo
+      CHECK ebeln IS NOT INITIAL.
+*     add jtm 14.09.2022 cuando en entrada plancha grupo se mete la entrada en el campo TKNUM aparece relleno con el literal "undefined"
+      IF NOT  tknum CO '0123456789 '.
+        CLEAR tknum.
+      ENDIF.
+*     fin de add jtm 14.09.2022
+      WHILE ebeln+0(1) EQ space.
+        ebeln = ebeln+1.
+      ENDWHILE.
+      ebeln_aux = ebeln+0(10).
+      ebeln_aux = |{ ebeln_aux ALPHA = IN }|.
+
+*    Es una entrega???
+      SELECT SINGLE * INTO @DATA(r_likp) FROM likp WHERE vbeln EQ @ebeln_aux.
+      IF sy-subrc EQ 0.
+        vbeln_po = r_likp-vbeln.
+        CASE r_likp-vbtyp.
+          WHEN 'J'.
+            MOVE r_likp-vbeln TO data_delivery-vbeln_od.
+            PERFORM get_delivery USING 'X' ' ' data_delivery-vbeln_od CHANGING data_delivery-vbeln_id data_delivery-ebeln error tt_log.
+          WHEN '7'.
+            MOVE r_likp-vbeln TO data_delivery-vbeln_id.
+            PERFORM get_delivery USING ' ' 'X' data_delivery-vbeln_id CHANGING data_delivery-vbeln_od data_delivery-ebeln error tt_log.
+          WHEN OTHERS.
+            MOVE abap_true TO error.
+*              El documento & no es un tipo de entrega esperada.
+            PERFORM mensaje USING 'E' 'ZSWM_UI5' '027' ebeln_aux space space space CHANGING tt_log[].
+        ENDCASE.
+*       add jtm 26.10.2022
+        IF data_delivery-vbeln_id IS NOT INITIAL AND error NE abap_true.
+          SELECT SINGLE lgnum INTO @DATA(lgnum_id) FROM likp WHERE vbeln EQ @data_delivery-vbeln_id.
+          IF sy-subrc EQ 0 AND lgnum_id IS INITIAL OR lgnum_id NE data_user-lgnum.
+*              Entrega entrante & para número de almacén &. (estamos en &)
+            PERFORM mensaje USING 'E' 'ZSWM_UI5' '185' data_delivery-vbeln_id lgnum_id  data_user-lgnum space CHANGING tt_log[].
+            MOVE abap_true TO error.
+          ELSE.
+*            add jtm 27.03.2023 JTM AMPLWM002 Ubicar entradas RF
+            DELETE FROM zswm_ui5_nlpla WHERE lgnum EQ lgnum_id
+                                         AND vbeln EQ data_delivery-vbeln_id.
+            COMMIT WORK AND WAIT.
+*            fin de add jtm 27.03.2023 JTM AMPLWM002 Ubicar entradas RF
+          ENDIF.
+        ENDIF.
+*       fin de add jtm 26.10.2022
+      ELSE.
+*       Es un pedido??
+        SELECT SINGLE * INTO @DATA(r_ekko) FROM ekko WHERE ebeln EQ @ebeln_aux.
+        IF sy-subrc NE 0.
+          MOVE abap_true TO error.
+*              El documento & no es un tipo de entrega esperada.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '027' ebeln_aux space space space CHANGING tt_log[].
+
+        ELSEIF r_ekko-reswk IS INITIAL.
+          MOVE abap_true TO error.
+*         El documento & no es un traslado
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '009' ebeln_aux space space space CHANGING tt_log[].
+        ELSE.
+          SELECT * INTO TABLE @DATA(tt_ekbe) FROM ekbe WHERE ebeln EQ @ebeln
+                                                         AND vgabe EQ '8'.
+          SORT tt_ekbe BY belnr.
+          DELETE ADJACENT DUPLICATES FROM tt_ekbe COMPARING belnr.
+          DESCRIBE TABLE tt_ekbe LINES DATA(n_entregas).
+          IF n_entregas > 1 AND vbeln_po IS NOT INITIAL.
+            DELETE tt_ekbe WHERE belnr NE vbeln_po.
+            DESCRIBE TABLE tt_ekbe LINES DATA(n_entregas_filtro).
+            IF n_entregas_filtro EQ 1. n_entregas = 1. ENDIF.
+          ENDIF.
+          CASE n_entregas.
+            WHEN 0.
+              MOVE abap_true TO error.
+*            El documento & no tiene entregas generadas
+              PERFORM mensaje USING 'E' 'ZSWM_UI5' '029' ebeln_aux space space space CHANGING tt_log[].
+
+            WHEN 1.
+              READ TABLE tt_ekbe INTO DATA(rt_ekbe) INDEX 1.
+              MOVE rt_ekbe-belnr TO data_delivery-vbeln_od.
+              PERFORM get_delivery USING 'X' ' ' data_delivery-vbeln_od CHANGING data_delivery-vbeln_id data_delivery-ebeln error tt_log.
+
+            WHEN OTHERS.
+              MOVE abap_true TO error.
+*            El documento & tiene más de una entrega asociada
+              PERFORM mensaje USING 'E' 'ZSWM_UI5' '030' ebeln_aux space space space CHANGING tt_log[].
+
+          ENDCASE.
+        ENDIF.
+      ENDIF.
+      IF error NE abap_true.
+        IF tknum IS NOT INITIAL.
+          data_delivery-tknum = tknum.
+          SELECT COUNT( * ) FROM vttp WHERE tknum EQ tknum
+                                        AND ( vbeln EQ data_delivery-vbeln_id
+                                           OR vbeln EQ data_delivery-vbeln_od ).
+          IF sy-subrc NE 0.
+*             El documento & no pertenece al transporte &
+            PERFORM mensaje USING 'E' 'ZSWM_UI5' '031' ebeln_aux tknum space space CHANGING tt_log[].
+            MOVE abap_true TO error.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+      IF error NE abap_true.
+        CALL FUNCTION 'ZSWM_CHECK_DELIVERY'
+          EXPORTING
+            vbeln     = data_delivery-vbeln_id
+            ebeln     = data_delivery-ebeln
+            data_user = data_user
+            tcode     = tcode
+          IMPORTING
+            error     = error
+            tt_log    = tt_log.
+      ENDIF.
+      IF error NE abap_true.
+        SELECT * INTO TABLE @DATA(tt_lips) FROM lips WHERE vbeln EQ @data_delivery-vbeln_id.
+        DELETE tt_lips WHERE charg IS INITIAL.
+        LOOP AT tt_lips INTO DATA(rt_lips).
+          ADD  rt_lips-lfimg TO data_delivery-lfimg.
+          MOVE rt_lips-vrkme TO data_delivery-vrkme.
+        ENDLOOP.
+        SELECT SINGLE lifnr reswk INTO (data_delivery-lifnr, data_delivery-reswk) FROM ekko WHERE ebeln EQ data_delivery-ebeln.
+        IF data_delivery-lifnr IS INITIAL.
+          SELECT SINGLE * INTO @DATA(t001w) FROM t001w WHERE werks EQ @data_delivery-reswk.
+          MOVE t001w-lifnr TO data_delivery-lifnr.
+        ENDIF.
+
+        SELECT SINGLE name1 INTO data_delivery-name1 FROM lfa1 WHERE lifnr EQ data_delivery-lifnr.
+*        SELECT SINGLE anzpk INTO data_delivery-anzpk_total FROM likp WHERE vbeln EQ data_delivery-vbeln_id.
+        PERFORM get_bultos USING data_delivery-vbeln_id CHANGING data_delivery-tt_bultos data_delivery-lfimg_total data_delivery-vrkme.
+        CLEAR data_delivery-lfimg. " add jtm 20.10.2022
+        DESCRIBE TABLE data_delivery-tt_bultos LINES data_delivery-anzpk_total.
+      ENDIF.
+    WHEN 'ZWM_RF_UI5_ENT_007'. "--------------------------------------->Entregas desde Centro de Montaje. Adaptamos el 001-007
+      CHECK ebeln IS NOT INITIAL.
+
+      "Cuando en entrada plancha grupo se mete la entrada en el campo TKNUM aparece relleno con el literal "undefined"
+      IF NOT tknum CO '0123456789 '.
+        CLEAR tknum.
+      ENDIF.
+
+      WHILE ebeln+0(1) EQ space.
+        ebeln = ebeln+1.
+      ENDWHILE.
+
+      CLEAR ebeln_aux. ebeln_aux = ebeln+0(10).
+      ebeln_aux = |{ ebeln_aux ALPHA = IN }|.
+
+      CLEAR r_likp. SELECT SINGLE * INTO r_likp FROM likp WHERE vbeln EQ ebeln_aux.
+      IF sy-subrc EQ 0. "Es una entrega
+
+        CASE r_likp-vbtyp.
+          WHEN 'J'. "Entrega
+            MOVE r_likp-vbeln TO data_delivery-vbeln_od. "Entrega de salida
+            SELECT SINGLE ebeln INTO data_delivery-ebeln FROM ekbe WHERE belnr EQ data_delivery-vbeln_od. "Pedido
+            gv_entrega = ebeln_aux.
+
+          WHEN OTHERS. "El documento & no es un tipo de entrega esperada.
+            MOVE abap_true TO error.
+            PERFORM mensaje USING 'E' 'ZSWM_UI5' '027' ebeln_aux space space space CHANGING tt_log[].
+        ENDCASE.
+      ELSE.
+        CLEAR r_ekko. SELECT SINGLE * INTO r_ekko FROM ekko WHERE ebeln EQ ebeln_aux.
+        IF sy-subrc NE 0. "El documento & no es un tipo de entrega esperada.
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '027' ebeln_aux space space space CHANGING tt_log[].
+        ELSEIF r_ekko-reswk IS INITIAL. "El documento & no es un traslado
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '009' ebeln_aux space space space CHANGING tt_log[].
+        ELSE. "Es un pedido
+
+          data_delivery-ebeln = r_ekko-ebeln.
+
+          IF gv_entrega IS NOT INITIAL.
+            r_entrega_posiciones = VALUE #( ( sign = 'I' option = 'EQ' low = gv_entrega ) ).
+          ENDIF.
+
+          REFRESH tt_ekbe. SELECT * INTO TABLE tt_ekbe FROM ekbe WHERE ebeln EQ r_ekko-ebeln
+                                                                   AND belnr IN r_entrega_posiciones
+                                                                   AND vgabe EQ '8'.
+          SORT tt_ekbe BY belnr.
+          DELETE ADJACENT DUPLICATES FROM tt_ekbe COMPARING belnr.
+          CLEAR n_entregas. DESCRIBE TABLE tt_ekbe LINES n_entregas.
+
+          CASE n_entregas.
+            WHEN 0. "El documento & no tiene entregas generadas
+              MOVE abap_true TO error.
+              PERFORM mensaje USING 'E' 'ZSWM_UI5' '029' ebeln_aux space space space CHANGING tt_log[].
+            WHEN 1.
+              CLEAR rt_ekbe. READ TABLE tt_ekbe INTO rt_ekbe INDEX 1.
+              MOVE rt_ekbe-belnr TO data_delivery-vbeln_od.
+            WHEN OTHERS. "El documento & tiene más de una entrega asociada
+              MOVE abap_true TO error.
+              PERFORM mensaje USING 'E' 'ZSWM_UI5' '030' ebeln_aux space space space CHANGING tt_log[].
+          ENDCASE.
+        ENDIF.
+      ENDIF.
+
+      IF error NE abap_true.
+        IF tknum IS NOT INITIAL.
+          data_delivery-tknum = tknum.
+
+          SELECT COUNT( * )
+            FROM vttp
+            WHERE tknum EQ tknum
+              AND ( vbeln EQ data_delivery-vbeln_id OR vbeln EQ data_delivery-vbeln_od ).
+
+          IF sy-subrc NE 0. "El documento & no pertenece al transporte &
+            MOVE abap_true TO error.
+            PERFORM mensaje USING 'E' 'ZSWM_UI5' '031' ebeln_aux tknum space space CHANGING tt_log[].
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      IF error NE abap_true.
+
+        DATA rt_entrega TYPE zst_rf_em_po.
+
+        REFRESH tt_lips.
+
+        SELECT * INTO TABLE tt_lips
+          FROM lips
+          WHERE vbeln EQ data_delivery-vbeln_od.
+
+        IF tt_lips IS NOT INITIAL. "Obtener posiciones borradas / entrega completa / entrega final / bloqueos
+          SELECT ebeln, ebelp, loekz, elikz, eglkz, zzbloq_plan, zzbloq_fabr
+            INTO TABLE @DATA(lt_pedidos)
+            FROM ekpo
+            FOR ALL ENTRIES IN @tt_lips
+            WHERE ebeln EQ @tt_lips-vgbel
+              AND ebelp EQ @tt_lips-vgpos+1(5).
+        ENDIF.
+
+        DELETE tt_lips WHERE charg IS INITIAL.
+        LOOP AT tt_lips INTO rt_lips.
+
+          READ TABLE lt_pedidos INTO DATA(ls_pedido) WITH KEY ebeln = rt_lips-vgbel
+                                                              ebelp = rt_lips-vgpos+1(5).
+          IF sy-subrc EQ 0.
+            IF ls_pedido-loekz IS NOT INITIAL. "Borrada - Se descarta posición
+              CONTINUE.
+            ENDIF.
+
+            IF ls_pedido-elikz EQ abap_true. "Entrega completa - Se descarta posicion
+              CONTINUE.
+            ENDIF.
+
+            IF ls_pedido-eglkz EQ abap_true. "Entrega final - Se descarta posición
+              CONTINUE.
+            ENDIF.
+
+            IF ls_pedido-zzbloq_plan EQ abap_true. "Bloqueo planificación - Se descarta posición
+              CONTINUE.
+            ENDIF.
+
+            IF ls_pedido-zzbloq_fabr EQ abap_true. "Exento Fabricación - Se descarta posición
+              CONTINUE.
+            ENDIF.
+          ENDIF.
+
+          IF data_delivery-vrkme IS INITIAL.
+            MOVE rt_lips-vrkme TO data_delivery-vrkme.
+          ENDIF.
+
+          CLEAR rt_entrega.
+          rt_entrega-ebeln = rt_lips-vgbel.       "Pedido
+          rt_entrega-ebelp = rt_lips-vgpos+1(5).
+          rt_entrega-vbeln = rt_lips-vbeln.       "Entrega salida
+          rt_entrega-posnr = rt_lips-posnr.
+          rt_entrega-matnr = rt_lips-matnr.
+          rt_entrega-maktx = rt_lips-arktx.
+          rt_entrega-charg = rt_lips-charg.
+          rt_entrega-menge = rt_lips-lfimg.
+          rt_entrega-meins = rt_lips-meins.
+          APPEND rt_entrega TO data_delivery-tt_pedidos.
+        ENDLOOP.
+
+        SELECT SINGLE lifnr reswk INTO (data_delivery-lifnr, data_delivery-reswk) FROM ekko WHERE ebeln EQ data_delivery-ebeln.
+        IF data_delivery-lifnr IS INITIAL.
+          SELECT SINGLE lifnr INTO data_delivery-lifnr FROM t001w WHERE werks EQ data_delivery-reswk.
+        ENDIF.
+        SELECT SINGLE name1 INTO data_delivery-name1 FROM lfa1 WHERE lifnr EQ data_delivery-lifnr.
+      ENDIF.
+
+    WHEN OTHERS. ""---------------------------------------> OTROS
+
+      CHECK ebeln IS NOT INITIAL.
+      WHILE ebeln+0(1) EQ space.
+        ebeln = ebeln+1.
+      ENDWHILE.
+
+      ebeln_aux = ebeln+0(10).
+      ebeln_aux = |{ ebeln_aux ALPHA = IN }|.
+
+*     add jtm 14.09.2022 cuando en entrada plancha grupo se mete la entrada en el campo TKNUM aparece relleno con el literal "undefined"
+      IF NOT  tknum CO '0123456789 '.
+        CLEAR tknum.
+      ENDIF. "fin de add jtm 14.09.2022
+
+      SELECT SINGLE * INTO r_ekko FROM ekko WHERE ebeln EQ ebeln_aux.
+
+      DATA(sw_subrc) = sy-subrc.
+      IF sw_subrc NE 0 AND ebeln_aux+0(1) EQ '9'. " etiqueta CARDEDEU
+        DATA r_etiqueta_cliente TYPE zswm_etiqueta_cardedeu_str.
+
+        CALL FUNCTION 'ZSWM_EANDECODE_RF_UI5'
+          EXPORTING
+            tcode              = tcode
+            barcode_in         = ebeln
+            lgnum              = data_user-lgnum
+          IMPORTING
+            error              = error
+            tt_log             = tt_log
+            r_etiqueta_cliente = r_etiqueta_cliente.
+
+        ebeln_aux = r_etiqueta_cliente-ebeln.
+        SELECT SINGLE * INTO r_ekko FROM ekko WHERE ebeln EQ ebeln_aux.
+        sw_subrc = sy-subrc.
+      ENDIF.
+
+      IF sw_subrc NE 0. "Devolución
+        DATA sw_find_doc TYPE flag.
+        PERFORM que_es USING data_user ebeln_aux ebelp tknum tcode CHANGING data_delivery sw_find_doc error tt_log.
+*          PERFORM que_es USING ebeln CHANGING sw_que_es.
+
+        IF sw_find_doc NE abap_true. "El documento & no es un pedido de compra.
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '008' ebeln space space space CHANGING tt_log[].
+        ENDIF.
+      ELSE. "Pedido de compras
+        data_delivery-ebeln = r_ekko-ebeln.
+        data_delivery-lifnr = r_ekko-lifnr.
+        SELECT SINGLE name1 INTO data_delivery-name1 FROM lfa1 WHERE lifnr EQ data_delivery-lifnr.
+*         --------------------------------------------------------------------------------------------*
+*         Rutina copiada de MZ_WM_RF_F01 FORM get_valid_items_from_po
+*         --------------------------------------------------------------------------------------------*
+        DATA: lv_valid_ekes     TYPE boolean.
+*          DATA gt_em_po TYPE TABLE OF zst_rf_em_po.
+        lv_valid_ekes = zcl_wm_rf_func=>check_parameter( EXPORTING iv_func = 'NUEVAS_FUNC_EM_SIN'   " ABA: Nombre de variables en variante
+                                                                   iv_lgnum  =  data_user-lgnum ).  " Núm.almacén/Complejo alm.
+
+        CALL FUNCTION 'ZSWM_GET_PARAM_UI5'
+          EXPORTING
+            data_user         = data_user
+            tcode             = tcode
+            no_gen_log        = abap_true
+          IMPORTING
+            r_param           = data_user-r_param
+            r_funcionalidades = data_user-r_funci.
+
+        SELECT * INTO TABLE @DATA(tt_ekpo) FROM ekpo WHERE ebeln EQ @ebeln_aux.
+        IF ebelp IS NOT INITIAL.
+          DELETE tt_ekpo WHERE ebelp NE ebelp.
+        ENDIF. "ADD jtm 20.09.2022
+
+        SELECT * INTO TABLE @DATA(tt_entregas_entrantes) FROM lips WHERE vgbel EQ @r_ekko-ebeln.
+
+        SORT tt_entregas_entrantes BY vbeln. DELETE ADJACENT DUPLICATES FROM tt_entregas_entrantes COMPARING vbeln.
+        LOOP AT tt_entregas_entrantes INTO DATA(rt_entregas_entrantes).
+
+          SELECT SINGLE wbstk INTO @DATA(wbstk) FROM vbuk WHERE vbeln EQ @rt_entregas_entrantes-vbeln.
+          CHECK sy-subrc EQ 0 AND wbstk NE 'C'.
+
+          "El pedido & tiene una entrega entrante & no contabilziada
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '180' r_ekko-ebeln rt_entregas_entrantes-vbeln space space CHANGING tt_log[].
+        ENDLOOP. "FIN de add jtm 20.09.2022
+
+        IF tt_ekpo[] IS INITIAL AND error NE abap_true. "El documento & no es un pedido de compra.
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '008' ebeln space space space CHANGING tt_log[].
+        ENDIF.
+
+        DELETE tt_ekpo WHERE werks NE data_user-r_param-werks.
+        IF tt_ekpo[] IS INITIAL AND error NE abap_true. "El pedido & no es del centro &
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '035' ebeln_aux data_user-r_param-werks space space CHANGING tt_log[].
+        ENDIF.
+
+        DELETE tt_ekpo WHERE NOT mtart IN data_user-r_param-rr_mtart.
+        IF tt_ekpo[] IS INITIAL AND error NE abap_true. "El pedido & no es de &
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '036' ebeln_aux 'PLANCHA' space space CHANGING tt_log[].
+        ENDIF.
+
+        DELETE tt_ekpo WHERE elikz NE space. "Entrega final
+        DELETE tt_ekpo WHERE erekz NE space. "Factura final
+        IF tt_ekpo[] IS INITIAL AND error NE abap_true. "Pedido & ya recepcionado y/o facturado
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '037' ebeln_aux space space space CHANGING tt_log[].
+        ENDIF.
+
+        DELETE tt_ekpo WHERE loekz NE space. "Borrado
+        IF tt_ekpo[] IS INITIAL AND error NE abap_true. "El pedido & está borrado
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '040' ebeln_aux space space space CHANGING tt_log[].
+        ENDIF.
+
+        DELETE tt_ekpo WHERE bstae NE '0004'. "Control de confirmación EE
+        IF tt_ekpo[] IS INITIAL
+        AND error NE abap_true.
+          MOVE abap_true TO error.
+*            Pedido & sin clave de confirmación de entrega entrante "0004"
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '039' ebeln_aux space space space CHANGING tt_log[].
+        ENDIF.
+
+        DELETE tt_ekpo WHERE lblkz NE space. "Subcontratación
+        IF tt_ekpo[] IS INITIAL AND error NE abap_true. "Pedido & de subcontratación
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '038' ebeln_aux space space space CHANGING tt_log[].
+        ENDIF.
+
+*          PERFORM get_data_po USING tt_ekpo
+
+        DATA: gs_em_po TYPE zst_rf_em_po,
+              lt_ekbe  TYPE TABLE OF ekbe,
+              lt_ekes  TYPE TABLE OF ekes,
+              l_menge  TYPE menge_d,
+              ls_vbfa  TYPE vbfa,
+              ls_ekes  TYPE ekes.
+
+        LOOP AT tt_ekpo INTO DATA(ls_ekpo).
+
+          CLEAR gs_em_po.
+          MOVE-CORRESPONDING ls_ekpo TO gs_em_po.
+
+          " 61764 - recuperar lote de pedido
+          SELECT SINGLE charg INTO gs_em_po-charg
+            FROM eket
+            WHERE ebeln EQ gs_em_po-ebeln
+              AND ebelp EQ gs_em_po-ebelp
+              AND charg NE space.
+
+          gs_em_po-menge_org = ls_ekpo-menge.
+
+          SELECT * INTO TABLE lt_ekbe
+                   FROM ekbe
+                   WHERE ebeln =  ls_ekpo-ebeln  AND
+                         ebelp =  ls_ekpo-ebelp AND
+                       ( bwart = '101' OR
+                         bwart = '102' OR
+                         bwart = '161' ).
+* leemos las confirmaciones del pedido
+          SELECT * INTO TABLE  lt_ekes
+                   FROM ekes
+                   WHERE ebeln = ls_ekpo-ebeln AND
+                         ebelp = ls_ekpo-ebelp AND
+                         vbeln <> space.
+
+          CLEAR l_menge.
+          LOOP AT lt_ekbe INTO DATA(ls_ekbe). "Buscamos en el flujo de documentos a que entrega pertenece
+
+            SELECT SINGLE * INTO ls_vbfa
+                   FROM vbfa
+                   WHERE vbeln = ls_ekbe-belnr AND
+                         posnn = ls_ekbe-buzei AND
+                         vbtyp_n = 'R'.
+
+            IF sy-subrc IS INITIAL.
+              READ TABLE lt_ekes INTO ls_ekes
+                                 WITH KEY vbeln = ls_vbfa-vbelv
+                                          vbelp = ls_vbfa-posnv.
+              IF sy-subrc IS INITIAL.
+*borramos los 101 de las entregas
+                DELETE lt_ekes WHERE vbeln = ls_vbfa-vbelv AND
+                                     vbelp = ls_vbfa-posnv..
+              ENDIF.
+            ENDIF.
+            IF ls_ekbe-bwart = '101'.
+              gs_em_po-menge = gs_em_po-menge - ls_ekbe-menge.
+            ELSE.
+              gs_em_po-menge = gs_em_po-menge + ls_ekbe-menge.
+            ENDIF.
+
+          ENDLOOP.
+* restamos las cantidades de las confirmaciones sin EM, salvo que sea la que estamos tratando
+* o sea una entrega del pedido sin asociar a transporte
+          LOOP AT lt_ekes INTO ls_ekes.
+*      READ TABLE gr_dlv_inb INTO DATA(lr_dlv_inb) WITH KEY low = ls_ekes-vbeln.
+*      IF NOT sy-subrc IS INITIAL.
+* chequeamos si es una entrega sin asociar al transporte
+*        SELECT SINGLE vbeln INTO ls_ekes-vbeln FROM vttp WHERE vbeln = ls_ekes-vbeln.
+*        IF NOT sy-subrc IS INITIAL.
+*          lr_dlv_inb = 'IEQ'.
+*          lr_dlv_inb-low = ls_ekes-vbeln.
+*          COLLECT lr_dlv_inb INTO gr_dlv_inb.
+*        ELSE.
+
+            "BEG Kyvor - RDM - 20190906 - check batch split
+            " if batch split exists, should consider only the batch items
+            " otherwise, consider item
+
+
+            IF lv_valid_ekes = abap_true.
+              IF ls_ekes-uecha IS INITIAL.
+                CHECK NOT line_exists( lt_ekes[ uecha = ls_ekes-ebelp ] ).
+              ENDIF.
+
+              " check status for inbound delivery item
+              SELECT SINGLE lvsta FROM vbup
+                INTO @DATA(lv_lvsta)
+                WHERE vbeln = @ls_ekes-vbeln
+                AND posnr = @ls_ekes-vbelp.
+
+              CHECK lv_lvsta = 'C'.
+
+            ENDIF.
+
+            "END Kyvor - RDM - 20190906 - check batch split
+
+
+            gs_em_po-menge =  gs_em_po-menge  - ls_ekes-menge.
+*        ENDIF.
+*      ELSE.
+** leemos la cantidad e picking de la posicion de pedido
+**  para saber la cantidad que queda realmente por descargar
+*        SELECT * INTO TABLE lt_vbfa
+*          FROM vbfa
+*          WHERE vbelv = ls_ekes-vbeln AND
+*                posnv = ls_ekes-vbelp AND
+*                vbtyp_n = gc_vbtyp_n_q.
+*        LOOP AT lt_vbfa INTO ls_vbfa.
+*          IF ls_vbfa-plmin = '-'.
+*            ls_vbfa-rfmng = ls_vbfa-rfmng  * -1.
+*          ENDIF.
+*          gs_em_po-menge_pick = gs_em_po-menge_pick  + ls_vbfa-rfmng.
+*          SELECT * APPENDING TABLE gs_em_po-t_lqua
+*                   FROM lqua
+*                   WHERE btanr = ls_vbfa-vbeln AND
+*                         btaps = ls_vbfa-posnn+2(4) AND
+*                         lenum <> space.
+*        ENDLOOP.
+*      ENDIF.
+          ENDLOOP.
+          gs_em_po-menge = gs_em_po-menge - gs_em_po-menge_pick.
+          IF gs_em_po-menge GT 0 OR
+                 gs_em_po-uebtk = abap_true. " OR "si no tiene limite no calculamos cantidad pendiente
+*                   gs_param-uebtk_rf = abap_true. " cvivo - 14.06.19 - Trabajar simultáneamente sobre el mismo pedido
+
+            SELECT SINGLE maktx INTO gs_em_po-maktx
+                   FROM makt
+                   WHERE matnr = gs_em_po-matnr AND
+                         spras = sy-langu.
+            APPEND gs_em_po TO data_delivery-tt_pedidos.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+      CHECK ebeln IS NOT INITIAL AND error NE abap_true.
+
+      IF tcode EQ 'ZWM_RF_UI5_ENT_001' AND tknum IS NOT INITIAL.
+        SELECT SINGLE abfer INTO @DATA(abfer) FROM vttk WHERE tknum EQ @tknum.
+        IF abfer NE '2'.
+*            Transporte & es de salida o devolucion
+          MOVE abap_true TO error.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '056' tknum space space space CHANGING tt_log[].
+
+        ELSE.
+          SELECT * INTO TABLE @DATA(tt_vttp) FROM vttp WHERE tknum EQ @tknum.
+          DATA sw_find TYPE flag.
+          CLEAR sw_find.
+          LOOP AT tt_vttp INTO DATA(rt_vttp).
+            SELECT SINGLE vgbel INTO @DATA(vgbel) FROM lips WHERE vbeln EQ @rt_vttp-vbeln
+                                                              AND vgbel EQ @ebeln.
+            CHECK sy-subrc EQ 0.
+            MOVE abap_true TO sw_find.
+            EXIT.
+          ENDLOOP.
+          CHECK sw_find NE abap_true.
+          MOVE abap_true TO error.
+*     El documento & no es un pedido de compra.
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '024' ebeln tknum space space CHANGING tt_log[].
+        ENDIF.
+      ENDIF.
+*      ELSEIF tcode EQ 'ZWM_RF_UI5_ENT_001'. " entrada plancha grupo
+*      ENDIF.
+  ENDCASE.
+
+  CALL METHOD zcl_ui5_log=>save_log
+    EXPORTING
+      mf     = fname
+      uname  = uname
+*     statu  = 'X'
+      tcode  = tcode
+      lgnum  = data_user-lgnum
+*     vbeln  =
+      tknum  = tknum
+*     cerrar_transporte   =
+*     operario            = operario
+*     fieldname           =
+*     fval   =
+*     reg_parametros      =
+*     reg_funcionalidades =
+*     tt_pedidos          =
+*     tt_picking          =
+      tt_log = tt_log
+*     rt_acciones         =
+*     tt_acciones         =
+      error  = error
+*     commit = 'X'
+    .
+
+  CASE error.
+    WHEN abap_true.
+      CLEAR: data_delivery_total, data_delivery_total-tt_bultos[],
+             data_of. " add jtm 01.07.2022
+    WHEN OTHERS.
+      data_delivery_total = data_delivery.
+      data_delivery_total-tt_bultos[] = data_delivery-tt_bultos[].
+      CLEAR: error, tt_log[].
+  ENDCASE.
+
+  data_delivery-tcode = tcode.
+ENDFUNCTION.

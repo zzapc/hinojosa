@@ -1,0 +1,538 @@
+
+class ZCL_IM_SEITR_FEB_BADI definition
+  public
+  final
+  create public .
+
+public section.
+
+  interfaces IF_EX_FEB_BADI .
+protected section.
+private section.
+endclass. "ZCL_IM_SEITR_FEB_BADI definition
+class ZCL_IM_SEITR_FEB_BADI implementation.
+  METHOD if_ex_feb_badi~change_posting_data.
+
+* Consultor: David España (Seidor) (04.01.2019)
+
+***********************************************************************************************************************************************
+* Esta BADI se utiliza UNICAMENTE para la contabilización en cuentas de mayor, cambios de cuenta, etc.
+*
+* Nota: Se pueden realizar cambios de cuenta y contabilizaciones sobre cuentas de mayor tanto en el área de contabilización bancaria
+*       como en el área de contabilización auxiliar.
+*
+* Para la búsqueda y compensación de partidas abiertas de cliente y proveedor, se utiliza el módulo de funciones: Z_FIEB_901_ALGORITHM
+*
+* Para la búsqueda y propuesta de proveedor o cliente en la FEBAN, se utiliza el módulo de funciones: Z_FIEB_902_ALGORITHM
+*
+* Para la búsqueda y propuesta + compensación de proveedor o cliente en la FEBAN, se utiliza el módulo de funciones: Z_FIEB_903_ALGORITHM
+***********************************************************************************************************************************************
+
+    DATA:    lv_cuenta_n    TYPE zecuenta_n,
+             lv_tabix       TYPE i,
+             lv_zeecuenta_n TYPE zecuenta_n,
+             lv_zeeregla    TYPE zeregla,
+             wa_febre       TYPE febre,
+             lv_absnd       TYPE absnd_eb,
+             lv_texto(260)  TYPE c,
+             wa_febcl       TYPE febcl,
+             wa_ftclear     TYPE ftclear,
+             lv_post_k      TYPE xfeld,
+             lv_post_d      TYPE xfeld,
+             lv_bschl       TYPE string,
+             lv_count       TYPE string,
+             wa_ftpost      TYPE ftpost,
+             wa_ftpost2     TYPE ftpost,
+             lv_lifnr       TYPE lifnr,
+             lv_kunnr       TYPE kunnr,
+             lv_wrbtr       TYPE string,
+             lv_orden       TYPE aufnr,
+             lv_gsber       TYPE gsber,
+             lv_cycle       TYPE st_kostl,
+             lv_prctr       TYPE prctr,
+             lv_index       LIKE sy-tabix,
+             lv_ok          TYPE xfeld,
+             lv_selvon      TYPE sel01_f05a,
+             lv_agbuk       TYPE bukrs.
+
+    FIELD-SYMBOLS: <ls_ftpost>  TYPE ftpost,
+                   <ls_febre>   TYPE febre,
+                   <ls_ftclear> TYPE ftclear,
+                   <ls_febcl>   TYPE febcl.
+
+
+    CLEAR: lv_zeecuenta_n, lv_zeeregla, lv_absnd, lv_texto, lv_post_k, lv_bschl, lv_lifnr.
+
+
+* Esta ampliación se puede utilizar para la presentación de cheques y el extracto electrónico.
+* Filtramos que sólo se utilice con la aplicación "0001" del extracto electrónico.
+
+    IF i_febko-anwnd = '0001'.
+
+      IF sy-tcode NE 'FEB_BSPROC' AND sy-tcode NE 'FEBAN'. "solo debe aplicar en la carga del extracto.
+
+        CASE i_febep-intag.
+
+**************************************************************************************************
+* Algoritmo de interpretación 909: N43 - Modificaciones en contabilización de cuenta de mayor
+**************************************************************************************************
+
+          WHEN '909'.
+
+            lv_absnd = i_febko-absnd(8). "Banco del extracto electrónico
+
+************** CASO 1: Sustituciones de cuentas de mayor **************
+
+* Seleccionamos la cuenta de mayor a sustituir para la combinación de este banco y cuenta bancaria.
+
+            SELECT * INTO TABLE @DATA(tl_zseitrt_001)
+              FROM zseitrt_001
+               WHERE zeebanc   = @lv_absnd  "banco
+                 AND zeecuenta = @i_febko-ktonr
+                 AND zeeregla  = @i_febep-vgint
+                 AND zeearea   = @i_ikofi-eigr2
+                 AND zeecta_sust NE '*'.
+
+            IF sy-subrc EQ 0.
+
+              LOOP AT t_febre INTO wa_febre. "Nos guardamos todo el texto del extracto en una única variable de 260 carácteres.
+                CASE sy-tabix.
+                  WHEN 1.
+                    lv_texto(65) = wa_febre-vwezw.
+                  WHEN 2.
+                    lv_texto+65(65) = wa_febre-vwezw.
+                  WHEN 3.
+                    lv_texto+130(65) = wa_febre-vwezw.
+                  WHEN 4.
+                    lv_texto+195(65) = wa_febre-vwezw.
+                ENDCASE.
+              ENDLOOP.
+
+
+* Si el texto del extracto coincide con alguna cuenta de mayor a sustituir nos guardamos la cuenta nueva y la regla de contabilización.
+
+              LOOP AT tl_zseitrt_001 INTO DATA(xl_zseitrt_001).
+
+                IF lv_texto CS xl_zseitrt_001-zeetext.
+
+                  lv_zeecuenta_n = xl_zseitrt_001-zeecuenta_n.
+
+                  EXIT.
+
+                ENDIF.
+
+              ENDLOOP.
+
+              IF lv_zeecuenta_n IS NOT INITIAL.
+
+* Procedemos a modificar la cuenta contable.
+
+                LOOP AT t_febre ASSIGNING <ls_febre>.
+
+                  IF <ls_febre>-kukey = i_febep-kukey AND
+                     <ls_febre>-esnum = i_febep-esnum.
+
+                    LOOP AT t_ftpost ASSIGNING <ls_ftpost>.
+
+                      IF <ls_ftpost>-fnam CS 'HKONT' AND
+                         <ls_ftpost>-fval CS xl_zseitrt_001-zeecta_sust.
+
+                        lv_tabix = sy-tabix.
+
+                        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+                          EXPORTING
+                            input  = xl_zseitrt_001-zeecuenta_n
+                          IMPORTING
+                            output = lv_cuenta_n.
+
+                        <ls_ftpost>-fval = lv_cuenta_n.
+
+                        MODIFY t_ftpost FROM <ls_ftpost> INDEX lv_tabix.
+
+                      ENDIF.
+
+                    ENDLOOP.
+                  ENDIF.
+                ENDLOOP.
+              ENDIF.
+            ENDIF.
+
+************** CASO 2: Contabilizaciones de cargos (comisiones, timbres, visas...) en orden de gasto adecuada.
+
+* En Hinojosa, ciertos movimientos se contabilizan contra una cuenta de mayor de gasto y orden de gasto concreta
+* Se requiere automatizar la contabilización de este tipo de movimientos.
+*
+* Nota: La cuenta de mayor adecuada estará informada en customizing (OT83) por el propio símbolo de cuenta.
+
+
+            CLEAR: lv_texto, lv_orden, lv_gsber, lv_cycle, lv_prctr, lv_bschl, lv_count, lv_wrbtr, lv_index, lv_ok.
+
+            SELECT * INTO TABLE @DATA(tl_zseitrt_004)
+              FROM zseitrt_004
+               WHERE zeebanc   = @lv_absnd  "banco
+                 AND zeecuenta = @i_febko-ktonr
+                 AND zeeregla  = @i_febep-vgint
+                 AND zeearea   = @i_ikofi-eigr2.
+
+            IF sy-subrc EQ 0.
+
+              LOOP AT t_febre INTO wa_febre. "Nos guardamos todo el texto del extracto en una única variable de 260 carácteres.
+                CASE sy-tabix.
+                  WHEN 1.
+                    lv_texto(65) = wa_febre-vwezw.
+                  WHEN 2.
+                    lv_texto+65(65) = wa_febre-vwezw.
+                  WHEN 3.
+                    lv_texto+130(65) = wa_febre-vwezw.
+                  WHEN 4.
+                    lv_texto+195(65) = wa_febre-vwezw.
+                ENDCASE.
+              ENDLOOP.
+
+* Si el texto del extracto coincide con alguna cuenta de mayor a sustituir nos guardamos la orden de gasto.
+
+              LOOP AT tl_zseitrt_004 INTO DATA(xl_zseitrt_004).
+
+                IF lv_texto CS xl_zseitrt_004-zeetext.
+
+                  lv_orden = xl_zseitrt_004-zeeorden.
+
+                  EXIT.
+
+                ENDIF.
+
+              ENDLOOP.
+
+              IF lv_orden IS NOT INITIAL.
+
+* Procedemos a buscar el centro de coste real de la orden (estadística) para pasarlo a la ft_post más adelante.
+
+                SELECT SINGLE cycle
+                   INTO lv_cycle
+                    FROM aufk
+                     WHERE aufnr EQ lv_orden.
+
+                IF sy-subrc EQ 0.
+
+                  SELECT SINGLE prctr gsber "buscamos la división y cebe del CeCo encontrado anteriormente.
+                    INTO ( lv_prctr, lv_gsber )
+                    FROM csks
+                    WHERE kostl EQ lv_cycle.
+
+                  IF sy-subrc EQ 0.
+
+                    LOOP AT t_febre ASSIGNING <ls_febre>.
+
+                      IF <ls_febre>-kukey = i_febep-kukey AND
+                         <ls_febre>-esnum = i_febep-esnum.
+
+* Ahora vamos a pasarle los valores a la ftpost. El append de los campos orden, centro de coste y centro de beneficio
+* tienen que ir en un orden en particular dentro de la tabla t_ftpost (sino la contabilización falla...).
+
+                        IF lv_ok IS INITIAL.
+
+                          LOOP AT t_ftpost ASSIGNING <ls_ftpost>.
+
+                            IF <ls_ftpost>-fnam CS 'BSCHL'.
+
+                              IF <ls_ftpost>-fval EQ '40'. "en este tipo de movimientos, el gasto siempre estará en la posición debe (siempre serán cargos).
+
+                                lv_count = <ls_ftpost>-count.
+                                lv_index = sy-tabix.
+
+                                IF lv_index IS NOT INITIAL.
+
+                                  lv_index = sy-tabix + 1.
+
+                                  wa_ftpost-stype = 'P'.
+                                  wa_ftpost-count = lv_count.
+                                  wa_ftpost-fnam = 'COBL-GSBER'.
+                                  wa_ftpost-fval = lv_gsber.
+
+                                  INSERT wa_ftpost INTO t_ftpost INDEX lv_index.
+
+                                  lv_index = sy-tabix + 2.
+
+                                  wa_ftpost-stype = 'P'.
+                                  wa_ftpost-count = lv_count.
+                                  wa_ftpost-fnam = 'COBL-KOSTL'.
+                                  wa_ftpost-fval = lv_cycle.
+
+                                  INSERT wa_ftpost INTO t_ftpost INDEX lv_index.
+
+                                  lv_index = sy-tabix + 3.
+
+                                  wa_ftpost-stype = 'P'.
+                                  wa_ftpost-count = lv_count.
+                                  wa_ftpost-fnam = 'COBL-AUFNR'.
+                                  wa_ftpost-fval = lv_orden.
+
+                                  INSERT wa_ftpost INTO t_ftpost INDEX lv_index.
+
+                                  lv_index = sy-tabix + 4.
+
+                                  wa_ftpost-stype = 'P'.
+                                  wa_ftpost-count = lv_count.
+                                  wa_ftpost-fnam = 'COBL-PRCTR'.
+                                  wa_ftpost-fval = lv_prctr.
+
+                                  INSERT wa_ftpost INTO t_ftpost INDEX lv_index.
+
+                                  lv_ok = 'X'.
+
+                                  EXIT.
+
+                                ENDIF.
+
+                              ENDIF.
+                            ENDIF.
+                          ENDLOOP.
+                        ENDIF.
+                      ENDIF.
+                    ENDLOOP.
+                  ENDIF.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+
+
+**************************************************************************************************
+* Algoritmo de interpretación: 901 / 903 / 904 / 906
+**************************************************************************************************
+
+* Por parte de Hinojosa, se pide que para aquellos cargos en cuenta (pagos) para los que la empresa
+* no tiene la iniciativa, si la búsqueda del tercero (proveedor) es satisfactoria pero no se consigue
+* compensar ninguna partida abierta, el sistema debe contabilizar automáticamente un pago a cuenta
+* en la cuenta del tercero.
+
+            DATA: lv_bukrs  TYPE bukrs,
+                  lv_togru  TYPE togru,
+                  lv_gsber2 TYPE gsber.
+
+          WHEN '901' OR '903' OR '904' OR '906'.
+
+            CLEAR: lv_texto, lv_orden, lv_gsber, lv_cycle, lv_prctr, lv_bschl, lv_count, lv_wrbtr,
+                   lv_togru, lv_bukrs, lv_gsber2, lv_kunnr, lv_lifnr, lv_post_k.
+
+            IF i_posting_area EQ '2'.
+
+              LOOP AT t_febcl INTO wa_febcl.
+
+                IF wa_febcl-agkon  IS NOT INITIAL AND "si ha encontrado al tercero (solo si es proveedor) pero no ha podido encontrar documentos a compensar.
+                   wa_febcl-selvon IS INITIAL     AND
+                   wa_febcl-koart  EQ 'K'.
+
+                  lv_post_k = 'X'.
+
+                  lv_lifnr = wa_febcl-agkon.
+
+                  EXIT.
+
+                ENDIF.
+
+              ENDLOOP.
+
+              IF lv_post_k EQ 'X'.
+
+                LOOP AT t_febre ASSIGNING <ls_febre>.
+
+                  IF <ls_febre>-kukey = i_febep-kukey AND
+                     <ls_febre>-esnum = i_febep-esnum.
+
+                    LOOP AT t_ftpost ASSIGNING <ls_ftpost>.
+
+                      IF <ls_ftpost>-fnam CS 'BSCHL'.
+
+                        lv_bschl = <ls_ftpost>-fval.
+                        lv_count = <ls_ftpost>-count.
+
+                      ENDIF.
+
+                      IF <ls_ftpost>-fnam CS 'WRBTR'.
+
+                        lv_wrbtr = <ls_ftpost>-fval.
+
+                      ENDIF.
+
+                      IF <ls_ftpost>-fnam CS 'BUKRS'.
+
+                        lv_bukrs = <ls_ftpost>-fval.
+
+                      ENDIF.
+
+                    ENDLOOP.
+                  ENDIF.
+                ENDLOOP.
+
+* Buscamos la división que se debe determinar en la contabilización del pago a cuenta.
+
+
+                SELECT SINGLE togru "la división se determina en función del grupo de tolerancia del proveedor.
+                  INTO lv_togru
+                  FROM lfb1
+                  WHERE lifnr EQ lv_lifnr AND
+                        bukrs EQ lv_bukrs.
+
+                IF sy-subrc EQ 0.
+                  CASE lv_togru.
+                    WHEN 'COMU'.
+                      lv_gsber2 = 'GRAL'.
+                    WHEN 'PACS'.
+                      lv_gsber2 = 'HIPA'.
+                    WHEN 'XATI'.
+                      lv_gsber2 = 'HIXA'.
+                    WHEN OTHERS.
+                  ENDCASE.
+                ENDIF.
+
+                CASE lv_bschl.
+
+                  WHEN '40'.
+
+                    wa_ftpost-stype = 'P'.
+                    wa_ftpost-count = lv_count + 1.
+                    wa_ftpost-fnam = 'BSCHL'.
+                    wa_ftpost-fval = '39'. "CME Acreedor Haber
+
+                    APPEND wa_ftpost TO t_ftpost.
+
+                    wa_ftpost-stype = 'P'.
+                    wa_ftpost-count = lv_count + 1.
+                    wa_ftpost-fnam = 'BSEG-UMSKZ'.
+                    wa_ftpost-fval = 'A'. "CME Anticipo
+
+                    APPEND wa_ftpost TO t_ftpost.
+
+                    wa_ftpost-stype = 'P'.
+                    wa_ftpost-count = lv_count + 1.
+                    wa_ftpost-fnam = 'BSEG-HKONT'.
+                    wa_ftpost-fval = lv_lifnr.
+
+                    APPEND wa_ftpost TO t_ftpost.
+
+                    wa_ftpost-stype = 'P'.
+                    wa_ftpost-count = lv_count + 1.
+                    wa_ftpost-fnam = 'BSEG-WRBTR'.
+                    wa_ftpost-fval = lv_wrbtr.
+
+                    APPEND wa_ftpost TO t_ftpost.
+
+                    IF lv_gsber2 IS NOT INITIAL.
+
+                      wa_ftpost-stype = 'P'.
+                      wa_ftpost-count = lv_count + 1.
+                      wa_ftpost-fnam = 'BSEG-GSBER'.
+                      wa_ftpost-fval = lv_gsber2.
+
+                      APPEND wa_ftpost TO t_ftpost.
+
+                    ENDIF.
+
+
+                  WHEN '50'.
+
+                    wa_ftpost-stype = 'P'.
+                    wa_ftpost-count = lv_count + 1.
+                    wa_ftpost-fnam = 'BSEG-BSCHL'.
+                    wa_ftpost-fval = '29'. "CME Acreedor Debe
+
+                    APPEND wa_ftpost TO t_ftpost.
+
+                    wa_ftpost-stype = 'P'.
+                    wa_ftpost-count = lv_count + 1.
+                    wa_ftpost-fnam = 'BSEG-UMSKZ'.
+                    wa_ftpost-fval = 'A'. "CME Anticipo
+
+                    APPEND wa_ftpost TO t_ftpost.
+
+                    wa_ftpost-stype = 'P'.
+                    wa_ftpost-count = lv_count + 1.
+                    wa_ftpost-fnam = 'BSEG-HKONT'.
+                    wa_ftpost-fval = lv_lifnr.
+
+                    APPEND wa_ftpost TO t_ftpost.
+
+                    wa_ftpost-stype = 'P'.
+                    wa_ftpost-count = lv_count + 1.
+                    wa_ftpost-fnam = 'BSEG-WRBTR'.
+                    wa_ftpost-fval = lv_wrbtr.
+
+                    APPEND wa_ftpost TO t_ftpost.
+
+                    IF lv_gsber2 IS NOT INITIAL.
+
+                      wa_ftpost-stype = 'P'.
+                      wa_ftpost-count = lv_count + 1.
+                      wa_ftpost-fnam = 'BSEG-GSBER'.
+                      wa_ftpost-fval = lv_gsber2.
+
+                      APPEND wa_ftpost TO t_ftpost.
+
+                    ENDIF.
+
+
+                ENDCASE.
+              ENDIF.
+            ENDIF.
+
+* Por parte de Hinojosa, se requiere compensar partidas de deudor con CME.
+* Únicamente los siguientes CME de deudor: I, J.
+
+            IF i_posting_area EQ '2'.
+
+              CLEAR lv_tabix.
+
+              LOOP AT t_febcl INTO wa_febcl.
+
+                IF wa_febcl-agkon  IS NOT INITIAL AND "si ha encontrado al tercero (solo si es cliente) y ha podido encontrar documentos a compensar.
+                   wa_febcl-selvon IS NOT INITIAL AND
+                   wa_febcl-koart  EQ 'D'.
+
+                  lv_tabix = sy-tabix.
+
+                  IF wa_febcl-selvon+14(1) EQ 'I' OR
+                     wa_febcl-selvon+14(1) EQ 'J' OR
+                     wa_febcl-selvon+14(1) EQ 'A'.
+
+                    wa_febcl-agums = wa_febcl-selvon+14(1).
+                    wa_febcl-selvon+14(1) = ''.
+
+                    MODIFY t_febcl FROM wa_febcl INDEX lv_tabix.
+
+                  ENDIF.
+                ENDIF.
+              ENDLOOP.
+
+              CLEAR lv_tabix.
+
+              LOOP AT t_ftclear INTO wa_ftclear.
+
+                IF wa_ftclear-agkon  IS NOT INITIAL AND "si ha encontrado al tercero (solo si es cliente) y ha podido encontrar documentos a compensar.
+                   wa_ftclear-selvon IS NOT INITIAL AND
+                   wa_ftclear-agkoa EQ 'D'.
+
+                  lv_tabix = sy-tabix.
+
+                  IF wa_ftclear-selvon+14(1) EQ 'I' OR
+                     wa_ftclear-selvon+14(1) EQ 'J' OR
+                     wa_ftclear-selvon+14(1) EQ 'A'.
+
+                    wa_ftclear-agums = wa_ftclear-selvon+14(1).
+                    wa_ftclear-xnops = ''.
+                    wa_ftclear-selvon+14(1) = ''.
+
+                    MODIFY t_ftclear FROM wa_ftclear INDEX lv_tabix.
+
+                  ENDIF.
+                ENDIF.
+              ENDLOOP.
+            ENDIF.
+
+
+        ENDCASE.
+      ENDIF.
+    ENDIF.
+
+  ENDMETHOD.
+endclass. "ZCL_IM_SEITR_FEB_BADI definition
+endclass. "ZCL_IM_SEITR_FEB_BADI implementation

@@ -1,0 +1,273 @@
+FUNCTION zswm_ui5_reubicar_lote.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(VP_WERKS) TYPE  WERKS_D
+*"     VALUE(VP_LGORT_O) TYPE  LGORT_D OPTIONAL
+*"     VALUE(VP_LGORT_D) TYPE  LGORT_D
+*"     VALUE(VP_MATNR) TYPE  MATNR
+*"     VALUE(VP_CHARG) TYPE  CHARG_D
+*"     VALUE(VP_LENUM) TYPE  LENUM
+*"     VALUE(VP_MENGE) TYPE  MENGE_D
+*"     VALUE(VP_MEINS) TYPE  MEINS
+*"     VALUE(VP_NLTYP) TYPE  LTAP_NLTYP
+*"     VALUE(VP_NLPLA) TYPE  LTAP_NLPLA
+*"     VALUE(VP_GRUPO_DEFECTO) TYPE  QCODEGRP OPTIONAL
+*"     VALUE(VP_CODIGO_DEFECTO) TYPE  QCODE OPTIONAL
+*"  EXPORTING
+*"     VALUE(TP_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+
+
+  DATA: vl_reproceso TYPE xfeld.
+  DATA: lt_goodsmvt_item TYPE bapi2017_gm_item_create_t.
+
+  DATA: ls_goodsmvt_header TYPE bapi2017_gm_head_01,
+        ls_goodsmvt_item   TYPE bapi2017_gm_item_create.
+
+  DATA: lv_mblnr TYPE bapi2017_gm_head_ret-mat_doc,
+        lv_mjahr TYPE bapi2017_gm_head_ret-doc_year.
+
+  DATA tl_return LIKE tp_return.
+
+
+  "Buscamos almacen WM
+  SELECT SINGLE lgnum
+    INTO @DATA(vl_lgnum)
+    FROM t320
+    WHERE werks = @vp_werks AND
+          lgort = '1000'.
+
+  SELECT SINGLE mtart
+    INTO @DATA(vl_mtart)
+    FROM mara
+    WHERE matnr = @vp_matnr.
+
+
+
+
+  DATA tl_tipos_almacen_aprov TYPE  zswm_t_tipos_almacen_aprov.
+  CALL FUNCTION 'ZSWM_GET_TIPOS_ALMACEN_APROV'
+    EXPORTING
+      vp_lgnum               = vl_lgnum
+      vp_lgtyp               = vp_nltyp
+      vp_mtart               = vl_mtart
+    IMPORTING
+      tp_tipos_almacen_aprov = tl_tipos_almacen_aprov.
+
+  READ TABLE tl_tipos_almacen_aprov ASSIGNING FIELD-SYMBOL(<fs_tipos_almacen_aprov>) INDEX 1.
+  IF sy-subrc <> 0.
+    PERFORM mensaje USING 'E' 'SY' '002' 'Falta parametrización de almacén' space space space CHANGING tp_return.
+    RETURN.
+  ENDIF.
+
+  IF vp_lgort_o IS INITIAL.
+    vp_lgort_o = <fs_tipos_almacen_aprov>-lgort.
+  ENDIF.
+
+  vl_reproceso = <fs_tipos_almacen_aprov>-cla_reprocesar.
+
+
+
+
+  "HEADER
+  ls_goodsmvt_header-pstng_date = sy-datum.
+  ls_goodsmvt_header-doc_date   = sy-datum.
+
+  "ITEM
+  ls_goodsmvt_item-plant       = vp_werks.
+  ls_goodsmvt_item-stge_loc    = vp_lgort_o.
+  ls_goodsmvt_item-move_stloc  = vp_lgort_d.
+  ls_goodsmvt_item-material    = vp_matnr.
+  ls_goodsmvt_item-batch       = vp_charg.
+  ls_goodsmvt_item-move_type   = '311'.
+  ls_goodsmvt_item-entry_qnt   = vp_menge.
+  ls_goodsmvt_item-entry_uom   = vp_meins.
+  ls_goodsmvt_item-unload_pt   = vp_lenum.
+  APPEND ls_goodsmvt_item TO lt_goodsmvt_item.
+
+  "CREATE MVT
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header  = ls_goodsmvt_header
+      goodsmvt_code    = '04'
+    IMPORTING
+      materialdocument = lv_mblnr
+      matdocumentyear  = lv_mjahr
+    TABLES
+      goodsmvt_item    = lt_goodsmvt_item
+      return           = tp_return.
+
+  IF line_exists( tp_return[ type = 'E' ] ).
+    RETURN.
+  ENDIF.
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+    EXPORTING
+      wait = 'X'.
+
+
+
+  SELECT SINGLE *
+    FROM mseg
+    INTO @DATA(ls_mseg)
+    WHERE mblnr = @lv_mblnr AND
+          mjahr = @lv_mjahr AND
+          werks = @vp_werks AND
+          lgort = @vp_lgort_d.
+
+  IF sy-subrc = 0.
+    "Genero LB03_TRITE
+    DATA: ls_trite TYPE l03b_trite,
+          lt_trite TYPE l03b_trite_t,
+          vl_tanum TYPE ltak-tanum.
+    ls_trite-tbpos = ls_mseg-tbpos.
+    ls_trite-altme = ls_mseg-meins.
+    ls_trite-anfme = ls_mseg-menge.
+    ls_trite-charg = ls_mseg-charg.
+    ls_trite-nltyp = vp_nltyp.
+    ls_trite-nlpla = vp_nlpla.
+    ls_trite-nlenr = vp_lenum.
+    ls_trite-vltyp = ls_mseg-lgtyp.
+    ls_trite-vlpla = ls_mseg-lgpla.
+
+    SELECT SINGLE lety0
+      INTO @ls_trite-letyp
+      FROM t334e
+      WHERE lgnum = @vl_lgnum AND
+            lgtyp = @vp_nltyp.
+
+
+
+
+    APPEND ls_trite TO lt_trite.
+
+    DATA: tl_ltak      TYPE TABLE OF ltak_vb,
+          tl_ltap_vb   TYPE TABLE OF ltap_vb,
+          tl_wmgrp_msg TYPE TABLE OF wmgrp_msg.
+    CALL FUNCTION 'L_TO_CREATE_TR'
+      EXPORTING
+        i_lgnum                        = vl_lgnum
+        i_tbnum                        = ls_mseg-tbnum
+        i_commit_work                  = 'X'
+        it_trite                       = lt_trite
+      IMPORTING
+        e_tanum                        = vl_tanum
+      TABLES
+        t_ltak                         = tl_ltak
+        t_ltap_vb                      = tl_ltap_vb
+        t_wmgrp_msg                    = tl_wmgrp_msg
+      EXCEPTIONS
+        foreign_lock                   = 1
+        qm_relevant                    = 2
+        tr_completed                   = 3
+        xfeld_wrong                    = 4
+        ldest_wrong                    = 5
+        drukz_wrong                    = 6
+        tr_wrong                       = 7
+        squit_forbidden                = 8
+        no_to_created                  = 9
+        update_without_commit          = 10
+        no_authority                   = 11
+        preallocated_stock             = 12
+        partial_transfer_req_forbidden = 13
+        input_error                    = 14
+        error_message                  = 16
+        OTHERS                         = 17.
+    IF sy-subrc = 0.
+      IF vp_lenum IS INITIAL.
+        vp_lenum = tl_ltap_vb[ 1 ]-nlenr.
+      ENDIF.
+    ELSE.
+      APPEND INITIAL LINE TO tp_return ASSIGNING FIELD-SYMBOL(<fs_return>).
+      <fs_return>-id          = sy-msgid.
+      <fs_return>-number      = sy-msgno.
+      <fs_return>-type        = sy-msgty.
+      <fs_return>-message_v1  = sy-msgv1.
+      <fs_return>-message_v2  = sy-msgv2.
+      <fs_return>-message_v3  = sy-msgv3.
+      <fs_return>-message_v4  = sy-msgv4.
+
+      CALL FUNCTION 'BAPI_GOODSMVT_CANCEL'
+        EXPORTING
+          materialdocument = lv_mblnr
+          matdocumentyear  = lv_mjahr
+        TABLES
+          return           = tl_return.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+
+
+  IF vl_reproceso = 'X'.
+*    CALL FUNCTION 'ZSWM_UI5_ACCIONES'
+*      EXPORTING
+*        tcode     = 'ZWM_RF_UI5_PIN_003'
+*        lenum     = vp_lenum
+*        reproceso = 'X'
+*        recorte   = space
+*        lgpla_rep = vp_nlpla
+*      IMPORTING
+*        tt_log    = tp_return.
+
+    SELECT SINGLE prueflos, mjahr, mblnr
+      INTO @DATA(wl_qals)
+      FROM qals
+      WHERE mjahr = @lv_mjahr AND
+            mblnr = @lv_mblnr.
+    IF sy-subrc = 0.
+      CALL FUNCTION 'ZSUI5_SET_DEFECTO_LOT_INSP'
+        EXPORTING
+          i_grupo_defecto  = vp_grupo_defecto
+          i_codigo_defecto = vp_codigo_defecto
+          i_lote           = wl_qals-prueflos
+        IMPORTING
+          et_return        = tp_return.
+    ENDIF.
+
+
+  ENDIF.
+
+  IF line_exists( tp_return[ type = 'E' ] ).
+    RETURN.
+  ENDIF.
+
+
+*  "Impresión
+*  DATA(rl_consumos) = NEW zcl_zui5_wm_consumos_dpc_imp( ).
+*  TRY.
+*      DATA(wl_return) = rl_consumos->imprimir_ua( vp_lgpla = vp_nlpla
+*                                                  vp_werks = vp_werks
+*                                                  vp_ua    = vp_lenum ).
+*
+*    CATCH /iwbep/cx_mgw_busi_exception INTO DATA(rl_exc).
+*  ENDTRY.
+
+
+
+  "Impresión
+*    DATA tl_selection_table TYPE TABLE OF rsparamsl_255.
+*    EXPORT lv_vengo_inter_consumo = abap_false  TO MEMORY ID 'VENGO_CONSUMO' .
+*    EXPORT lv_cod_maq_portabo     = vp_nlpla    TO MEMORY ID 'MAQUINA' .
+*
+*    " create label for remaining
+*    tl_selection_table = VALUE #( ( selname = 'P_LGNUM' kind = 'P' sign = 'I' option = 'EQ' low = vl_lgnum )
+*                                  ( selname = 'S_LENUM' kind = 'S' sign = 'I' option = 'EQ' low = vp_lenum ) ).
+*    SUBMIT zimpresion_ua WITH SELECTION-TABLE tl_selection_table AND RETURN.
+*    FREE MEMORY ID: 'VENGO_CONSUMO', 'MAQUINA'.
+
+
+  CALL FUNCTION 'ZSWM_PRINT_EXIDV'
+    EXPORTING
+      tcode  = 'ZWM_RF_UI5_PIN_003'
+      lenum  = vp_lenum
+    IMPORTING
+      tt_log = tp_return.
+
+
+
+ENDFUNCTION.

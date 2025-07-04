@@ -1,0 +1,276 @@
+FUNCTION zsdcom_sacar_traza_factura_org.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_BUKRS) TYPE  BUKRS
+*"     VALUE(I_BELNR) TYPE  BELNR_D
+*"     VALUE(I_GJAHR) TYPE  GJAHR
+*"     VALUE(I_VALUT) TYPE  VALUT OPTIONAL
+*"     VALUE(I_C_IMP) TYPE  CHAR1 DEFAULT 'X'
+*"  EXPORTING
+*"     VALUE(E_IMPORTE) TYPE  WRBTR
+*"  CHANGING
+*"     VALUE(CT_TRAZA) TYPE  ZTTSDCOM_TRAZA_OR OPTIONAL
+*"----------------------------------------------------------------------
+
+  DATA: lti_bseg      TYPE TABLE OF bseg,
+        lti_bseg_com  TYPE TABLE OF bseg.
+
+  DATA: ls_bseg       TYPE bseg,
+        ls_bseg_com   TYPE bseg,
+        ls_traza      TYPE zssdcom_traza_or.
+
+  DATA: lv_impagados  TYPE flag,
+        lv_ind        TYPE i,
+        lv_bldat      TYPE bldat.
+
+
+* Busqueda de documentos asociados...
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE lti_bseg
+      FROM  bseg
+      WHERE bukrs  = i_bukrs
+      AND   belnr  = i_belnr
+      AND   gjahr  = i_gjahr
+      AND   augbl <> i_belnr
+      AND   koart <> 'S'.
+
+* Factura con Anulación factura
+  IF ct_traza[] IS INITIAL AND lti_bseg[] IS INITIAL.
+    SELECT * INTO CORRESPONDING FIELDS OF TABLE lti_bseg
+        FROM  bseg
+        WHERE bukrs = i_bukrs
+        AND   belnr = i_belnr
+        AND   gjahr = i_gjahr
+        AND   augbl = i_belnr
+        AND   koart <> 'S'
+        AND   bschl IN ('01', '11', '02', '12','04','14').
+  ENDIF.
+
+* Filtramos por la fecha de compensación
+  LOOP AT lti_bseg INTO ls_bseg
+                   WHERE augdt IS NOT INITIAL
+                   AND   augdt > i_valut.
+    lv_ind = sy-tabix.
+    DELETE lti_bseg INDEX lv_ind.
+  ENDLOOP.
+
+* Busqueda de impagados solo del documento inicial...
+  IF i_c_imp IS NOT INITIAL.
+    CALL FUNCTION 'ZSDCOM_COMPROBAR_IMPAGADOS_ORG'
+      EXPORTING
+        i_valut     = i_valut
+      IMPORTING
+        e_impagados = lv_impagados
+      TABLES
+        it_bseg     = lti_bseg.
+  ENDIF.
+
+  data: lv_gjahr type gjahr,
+        lv_monat type monat.
+
+
+* Busqueda de documentos de compensación
+  LOOP AT lti_bseg INTO ls_bseg
+                   WHERE augbl IS NOT INITIAL.
+
+  call function 'FI_PERIOD_DETERMINE'
+    exporting
+      i_budat        = ls_bseg-augdt
+      i_bukrs        = I_BUKRS
+    importing
+      e_gjahr        = lv_gjahr
+      e_monat        = lv_monat
+*     E_POPER        =
+    exceptions
+      fiscal_year    = 1
+      period         = 2
+      period_version = 3
+      posting_period = 4
+      special_period = 5
+      version        = 6
+      posting_date   = 7
+      others         = 8.
+  if sy-subrc <> 0.
+* Implement suitable error handling here
+  endif.
+
+*   Sacamos las posiciones con el documento de compensación
+    SELECT * INTO CORRESPONDING FIELDS OF TABLE lti_bseg_com
+        FROM  bseg
+        WHERE bukrs  = ls_bseg-bukrs
+        AND   gjahr  = lv_gjahr " ls_bseg-augdt(4)
+        AND   belnr  = ls_bseg-augbl
+        AND   augbl <> ls_bseg-augbl.
+*   Recorremos los documentos sacados añadiendo los que no estén ya en la tabla
+    LOOP AT lti_bseg_com INTO ls_bseg_com.
+*     Chequeamos si ya lo tenemos en la tabla
+      READ TABLE lti_bseg INTO ls_bseg WITH KEY bukrs = ls_bseg_com-bukrs
+                                                belnr = ls_bseg_com-belnr
+                                                buzei = ls_bseg_com-buzei
+                                                gjahr = ls_bseg_com-gjahr.
+*     Si no está, lo añadimos
+      IF sy-subrc <> 0.
+        APPEND ls_bseg_com TO lti_bseg.
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+
+* Sacamos la utilización del pago de todos los documentos
+  CALL FUNCTION 'ZSDCOM_UTILIZACION_PAGO_ORG'
+    TABLES
+      et_bseg = lti_bseg.
+
+* Busqueda recursiva de documentos asociados...
+  LOOP AT lti_bseg INTO ls_bseg.
+*   Chequeamos si el documento ya está en la traza
+    READ TABLE ct_traza INTO ls_traza WITH KEY belnr = ls_bseg-belnr
+                                               gjahr = ls_bseg-gjahr
+                                               buzei = ls_bseg-buzei.
+    CHECK sy-subrc <> 0.
+
+*   Añadimos el documento a la traza
+    MOVE-CORRESPONDING ls_bseg TO ls_traza.
+    APPEND ls_traza TO ct_traza.
+
+
+
+  call function 'FI_PERIOD_DETERMINE'
+    exporting
+      i_budat        = ls_bseg-augdt
+      i_bukrs        = I_BUKRS
+    importing
+      e_gjahr        = lv_gjahr
+      e_monat        = lv_monat
+*     E_POPER        =
+    exceptions
+      fiscal_year    = 1
+      period         = 2
+      period_version = 3
+      posting_period = 4
+      special_period = 5
+      version        = 6
+      posting_date   = 7
+      others         = 8.
+  if sy-subrc <> 0.
+* Implement suitable error handling here
+  endif.
+
+
+*   Llamamos a la función recursivamente para sacar la traza del documento de compensación
+    CALL FUNCTION 'ZSDCOM_SACAR_TRAZA_FACTURA_ORG'
+      EXPORTING
+        i_bukrs  = ls_bseg-bukrs
+        i_belnr  = ls_bseg-augbl
+        i_gjahr  = lv_gjahr  "ls_bseg-augdt(4)
+        i_valut  = i_valut
+        i_c_imp  = 'X'
+      CHANGING
+        ct_traza = ct_traza.
+
+*   Si el documento tiene documento de compensación...
+    IF ls_bseg-augbl IS NOT INITIAL.
+*     Chequeamos que no está en la traza
+      READ TABLE ct_traza INTO ls_traza WITH KEY bukrs = ls_bseg-bukrs
+                                                 belnr = ls_bseg-augbl
+                                                 gjahr = lv_gjahr  " ls_bseg-augdt(4)
+                                                 buzei = ls_bseg-buzei.
+*     Lo añadimos a la tabla de la traza
+      IF sy-subrc <> 0.
+        CLEAR ls_traza.
+        SELECT SINGLE * INTO CORRESPONDING FIELDS OF ls_traza
+            FROM  bseg
+            WHERE bukrs  = ls_bseg-bukrs
+            AND   belnr  = ls_bseg-augbl
+            AND   gjahr  = lv_gjahr  " ls_bseg-augdt(4)
+            AND   buzei  = ls_bseg-buzei
+            AND   augbl <> ls_bseg-augbl.
+        IF sy-subrc = 0.
+          APPEND ls_traza TO ct_traza.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Calculo del importe cobrado...
+  CHECK i_c_imp IS NOT INITIAL.
+
+* Descartamos aquellas líneas cuya fecha de documento sea mayor que la indicada
+  LOOP AT ct_traza INTO ls_traza.
+    lv_ind = sy-tabix.
+*   Sacamos la fecha de documento
+    SELECT SINGLE bldat INTO lv_bldat
+        FROM  bkpf
+        WHERE bukrs = ls_traza-bukrs
+        AND   gjahr = ls_traza-gjahr
+        AND   belnr = ls_traza-belnr.
+    IF lv_bldat > i_valut.
+      DELETE ct_traza INDEX lv_ind.
+    ENDIF.
+  ENDLOOP.
+
+*** Llamamos a la función de traza del importe cobrado
+  CALL FUNCTION 'ZSDCOM_TRAZA_IMPORTE_ORG'
+    EXPORTING
+      i_belnr   = i_belnr
+      i_gjahr   = i_gjahr
+      i_bukrs   = i_bukrs
+      i_valut   = i_valut
+      i_imp     = i_c_imp
+    IMPORTING
+      e_importe = e_importe
+    TABLES
+      it_bseg   = lti_bseg
+    CHANGING
+      ct_traza  = ct_traza.
+
+* Busqueda de documentos asociados aunque no cumplan el filtro de fecha los mostramos...
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE lti_bseg
+      FROM  bseg
+      WHERE bukrs  = i_bukrs
+      AND   belnr  = i_belnr
+      AND   gjahr  = i_gjahr
+      AND   augbl <> i_belnr
+      AND   koart <> 'S'.
+
+* Factura con Anulación factura
+  IF ct_traza[] IS INITIAL AND lti_bseg[] IS INITIAL.
+    SELECT * INTO CORRESPONDING FIELDS OF TABLE lti_bseg
+        FROM  bseg
+        WHERE bukrs  = i_bukrs
+        AND   belnr  = i_belnr
+        AND   gjahr  = i_gjahr
+        AND   augbl  = i_belnr
+        AND   koart <> 'S'
+        AND   bschl IN ('01', '11', '02', '12', '04', '14' ).
+  ENDIF.
+
+* Recorremos los documentos añadiendo los que no estén
+  LOOP AT lti_bseg INTO ls_bseg.
+    READ TABLE ct_traza INTO ls_traza WITH KEY belnr = ls_bseg-belnr
+                                               gjahr = ls_bseg-gjahr
+                                               buzei = ls_bseg-buzei.
+    CHECK sy-subrc <> 0.
+    CLEAR ls_traza.
+    MOVE-CORRESPONDING ls_bseg TO ls_traza.
+    APPEND ls_traza TO ct_traza.
+  ENDLOOP.
+
+* Datos de cabecera del documento
+  LOOP AT ct_traza INTO ls_traza.
+    lv_ind = sy-tabix.
+*   Sacamos la fecha y la moneda
+    SELECT SINGLE bldat waers
+        INTO (ls_traza-bldat, ls_traza-waers)
+        FROM  bkpf
+        WHERE bukrs = ls_traza-bukrs
+        AND   gjahr = ls_traza-gjahr
+        AND   belnr = ls_traza-belnr.
+*   Chequeamos la fecha
+    IF ls_traza-bldat <= i_valut.
+      MODIFY ct_traza FROM ls_traza INDEX lv_ind.
+    ELSE.
+      DELETE ct_traza INDEX lv_ind.
+    ENDIF.
+  ENDLOOP.
+
+ENDFUNCTION.

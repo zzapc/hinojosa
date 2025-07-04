@@ -1,0 +1,120 @@
+FUNCTION z_scm042_modificar_pos_entrega.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IT_ENT_POS_MOD) TYPE  /SPE/DELIVERY_QUANT_RED_T
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_TT
+*"----------------------------------------------------------------------
+* JGM 02.2024 GAPCM042 Aplicativo Gestión de Desvíos:
+* Modificar posiciones (reducir cantidad) de ENTREGAS de salida.
+*--------------------------------------------------------------------*
+  DATA: lt_ent_pos     TYPE /spe/delivery_quant_red_t,
+        lt_ent_pos_aux TYPE /spe/delivery_quant_red_t,
+        lt_return      TYPE bapiret2_tt.
+
+  DATA: lt_item_data    TYPE TABLE OF bapiobdlvitemchg,
+        lt_item_control TYPE TABLE OF bapiobdlvitemctrlchg.
+
+  DATA: ls_header_data    TYPE bapiobdlvhdrchg,
+        ls_header_control TYPE bapiobdlvhdrctrlchg.
+  DATA: ls_item_data    TYPE bapiobdlvitemchg,
+        ls_item_control TYPE bapiobdlvitemctrlchg.
+
+  DATA:  lv_lfimg_new TYPE lfimg.
+
+  DATA: lr_type_error TYPE RANGE OF bapi_mtype.
+
+
+  lr_type_error = VALUE #( sign = 'I' option = 'EQ' ( low = 'E' ) ( low = 'A' ) ).
+
+*  lt_ent_pos = it_ent_pos_mod.
+*  SORT lt_ent_pos BY delivery_number delivery_item.
+
+  ">Puede haber partición de lotes (varios items de una misma posición superior), agrupar registros por posiciones.
+  lt_ent_pos_aux = it_ent_pos_mod.
+  SORT lt_ent_pos_aux BY delivery_number delivery_item.
+
+  LOOP AT lt_ent_pos_aux INTO DATA(wa_aux).
+    COLLECT wa_aux INTO lt_ent_pos.
+  ENDLOOP.
+  "<
+
+  LOOP AT lt_ent_pos ASSIGNING FIELD-SYMBOL(<fs_ent_pos>).
+
+    AT NEW delivery_number.
+      SELECT *
+        INTO TABLE @DATA(lt_lips)
+        FROM lips
+        WHERE vbeln EQ @<fs_ent_pos>-delivery_number.
+
+      "Cabecera:
+      CLEAR: ls_header_data,
+             ls_header_control.
+      ls_header_data-deliv_numb     = <fs_ent_pos>-delivery_number.
+      ls_header_control-deliv_numb  = <fs_ent_pos>-delivery_number.
+    ENDAT.
+
+    "Posiciones:
+    TRY .
+        DATA(ls_lips) = lt_lips[ posnr = <fs_ent_pos>-delivery_item ].
+      CATCH cx_root.
+    ENDTRY.
+
+    IF ls_lips IS NOT INITIAL.
+      lv_lfimg_new                  = ls_lips-lfimg - <fs_ent_pos>-quantity_chg.  "Reducción cantidad.
+      ls_item_data-fact_unit_nom    = ls_lips-umvkz.
+      ls_item_data-fact_unit_denom  = ls_lips-umvkn.
+      ls_item_data-batch            = ls_lips-charg.  "Mantener lote.
+      ls_item_data-material         = ls_lips-matnr.  "Mantener lote.
+    ENDIF.
+    ls_item_data-deliv_numb = <fs_ent_pos>-delivery_number.
+    ls_item_data-deliv_item = <fs_ent_pos>-delivery_item.
+    ls_item_data-dlv_qty    = lv_lfimg_new.
+    ls_item_data-base_uom   = <fs_ent_pos>-base_uom.
+    ls_item_data-dlv_qty_imunit = lv_lfimg_new.
+    APPEND ls_item_data TO lt_item_data.
+    CLEAR ls_item_data.
+
+    ls_item_control-deliv_numb = <fs_ent_pos>-delivery_number.
+    ls_item_control-deliv_item = <fs_ent_pos>-delivery_item.
+    ls_item_control-chg_delqty   = 'X'.
+    APPEND ls_item_control TO lt_item_control.
+    CLEAR ls_item_control.
+
+    CLEAR ls_lips.
+    CLEAR lv_lfimg_new.
+
+    AT END OF delivery_number.
+      CALL FUNCTION 'BAPI_OUTB_DELIVERY_CHANGE'
+        EXPORTING
+          header_data    = ls_header_data
+          header_control = ls_header_control
+          delivery       = ls_header_data-deliv_numb
+        TABLES
+          item_data      = lt_item_data
+          item_control   = lt_item_control
+          return         = lt_return.
+
+      LOOP AT lt_return TRANSPORTING NO FIELDS WHERE type IN lr_type_error.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc EQ 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+      ENDIF.
+
+      "Solo mensajes de error de la bapi.
+      DELETE lt_return WHERE type NOT IN lr_type_error.
+      APPEND LINES OF lt_return TO et_return.
+
+      FREE: lt_return,
+            lt_item_data,
+            lt_item_control.
+    ENDAT.
+  ENDLOOP.
+
+ENDFUNCTION.

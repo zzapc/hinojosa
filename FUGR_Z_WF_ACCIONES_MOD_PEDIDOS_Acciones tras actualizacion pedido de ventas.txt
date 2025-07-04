@@ -1,0 +1,212 @@
+FUNCTION z_wf_acciones_mod_pedidos .
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(VBELN) TYPE  VBAK-VBELN
+*"----------------------------------------------------------------------
+  DATA: l_vbak TYPE vbak,
+        xvbap  TYPE va_vbapvb_t,
+        yvbap  TYPE va_vbapvb_t,
+        xkomv  TYPE komv_t,
+        cdhdr  TYPE cdhdr.
+
+* Muchas veces se lanzan dos eventos de modificación consecutivos, sí no ha pasado al menos dos segundos, los ignoramos
+  DATA(l_seg) = zcl_ap_temp=>get_segundos_st( clave = 'WF_MOD_PED' subclave = vbeln ).
+  IF l_seg < 3.
+    RETURN.
+  ELSE.
+* Fijamos semáforo para saber el último que llegó
+    zcl_ap_temp=>set_st( clave = 'WF_MOD_PED' subclave = vbeln ).
+    COMMIT WORK AND WAIT.
+  ENDIF.
+
+  DATA(l_udate) = sy-datum.
+  DATA(l_utime) = sy-uzeit.
+
+* No queremos que haya dos WF con el mismo pedido a la vez
+  IF zcl_ap_utils=>bloquear_programa( cprog = 'WF_MOD_PED-' && vbeln intentos = 1 espera = 0 ).
+*    zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = 'Existe bloqueo. Salimos' ).
+*    RETURN.
+    DATA(l_bloqueo) = 'X'.
+  ENDIF.
+
+* Esperamos a grabado para asegurarnos que se han grabado los cambios
+  IF NOT sy-batch IS INITIAL OR sy-tcode IS INITIAL.
+    WAIT UP TO 5 SECONDS.
+
+* Si se procesan varios registros muy seguidos nos aseguramos que de que no coje uno ya procesado
+    DATA(l_changenr) = zcl_ap_temp=>get_st_valor1( clave = 'WF_PC_C' subclave = vbeln ).
+    IF NOT l_changenr IS INITIAL.
+      DATA r_changenr TYPE RANGE OF cdhdr-changenr.
+      r_changenr = VALUE #( ( option = 'GT' sign = 'I' low = l_changenr ) ).
+    ENDIF.
+
+  ENDIF.
+  DO 5 TIMES.
+    SELECT SINGLE * FROM vbak
+      INTO CORRESPONDING FIELDS OF l_vbak
+     WHERE vbeln = vbeln.
+    IF sy-subrc NE 0.
+      WAIT UP TO 1 SECONDS.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDDO.
+  IF l_vbak IS INITIAL.
+    zcl_ap_log=>set_log( proceso = 'WP_MOD_PED' clave = vbeln p1 = 'No existe pedido. salimos' ).
+    RETURN.
+  ENDIF.
+
+
+  SELECT * FROM vbap
+    INTO CORRESPONDING FIELDS OF TABLE xvbap
+   WHERE vbeln = vbeln.
+
+* Es posible que hayan modificaciones de posiciones pero no cabecera
+  IF l_vbak-aedat IS INITIAL.
+    LOOP AT xvbap ASSIGNING FIELD-SYMBOL(<xvbap>) WHERE NOT aedat IS INITIAL.
+      l_vbak-aedat = <xvbap>-aedat.
+      EXIT.
+    ENDLOOP.
+  ENDIF.
+
+* Recuperamos datos de reparto para forzar actualización de tabla ZVBEP
+  zcl_ap_log=>set_log( proceso = 'WP_MOD_PED' clave = vbeln p1 = 'Se van a actualizar estados de pedido:' p2 = vbeln msgty = 'I' ).
+  DATA(o_sd) = NEW zhcl_sd_core( ).
+  DATA(l_contrato) = SWITCH abap_bool( l_vbak-vbtyp WHEN 'G' THEN 'X' ).
+  DATA(i_rep) = o_sd->get_repartos( r_vbeln     = VALUE #( ( option = 'EQ' sign = 'I' low = vbeln ) )
+                                    historico = 'X'
+                                    add_contratos_sin_pedido = l_contrato
+                                    datos_medidas = ''
+                                    datos_interlocutores = ''
+                                    datos_stocks = 'X'
+                                    origen = 'WF_PV' ).
+
+
+  IF l_vbak-aedat IS INITIAL.
+    DATA(l_new) = 'X'.
+*    zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = 'Nuevo pedido' msgty = 'I' ).
+    LOOP AT xvbap ASSIGNING <xvbap>.
+      <xvbap>-updkz = 'I'.
+    ENDLOOP.
+  ELSE.
+    SELECT * FROM cdhdr
+      INTO cdhdr
+      UP TO 1 ROWS
+     WHERE objectclas = 'VERKBELEG'
+       AND objectid   = vbeln
+       AND NOT username IN ('WF-BATCH', 'SAP_WFRT') "No queremos retroalimentarnos si hay modificaciones
+       AND changenr IN r_changenr
+       AND udate = l_udate
+       AND utime <= l_utime
+    ORDER BY changenr DESCENDING.
+    ENDSELECT.
+    IF sy-subrc NE 0.
+      zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = 'Sin cambios...' ).
+      RETURN. "Sin cambios, salimos
+    ENDIF.
+    IF NOT cdhdr-changenr  IS INITIAL.
+      zcl_ap_temp=>set_st( clave = 'WF_PC_C' subclave = vbeln valor1 = cdhdr-changenr ).
+      COMMIT WORK AND WAIT.
+      zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = 'Nº mod.' p2 = cdhdr-changenr p3 = cdhdr-udate p4 = cdhdr-utime msgty = 'I' ).
+      SELECT * FROM cdpos
+        INTO TABLE @DATA(i_cdpos)
+       WHERE objectclas = 'VERKBELEG'
+         AND objectid   = @vbeln
+         AND changenr   = @cdhdr-changenr.
+    ENDIF.
+
+*    zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = 'Cambio' p2 = cdhdr-changenr p3 = 'Usuario' p4 = cdhdr-username msgty = 'I' ).
+*    zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = 'Pedido modificado' msgty = 'I' ).
+
+    yvbap = xvbap.
+    LOOP AT xvbap ASSIGNING <xvbap> WHERE aedat = sy-datum.
+      DATA(l_tabkey) = sy-mandt && <xvbap>-vbeln && <xvbap>-posnr.
+      ASSIGN i_cdpos[ tabname = 'VBAP' tabkey = l_tabkey ] TO FIELD-SYMBOL(<cdpos>).
+      IF sy-subrc = 0.
+        <xvbap>-updkz = <cdpos>-chngind.
+      ENDIF.
+      IF <xvbap>-updkz = 'U'.
+        ASSIGN yvbap[ posnr = <xvbap>-posnr ] TO FIELD-SYMBOL(<yvbap>).
+        LOOP AT i_cdpos ASSIGNING <cdpos> WHERE tabname = 'VBAP' AND tabkey = l_tabkey.
+          ASSIGN COMPONENT <cdpos>-fname OF STRUCTURE <yvbap> TO FIELD-SYMBOL(<fname_old>).
+          IF sy-subrc = 0.
+            TRY.
+                <fname_old> = <cdpos>-value_old.
+*                IF <cdpos>-fname = 'ZSTATP'.
+*                  zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = 'Campo' p2 = <cdpos>-fname p3 = 'Antes=' p4 =  <cdpos>-value_old p5 = 'Nuevo valor=' p6 = <cdpos>-value_new msgty = 'I' ).
+*                ENDIF.
+              CATCH cx_root INTO DATA(o_root).
+                zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = o_root->get_text( ) ).
+            ENDTRY.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ENDLOOP.
+
+
+*    LOOP AT i_vbap_hpg ASSIGNING FIELD-SYMBOL(<vbap_hpg>).
+*      ASSIGN yvbap[ posnr = <vbap_hpg>-posnr ] TO <yvbap>.
+*      IF sy-subrc = 0.
+*        IF <yvbap>-zstatp NE <vbap_hpg>-zstatp_prev.
+*          <yvbap>-zstatp =  <vbap_hpg>-zstatp_prev.
+*          zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = 'Recuperamos valor del campo ZSTATP previo =' p2 = <vbap_hpg>-zstatp_prev msgty = 'I' ).
+*        ENDIF.
+*      ENDIF.
+*    ENDLOOP.
+  ENDIF.
+
+
+********************************** PROCESOS QUE ACTUALIZAN
+  DATA(l_msg) = zcl_ap_pedido_sd=>espera_si_bloqueado( vbeln = vbeln ).
+  IF NOT l_msg IS INITIAL.
+    zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = l_msg msgty = 'E' ).
+  ENDIF.
+
+  SELECT COUNT( * ) FROM ztsd0014
+    INTO @DATA(l_mc_pend)
+   WHERE status = ''.
+  IF sy-subrc = 0.
+    l_seg = zcl_ap_temp=>get_segundos_st( clave = 'ZRSD0053' ).
+    IF l_seg > 60.
+      zcl_ap_log=>set_log( proceso = 'WF_MOD_PED' clave = vbeln p1 = 'Existen ' p2 = l_mc_pend p3 = 'posiciones pendientes de procesar margen de contribución' msgty = 'I' ).
+      SUBMIT zrsd0053
+       AND RETURN
+      WITH p_ejec = 'X'.
+    ENDIF.
+  ENDIF.
+
+*
+*  IF NOT l_vbak-knumv IS INITIAL.
+*    SELECT * FROM konv
+*      INTO CORRESPONDING FIELDS OF TABLE xkomv
+*     WHERE knumv = l_vbak-knumv.
+*  ENDIF.
+*  zcl_exits_sd=>autorizacion_margen_contrib( EXPORTING wf = 'X'
+*                                             CHANGING  vbak  = l_vbak
+*                                                       xvbap = xvbap[]
+*                                                       yvbap = yvbap[]
+*                                                       xkomv = xkomv[] ).
+
+
+
+* Lanzamos posible actualización de catálogo (Sólo si modificaciones en cabecera)
+  IF l_new = 'X' OR line_exists( i_cdpos[ tabname = 'VBAK' ] ).
+    DATA s_erdat TYPE RANGE OF sy-datum.
+    SUBMIT zrsd0040
+      AND RETURN
+     WITH s_vbeln = vbeln
+     WITH s_erdat IN s_erdat
+     WITH p_ejec  = 'X'
+     WITH p_log = 'WF_MOD_PED'.
+  ENDIF.
+
+
+  IF l_bloqueo IS INITIAL.
+* Procesos que necesitan bloquear el WF
+  ENDIF.
+
+  zcl_ap_utils=>desbloquear_programa( cprog = 'WF_MOD_PED-' && vbeln  ).
+
+
+ENDFUNCTION.

@@ -1,0 +1,310 @@
+*&---------------------------------------------------------------------*
+*& Report  ZSSD_IF_OMP_HU_FOTO_STOCK
+*&
+*&---------------------------------------------------------------------*
+*&
+*& Inteface OMP - Transporte.
+*& HU Events
+*&
+*& Envio de la foto del stock a OMP.
+*&
+*& R.Malea. 22.05.2023
+*&
+*&---------------------------------------------------------------------*
+REPORT zssd_if_omp_hu_foto_stock.
+
+CONSTANTS: c_edi_extern TYPE edi_rcvpor VALUE 'OMP',
+           c_rcvprn     TYPE edi_rcvprn VALUE 'OMP',
+           c_ls_d       TYPE edi_rcvprt VALUE 'LS',
+           c_ls_r       TYPE edi_sndprt VALUE 'LS',
+           c_zmsg       TYPE edi_mestyp VALUE 'ZIF_OMP_HU',
+           c_idoctp     TYPE edi_idoctp VALUE 'ZIF_OMP_HU'.
+
+TABLES: mara, lqua.
+
+PARAMETERS: p_lgnum TYPE t320-lgnum OBLIGATORY.
+
+SELECT-OPTIONS: s_matnr FOR mara-matnr,
+                s_lgtyp FOR lqua-lgtyp,
+                s_lgpla FOR lqua-lgpla.
+
+PARAMETERS: p_bestq TYPE lqua-bestq.
+
+
+*-----------------------------------------------------------------------
+* INITIALIZATION.
+*-----------------------------------------------------------------------
+INITIALIZATION.
+
+*-----------------------------------------------------------------------
+* START-OF-SELECTION.
+*-----------------------------------------------------------------------
+START-OF-SELECTION.
+
+  DATA: rl_mtart TYPE RANGE OF mara-mtart,
+        wl_mtart LIKE LINE OF rl_mtart.
+
+  DATA: vl_idoc_header       TYPE edidc,
+        tl_idoc_comm_control TYPE TABLE OF edidc,
+        ls_idoc_comm_control TYPE edidc,
+        tl_edidd             TYPE edidd_tt,
+        wl_edidd             TYPE edidd,
+        vl_segnum            TYPE edidd-segnum,
+        vl_psgnum            TYPE edidd-psgnum.
+
+  DATA: wl_zcc_hu_event     TYPE  zcchandlingunitevent,
+        wl_zcc_hu_eventdata TYPE  zcchandlinguniteventdata.
+
+  DATA: vl_eventdateseqnr TYPE int4.
+
+  CLEAR vl_eventdateseqnr.
+
+  "
+  " Configuración criterios selección.
+  "
+  DATA: wl_config_omp  TYPE zssd_if_omp_cfg,
+        rl_range_mtart TYPE efg_tab_ranges.
+  CALL FUNCTION 'ZSD_IF_OMP_TRANS_GET_CONFG'
+    EXPORTING
+      vp_lgnum       = p_lgnum
+    IMPORTING
+      wp_config      = wl_config_omp
+      tp_range_mtart = rl_range_mtart
+    EXCEPTIONS
+      no_config      = 1
+      OTHERS         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE 'El almacén WM no está configurado para OMP' TYPE 'E'.
+  ENDIF.
+  rl_mtart = rl_range_mtart.
+
+*  CLEAR rl_mtart.
+*  CLEAR wl_mtart.
+*  wl_mtart-sign = 'I'.
+*  wl_mtart-option = 'EQ'.
+*  wl_mtart-low = 'ZSEM'.
+*  APPEND wl_mtart TO rl_mtart.
+*  wl_mtart-low = 'ZPTO'.
+*  APPEND wl_mtart TO rl_mtart.
+
+  "
+  " Selección de los cuantos.
+  "
+  SELECT lqua~*
+    FROM lqua
+    INNER JOIN mara ON mara~matnr = lqua~matnr
+    INTO TABLE @DATA(tl_lqua)
+    WHERE lqua~lgnum = @p_lgnum AND
+          lqua~matnr IN @s_matnr AND
+          mara~mtart IN @rl_mtart AND
+          lqua~bestq = @p_bestq AND
+          lqua~lgtyp IN @s_lgtyp AND
+          lqua~lgpla IN @s_lgpla AND
+          lqua~lenum > 0.
+  "
+  " Ver en este include un ejemplo de llamada a proxy PI : ZRWM_INTF_OMP_F01_PACS
+  " https://help.sap.com/doc/saphelp_ssb/1.0/en-US/1b/e57b5185504372b77267fb5ef3e93b/content.htm?no_cache=true
+  DATA: lo_proxy_foto_hu TYPE REF TO zco_si_omp_hu_foto_stock_out,
+        lv_log_port      TYPE prx_logical_port_name,
+        ls_datos_foto_hu TYPE zmessage.
+" Para esta interface no está definida un LOGICAL_PORT
+**  SELECT SINGLE valor1
+**    FROM ztwm001
+**    INTO lv_log_port
+**    WHERE cprog = sy-repid AND
+**          param1 = 'LOGICAL_PORT_NAME'.
+**  IF sy-subrc <> 0.
+**    lv_log_port = 'LP_OMP'.
+**  ENDIF.
+
+  IF lo_proxy_foto_hu IS NOT BOUND.
+    TRY.
+        CREATE OBJECT lo_proxy_foto_hu
+          EXPORTING
+            logical_port_name = lv_log_port.
+
+      CATCH cx_ai_system_fault INTO data(ls_excp).
+        data(lv_msg) = ls_excp->get_text( ).
+        MESSAGE lv_msg TYPE 'S' DISPLAY LIKE 'E'.
+        EXIT.
+    ENDTRY.
+
+  ENDIF.
+
+  CLEAR ls_datos_foto_hu.
+
+  LOOP AT tl_lqua ASSIGNING FIELD-SYMBOL(<fs_lqua>).
+
+    CALL FUNCTION 'ZSD_IF_OMP_HU_DATA_LQUA'
+      EXPORTING
+        vp_lgnum = <fs_lqua>-lgnum
+        vp_lqnum = <fs_lqua>-lqnum
+        wp_lqua  = <fs_lqua>
+      CHANGING
+        wp_data  = wl_zcc_hu_eventdata.
+
+    APPEND INITIAL LINE TO ls_datos_foto_hu-action-cchandlingunitevent ASSIGNING FIELD-SYMBOL(<fs_zcc_hu>).
+*    MOVE-CORRESPONDING wl_zcc_hu_eventdata to <fs_zcc_hu>-cchandlinguniteventdata.
+
+    <fs_zcc_hu>-cchandlinguniteventdata-comments-content = wl_zcc_hu_eventdata-comments.
+    <fs_zcc_hu>-cchandlinguniteventdata-endcreation = wl_zcc_hu_eventdata-endcreation.
+    <fs_zcc_hu>-cchandlinguniteventdata-endeff = wl_zcc_hu_eventdata-endeff.
+    <fs_zcc_hu>-cchandlinguniteventdata-erphandlingunitid = wl_zcc_hu_eventdata-erphandlingunitid .
+    <fs_zcc_hu>-cchandlinguniteventdata-event = wl_zcc_hu_eventdata-event.
+    <fs_zcc_hu>-cchandlinguniteventdata-eventdate = wl_zcc_hu_eventdata-eventdate.
+    <fs_zcc_hu>-cchandlinguniteventdata-eventdateseqnr = wl_zcc_hu_eventdata-eventdateseqnr.
+    <fs_zcc_hu>-cchandlinguniteventdata-footprintlength-content = wl_zcc_hu_eventdata-footprintlength.
+    <fs_zcc_hu>-cchandlinguniteventdata-footprintlength-unit = wl_zcc_hu_eventdata-footprintlength_uom.
+    <fs_zcc_hu>-cchandlinguniteventdata-footprintwidth-content = wl_zcc_hu_eventdata-footprintwidth.
+    <fs_zcc_hu>-cchandlinguniteventdata-footprintwidth-unit = wl_zcc_hu_eventdata-footprintwidth_uom.
+    <fs_zcc_hu>-cchandlinguniteventdata-goodsid = wl_zcc_hu_eventdata-goodsid.
+    <fs_zcc_hu>-cchandlinguniteventdata-grossheight-content = wl_zcc_hu_eventdata-grossheight.
+    <fs_zcc_hu>-cchandlinguniteventdata-grossheight-unit = wl_zcc_hu_eventdata-grossheight_uom.
+    <fs_zcc_hu>-cchandlinguniteventdata-grossweight-content = wl_zcc_hu_eventdata-grossweight.
+    <fs_zcc_hu>-cchandlinguniteventdata-grossweight-unit = wl_zcc_hu_eventdata-grossweight_uom.
+    <fs_zcc_hu>-cchandlinguniteventdata-handlingunitquantity = wl_zcc_hu_eventdata-handlingunitquantity.
+    <fs_zcc_hu>-cchandlinguniteventdata-netweight-content = wl_zcc_hu_eventdata-netweight.
+    <fs_zcc_hu>-cchandlinguniteventdata-netweight-unit = wl_zcc_hu_eventdata-netweight_uom.
+    <fs_zcc_hu>-cchandlinguniteventdata-orderid = wl_zcc_hu_eventdata-orderid.
+    <fs_zcc_hu>-cchandlinguniteventdata-runid = wl_zcc_hu_eventdata-runid.
+    <fs_zcc_hu>-cchandlinguniteventdata-startcreation = wl_zcc_hu_eventdata-startcreation.
+    <fs_zcc_hu>-cchandlinguniteventdata-starteff = wl_zcc_hu_eventdata-starteff.
+    <fs_zcc_hu>-cchandlinguniteventdata-stepid = wl_zcc_hu_eventdata-stepid.
+    <fs_zcc_hu>-cchandlinguniteventdata-storageposition = wl_zcc_hu_eventdata-storageposition.
+    <fs_zcc_hu>-cchandlinguniteventdata-transportlocationid = wl_zcc_hu_eventdata-transportlocationid.
+    <fs_zcc_hu>-cchandlinguniteventdata-whid     = wl_zcc_hu_eventdata-whid.
+
+
+    CONDENSE <fs_zcc_hu>-cchandlinguniteventdata-footprintlength-content.
+    CONDENSE <fs_zcc_hu>-cchandlinguniteventdata-footprintwidth-content.
+    CONDENSE <fs_zcc_hu>-cchandlinguniteventdata-grossheight-content.
+    CONDENSE <fs_zcc_hu>-cchandlinguniteventdata-grossweight-content.
+    CONDENSE <fs_zcc_hu>-cchandlinguniteventdata-handlingunitquantity.
+    CONDENSE <fs_zcc_hu>-cchandlinguniteventdata-netweight-content.
+
+  ENDLOOP.
+
+  TRY.
+      CALL METHOD lo_proxy_foto_hu->si_omp_hu_foto_stock_out
+        EXPORTING
+          output = ls_datos_foto_hu.
+
+      COMMIT WORK.
+
+    CATCH cx_ai_system_fault INTO data(ls_excp_env).
+        lv_msg = ls_excp_env->get_text( ).
+        MESSAGE lv_msg TYPE 'S' DISPLAY LIKE 'E'.
+        EXIT.
+  ENDTRY.
+
+
+
+  "
+  " Proceso antiguo. Vía IDOC.
+  "
+***  vl_segnum = 1.
+***  CLEAR tl_edidd.
+***  LOOP AT tl_lqua ASSIGNING FIELD-SYMBOL(<fs_lqua>).
+***
+***    CLEAR wl_zcc_hu_event.
+***    wl_zcc_hu_event-operation = 'Replace'.
+***
+***    CLEAR: wl_edidd.
+***    wl_edidd-sdata = wl_zcc_hu_event.
+***    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcc_hu_event )->get_relative_name( ).
+***    wl_edidd-segnum = vl_segnum.
+***    vl_psgnum = vl_segnum.
+***    ADD 1 TO vl_segnum.
+***    APPEND wl_edidd TO tl_edidd.
+***    CLEAR wl_zcc_hu_event.
+***
+***    CLEAR wl_zcc_hu_eventdata.
+***
+***    CALL FUNCTION 'ZSD_IF_OMP_HU_DATA_LQUA'
+***      EXPORTING
+***        vp_lgnum = <fs_lqua>-lgnum
+***        vp_lqnum = <fs_lqua>-lqnum
+***        wp_lqua  = <fs_lqua>
+***      CHANGING
+***        wp_data  = wl_zcc_hu_eventdata.
+***
+***    CLEAR: wl_edidd.
+***    " Quitar espacios campos float.
+***    CONDENSE wl_zcc_hu_eventdata-footprintlength.
+***    CONDENSE wl_zcc_hu_eventdata-footprintwidth.
+***    CONDENSE wl_zcc_hu_eventdata-grossheight.
+***    CONDENSE wl_zcc_hu_eventdata-grossweight.
+***    CONDENSE wl_zcc_hu_eventdata-handlingunitquantity.
+***    " Añadir número secuencia.
+***    ADD 1 TO vl_eventdateseqnr.
+***    wl_zcc_hu_eventdata-eventdateseqnr = vl_eventdateseqnr.
+***    CONDENSE wl_zcc_hu_eventdata-eventdateseqnr.
+***
+***    wl_edidd-sdata = wl_zcc_hu_eventdata.
+***    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcc_hu_eventdata )->get_relative_name( ).
+***    wl_edidd-segnum = vl_segnum.
+***    wl_edidd-psgnum = vl_psgnum.
+***    ADD 1 TO vl_segnum.
+***    APPEND wl_edidd TO tl_edidd.
+***    CLEAR wl_zcc_hu_eventdata.
+***
+***  ENDLOOP.
+***
+***  "
+***  " Generamos IDOC
+***  "
+***  CLEAR vl_idoc_header.
+***  vl_idoc_header-mandt  = sy-mandt.
+***  vl_idoc_header-direct = '1'.
+***  vl_idoc_header-rcvpor = c_edi_extern.
+***  vl_idoc_header-rcvprt = c_ls_d.
+***  vl_idoc_header-rcvprn = c_rcvprn.
+***  vl_idoc_header-sndprt = c_ls_r.
+***  vl_idoc_header-sndprn = sy-uname.
+***  vl_idoc_header-mestyp = c_zmsg.
+***  vl_idoc_header-idoctp = c_idoctp.
+***
+***  SORT tl_edidd BY segnum ASCENDING.
+***
+***
+***  CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE' "IN UPDATE TASK
+***    EXPORTING
+***      master_idoc_control            = vl_idoc_header
+***    TABLES
+***      communication_idoc_control     = tl_idoc_comm_control
+***      master_idoc_data               = tl_edidd
+***    EXCEPTIONS
+***      error_in_idoc_control          = 1
+***      error_writing_idoc_status      = 2
+***      error_in_idoc_data             = 3
+***      sending_logical_system_unknown = 4
+***      OTHERS                         = 5.
+***  IF sy-subrc <> 0.
+****      "KO
+****      ls_return-type        = sy-msgty.
+****      ls_return-number      = sy-msgno.
+****      ls_return-id          = sy-msgid.
+****      ls_return-message_v1  = sy-msgv1.
+****      ls_return-message_v2  = sy-msgv2.
+****      ls_return-message_v3  = sy-msgv3.
+****      ls_return-message_v4  = sy-msgv4.
+****      APPEND ls_return TO lt_return.
+***    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+***  ELSE.
+****      "OK
+****      READ TABLE lt_idoc_comm_control INTO DATA(ls_control_record_out) INDEX 1.
+****      CHECK sy-subrc = 0.
+****      DATA(docnum) = ls_control_record_out-docnum.
+****      ls_return-type        = 'S'.
+****      ls_return-number      = '398'.
+****      ls_return-id          = '00'.
+****      ls_return-message_v1  = docnum.
+****      APPEND ls_return TO lt_return.
+***    MESSAGE 'Proceso terminado correctamente' TYPE 'I'.
+***  ENDIF.
+***
+**** Hacemos un COMMIT para el Idoc
+****  CALL FUNCTION 'DEQUEUE_ALL'.
+****  COMMIT WORK AND WAIT.
+***  CALL FUNCTION 'DB_COMMIT'.
+***  CALL FUNCTION 'DEQUEUE_ALL'.

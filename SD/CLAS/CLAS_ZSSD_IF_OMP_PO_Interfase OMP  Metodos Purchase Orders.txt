@@ -1,0 +1,323 @@
+
+class ZSSD_IF_OMP_PO definition
+  public
+  final
+  create public .
+
+public section.
+
+  methods SAVE_DOCUMENT
+    importing
+      !WP_MEPOHEADER type MEPOHEADER
+      !TP_MEPOITEMS type TAB_MEPOITEM
+      !TP_MEPOSCHEDULES type TAB_MEPOSCHEDULE
+      !IM_HEADER type ref to IF_PURCHASE_ORDER_MM optional .
+protected section.
+private section.
+endclass. "ZSSD_IF_OMP_PO definition
+class ZSSD_IF_OMP_PO implementation.
+  METHOD save_document.
+    DATA: vl_en_omp TYPE xflag,
+          vl_accion TYPE zif_omp_trans_req_accion.
+    DATA: vl_ebeln   TYPE ekko-ebeln,
+          vl_num_req TYPE zssd_if_omp_tp_r-num_req.
+    DATA: vl_lanzar_job TYPE xflag.
+
+    DATA: tl_mepoitems_previous TYPE tab_mepoitem,
+          wl_mepoitems          TYPE mepoitem,
+          tl_meposched_previous TYPE tab_meposchedule,
+          wl_meposched          TYPE meposchedule.
+
+    CLEAR vl_lanzar_job.
+    "
+    " Preparamos estructuras para obtener valores previos al cambio.
+    "
+    CLEAR tl_mepoitems_previous.
+    CLEAR tl_meposched_previous.
+    DATA(lt_mepoitems_r)  = im_header->get_items( ).
+    LOOP AT lt_mepoitems_r ASSIGNING FIELD-SYMBOL(<fs_mepoitems_r>).
+      TRY.
+          CLEAR wl_mepoitems.
+          <fs_mepoitems_r>-item->get_persistent_data( IMPORTING ex_data = wl_mepoitems  EXCEPTIONS no_data = 1 ).
+          IF wl_mepoitems IS NOT INITIAL.
+            APPEND wl_mepoitems TO tl_mepoitems_previous.
+          ENDIF.
+        CATCH cx_root.
+      ENDTRY.
+
+* Obtenemos también los repartos.
+      DATA(lt_meposched_r) = <fs_mepoitems_r>-item->get_schedules( ).
+
+      LOOP AT lt_meposched_r ASSIGNING FIELD-SYMBOL(<fs_meposched_r>).
+        TRY.
+            CLEAR wl_meposched.
+            <fs_meposched_r>-schedule->get_previous_data( IMPORTING ex_data = wl_meposched EXCEPTIONS no_data = 1 ).
+            IF wl_meposched IS NOT INITIAL.
+              APPEND wl_meposched TO tl_meposched_previous.
+            ENDIF.
+          CATCH cx_root.
+        ENDTRY.
+
+      ENDLOOP.
+    ENDLOOP.
+
+    "
+    " Recorremos los repartos del pedido y decidimos las acciones a realizar.
+    "
+    LOOP AT tp_meposchedules ASSIGNING FIELD-SYMBOL(<fs_schedules>).
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = <fs_schedules>-ebeln
+        IMPORTING
+          output = vl_ebeln.
+      CLEAR vl_accion.
+
+      READ TABLE tp_mepoitems ASSIGNING FIELD-SYMBOL(<fs_poitem>) WITH KEY ebelp = <fs_schedules>-ebelp.
+      IF sy-subrc <> 0.
+        CLEAR <fs_poitem>.
+      ENDIF.
+
+      "
+      " Miramos si ya se envió a OMP.
+      "
+      CLEAR vl_en_omp.
+      SELECT SINGLE *
+        FROM zssd_if_omp_tr
+        INTO @DATA(wl_zssd_if_omp_tr)
+        WHERE ebeln = @<fs_schedules>-ebeln AND
+              ebelp = @<fs_schedules>-ebelp AND
+              etenr = @<fs_schedules>-etenr.
+      IF sy-subrc <> 0.
+        SELECT SINGLE *
+        FROM zssd_if_omp_tr_p
+        INTO @DATA(wl_zssd_if_omp_tr_p)
+        WHERE ebeln = @<fs_schedules>-ebeln AND
+              ebelp = @<fs_schedules>-ebelp AND
+              etenr = @<fs_schedules>-etenr.
+      ENDIF.
+      IF sy-subrc = 0.
+        vl_en_omp = 'X'.
+      ENDIF.
+
+      DATA: lv_tipo_correcto TYPE xflag.
+      CLEAR lv_tipo_correcto.
+      IF <fs_poitem> IS ASSIGNED AND ( <fs_poitem>-pstyp = 3 OR <fs_poitem>-pstyp = 7 ).
+        lv_tipo_correcto = 'X'.
+      ENDIF.
+
+      IF vl_en_omp IS INITIAL AND lv_tipo_correcto IS INITIAL.
+        CONTINUE.
+      ENDIF.
+      IF vl_en_omp IS NOT INITIAL AND lv_tipo_correcto IS INITIAL.
+        vl_accion = 'B'.
+      ENDIF.
+
+      "
+      " Buscamos el almacén WM asociado.
+      "
+      IF <fs_poitem> IS ASSIGNED.
+        SELECT SINGLE *
+          FROM t320
+          INTO @DATA(wl_t320)
+          WHERE werks = @<fs_poitem>-werks AND
+                lgort = @<fs_poitem>-reslo.
+        IF sy-subrc <> 0.
+          SELECT SINGLE *
+            FROM t320
+            INTO wl_t320
+            WHERE werks = <fs_poitem>-werks.
+        ENDIF.
+        IF sy-subrc <> 0.
+          CLEAR wl_t320.
+        ENDIF.
+        "
+        " Configuración criterios selección.
+        "
+        DATA: wl_config_omp  TYPE zssd_if_omp_cfg,
+              rl_range_mtart TYPE efg_tab_ranges,
+              rl_range_bsart TYPE efg_tab_ranges,
+              rl_range_vstel TYPE efg_tab_ranges.
+        CALL FUNCTION 'ZSD_IF_OMP_TRANS_GET_CONFG'
+          EXPORTING
+            vp_lgnum       = wl_t320-lgnum
+          IMPORTING
+            wp_config      = wl_config_omp
+            tp_range_mtart = rl_range_mtart
+            tp_range_bsart = rl_range_bsart
+            tp_range_vstel = rl_range_vstel
+          EXCEPTIONS
+            no_config      = 1
+            OTHERS         = 2.
+        " Validar que es del almacén wm que toca.
+        CHECK sy-subrc = 0.
+      ENDIF.
+
+
+      IF vl_en_omp IS INITIAL.
+        " Si no se ha enviado a OMP, como si fuera un alta.
+        vl_accion = 'A'.
+      ELSE.
+        "
+        " Buscamos los datos guardados para ver si han cambiado y avisar a OMP.
+        "
+        DATA wl_eket_old TYPE eket.
+        CLEAR wl_eket_old.
+
+        READ TABLE tl_meposched_previous
+        ASSIGNING FIELD-SYMBOL(<fs_eket_old>)
+        WITH KEY ebeln = <fs_schedules>-ebeln
+                 ebelp = <fs_schedules>-ebelp
+                 etenr = <fs_schedules>-etenr.
+        IF sy-subrc = 0.
+          MOVE-CORRESPONDING <fs_eket_old> TO wl_eket_old.
+        ELSE.
+          SELECT SINGLE *
+            FROM eket
+            INTO CORRESPONDING FIELDS OF wl_eket_old
+            WHERE ebeln = <fs_schedules>-ebeln AND
+                ebelp = <fs_schedules>-ebelp AND
+                etenr = <fs_schedules>-etenr.
+          IF sy-subrc <> 0.
+            vl_accion = 'A'.
+          ENDIF.
+        ENDIF.
+
+        IF wl_eket_old IS INITIAL.
+          vl_accion = 'A'.
+        ELSE.
+          DATA wl_ekpo_old TYPE ekpo.
+
+          CLEAR wl_ekpo_old.
+
+          READ TABLE tl_mepoitems_previous
+          ASSIGNING FIELD-SYMBOL(<fs_ekpo_old>)
+          WITH KEY ebeln = <fs_schedules>-ebeln
+                   ebelp = <fs_schedules>-ebelp.
+          IF sy-subrc = 0.
+            MOVE-CORRESPONDING <fs_ekpo_old> TO wl_ekpo_old.
+          ELSE.
+            SELECT SINGLE *
+              FROM ekpo
+              INTO CORRESPONDING FIELDS OF wl_ekpo_old
+              WHERE ebeln = <fs_schedules>-ebeln AND
+                  ebelp = <fs_schedules>-ebelp.
+          ENDIF.
+          IF wl_ekpo_old IS INITIAL.
+            vl_accion = 'A'.
+          ELSEIF wl_eket_old-menge <> <fs_schedules>-menge OR
+                 wl_eket_old-eindt <> <fs_schedules>-eindt OR
+                 wl_ekpo_old-loekz <> <fs_poitem>-loekz OR
+                 wl_ekpo_old-lgort  <> <fs_poitem>-lgort OR
+                 wl_ekpo_old-menge  <> <fs_poitem>-menge OR
+                 wl_ekpo_old-uebto <> <fs_poitem>-uebto OR
+                 wl_ekpo_old-untto <> <fs_poitem>-untto OR
+                 wl_ekpo_old-zzcrear_of <> <fs_poitem>-zzcrear_of OR
+                 wl_ekpo_old-elikz <> <fs_poitem>-elikz OR
+                 wl_ekpo_old-eglkz <> <fs_poitem>-eglkz.
+            vl_accion = 'M'.
+          ENDIF.
+        ENDIF.
+
+*        SELECT SINGLE *
+*          FROM eket
+*          INTO @DATA(wl_eket_old)
+*          WHERE ebeln = @<fs_schedules>-ebeln AND
+*              ebelp = @<fs_schedules>-ebelp AND
+*              etenr = @<fs_schedules>-etenr.
+*        IF sy-subrc <> 0.
+*          vl_accion = 'A'.
+*        ELSE.
+*          SELECT SINGLE *
+*            FROM ekpo
+*            INTO @DATA(wl_ekpo_old)
+*            WHERE ebeln = @<fs_schedules>-ebeln AND
+*                ebelp = @<fs_schedules>-ebelp.
+*
+*          IF wl_eket_old-menge <> <fs_schedules>-menge OR
+*             wl_eket_old-eindt <> <fs_schedules>-eindt OR
+*             wl_ekpo_old-loekz <> <fs_poitem>-loekz OR
+*            wl_ekpo_old-lgort  <> <fs_poitem>-lgort OR
+*            wl_ekpo_old-menge  <> <fs_poitem>-menge OR
+*            wl_ekpo_old-zzcrear_of <> <fs_poitem>-zzcrear_of.
+*            vl_accion = 'M'.
+*          ENDIF.
+*        ENDIF.
+      ENDIF.
+
+      IF vl_en_omp IS NOT INITIAL AND
+        <fs_poitem>-loekz = 'L'. "Posición borrada.
+        vl_accion = 'B'. "Baja.
+      ENDIF.
+
+      IF <fs_poitem>-elikz IS NOT INITIAL OR
+         <fs_poitem>-eglkz IS NOT INITIAL.
+        vl_accion = 'F'. "Fulfilled. Completado.
+      ENDIF.
+
+
+***      IF vl_en_omp IS NOT INITIAL AND
+***        ( <fs_xvbap>-updkz = 'D' OR
+***          <fs_xvbep>-updkz = 'D' ).
+***        vl_accion = 'B'.
+***      ENDIF.
+
+      IF vl_accion = 'A' AND <fs_schedules>-menge = 0. CONTINUE. ENDIF.
+
+      " Confirmar que no está procesada e incluida en un transporte.
+      CONCATENATE vl_ebeln '.' <fs_schedules>-ebelp '.' <fs_schedules>-etenr INTO vl_num_req.
+      SELECT SINGLE *
+        FROM zssd_if_omp_tp_r
+        INTO @DATA(wl_zssd_if_omp_tp_r)
+        WHERE num_req = @vl_num_req.
+      IF sy-subrc = 0.
+        CLEAR vl_accion.
+      ENDIF.
+
+      IF vl_accion IS NOT INITIAL.
+        "
+        " Mandamos a OMP la información del requisito.
+        "
+        DATA: wl_ekko TYPE  ekko,
+              wl_ekpo TYPE  ekpo,
+              wl_eket TYPE  eket.
+
+        MOVE-CORRESPONDING wp_mepoheader TO wl_ekko.
+        MOVE-CORRESPONDING <fs_poitem> TO wl_ekpo.
+        MOVE-CORRESPONDING <fs_schedules> TO wl_eket.
+
+        IF wl_ekko-ebeln IS INITIAL.
+          wl_ekko-ebeln = <fs_schedules>-ebeln.
+        ENDIF.
+        IF wl_ekpo-ebeln IS INITIAL.
+          wl_ekpo-ebeln = <fs_schedules>-ebeln.
+        ENDIF.
+
+        DATA vl_seleccionado TYPE xflag.
+
+        CALL FUNCTION 'ZSD_IF_OMP_TRANS_REQ_EKET_PDTE'
+          EXPORTING
+            vp_accion       = vl_accion
+            vp_ebeln        = <fs_schedules>-ebeln
+            vp_ebelp        = <fs_schedules>-ebelp
+            vp_etenr        = <fs_schedules>-etenr
+            wp_ekko         = wl_ekko
+            wp_ekpo         = wl_ekpo
+            wp_eket         = wl_eket
+          IMPORTING
+            vp_seleccionado = vl_seleccionado.
+
+        IF vl_seleccionado IS NOT INITIAL.
+          vl_lanzar_job = 'X'.
+        ENDIF.
+
+
+      ENDIF.
+
+    ENDLOOP.
+
+    IF vl_lanzar_job IS NOT INITIAL.
+      CALL FUNCTION 'ZSD_IF_OMP_TRANS_REQ_SEND'.
+    ENDIF.
+
+  ENDMETHOD.
+endclass. "ZSSD_IF_OMP_PO implementation

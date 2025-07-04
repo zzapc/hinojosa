@@ -1,0 +1,740 @@
+
+class YCL_HP_SMD_AIS_STP_S001 definition
+  public
+  inheriting from /VCXI/CL_CKMR_CLSTP
+  final
+  create public .
+
+public section.
+
+  methods CONSTRUCTOR
+    importing
+      !IR_RPSEG type ref to /VCXI/CL_CKMR_RPSEG
+    raising
+      /VCXI/CX_CKX .
+
+  methods EXECUTE
+    redefinition .
+protected section.
+
+  data R_DCO_OUTPUT type ref to YCL_HP_SMD_AIS_DCO .
+  data R_DCO_INPUT type ref to YCL_HP_SMD_AIS_DCO .
+  data R_CSV type ref to YCL_HP_SMD_AIS_CSV .
+
+  methods CONVERT_SVCEL_DATA
+    raising
+      /VCXI/CX_CKX .
+  methods FILTER_SVCEL
+    changing
+      !CT_SVCEL type ZVCXI_XCI_TT_SVCEL
+    exceptions
+      /VCXI/CX_CKX .
+  methods GET_CMPRK
+    raising
+      /VCXI/CX_CKX .
+  methods GET_CSV_DATA
+    raising
+      /VCXI/CX_CKX .
+  methods GET_WAERS
+    importing
+      !IF_WERKS type WERKS_D
+    returning
+      value(RF_WAERS) type WAERS
+    raising
+      /VCXI/CX_CKX .
+  methods CONVERT_SVCEL_DATA_DIMEN
+    importing
+      !IF_VALUE type STRING
+    returning
+      value(RF_VALUE) type STRING
+    raising
+      /VCXI/CX_CKX .
+  methods CONVERT_SVCEL_DATA_LIMIT
+    importing
+      !IF_VALUE type STRING
+    returning
+      value(RF_VALUE) type STRING
+    raising
+      /VCXI/CX_CKX .
+  methods APPLY_INPUT_FORMAT
+    importing
+      !IS_TD01 type YHP_SMD_AIS_TD01
+    changing
+      !CF_DATA type /VCXI/CKX_STRING
+    raising
+      /VCXI/CX_CKX .
+private section.
+endclass. "YCL_HP_SMD_AIS_STP_S001 definition
+class YCL_HP_SMD_AIS_STP_S001 implementation.
+  method APPLY_INPUT_FORMAT.
+
+    data: LF_DATA_BUF type /VCXI/CKX_STRING.
+
+***-------------------------------------------------------------------*
+*** Buffer data
+    check CF_DATA is not initial.
+    move CF_DATA to LF_DATA_BUF.
+
+***-------------------------------------------------------------------*
+*** Handle Material Numbers
+    if IS_TD01-CHILDID cp 'PACKMAT*'   or
+       IS_TD01-CHILDID eq 'CSTEP_DCUT' or
+       IS_TD01-CHILDID eq 'MS_CRPROC'  or
+       IS_TD01-CHILDID eq 'MS_INK'     or
+       IS_TD01-CHILDID eq 'MS_PAPER'   or
+       IS_TD01-CHILDID eq 'MS_STARCH'  or
+       IS_TD01-CHILDID eq 'MS_WAX'.
+      case IS_TD01-PARID.
+        when 'LEOKY' or 'ZVCXI_P0_TDCUT'.
+
+          call function 'CONVERSION_EXIT_MATN1_INPUT'
+            exporting
+              INPUT        = LF_DATA_BUF
+            importing
+              OUTPUT       = LF_DATA_BUF
+            exceptions
+              LENGTH_ERROR = 1
+              others       = 2.
+          if SY-SUBRC eq 0.
+            move LF_DATA_BUF to CF_DATA.
+          endif.
+
+      endcase.
+    endif.
+
+  endmethod.
+method CONSTRUCTOR.
+
+*** Super Constructor
+  SUPER->CONSTRUCTOR( IR_RPSEG = IR_RPSEG ).
+
+*** Map DCO to Required Input/Output
+  ME->R_RPSEG->MAP_DCO( changing CR_DCO = ME->R_DCO_INPUT ).
+  ME->R_RPSEG->MAP_DCO( changing CR_DCO = ME->R_DCO_OUTPUT ).
+
+endmethod.
+method CONVERT_SVCEL_DATA.
+
+  data: LF_ISETBY type I,
+        LF_IVALUE type I,
+        LF_SETBY  type /VCXI/VKSR_SETBY,
+        LF_DATA   type /VCXI/CKX_STRING,
+        LF_GUID   type /VCXI/CKX_GUID,
+        LF_ATWRT  type ATWRT,
+*        LF_ATFLV  type ATFLV,
+        LF_VALUEC type CHAR1024.
+
+  data: LS_TABFIELD type TABFIELD,
+        LS_SVCEL_SU type ZVCXI_XCI_S_SVCEL,
+        LS_SVCEL_PM type ZVCXI_XCI_S_SVCEL,
+        LS_SVCPA    type ZVCXI_XCI_S_SVCPA.
+
+  data: LT_DATA type /VCXI/CKX_TT_STRING.
+
+  data: LR_PARAM type ref to /VCXI/CL_VKSC_PARAM.
+
+  field-symbols: <S_TD01>  type YHP_SMD_AIS_TD01,
+                 <S_WRKLI> type YHP_SMD_AIS_S_QUOT_WRKLI,
+                 <S_SVCEL> type ZVCXI_XCI_S_SVCEL,
+                 <S_SVCPA> type ZVCXI_XCI_S_SVCPA.
+
+*** Clear Data
+  loop at ME->R_DCO_INPUT->T_WRKLI assigning <S_WRKLI>.
+    clear <S_WRKLI>-S_IDAT-T_SVCEL.
+  endloop.
+
+*** Process Configuration Relevant Lines
+  loop at ME->R_CSV->T_TD01 assigning <S_TD01> where PARENTID    is not initial
+                                                  or PARENTPOSID is not initial
+                                                  or CHILDID     is not initial
+                                                  or CHILDPOSID  is not initial.
+
+    split <S_TD01>-LITXT at ME->R_CSV->F_DELIM into table LT_DATA.
+
+*** Get Selected Quotations
+    loop at ME->R_DCO_INPUT->T_WRKLI assigning <S_WRKLI>.
+
+***   Determine Index from CSV
+      read table ME->R_CSV->T_QUOT with key GROUPING = <S_WRKLI>-GROUPING
+                                            POSNR    = <S_WRKLI>-POSNR
+                                            transporting no fields.
+      if SY-SUBRC ne 0.
+        continue.
+      endif.
+
+      LF_ISETBY = SY-TABIX  * 2 - 1.
+      LF_IVALUE = LF_ISETBY + 1.
+
+***   Get SetBy
+      clear: LF_DATA, LF_SETBY.
+      read table LT_DATA into LF_DATA index LF_ISETBY.
+      if LF_DATA is not initial.
+        case LF_DATA+0(1).
+          when 'C'.
+            move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC to LF_SETBY.
+          when 'U'.
+            move /VCXI/CL_VKSR_GATE=>C_SETBY_USER to LF_SETBY.
+          when 'F'.
+            move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC to LF_SETBY.
+          when 'X'.
+            move /VCXI/CL_VKSR_GATE=>C_SETBY_USER to LF_SETBY.
+          when others.
+            clear LF_SETBY.
+        endcase.
+        clear LF_DATA.
+      endif.
+
+***   Get Parameter Value
+      clear LF_DATA.
+      read table LT_DATA into LF_DATA index LF_IVALUE.
+
+***   Add SVCEL if New Key
+      read table <S_WRKLI>-S_IDAT-T_SVCEL assigning <S_SVCEL> with key IPARE = <S_TD01>-PARENTID
+                                                                       CPARE = <S_TD01>-PARENTPOSID
+                                                                       ISELF = <S_TD01>-CHILDID
+                                                                       CSELF = <S_TD01>-CHILDPOSID.
+      if SY-SUBRC ne 0.
+        append initial line to <S_WRKLI>-S_IDAT-T_SVCEL assigning <S_SVCEL>.
+        <S_SVCEL>-IPARE = <S_TD01>-PARENTID.
+        <S_SVCEL>-CPARE = <S_TD01>-PARENTPOSID.
+        <S_SVCEL>-ISELF = <S_TD01>-CHILDID.
+        <S_SVCEL>-CSELF = <S_TD01>-CHILDPOSID.
+        <S_SVCEL>-POSID = <S_TD01>-CHILDPOSID.
+      endif.
+
+***   Check if SetBy CALC are to be included
+      if ME->R_DCO_INPUT->F_FCALC is initial.
+        check LF_SETBY eq /VCXI/CL_VKSR_GATE=>C_SETBY_USER or
+              LF_SETBY is initial.
+      endif.
+
+***   Apply input formatting if needed
+      me->APPLY_INPUT_FORMAT( exporting IS_TD01 = <S_TD01>
+                              changing  CF_DATA = LF_DATA ).
+
+***-------------------------------------------------------------------*
+***   Fill in SetBy and Parameter Value
+      if <S_TD01>-PARID eq 'LEOKY'.
+
+        move LF_DATA  to <S_SVCEL>-LEOKY.
+        move LF_SETBY to <S_SVCEL>-SETBY.
+
+      else.
+
+        case <S_TD01>-PARTY.
+
+          when 'CHAR'.
+
+            move LF_DATA to LF_ATWRT.
+
+            if LF_ATWRT is initial or
+               LF_ATWRT eq SPACE.
+              continue.
+            endif.
+
+            append initial line to <S_SVCEL>-T_SVCPA assigning <S_SVCPA>.
+            move <S_TD01>-PARID to <S_SVCPA>-PARID.
+            move LF_SETBY       to <S_SVCPA>-SETBY.
+            move LF_ATWRT       to <S_SVCPA>-ATWRT.
+
+            clear LF_ATWRT.
+
+          when 'NUMC'.
+
+*            try.
+*                move LF_DATA to LF_ATFLV.
+*              catch CX_SY_CONVERSION_NO_NUMBER into data(LR_ERROR).
+*                /VCXI/CX_CKX=>RAISE_CKX_BY_STRING( IF_STRING = LR_ERROR->GET_TEXT( ) ).
+*            endtry.
+*
+*            if LF_ATFLV is initial.
+*              continue.
+*            endif.
+
+            append initial line to <S_SVCEL>-T_SVCPA assigning <S_SVCPA>.
+            move <S_TD01>-PARID to <S_SVCPA>-PARID.
+            move LF_SETBY       to <S_SVCPA>-SETBY.
+
+            LS_TABFIELD-TABNAME   = 'ZVCXI_XCI_S_SVCPA'.
+            LS_TABFIELD-FIELDNAME = 'ATFLV'.
+            LF_VALUEC             = LF_DATA.
+
+            call function 'RS_CONV_EX_2_IN'
+              exporting
+                INPUT_EXTERNAL               = LF_VALUEC
+                TABLE_FIELD                  = LS_TABFIELD
+              importing
+                OUTPUT_INTERNAL              = <S_SVCPA>-ATFLV
+              exceptions
+                INPUT_NOT_NUMERICAL          = 1
+                TOO_MANY_DECIMALS            = 2
+                MORE_THAN_ONE_SIGN           = 3
+                ILL_THOUSAND_SEPARATOR_DIST  = 4
+                TOO_MANY_DIGITS              = 5
+                SIGN_FOR_UNSIGNED            = 6
+                TOO_LARGE                    = 7
+                TOO_SMALL                    = 8
+                INVALID_DATE_FORMAT          = 9
+                INVALID_DATE                 = 10
+                INVALID_TIME_FORMAT          = 11
+                INVALID_TIME                 = 12
+                INVALID_HEX_DIGIT            = 13
+                UNEXPECTED_ERROR             = 14
+                INVALID_FIELDNAME            = 15
+                FIELD_AND_DESCR_INCOMPATIBLE = 16
+                INPUT_TOO_LONG               = 17
+                NO_DECIMALS                  = 18
+                INVALID_FLOAT                = 19
+                CONVERSION_EXIT_ERROR        = 20
+                others                       = 21.
+            if SY-SUBRC ne 0.
+              /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+            endif.
+
+***         Add Unit
+            move <S_SVCPA>-PARID to LF_GUID.
+            LR_PARAM ?= /VCXI/CL_VKSC_PARAM=>/VCXI/IF_CKX_OBJECT~GET_INSTANCE( IF_GUID = LF_GUID ).
+
+            if LR_PARAM->F_TUORC eq /VCXI/CL_VKSC_PARAM=>C_TUORC_U.
+              if <S_SVCPA>-UNIT is initial.
+                move LR_PARAM->F_UOMKY_M to <S_SVCPA>-UNIT.
+              endif.
+
+***         Add currency
+            elseif LR_PARAM->F_TUORC eq /VCXI/CL_VKSC_PARAM=>C_TUORC_C.
+              if <S_SVCPA>-CURKY is initial.
+                move ME->GET_WAERS( IF_WERKS = <S_WRKLI>-WERKS ) to <S_SVCPA>-CURKY.
+              endif.
+            endif.
+
+          when 'STRG'.
+
+            case <S_TD01>-PARID.
+              when 'ZVCXI_XC_DIMEN'.
+*                check LF_DATA is not initial and
+*                      LF_DATA ne SPACE       and
+*                      LF_DATA eq /VCXI/CL_VKSR_GATE=>C_SETBY_USER.
+
+                append initial line to <S_SVCEL>-T_SVCPA assigning <S_SVCPA>.
+                move <S_TD01>-PARID to <S_SVCPA>-PARID.
+                move LF_SETBY       to <S_SVCPA>-SETBY.
+                <S_SVCPA>-STRNG = ME->CONVERT_SVCEL_DATA_DIMEN( exporting IF_VALUE = LF_DATA ).
+
+              when 'ZVCXI_XC_LIMIT'.
+*                check LF_DATA is not initial and
+*                      LF_DATA ne SPACE       and
+*                      LF_DATA eq /VCXI/CL_VKSR_GATE=>C_SETBY_USER.
+
+                append initial line to <S_SVCEL>-T_SVCPA assigning <S_SVCPA>.
+                move <S_TD01>-PARID to <S_SVCPA>-PARID.
+                move LF_SETBY       to <S_SVCPA>-SETBY.
+                <S_SVCPA>-STRNG = ME->CONVERT_SVCEL_DATA_LIMIT( exporting IF_VALUE = LF_DATA ).
+
+              when others.
+                append initial line to <S_SVCEL>-T_SVCPA assigning <S_SVCPA>.
+                move <S_TD01>-PARID to <S_SVCPA>-PARID.
+                move LF_SETBY       to <S_SVCPA>-SETBY.
+                move LF_DATA        to <S_SVCPA>-STRNG.
+
+            endcase.
+
+        endcase.
+
+      endif.
+      clear: LF_SETBY,
+             LF_DATA.
+
+    endloop.
+
+  endloop.
+
+*** Filter SVC Elements
+  loop at ME->R_DCO_INPUT->T_WRKLI assigning <S_WRKLI>.
+    ME->FILTER_SVCEL( changing CT_SVCEL = <S_WRKLI>-S_IDAT-T_SVCEL ).
+  endloop.
+
+***-------------------------------------------------------------------*
+*** Add Flag for S&U buffering
+  data: LF_FBUSU type XFLAG.
+
+  loop at ME->R_DCO_INPUT->T_WRKLI assigning <S_WRKLI>.
+    check <S_WRKLI> is assigned.
+    loop at <S_WRKLI>-S_IDAT-T_SVCEL assigning <S_SVCEL> where ISELF eq 'SHIPMGR' or
+                                                               ISELF eq 'SHIPMGR_CRCONO'.
+
+      clear LF_FBUSU.
+      clear: LS_SVCEL_SU, LS_SVCEL_PM, LS_SVCPA.
+
+      "check leading object key
+      if <S_SVCEL>-SETBY is not initial.
+        LF_FBUSU = ABAP_TRUE.
+      else.
+        "check own parameters
+        loop at <S_SVCEL>-T_SVCPA into LS_SVCPA where SETBY is not initial.
+          LF_FBUSU = ABAP_TRUE.
+          exit.
+        endloop.
+
+        "Check each shipping unit
+        if LF_FBUSU is initial.
+          loop at <S_WRKLI>-S_IDAT-T_SVCEL into LS_SVCEL_SU where IPARE eq <S_SVCEL>-ISELF and
+                                                                  CPARE eq <S_SVCEL>-CSELF and
+                                                                  ISELF eq 'SHIPUNIT'.
+            "check leading object key
+            if LS_SVCEL_SU-SETBY is not initial.
+              LF_FBUSU = ABAP_TRUE.
+            else.
+
+              "check own parameters
+              loop at LS_SVCEL_SU-T_SVCPA into LS_SVCPA where SETBY is not initial.
+                LF_FBUSU = ABAP_TRUE.
+                exit.
+              endloop.
+            endif.
+
+            "found it, then exit
+            if LF_FBUSU is not initial.
+              exit.
+
+              "check packaging materials
+            else.
+              loop at <S_WRKLI>-S_IDAT-T_SVCEL into LS_SVCEL_PM where IPARE eq LS_SVCEL_SU-ISELF and
+                                                                      CPARE eq LS_SVCEL_SU-CSELF and
+                                                                      ISELF cp 'PACKMAT_*'.
+                "check leading object key
+                if LS_SVCEL_PM-SETBY is not initial.
+                  LF_FBUSU = ABAP_TRUE.
+                else.
+
+                  "check own parameters
+                  loop at LS_SVCEL_PM-T_SVCPA into LS_SVCPA where SETBY is not initial.
+                    LF_FBUSU = ABAP_TRUE.
+                    exit.
+                  endloop.
+                endif.
+              endloop.
+            endif.
+          endloop.
+
+        endif.
+
+      endif.
+
+      "append flag parameter
+      if LF_FBUSU is not initial.
+        if not LINE_EXISTS( <S_SVCEL>-T_SVCPA[ PARID = YCL_HP_SVCU_PR_SHIPMGR=>C_PARID_FBUSU ] ).
+          append initial line to <S_SVCEL>-T_SVCPA assigning <S_SVCPA>.
+          move YCL_HP_SVCU_PR_SHIPMGR=>C_PARID_FBUSU to <S_SVCPA>-PARID.
+          move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC      to <S_SVCPA>-SETBY.
+          move 'X'                                   to <S_SVCPA>-ATWRT.
+        endif.
+      endif.
+    endloop.
+  endloop.
+
+endmethod.
+  method CONVERT_SVCEL_DATA_DIMEN.
+
+    data: LF_CHAR  type          CHAR30,
+          LF_FLOAT type          F.
+    data: LT_VALUE type table of STRING,
+          LT_DATA  type table of STRING,
+          LT_DIMEN type          ZVCXI_XCSU_TT_DIMEN.
+    field-symbols: <LF_VALUE> type          STRING,
+                   <LF_DATA>  type          STRING.
+    field-symbols: <LS_DIMEN> type          ZVCXI_XCSU_S_DIMEN.
+
+*** Split String to Dimension
+    split IF_VALUE at SPACE into table LT_VALUE.
+
+    loop at LT_VALUE assigning <LF_VALUE>.
+
+*** Split Dimension to Data
+      split <LF_VALUE> at '-' into table LT_DATA.
+      append initial line to LT_DIMEN assigning <LS_DIMEN>.
+
+      loop at LT_DATA assigning <LF_DATA>.
+
+***   Add values to Dimension by sequence
+        case SY-TABIX.
+          when 1.
+            <LS_DIMEN>-DIMEN      = <LF_DATA>.
+          when 2.
+
+            clear: LF_CHAR,
+                   LF_FLOAT.
+
+            LF_CHAR = <LF_DATA>.
+
+***       Convert String to Number
+            call function 'C14W_CHAR_NUMBER_CONVERSION'
+              exporting
+                I_STRING                   = LF_CHAR
+              importing
+                E_FLOAT                    = LF_FLOAT
+              exceptions
+                WRONG_CHARACTERS           = 1
+                FIRST_CHARACTER_WRONG      = 2
+                ARITHMETIC_SIGN            = 3
+                MULTIPLE_DECIMAL_SEPARATOR = 4
+                THOUSANDSEP_IN_DECIMAL     = 5
+                THOUSAND_SEPARATOR         = 6
+                NUMBER_TOO_BIG             = 7
+                others                     = 8.
+            if SY-SUBRC is initial.
+
+              <LS_DIMEN>-DIMVA = LF_FLOAT.
+
+            endif.
+
+          when 3.
+            <LS_DIMEN>-DIMVA_UOM  = <LF_DATA>.
+        endcase.
+      endloop.
+    endloop.
+
+    delete LT_DIMEN where DIMEN     is initial
+                       or DIMVA_UOM is initial.
+
+*** Return Values as XML
+    call transformation ID
+         source TABLE =  LT_DIMEN
+         result xml RF_VALUE.
+
+  endmethod.
+  method CONVERT_SVCEL_DATA_LIMIT.
+
+    data: LF_CHAR  type          CHAR30,
+          LF_FLOAT type          F.
+    data: LT_VALUE type table of STRING,
+          LT_DATA  type table of STRING,
+          LT_LIMIT type          ZVCXI_XCSU_TT_LIMIT.
+    field-symbols: <LF_VALUE> type          STRING,
+                   <LF_DATA>  type          STRING.
+    field-symbols: <LS_LIMIT> type          ZVCXI_XCSU_S_LIMIT.
+
+*** Split String to Dimension
+    split IF_VALUE at SPACE into table LT_VALUE.
+
+    loop at LT_VALUE assigning <LF_VALUE>.
+
+*** Split Limit to Data
+      split <LF_VALUE> at '-' into table LT_DATA.
+      append initial line to LT_LIMIT assigning <LS_LIMIT>.
+
+      loop at LT_DATA assigning <LF_DATA>.
+
+***   Add values to Limit by sequence
+        case SY-TABIX.
+          when 1.
+            <LS_LIMIT>-LIMIT      = <LF_DATA>.
+          when 2.
+            <LS_LIMIT>-DIMEN      = <LF_DATA>.
+          when 3.
+
+            clear: LF_CHAR,
+                   LF_FLOAT.
+
+            LF_CHAR = <LF_DATA>.
+
+***       Convert String to Number
+            call function 'C14W_CHAR_NUMBER_CONVERSION'
+              exporting
+                I_STRING                   = LF_CHAR
+              importing
+                E_FLOAT                    = LF_FLOAT
+              exceptions
+                WRONG_CHARACTERS           = 1
+                FIRST_CHARACTER_WRONG      = 2
+                ARITHMETIC_SIGN            = 3
+                MULTIPLE_DECIMAL_SEPARATOR = 4
+                THOUSANDSEP_IN_DECIMAL     = 5
+                THOUSAND_SEPARATOR         = 6
+                NUMBER_TOO_BIG             = 7
+                others                     = 8.
+            if SY-SUBRC is initial.
+
+              <LS_LIMIT>-DIMVA = LF_FLOAT.
+
+            endif.
+
+          when 4.
+            <LS_LIMIT>-DIMVA_UOM  = <LF_DATA>.
+        endcase.
+      endloop.
+    endloop.
+
+    delete LT_LIMIT where LIMIT     is initial
+                       or DIMEN     is initial
+                       or DIMVA_UOM is initial.
+
+*** Return Values as XML
+    call transformation ID
+         source TABLE =  LT_LIMIT
+         result xml RF_VALUE.
+
+  endmethod.
+method EXECUTE.
+
+  try.
+
+***   Get CSV Data from Database Table
+      ME->GET_CSV_DATA( ).
+
+***   Get Material Configuration Profile
+      ME->GET_CMPRK( ).
+
+***   Convert SVCEL Data
+      ME->CONVERT_SVCEL_DATA( ).
+
+***   Set Status to Complete
+      ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_COMPLETED ).
+
+    catch /VCXI/CX_CKX into data(LR_CX_CKX).
+
+***   Set Status to Error
+      ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_ERROR ).
+
+***   Add Message to Message Log
+      ME->R_RPSEG->R_MSG->ADD_MESSAGE_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+
+  endtry.
+
+*** Perform Save and Commit
+  ME->R_RPSEG->SAVE_AND_COMMIT( ).
+
+endmethod.
+method FILTER_SVCEL.
+
+  data: LF_FILTERED type ABAP_BOOL.
+
+  data: LS_SVCEL type ZVCXI_XCI_S_SVCEL.
+
+  do.
+
+    clear LF_FILTERED.
+
+*** Process all Elements
+    loop at CT_SVCEL into LS_SVCEL.
+
+***   Find Children
+      read table CT_SVCEL with key IPARE = LS_SVCEL-ISELF
+                                   CPARE = LS_SVCEL-CSELF
+                          transporting no fields.
+      check SY-SUBRC ne 0.
+
+***   Check Leading Object Key not defined
+      check LS_SVCEL-SETBY is initial.
+
+***   Check Parameter are not defined
+      read table LS_SVCEL-T_SVCPA transporting no fields
+                                  with key SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_CALC.
+      check SY-SUBRC ne 0.
+
+      read table LS_SVCEL-T_SVCPA transporting no fields
+                                  with key SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_USER.
+      check SY-SUBRC ne 0.
+
+***   Filter
+      delete CT_SVCEL.
+      move ABAP_TRUE to LF_FILTERED.
+    endloop.
+
+*** Nothing was filtered
+    if LF_FILTERED ne ABAP_TRUE.
+      exit.
+    endif.
+
+  enddo.
+
+endmethod.
+method GET_CMPRK.
+
+  data: LF_CUOBJ type CUOBJ.
+
+  data: LS_CUCO type CUCO.
+
+  field-symbols: <S_WRKLI> type YHP_SMD_AIS_S_QUOT_WRKLI.
+
+  loop at ME->R_DCO_INPUT->T_WRKLI assigning <S_WRKLI>.
+
+*** Get CUOBJ of Reference Material
+    select single CUOBJ
+           into LF_CUOBJ
+           from MARC
+          where MATNR eq <S_WRKLI>-RMATN
+           and  WERKS eq <S_WRKLI>-WERKS.
+    if SY-SUBRC ne 0.
+      continue.
+    endif.
+
+*** Get Profile of Instance
+    call function 'CUCB_GET_PROFILE_OF_INSTANCE'
+      exporting
+        INSTANCE                     = LF_CUOBJ
+      importing
+        PROFILE_WA                   = LS_CUCO
+      exceptions
+        INVALID_INSTANCE             = 1
+        INSTANCE_IS_A_CLASSIFICATION = 2
+        PROFILE_NOT_FOUND            = 3
+        INVALID_INPUT                = 4.
+    if SY-SUBRC ne 0.
+      /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+    endif.
+
+*** Return Config. Material & Profile Key
+    move LS_CUCO-OBJEK to <S_WRKLI>-S_IDAT-S_CMPRK-CMATN.
+    move LS_CUCO-PRFID to <S_WRKLI>-S_IDAT-S_CMPRK-PRFID.
+
+*** Set Alias
+    <S_WRKLI>-S_IDAT-IEALI = 'X_IDATSPV'.
+
+    clear: LF_CUOBJ,
+           LS_CUCO.
+
+  endloop.
+
+endmethod.
+method GET_CSV_DATA.
+
+*** Create CSV Object
+  create object R_CSV
+    exporting
+      IF_DELIM = ME->R_DCO_INPUT->F_DELIM
+      IF_FGUID = ME->R_DCO_INPUT->F_FGUID.
+
+  if R_CSV->T_TD01 is initial.
+
+*** Input file does not contain any lines
+    /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGID = 'YHP_SMD_AIS'
+                                          IF_MSGTY = 'E'
+                                          IF_MSGNO = '007' ).
+
+  endif.
+
+endmethod.
+method GET_WAERS.
+
+  data: LF_BUKRS type BUKRS.
+
+*** Get the Company Code
+  call function 'CO_RM_COMPANYCODE_FIND'
+    exporting
+      WERKS    = IF_WERKS
+    importing
+      COMPCODE = LF_BUKRS
+    exceptions
+      NO_ENTRY = 1
+      others   = 2.
+  if SY-SUBRC ne 0.
+    return.
+  endif.
+
+*** Get Currency
+  select single WAERS
+    into RF_WAERS
+    from T001
+   where BUKRS eq LF_BUKRS.
+
+endmethod.

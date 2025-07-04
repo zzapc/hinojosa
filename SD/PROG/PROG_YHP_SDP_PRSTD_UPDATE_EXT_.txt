@@ -1,0 +1,108 @@
+*&---------------------------------------------------------------------*
+*& Report  YHP_SDP_PSTDY_UPD_QUOTE
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+report YHP_SDP_PSTDY_UPD_QUOTE.
+
+data: LF_BLANK_POSNR type VBAP-POSNR,
+      LF_TRIES       type I.
+data: LS_DATA        type YHP_SVC_S_PPUPL_DATA.
+data: LT_VALID_SDPOS type YRF_RQPT_TT_VBAPKEY.
+data: LR_PR_MAIN      type ref to YCL_RF_RQPTR_PR_MAIN,
+      LR_PR_MAIN_ADD  type ref to YCL_RF_RQPTR_PR_MAIN,
+      LR_DATA         type ref to DATA,
+      LR_DC_BOB_STUDY type ref to YCL_HP_SDP_DC_BOB_STUDY,
+      LR_BOB_SDOC     type ref to ZCL_VCXI_XCI_BOB_SDOC.
+
+***-------------------------------------------------------------------*
+parameters: P_PRSTD type YHP_SDP_TD001-PRSTD.
+
+start-of-selection.
+
+*** continue only if we have a price study
+  check P_PRSTD is not initial.
+
+*** Get pricing study
+  do 10 times.
+    select single *
+      into @data(LS_TD100)
+      from YRF_RQPTS_TD100
+      where PRSTD eq @P_PRSTD.
+    if SY-SUBRC ne 0.
+      if LF_TRIES gt 10.
+***   Pricing study &1 not found.
+        message E002(YHP_SDP) with |{ P_PRSTD alpha = out }|.
+      else.
+        LF_TRIES = LF_TRIES + 1.
+        wait up to 1 seconds.
+      endif.
+    else.
+      exit.
+    endif.
+  enddo.
+
+***-------------------------------------------------------------------*
+*** Crate DC instance and set attributes from XML
+  LR_DC_BOB_STUDY = YCL_HP_SDP_DC_BOB_STUDY=>GET_INSTANCE( IF_GUID = conv /VCXI/CKX_GUID( P_PRSTD ) ).
+
+  if LR_DC_BOB_STUDY->S_DATA-VBELN is not initial.
+    YCL_HP_SDP_DC_BOB_STUDY=>F_GBL_VBELN = LR_DC_BOB_STUDY->S_DATA-VBELN.
+  endif.
+
+*** 1) Load main price study & set status as "In progress"
+  LR_PR_MAIN = LR_DC_BOB_STUDY->LOAD_PRSTD( P_PRSTD ).
+  LR_DC_BOB_STUDY->SET_STATUS(  IR_PTR_PR_MAIN = LR_PR_MAIN
+                                IF_WIP         = ABAP_TRUE ).
+
+
+***-------------------------------------------------------------------*
+*** Continue creation of remaining lines
+  do.
+    try.
+
+*** Exit when all items have been processed
+        try.
+            data(LS_ITEM) = LR_DC_BOB_STUDY->S_DATA-T_ITEM[ POSNR = LF_BLANK_POSNR ].
+          catch CX_SY_ITAB_LINE_NOT_FOUND.
+            exit.
+        endtry.
+
+***     2) Create Next line
+        LR_DC_BOB_STUDY->CREATE_SDOC( importing EF_POSNR_LAST = data(LF_POSNR)
+                                                ER_BOB_SDOC   = LR_BOB_SDOC ).
+
+***     3) Get line items allowed for pricing study
+        LT_VALID_SDPOS = LR_DC_BOB_STUDY->GET_VALID_SDPOS( exporting IF_VBELN  = LR_BOB_SDOC->S_VBAK-VBELN
+                                                                     IF_POSNR  = LF_POSNR ).
+        loop at LT_VALID_SDPOS into data(LS_VALID_SDPOS).
+
+***     4) Create (temporary) Price Study for created quote item
+          LR_PR_MAIN_ADD = LR_DC_BOB_STUDY->GET_SDPOS_PRSTD( exporting IF_VBELN  = LR_BOB_SDOC->S_VBAK-VBELN
+                                                                       IF_POSNR  = LS_VALID_SDPOS-POSNR ).
+
+***     5) Now we merge temp study with main
+          LR_DC_BOB_STUDY->PRSTD_ADD_LINES( exporting IR_RQPTR_PR_MAIN      = LR_PR_MAIN
+                                                      IR_RQPTR_PR_MAIN_ADD  = LR_PR_MAIN_ADD ).
+
+***     6) Save main study
+          YCL_RF_RQPTS_BOB_PSTUDY=>F_NOUI = ABAP_TRUE.
+          LR_PR_MAIN->R_PTS_BOB_PSTUDY->UPDATE( exporting IR_PTR_PR_MAIN = LR_PR_MAIN  ).
+          YCL_RF_RQPTS_BOB_PSTUDY=>F_NOUI = ABAP_FALSE.
+
+        endloop.
+
+      catch /VCXI/CX_CKX into data(LR_CX).
+        LR_CX->SHOW_MESSAGE( 'I').
+    endtry.
+
+  enddo.
+
+*** 7) Set Done status and Save main study
+  LR_DC_BOB_STUDY->SET_STATUS(  IR_PTR_PR_MAIN = LR_PR_MAIN
+                                IF_DONE        = ABAP_TRUE ).
+  YCL_RF_RQPTS_BOB_PSTUDY=>F_NOUI = ABAP_TRUE.
+  LR_PR_MAIN->R_PTS_BOB_PSTUDY->UPDATE( exporting IR_PTR_PR_MAIN = LR_PR_MAIN  ).
+  YCL_RF_RQPTS_BOB_PSTUDY=>F_NOUI = ABAP_FALSE.

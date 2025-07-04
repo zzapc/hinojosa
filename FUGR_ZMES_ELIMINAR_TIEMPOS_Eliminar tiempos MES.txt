@@ -1,0 +1,208 @@
+FUNCTION zmes_eliminar_tiempos.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(IV_AUFNR) TYPE  AUFNR
+*"     REFERENCE(IV_PESO_TOT) TYPE  ZPESO
+*"     REFERENCE(IV_PESO) TYPE  STRING
+*"  CHANGING
+*"     REFERENCE(EV_PESO_DEL) TYPE  STRING
+*"     REFERENCE(EV_ERROR) TYPE  XFELD OPTIONAL
+*"----------------------------------------------------------------------
+
+* Las notificaciones de los tiempos en las 2 operaciones, pulper y en máquina,
+* en este caso hay que eliminar la notificación de la operación 0040, ya que
+* va concatenada con la 0020
+* Con la bapi BAPI_PROCORDCONF_GETDETAIL, se mira la phase = 0040 y REVERSED = ‘’.
+* Si cumple esta condición, se elimina la notificación de tiempos.
+
+  DATA: lt_order_range    TYPE TABLE OF bapi_pi_orderrange,
+        lt_return_1       TYPE TABLE OF bapiret1,
+        lt_confirmations  TYPE TABLE OF bapi_pi_conf_key,
+        lt_goodsmovements TYPE TABLE OF bapi2017_gm_item_show,
+        lt_failedgmoves   TYPE TABLE OF bapi_coru_fgm,
+        lt_messages       LIKE bapiret2 OCCURS 0,
+        ls_confirmations  TYPE          bapi_pi_conf_key,
+        ls_return         TYPE          bapiret1,
+        ls_order_range    TYPE          bapi_pi_orderrange,
+        ls_return_1       TYPE bapiret1,
+        ls_detail         TYPE bapi_pi_confirm,
+        ls_messages       TYPE bapiret2,
+        lv_postg_date     TYPE bapi_pi_confirm-postg_date,
+        lv_extnumber      TYPE balnrext,
+        lv_eliminado      TYPE flag.
+
+  CLEAR: lt_order_range[],lt_confirmations[], ls_order_range, ls_return, lv_eliminado.
+  CLEAR: lt_messages[], lv_extnumber.
+
+* Se obtienen las notificaciones de tiempo
+  ls_order_range-sign   = 'I'.
+  ls_order_range-option = 'EQ'.
+  ls_order_range-low    = iv_aufnr.
+  APPEND ls_order_range TO lt_order_range.
+
+  CALL FUNCTION 'BAPI_PROCORDCONF_GETLIST'
+    IMPORTING
+      return        = ls_return
+    TABLES
+      order_range   = lt_order_range
+      confirmations = lt_confirmations.
+
+  SORT lt_confirmations BY created_date DESCENDING.
+
+* Se borran las notificaciones de tiempos
+
+* CMS - 17.07.2020 - 62097 - Corregir error al anular 2º rollo con el mismo peso.
+* Se añade al LOOP la condición rev_conf_cnt = 0, para encontrar el registro pendiente de anular.
+  LOOP AT lt_confirmations INTO ls_confirmations WHERE reversed     = '' AND
+                                                       rev_conf_cnt = 0  AND
+                                                       phase        = '0040'.
+
+    CLEAR: ls_return_1, ls_detail, lt_goodsmovements[], lt_failedgmoves[].
+
+    CALL FUNCTION 'BAPI_PROCORDCONF_GETDETAIL'
+      EXPORTING
+        confirmation        = ls_confirmations-conf_no
+        confirmationcounter = ls_confirmations-conf_cnt
+      IMPORTING
+        return              = ls_return_1
+        conf_detail         = ls_detail
+      TABLES
+        goodsmovements      = lt_goodsmovements
+        failedgmoves        = lt_failedgmoves.
+
+    CHECK ls_detail-yield = iv_peso_tot.
+
+* Sólo se elimina la notificación si tiene fecha válida, sino no hace nada
+    IF ls_confirmations-created_date+4(2) NE sy-datum+4(2)
+       AND ls_confirmations-created_date(4) NE sy-datum(4).
+
+      ev_error = abap_true.
+      lv_eliminado = abap_true.
+      EXIT.
+
+    ELSE.
+
+      CLEAR: ls_return_1.
+
+      CALL FUNCTION 'BAPI_PROCORDCONF_CANCEL'
+        EXPORTING
+          confirmation        = ls_confirmations-conf_no
+          confirmationcounter = ls_confirmations-conf_cnt
+        IMPORTING
+          return              = ls_return_1.
+
+      IF ls_return_1-type NE 'E'.
+
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = abap_true.
+
+        lv_eliminado = abap_true. "DTM
+
+        EXIT.
+
+      ELSE.
+
+        ev_error = abap_true.
+
+        MOVE-CORRESPONDING ls_return_1 TO ls_messages.
+        APPEND ls_messages TO lt_messages.
+
+        CLEAR: lv_extnumber.
+
+        CONCATENATE 'Notif.Tiempo' ls_confirmations-conf_no ls_confirmations-conf_cnt
+          INTO lv_extnumber SEPARATED BY space.
+
+        CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+          EXPORTING
+            objeto    = 'ZPP'
+            subobjeto = sy-tcode
+            mensajes  = lt_messages[]
+            extnumber = lv_extnumber.
+
+      ENDIF.
+
+    ENDIF.
+
+  ENDLOOP.
+
+* Si no se ha encontrado la notificación a eliminar
+  IF lv_eliminado IS INITIAL.
+
+* Se busca una notificación mayor al peso a eliminar
+    LOOP AT lt_confirmations INTO ls_confirmations WHERE reversed     = '' AND
+                                                         rev_conf_cnt = 0  AND
+                                                         phase        = '0040'.
+
+      CLEAR: ls_return_1, ls_detail, lt_goodsmovements[], lt_failedgmoves[].
+
+      CALL FUNCTION 'BAPI_PROCORDCONF_GETDETAIL'
+        EXPORTING
+          confirmation        = ls_confirmations-conf_no
+          confirmationcounter = ls_confirmations-conf_cnt
+        IMPORTING
+          return              = ls_return_1
+          conf_detail         = ls_detail
+        TABLES
+          goodsmovements      = lt_goodsmovements
+          failedgmoves        = lt_failedgmoves.
+
+      CHECK ls_detail-yield GT iv_peso.
+
+* Sólo se elimina la notificación si tiene fecha válida, sino no hace nada
+      IF ls_confirmations-created_date+4(2) NE sy-datum+4(2)
+         AND ls_confirmations-created_date(4) NE sy-datum(4).
+
+        ev_error = abap_true.
+        EXIT.
+
+      ELSE.
+
+        CLEAR: ls_return_1.
+
+        CALL FUNCTION 'BAPI_PROCORDCONF_CANCEL'
+          EXPORTING
+            confirmation        = ls_confirmations-conf_no
+            confirmationcounter = ls_confirmations-conf_cnt
+          IMPORTING
+            return              = ls_return_1.
+
+        IF ls_return_1-type NE 'E'.
+
+          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+            EXPORTING
+              wait = abap_true.
+
+          ev_peso_del = ls_detail-yield.
+
+          EXIT.
+
+        ELSE.
+
+          ev_error = abap_true.
+
+          MOVE-CORRESPONDING ls_return_1 TO ls_messages.
+          APPEND ls_messages TO lt_messages.
+
+          CLEAR: lv_extnumber.
+
+          CONCATENATE 'Notif.Tiempo' ls_confirmations-conf_no ls_confirmations-conf_cnt
+            INTO lv_extnumber SEPARATED BY space.
+
+          CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+            EXPORTING
+              objeto    = 'ZPP'
+              subobjeto = sy-tcode
+              mensajes  = lt_messages[]
+              extnumber = lv_extnumber.
+
+        ENDIF.
+
+      ENDIF.
+
+    ENDLOOP.
+
+  ENDIF.
+
+ENDFUNCTION.

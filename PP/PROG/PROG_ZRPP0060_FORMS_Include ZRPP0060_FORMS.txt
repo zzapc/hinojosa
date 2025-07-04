@@ -1,0 +1,623 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0060_FORMS
+*&---------------------------------------------------------------------*
+FORM inicializacion_sel.
+
+*  IF sy-batch <> 'X'.
+*    SELECT SINGLE parva FROM usr05
+*          INTO p_werks
+*          WHERE bname = sy-uname AND
+*          parid = 'WRK'.
+*  ENDIF.
+*
+*  CHECK p_werks IS NOT INITIAL.
+
+  CALL METHOD zclpp_recetas_reparto_pulper=>calcular_fechas
+    EXPORTING
+      i_werks    = p_werks
+    IMPORTING
+      o_d_ini_ro = p_dinro
+      o_h_ini_ro = p_hinro
+      o_d_fin_ro = p_dfiro
+      o_h_fin_ro = p_hfiro.
+*     o_d_ini_mp = p_dinmp
+*     o_h_ini_mp = p_hinmp
+*      o_d_fin_mp = p_dfimp
+*      o_h_fin_mp = p_hfimp.
+
+ENDFORM.
+
+FORM generar_alv_100.
+
+  IF gs_dyn100-container IS NOT BOUND.
+
+    CREATE OBJECT gs_dyn100-container
+      EXPORTING
+        container_name              = 'GS_DYN100-CONTAINER'
+      EXCEPTIONS
+        cntl_error                  = 1
+        cntl_system_error           = 2
+        create_error                = 3
+        lifetime_error              = 4
+        lifetime_dynpro_dynpro_link = 5
+        OTHERS                      = 6.
+
+*    TRY.
+    cl_salv_table=>factory(
+      EXPORTING
+        r_container    = gs_dyn100-container
+        container_name = 'GS_DYN100-CONTAINER'
+      IMPORTING
+        r_salv_table = go_alv
+      CHANGING
+        t_table      = gr_proces->gt_ztpp0043 ).
+
+    PERFORM tunning_alv.
+
+    go_alv->display( ).
+*      CATCH cx_root .
+    " error handling
+*    ENDTRY.
+  ENDIF.
+
+ENDFORM.
+
+FORM handle_user_command100 USING i_ucomm TYPE salv_de_function.
+
+  DATA: lt_rows               TYPE salv_t_row,
+        ls_bapi_items         TYPE  bapi2017_gm_item_create,
+        lt_bapi_items         TYPE TABLE OF bapi2017_gm_item_create,
+        lt_bapi_items_no_resb TYPE TABLE OF bapi2017_gm_item_create
+        .
+  CASE i_ucomm.
+
+    WHEN 'REPAR'.
+      CLEAR i_ucomm.
+      PERFORM obtener_seleccion_alv100 CHANGING lt_rows.
+
+      LOOP AT lt_rows INTO DATA(ls_row).
+        TRY.
+            DATA(ls_43) = gr_proces->gt_ztpp0043[ ls_row ].
+
+          CATCH cx_root .
+            CONTINUE.
+        ENDTRY.
+
+        CLEAR: ls_bapi_items.
+        ls_bapi_items-material     = ls_43-matnr_mp. "i_material.
+        ls_bapi_items-plant        = ls_43-werks.
+        ls_bapi_items-stge_loc     = ls_43-almacen_pm. "p_lgort2. "'4002'.
+        ls_bapi_items-batch        = ls_43-lote_mp.
+        ls_bapi_items-move_type    = '261'.
+        ls_bapi_items-stck_type    = ' '. " Libre utilización
+        ls_bapi_items-entry_qnt    = ls_43-kg_mp.  "i_menge.
+        ls_bapi_items-entry_uom    = 'KG'.
+        ls_bapi_items-orderid      = ls_43-of_rollo. " i_aufnr.
+
+*        CLEAR: ls_goodsmvt_item-reserv_no , ls_goodsmvt_item-res_item.
+
+        CALL METHOD gr_proces->obtener_datos_reserva
+          EXPORTING
+            i_lote_rollo  = ls_43-lote_rollo
+            i_of_rollo    = ls_43-of_rollo
+            i_matnr       = ls_43-matnr_mp
+          IMPORTING
+            o_sw_res      = DATA(l_sw_res)
+            o_reserva     = ls_bapi_items-reserv_no "DATA(l_res)
+            o_reserva_pos = ls_bapi_items-res_item. "DATA(l_pos_res).
+
+        IF l_sw_res = 'X'.
+          APPEND ls_bapi_items TO lt_bapi_items.
+        ELSE.
+          APPEND ls_bapi_items TO lt_bapi_items_no_resb.
+        ENDIF.
+
+      ENDLOOP.
+
+      IF lt_bapi_items IS NOT INITIAL.
+        CALL METHOD zclpp_recetas_reparto_pulper=>generar_movimiento_261
+          EXPORTING
+            it_bapi_items = lt_bapi_items
+            i_tp_consumo  = 'P' "Consumo pulper / Diferido
+          IMPORTING
+            o_mblnr       = DATA(l_mblnr)
+            o_mjahr       = DATA(l_mjahr)
+            o_rc          = DATA(l_rc)
+            ot_bapiret2   = DATA(lt_bret2).
+
+        IF line_exists( lt_bret2[ type = 'E' ] ).
+
+          CALL FUNCTION 'RSCRMBW_DISPLAY_BAPIRET2'
+            TABLES
+              it_return = lt_bret2.
+        ELSE.
+          SET PARAMETER ID 'MBN' FIELD l_mblnr.
+
+          CALL TRANSACTION 'MB03' AND SKIP FIRST SCREEN.
+          MESSAGE |Documento de material { l_mblnr } / { l_mjahr } creado correctamente| TYPE 'S'.
+*    write |Creado correctamente 261: { lv_materialdocument } { lv_matdocumentyear }|.
+
+        ENDIF.
+      ENDIF.
+
+      IF lt_bapi_items_no_resb IS NOT INITIAL.
+        CALL METHOD zclpp_recetas_reparto_pulper=>generar_movimiento_261
+          EXPORTING
+            it_bapi_items = lt_bapi_items_no_resb
+            i_tp_consumo  = 'P' "Consumo pulper / Diferido
+          IMPORTING
+            o_mblnr       = l_mblnr
+            o_mjahr       = l_mjahr
+            o_rc          = l_rc
+            ot_bapiret2   = lt_bret2.
+
+        IF line_exists( lt_bret2[ type = 'E' ] ).
+          CALL FUNCTION 'RSCRMBW_DISPLAY_BAPIRET2'
+            TABLES
+              it_return = lt_bret2.
+        ELSE.
+          SET PARAMETER ID 'MBN' FIELD l_mblnr.
+          CALL TRANSACTION 'MB03' AND SKIP FIRST SCREEN.
+          MESSAGE |Documento de material { l_mblnr } / { l_mjahr } creado correctamente| TYPE 'S'.
+*    write |Creado correctamente 261: { lv_materialdocument } { lv_matdocumentyear }|.
+
+        ENDIF.
+
+      ENDIF.
+  ENDCASE.
+
+ENDFORM.
+
+FORM obtener_seleccion_alv100 CHANGING p_rows TYPE salv_t_row.
+  DATA: lr_selections TYPE REF TO cl_salv_selections.
+
+  lr_selections = go_alv->get_selections( ).
+  p_rows       = lr_selections->get_selected_rows( ).
+
+ENDFORM.
+
+
+FORM tunning_alv.
+
+  DATA: lr_columns   TYPE REF TO cl_salv_columns,
+        lr_cols_tab  TYPE REF TO cl_salv_columns_table,
+        lr_column    TYPE REF TO cl_salv_column_table,
+        l_text       TYPE string,
+*        lr_functions TYPE REF TO cl_salv_functions,
+        lr_func_list TYPE REF TO cl_salv_functions_list.
+  DATA: lr_events TYPE REF TO cl_salv_events_table.
+
+*... §7 selections
+  DATA: lr_selections TYPE REF TO cl_salv_selections,
+        lv_key        TYPE salv_s_layout_key,  "To save ALV salv_table
+        lo_layout     TYPE REF TO cl_salv_layout,
+        lt_rows       TYPE salv_t_row,
+        lt_column     TYPE salv_t_column,
+        ls_cell       TYPE salv_s_cell.
+
+* Grabar disposición.
+  CLEAR lv_key.
+  lv_key-report         = sy-repid.
+  lv_key-handle         = '1'.
+  lo_layout = go_alv->get_layout( ).
+  lo_layout->set_key( lv_key ).
+  lo_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  lo_layout->set_default( abap_true ).
+
+
+  lo_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  lo_layout->set_default( abap_true ).
+
+
+  lr_selections = go_alv->get_selections( ).
+*
+**... §7.1 set selection mode
+  lr_selections->set_selection_mode( if_salv_c_selection_mode=>multiple ).
+
+  lr_events = go_alv->get_event( ).
+  CREATE OBJECT gr_events.
+  SET HANDLER gr_events->on_user_command FOR lr_events.
+
+  lr_func_list = go_alv->get_functions( ).
+  lr_func_list->set_all( abap_true ).
+*  TRY.
+*      l_text = text-b01.
+*      lr_func_list->add_function(
+*        name     = 'REPAR'
+*        icon     = '@0S@'
+*        text     = l_text
+*        tooltip  = l_text
+*        position = if_salv_c_function_position=>right_of_salv_functions ).
+*    CATCH cx_salv_wrong_call cx_salv_existing.
+*  ENDTRY.
+
+
+  lr_columns = go_alv->get_columns( ).
+  lr_cols_tab = go_alv->get_columns( ).
+  lr_columns->set_optimize( 'X' ).
+
+  TRY.
+      lr_column ?= lr_columns->get_column( columnname = 'MANDT' ).
+      lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+      lr_column ?= lr_columns->get_column( columnname = 'WERKS' ).
+      lr_column->set_visible( value  = if_salv_c_bool_sap=>false ).
+
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+* Formateo de columnas.
+  DATA:
+    lo_column  TYPE REF TO cl_salv_column,
+    lo_columns TYPE REF TO cl_salv_columns_table.
+
+  lo_columns = go_alv->get_columns( ).
+
+  TRY.
+      lo_column = lo_columns->get_column( 'ID_RECETA' ).
+      lo_column->set_short_text( 'Receta' ).
+      lo_column->set_medium_text( 'Receta' ).
+      lo_column->set_long_text( 'Receta' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'LOTE_MP' ).
+      lo_column->set_short_text( 'Lote MP' ).
+      lo_column->set_medium_text( 'Lote MP' ).
+      lo_column->set_long_text( 'Lote MP' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'LOTE_ROLLO' ).
+      lo_column->set_short_text( 'Lote rollo' ).
+      lo_column->set_medium_text( 'Lote rollo' ).
+      lo_column->set_long_text( 'Lote rollo' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'MATNR_MP' ).
+      lo_column->set_short_text( 'Mat. MP' ).
+      lo_column->set_medium_text( 'Material MP' ).
+      lo_column->set_long_text( 'Material MP' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'KG_MP' ).
+      lo_column->set_short_text( 'Kg. MP' ).
+      lo_column->set_medium_text( 'Kg. MP' ).
+      lo_column->set_long_text( 'Kg. MP' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'MEINS_MP' ).
+      lo_column->set_short_text( 'Unidad' ).
+      lo_column->set_medium_text( 'Unidad' ).
+      lo_column->set_long_text( 'Unidad' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'ALMACEN_PM' ).
+      lo_column->set_short_text( 'Almacén MP' ).
+      lo_column->set_medium_text( 'Almacén MP' ).
+      lo_column->set_long_text( 'Almacén MP' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'OF_ROLLO' ).
+      lo_column->set_short_text( 'OF rollo' ).
+      lo_column->set_medium_text( 'OF rollo' ).
+      lo_column->set_long_text( 'OF rollo' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'MATNR_ROLLO' ).
+      lo_column->set_short_text( 'Mat.Rollo' ).
+      lo_column->set_medium_text( 'Materia rollo' ).
+      lo_column->set_long_text( 'Materia rollo' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'KG_ROLLO' ).
+      lo_column->set_short_text( 'Kg. Rollo' ).
+      lo_column->set_medium_text( 'Kg. rollo' ).
+      lo_column->set_long_text( 'Kg. rollo' ).
+    CATCH cx_root .
+  ENDTRY.
+
+
+  TRY.
+      lo_column = lo_columns->get_column( 'KG_ROLLO' ).
+      lo_column->set_short_text( 'Kg. Rollo' ).
+      lo_column->set_medium_text( 'Kg. rollo' ).
+      lo_column->set_long_text( 'Kg. rollo' ).
+    CATCH cx_root .
+  ENDTRY.
+
+ENDFORM.
+
+
+FORM  print_alv.
+
+  DATA: t_variant TYPE disvariant.
+
+  gt_alv_print = CORRESPONDING #( gr_proces->gt_ztpp0043 ).
+
+  LOOP AT gt_alv_print ASSIGNING FIELD-SYMBOL(<fs_print>).
+
+    <fs_print>-maktx_mp    = zclpp_recetas_reparto_pulper=>obtener_descr_material( <fs_print>-matnr_mp ).
+    <fs_print>-maktx_rollo = zclpp_recetas_reparto_pulper=>obtener_descr_material( <fs_print>-matnr_rollo ).
+
+  ENDLOOP.
+
+* Variante ALV
+  CLEAR t_variant.
+  t_variant-report = sy-repid.
+
+  PERFORM col_alv.
+
+* Llamo a la Función que visualiza el ALV
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+*     i_structure_name = i_structure_name
+      it_fieldcat = gt_fieldcat_ant
+      i_save      = 'U'
+      is_variant  = t_variant
+    TABLES
+*     t_outtab    = gr_proces->gt_ztpp0043.
+      t_outtab    = gt_alv_print.
+
+ENDFORM.
+
+FORM col_alv .
+
+  DATA: ls_fcat TYPE slis_fieldcat_alv.
+  DATA: lv_tabix TYPE sytabix.
+  DATA: lt_43 TYPE zttpp0043.
+
+  REFRESH: gt_fieldcat_ant.
+
+* Pasar tabla interna al formato del fieldcat
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_program_name         = sy-repid
+*     i_internal_tabname     = 'LT_43'
+      i_structure_name       = 'ZSPP_REPARTO_PULPER'
+      i_inclname             = sy-repid
+*     i_bypassing_buffer     = 'X'
+    CHANGING
+      ct_fieldcat            = gt_fieldcat_ant
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+** Recorremos el catálogo de campos modificandolo
+
+  LOOP AT gt_fieldcat_ant INTO ls_fcat.
+    lv_tabix = sy-tabix.
+    CASE ls_fcat-fieldname.
+      WHEN 'MANDT'.
+        ls_fcat-no_out = 'X'.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'WERKS'.
+        ls_fcat-no_out = 'X'.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'FECHA_UPD'.
+        ls_fcat-no_out = 'X'.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'HORA_UPD'.
+        ls_fcat-no_out = 'X'.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'CONTR_UPD'.
+        ls_fcat-no_out = 'X'.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'CONTR_INS'.
+        ls_fcat-no_out = 'X'.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+*      WHEN 'COMP_MEINS_TOT'.
+*        ls_fcat-no_out = 'X'.
+*        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+*      WHEN 'COMP_PORCENTAJE'.
+*        ls_fcat-no_out = 'X'.
+*        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'LOTE_MP'.
+*        ls_fcat-seltext   = text-t01.
+        ls_fcat-seltext_l = |Lote MP|.
+        ls_fcat-seltext_m = |Lote MP|.
+        ls_fcat-seltext_s = |Lote MP|.
+        ls_fcat-reptext_ddic   = |Lote MP|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'LOTE_ROLLO'.
+*        ls_fcat-seltext   = text-t01.
+        ls_fcat-seltext_l = |Lote fab.|.
+        ls_fcat-seltext_m = |Lote fab.|.
+        ls_fcat-seltext_s = |Lote fab.|.
+        ls_fcat-reptext_ddic   = |Lote fab.|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'MATNR_MP'.
+*        ls_fcat-seltext   = text-t01.
+        ls_fcat-seltext_l = |Mat. MP|.
+        ls_fcat-seltext_m = |Mat. MP|.
+        ls_fcat-seltext_s = |Mat. MP|.
+        ls_fcat-reptext_ddic   = |Mat. MP|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'MATNR_ROLLO'.
+*        ls_fcat-seltext   = text-t01.
+        ls_fcat-seltext_l = |Mat. fab.|.
+        ls_fcat-seltext_m = |Mat. fab.|.
+        ls_fcat-seltext_s = |Mat. fab.|.
+        ls_fcat-reptext_ddic   = |Mat. fab.|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'KG_MP'.
+*        ls_fcat-seltext   = text-t01.
+        ls_fcat-seltext_l = |Kg repart.|.
+        ls_fcat-seltext_m = |Kg repart.|.
+        ls_fcat-seltext_s = |Kg repart.|.
+        ls_fcat-reptext_ddic   = |Kg repart.|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'KG_ROLLO'.
+*        ls_fcat-seltext   = text-t01.
+        ls_fcat-seltext_l = |Kg lote fab.|.
+        ls_fcat-seltext_m = |Kg lote fab.|.
+        ls_fcat-seltext_s = |Kg lote fab.|.
+        ls_fcat-reptext_ddic   = |Kg lote fab.|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'MAKTX_MP'.
+        ls_fcat-seltext_l = |Desc. mat. MP|.
+        ls_fcat-seltext_m = |Desc. mat. MP|.
+        ls_fcat-seltext_s = |Desc. mat. MP|.
+        ls_fcat-reptext_ddic   = |Desc. mat. MP|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'MAKTX_ROLLO'.
+        ls_fcat-seltext_l = |Desc. mat. fab.|.
+        ls_fcat-seltext_m = |Desc. mat. fab.|.
+        ls_fcat-seltext_s = |Desc. mat. fab.|.
+        ls_fcat-reptext_ddic   = |Desc. mat. fab.|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'ID_RECETA'.
+        ls_fcat-seltext_l = |Receta|.
+        ls_fcat-seltext_m = |Receta|.
+        ls_fcat-seltext_s = |Receta|.
+        ls_fcat-reptext_ddic   = |Receta|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'KG_MP'.
+        ls_fcat-seltext_l = |Kg consumo|.
+        ls_fcat-seltext_m = |Kg consumo|.
+        ls_fcat-seltext_s = |Kg consumo|.
+        ls_fcat-reptext_ddic   = |Kg consumo|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'MEINS_MP'.
+        ls_fcat-seltext_l = |UMB|.
+        ls_fcat-seltext_m = |UMB|.
+        ls_fcat-seltext_s = |UMB|.
+        ls_fcat-reptext_ddic   = |UMB|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'MEINS_ROLLO'.
+        ls_fcat-seltext_l = |UMB|.
+        ls_fcat-seltext_m = |UMB|.
+        ls_fcat-seltext_s = |UMB|.
+        ls_fcat-reptext_ddic   = |UMB|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'KG_MP'.
+        ls_fcat-seltext_l = |Kg consumo|.
+        ls_fcat-seltext_m = |Kg consumo|.
+        ls_fcat-seltext_s = |Kg consumo|.
+        ls_fcat-reptext_ddic   = |Kg consumo|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'KG_MP'.
+        ls_fcat-seltext_l = |Kg consumo|.
+        ls_fcat-seltext_m = |Kg consumo|.
+        ls_fcat-seltext_s = |Kg consumo|.
+        ls_fcat-reptext_ddic   = |Kg consumo|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'OF_ROLLO'.
+        ls_fcat-seltext_l = |Orden|.
+        ls_fcat-seltext_m = |Orden|.
+        ls_fcat-seltext_s = |Orden|.
+        ls_fcat-reptext_ddic   = |Orden|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'IND_NO_TRATADO'.
+        ls_fcat-seltext_l = |Ind.err|.
+        ls_fcat-seltext_m = |Ind.err|.
+        ls_fcat-seltext_s = |Ind.err|.
+        ls_fcat-reptext_ddic   = |Ind.err|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'MSG_NO_TRATADO'.
+        ls_fcat-seltext_l = |Mensaje|.
+        ls_fcat-seltext_m = |Mensaje|.
+        ls_fcat-seltext_s = |Mensaje|.
+        ls_fcat-reptext_ddic   = |Mensaje|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'MBLNR_261'.
+        ls_fcat-seltext_l = |Doc. Material|.
+        ls_fcat-seltext_m = |Doc. Material|.
+        ls_fcat-seltext_s = |Doc. Material|.
+        ls_fcat-reptext_ddic   = |Doc. Material|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'ZEILE_261'.
+        ls_fcat-seltext_l = |Posición|.
+        ls_fcat-seltext_m = |Posición|.
+        ls_fcat-seltext_s = |Posición|.
+        ls_fcat-reptext_ddic   = |Posición|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'MJAHR_261'.
+        ls_fcat-seltext_l = |Ejercicio|.
+        ls_fcat-seltext_m = |Ejercicio|.
+        ls_fcat-seltext_s = |Ejercicio|.
+        ls_fcat-reptext_ddic   = |Ejercicio|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'FECHA_INS'.
+        ls_fcat-seltext_l = |Fecha consumo|.
+        ls_fcat-seltext_m = |Fecha consumo|.
+        ls_fcat-seltext_s = |Fecha consumo|.
+        ls_fcat-reptext_ddic   = |Fecha consumo|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+      WHEN 'HORA_INS'.
+        ls_fcat-seltext_l = |Hora consumo|.
+        ls_fcat-seltext_m = |Hora consumo|.
+        ls_fcat-seltext_s = |Hora consumo|.
+        ls_fcat-reptext_ddic   = |Hora consumo|.
+        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+
+*      WHEN 'TYPE_RET'.
+**        ls_fcat-seltext   = text-t02.
+*        ls_fcat-seltext_l = text-t02.
+*        ls_fcat-seltext_m = text-t02.
+*        ls_fcat-seltext_s = text-t02.
+*        ls_fcat-reptext_ddic   = text-t02.
+*        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+*      WHEN 'MSG_RET'.
+**        ls_fcat-seltext   = text-t03.
+*        ls_fcat-seltext_l = text-t03.
+*        ls_fcat-seltext_m  = text-t03.
+*        ls_fcat-seltext_s = text-t03.
+*        ls_fcat-reptext_ddic   = text-t03.
+*        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+*      WHEN 'NO_RESB'.
+*        ls_fcat-no_out = 'X'.
+*        MODIFY gt_fieldcat_ant FROM ls_fcat INDEX lv_tabix.
+    ENDCASE.
+  ENDLOOP.
+
+*ID_RECETA
+*LOTE_MP
+*LOTE_ROLLO
+*MATNR_MP
+*KG_MP
+*MEINS_MP
+*ALMACEN_PM
+*OF_ROLLO
+*MATNR_ROLLO
+*KG_ROLLO
+*MEINS_ROLLO
+*MBLNR_261
+*MJAHR_261
+*ZEILE_261
+*IND_NO_TRATADO
+*MSG_NO_TRATADO
+*FECHA_INS
+*HORA_INS
+*CONTR_INS
+*FECHA_UPD
+*HORA_UPD
+*CONTR_UPD
+
+
+
+
+
+  LOOP AT gt_fieldcat_ant INTO ls_fcat WHERE fieldname = 'PROCESADO'.
+    lv_tabix = sy-tabix.
+    DELETE gt_fieldcat_ant INDEX lv_tabix.
+  ENDLOOP.
+
+ENDFORM.                    " COL_ALV

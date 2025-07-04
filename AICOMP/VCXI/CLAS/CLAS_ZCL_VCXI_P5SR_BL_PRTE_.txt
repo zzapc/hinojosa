@@ -1,0 +1,492 @@
+
+class ZCL_VCXI_P5SR_BL_PRTE definition
+  public
+  inheriting from ZCL_VCXI_PXSR_BL_PRTE
+  create public .
+
+public section.
+
+  methods CONVERT_TO_MQTYO
+    redefinition .
+  methods GET_SPVRE_MFMI
+    redefinition .
+  methods PREP_EVAL_WASTE
+    redefinition .
+  methods UPDATE_RHNDL
+    redefinition .
+  methods GET_EVQTY_IN
+    redefinition .
+protected section.
+
+  methods GET_RLDIM_BY_RTE_ARBPL
+    importing
+      !IR_RTE_ARBPL type ref to /VCXI/CL_VSMR_RTE_ARBPL
+    exporting
+      !ET_RLDIM_IN type ZVCXI_P5SP_TT_RLDIM
+      !ET_RLDIM_OUT type ZVCXI_P5SP_TT_RLDIM
+    raising
+      /VCXI/CX_CKX .
+
+  methods CONV_MQTYO_TO_MQTYI
+    redefinition .
+private section.
+endclass. "ZCL_VCXI_P5SR_BL_PRTE definition
+class ZCL_VCXI_P5SR_BL_PRTE implementation.
+  method CONV_MQTYO_TO_MQTYI.
+
+    data: LF_NOOUT_OUT type        ZVCXI_XCS_NOOUT,
+          LF_NOUPS_OUT type        ZVCXI_PXS_NOUPS,
+          LF_NOUPS_IN  type        ZVCXI_PXS_NOUPS.
+    data: LS_RLDIM_OUT type        ZVCXI_P5SP_S_RLDIM,
+          LS_RLDIM_IN  type        ZVCXI_P5SP_S_RLDIM.
+    data: LT_RLDIM_IN  type        ZVCXI_P5SP_TT_RLDIM,
+          LT_RLDIM_OUT type        ZVCXI_P5SP_TT_RLDIM.
+    data: LR_RTE_PSTEP type ref to /VCXI/CL_VSMR_RTE_PSTEP.
+
+***--------------------------------------------------------------------------------------
+*** Get Roll Dimension
+    ME->GET_RLDIM_BY_RTE_ARBPL( exporting IR_RTE_ARBPL = IR_RTE_ARBPL
+                                importing ET_RLDIM_IN  = LT_RLDIM_IN
+                                          ET_RLDIM_OUT = LT_RLDIM_OUT ).
+
+*** Collect Ups of all Dimension Outs (MFMO are suppressed by NOUPS = 0)
+    loop at LT_RLDIM_OUT into LS_RLDIM_OUT where NOUPS ne 0.
+      add LS_RLDIM_OUT-NOOUT to LF_NOOUT_OUT.
+      add LS_RLDIM_OUT-NOUPS to LF_NOUPS_OUT.
+    endloop.
+    check SY-SUBRC eq 0.
+
+***----------------------------------------------------------------------------
+*** Logic "No MFO"
+    if LINES( LT_RLDIM_OUT ) eq 0.
+      CS_CALCV-CALCV = 0.
+
+*** Logic "Single MFO"
+    elseif LINES( LT_RLDIM_OUT ) eq 1.
+***   Get maximum Ups of Flow In
+      loop at LT_RLDIM_IN into LS_RLDIM_IN.
+        if LS_RLDIM_IN-NOUPS gt LF_NOUPS_IN.
+          move LS_RLDIM_IN-NOUPS to LF_NOUPS_IN.
+        endif.
+      endloop.
+      check LF_NOUPS_IN is not initial.
+
+***   Convert it to Machine Quantity In using Ups Ratio (Due to S&U)
+      CS_CALCV-CALCV = CS_CALCV-CALCV * LF_NOUPS_OUT / LF_NOUPS_IN.
+
+*** Logic "Multiple MFO"
+    else.
+      check LF_NOOUT_OUT is not initial.
+***   Convert it to Machine Quantity In using the Total Out
+      CS_CALCV-CALCV = CS_CALCV-CALCV / LF_NOOUT_OUT.
+    endif.
+
+  endmethod.
+  method CONVERT_TO_MQTYO.
+
+    data: LF_UNIT      type ABAP_BOOL,
+          LF_NOUPS_OUT type ZVCXI_PXS_NOUPS,
+          LF_NOOUT     type ZVCXI_XCS_NOOUT.
+    data: LT_RLDIM_OUT type ZVCXI_P5SP_TT_RLDIM.
+
+
+***----------------------------------------------------------------------------
+*** Find Unitizing Step
+    loop at IR_RTE_ARBPL->T_RTE_PSTEP into data(LR_RTE_PSTEP)
+                                      where TABLE_LINE->R_BLOBJ is instance of ZCL_VCXI_P5SR_BL_PSTEP_UNIT.
+      if LR_RTE_PSTEP->R_PSTEP->/VCXI/IF_CKX_OBJECT~GET_ID( ) eq ZCL_VCXI_P5SR_BL_PSTEP_UNIT=>C_IPSTP_UNIT.
+        LF_UNIT = ABAP_TRUE.
+      endif.
+    endloop.
+
+    if LF_UNIT eq ABAP_TRUE.
+***   Get Roll Dimension
+      ME->GET_RLDIM_BY_RTE_ARBPL( exporting IR_RTE_ARBPL = IR_RTE_ARBPL
+                                  importing ET_RLDIM_OUT = LT_RLDIM_OUT ).
+***   Convert to PC based on total Roll Length
+      CS_CALCV = ZCL_VCXI_P5SP_SERVICE=>CONV_L_TO_P( IS_CALCV = CS_CALCV
+                                                     IS_RLDIM = value #( S_RLETA = value #( LT_RLDIM_OUT[ 1 ]-S_RLETA optional ) ) ).
+
+***   Ignore Dimension Outs of MFMO (suppressed by NOUPS = 0)
+      delete LT_RLDIM_OUT where NOUPS = 0.
+
+***   Collect Ups/Outs of all Roll Dimension Out
+      LF_NOUPS_OUT = reduce #( init NOUPS_OUT = 0 for LS_RLDIM_OUT in LT_RLDIM_OUT next NOUPS_OUT = NOUPS_OUT + ( LS_RLDIM_OUT-NOUPS * LS_RLDIM_OUT-NOOUT ) ).
+      LF_NOOUT =  reduce #( init NOOUT = 0 for LS_RLDIM_OUT in LT_RLDIM_OUT next NOOUT += LS_RLDIM_OUT-NOOUT ).
+
+***   Calculate
+      if LF_NOUPS_OUT is not initial.
+        CS_CALCV-CALCV = conv ZVCXI_XCSP_MQTYO( CS_CALCV-CALCV / LF_NOUPS_OUT * LF_NOOUT * ME->F_MFRAT ).
+      else.
+        clear CS_CALCV-CALCV.
+      endif.
+    endif.
+
+  endmethod.
+  method GET_EVQTY_IN.
+
+    SUPER->GET_EVQTY_IN( exporting IR_BL_RTESPV = IR_BL_RTESPV
+                                   IR_BL_PSTEP  = IR_BL_PSTEP
+                         importing ER_RTE_ARBPL = ER_RTE_ARBPL
+                         changing  CS_EVQTY     = CS_EVQTY ).
+
+*** Convert to PC based on total Roll Length (Unitizing only)
+    if CS_EVQTY-EVQTY_UOM eq 'ST'. "converted by first Machine
+      ME->GET_RLDIM_BY_RTE_ARBPL( exporting IR_RTE_ARBPL = ER_RTE_ARBPL
+                                  importing ET_RLDIM_OUT = data(LT_RLDIM) ).
+
+      data(LS_CALCV) = ZCL_VCXI_P5SP_SERVICE=>CONV_P_TO_L( IS_CALCV = value #( CALCV     = CS_EVQTY-EVQTY
+                                                                               CALCV_UOM = CS_EVQTY-EVQTY_UOM )
+                                                           IS_RLDIM = value #( LT_RLDIM[ 1 ] optional ) ).
+      CS_EVQTY = value #( EVQTY     = LS_CALCV-CALCV
+                          EVQTY_UOM = LS_CALCV-CALCV_UOM ).
+    endif.
+
+  endmethod.
+  method GET_RLDIM_BY_RTE_ARBPL.
+
+    data: LT_RLDIM     type        ZVCXI_P5SP_TT_RLDIM.
+    data: LR_RTE_ARBPL type ref to /VCXI/CL_VSMR_RTE_ARBPL,
+          LR_RTE_PSTEP type ref to /VCXI/CL_VSMR_RTE_PSTEP,
+          LR_ADJ_RLDIM type ref to ZIF_VCXI_P5SR_ADJ_RLDIM.
+    field-symbols: <T_MFMI>  type standard table,
+                   <T_MFSI>  type standard table,
+                   <S_MFMI>  type          ANY,
+                   <S_MFSI>  type          ANY,
+                   <S_RLDIM> type          ZVCXI_P5SP_S_RLDIM.
+
+
+    free: ET_RLDIM_IN,
+          ET_RLDIM_OUT.
+
+***--------------------------------------------------------------------------------------
+*** Material Flow Material In Dimensions
+    if ME->R_MFMI is bound.
+      assign ME->R_MFMI->* to <T_MFMI>.
+
+      loop at <T_MFMI> assigning <S_MFMI>.
+        append initial line to LT_RLDIM assigning <S_RLDIM>.
+        move-corresponding <S_MFMI> to <S_RLDIM>.
+      endloop.
+    endif.
+
+***--------------------------------------------------------------------------------------
+*** Material Flow SFG In Dimensions
+    if ME->R_MFSI is bound.
+      assign ME->R_MFSI->* to <T_MFSI>.
+
+      loop at <T_MFSI> assigning <S_MFSI>.
+        append initial line to LT_RLDIM assigning <S_RLDIM>.
+        move-corresponding <S_MFSI> to <S_RLDIM>.
+      endloop.
+    endif.
+
+*** Forward Processing of Roll Dimension Changes
+    loop at ME->R_RTE_PRTE->T_RTE_ARBPL into LR_RTE_ARBPL.
+
+***--------------------------------------------------------------------------------------
+***   Reset Number of Outs on next Work Center
+      loop at LT_RLDIM assigning <S_RLDIM>.
+        move 1 to <S_RLDIM>-NOOUT.
+      endloop.
+
+***--------------------------------------------------------------------------------------
+***   Adjust Roll Dimension In
+      loop at LR_RTE_ARBPL->T_RTE_PSTEP into LR_RTE_PSTEP.
+        try.
+            move LR_RTE_PSTEP->R_BLOBJ ?to LR_ADJ_RLDIM.
+            check LR_ADJ_RLDIM is bound.
+
+            LR_ADJ_RLDIM->CALC_RLDIM_IN( changing CT_RLDIM = LT_RLDIM ).
+            if LT_RLDIM is not initial.
+              exit. " Only first Production Step influences Roll Dimensions In
+            endif.
+          catch CX_SY_MOVE_CAST_ERROR.
+            continue.
+        endtry.
+      endloop.
+
+***   Keep Roll Dimension In at requested Work Center
+      if LR_RTE_ARBPL eq IR_RTE_ARBPL.
+        move LT_RLDIM to ET_RLDIM_IN.
+      endif.
+
+***--------------------------------------------------------------------------------------
+***   Calculate Roll Out
+      loop at LR_RTE_ARBPL->T_RTE_PSTEP into LR_RTE_PSTEP.
+*{   REPLACE        HEDK927942                                        1
+*\        if LR_RTE_PSTEP->R_BLOBJ is instance of ZIF_VCXI_P5SR_ADJ_RLDIM.
+       DATA: LR_RLDIM TYPE REF TO ZIF_VCXI_P5SR_ADJ_RLDIM.
+       TRY .
+        LR_RLDIM ?= LR_RTE_PSTEP->R_BLOBJ.
+      catch CX_SY_MOVE_CAST_ERROR.
+        continue.
+      ENDTRY.
+      IF LR_RLDIM IS BOUND.
+*}   REPLACE
+          cast ZIF_VCXI_P5SR_ADJ_RLDIM( LR_RTE_PSTEP->R_BLOBJ )->CALC_RLDIM_OUT( changing CT_RLDIM = LT_RLDIM ).
+        endif.
+      endloop.
+
+***   Stop calculating at requested Work Center
+      if LR_RTE_ARBPL eq IR_RTE_ARBPL.
+        move LT_RLDIM to ET_RLDIM_OUT.
+        exit.
+      endif.
+    endloop.
+
+  endmethod.
+  method GET_SPVRE_MFMI.
+
+    data: LS_MFMI  type          ZVCXI_P5SR_S_MFMI,
+          LS_LEOKY type          /VCXI/VKSR_S_LEOKY,
+          LS_PARAM type          /VCXI/VKSR_S_PARAM.
+    data: LR_SPVCE      type ref to   /VCXI/CL_VKSC_SPVCE,
+          LR_SPVRE_MFMI type ref to   /VCXI/CL_VKSR_SPVRE.
+    field-symbols: <T_MFMI> type standard table,
+                   <S_MFMI> type          ANY.
+
+
+    check ME->R_MFMI is bound.
+    assign ME->R_MFMI->* to <T_MFMI>.
+
+    loop at <T_MFMI> assigning <S_MFMI>.
+      move-corresponding <S_MFMI> to LS_MFMI.
+
+***--------------------------------------------------------------------------------------
+***   Get Customizing Element
+      LR_SPVCE = IR_BL_RTESPV->GET_SPVCE( IF_ID           = 'MFMI_A'
+                                          IR_SPVCE_PARENT = IR_SPVRE_MFMGR->R_SPVCE ).
+
+***   Create Supervisor Runtime Element
+      create object LR_SPVRE_MFMI
+        exporting
+          IR_SPVCE  = LR_SPVCE
+          IR_PARENT = IR_SPVRE_MFMGR.
+      append LR_SPVRE_MFMI to CT_SPVRE.
+      move   ABAP_TRUE     to CF_MFI.
+
+***   Set In Use
+      LR_SPVRE_MFMI->SET_INUSE( IF_INUSE = ABAP_TRUE ).
+
+***--------------------------------------------------------------------------------------
+***   Set Leading Object
+      LR_SPVRE_MFMI->SET_LEOKY( IS_LEOKY = value #( LEOKY = LS_MFMI-MATNR
+                                                    SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_CALC ) ).
+
+***   Set Component Scrap
+      clear LS_PARAM.
+      move ZCL_VCXI_XCSP_PR_MFMI=>C_PARID_KAUSF              to LS_PARAM-PARID.
+      move /VCXI/CL_VKSC_PARAM=>C_PARTY_NUMC                 to LS_PARAM-PARTY.
+      move LS_MFMI-KAUSF                                     to LS_PARAM-ATFLV.
+      move LS_MFMI-KAUSF_UOM                                 to LS_PARAM-UNIT.
+      move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC                  to LS_PARAM-SETBY.
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = LS_PARAM ).
+
+***   Set Setup Percentage for Material Flow In
+      clear LS_PARAM.
+      move ZCL_VCXI_XCSP_PR_MFMI=>C_PARID_MFISP              to LS_PARAM-PARID.
+      move /VCXI/CL_VKSC_PARAM=>C_PARTY_NUMC                 to LS_PARAM-PARTY.
+      move LS_MFMI-MFISP                                     to LS_PARAM-ATFLV.
+      move LS_MFMI-MFISP_UOM                                 to LS_PARAM-UNIT.
+      move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC                  to LS_PARAM-SETBY.
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = LS_PARAM ).
+
+***   Set Consumption Factor for Material Flow In
+      clear LS_PARAM.
+      move ZCL_VCXI_XCSP_PR_MFMI=>C_PARID_MFICF              to LS_PARAM-PARID.
+      move /VCXI/CL_VKSC_PARAM=>C_PARTY_NUMC                 to LS_PARAM-PARTY.
+      move LS_MFMI-MFICF                                     to LS_PARAM-ATFLV.
+      move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC                  to LS_PARAM-SETBY.
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = LS_PARAM ).
+
+***   Set Consumption Factor Per for Material Flow In
+      clear LS_PARAM.
+      move ZCL_VCXI_XCSP_PR_MFMI=>C_PARID_MFICP              to LS_PARAM-PARID.
+      move /VCXI/CL_VKSC_PARAM=>C_PARTY_NUMC                 to LS_PARAM-PARTY.
+      move LS_MFMI-MFICP                                     to LS_PARAM-ATFLV.
+      move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC                  to LS_PARAM-SETBY.
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = LS_PARAM ).
+
+***   Set Purchase Flag
+      clear LS_PARAM.
+      move ZCL_VCXI_XCSP_PR_MFMI=>C_PARID_PURCH              to LS_PARAM-PARID.
+      move /VCXI/CL_VKSC_PARAM=>C_PARTY_CHAR                 to LS_PARAM-PARTY.
+      move LS_MFMI-PURCH                                     to LS_PARAM-ATWRT.
+      move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC                  to LS_PARAM-SETBY.
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = LS_PARAM ).
+
+***   Set Costing Relevant
+      clear LS_PARAM.
+      move ZCL_VCXI_XCSP_PR_MFMI=>C_PARID_SANKA              to LS_PARAM-PARID.
+      move /VCXI/CL_VKSC_PARAM=>C_PARTY_CHAR                 to LS_PARAM-PARTY.
+      move LS_MFMI-SANKA                                     to LS_PARAM-ATWRT.
+      move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC                  to LS_PARAM-SETBY.
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = LS_PARAM ).
+
+***   Set Text
+      clear LS_PARAM.
+      move ZCL_VCXI_XCSP_PR_MFMI=>C_PARID_TEXT               to LS_PARAM-PARID.
+      move /VCXI/CL_VKSC_PARAM=>C_PARTY_CHAR                 to LS_PARAM-PARTY.
+      move LS_MFMI-TEXT                                      to LS_PARAM-ATWRT.
+      move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC                  to LS_PARAM-SETBY.
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = LS_PARAM ).
+
+***   Set Vendor Number
+      clear LS_PARAM.
+      move ZCL_VCXI_XCSP_PR_MFMI=>C_PARID_LIFNR              to LS_PARAM-PARID.
+      move /VCXI/CL_VKSC_PARAM=>C_PARTY_CHAR                 to LS_PARAM-PARTY.
+      move LS_MFMI-LIFNR                                     to LS_PARAM-ATWRT.
+      move /VCXI/CL_VKSR_GATE=>C_SETBY_CALC                  to LS_PARAM-SETBY.
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = LS_PARAM ).
+
+***--------------------------------------------------------------------------------------
+***   Fill Roll Dimensions
+
+***   Set Web Width
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = value #( PARID = ZCL_VCXI_P5SP_PR_MFMI=>ZIF_VCXI_P5SP_RLDIM~C_PARID_WEBWI
+                                                    PARTY = /VCXI/CL_VKSC_PARAM=>C_PARTY_NUMC
+                                                    ATFLV = LS_MFMI-WEBWI
+                                                    UNIT  = LS_MFMI-WEBWI_UOM
+                                                    SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_CALC ) ).
+
+***   Set Surface Weight
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = value #( PARID = ZCL_VCXI_P5SP_PR_MFMI=>ZIF_VCXI_P5SP_RLDIM~C_PARID_SURWT
+                                                    PARTY = /VCXI/CL_VKSC_PARAM=>C_PARTY_NUMC
+                                                    ATFLV = LS_MFMI-SURWT
+                                                    UNIT  = LS_MFMI-SURWT_UOM
+                                                    SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_CALC ) ).
+
+***   Set Roll Length Target
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = value #( PARID = ZCL_VCXI_P5SP_PR_MFMI=>ZIF_VCXI_P5SP_RLDIM~C_PARID_RLETA
+                                                    PARTY = /VCXI/CL_VKSC_PARAM=>C_PARTY_NUMC
+                                                    ATFLV = LS_MFMI-RLETA
+                                                    UNIT  = LS_MFMI-RLETA_UOM
+                                                    SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_CALC ) ).
+
+***   Set Number Ups
+      LR_SPVRE_MFMI->SET_PARAM( IS_PARAM = value #( PARID = ZCL_VCXI_P5SP_PR_MFMI=>ZIF_VCXI_P5SP_RLDIM~C_PARID_NOUPS
+                                                    PARTY = /VCXI/CL_VKSC_PARAM=>C_PARTY_NUMC
+                                                    ATFLV = LS_MFMI-NOUPS
+                                                    SETBY = /VCXI/CL_VKSR_GATE=>C_SETBY_CALC ) ).
+
+
+***--------------------------------------------------------------------------------------
+***   Add Price Scale Manager
+      IR_BL_RTESPV->ADD_PSCALE_MGR( exporting IR_SPVRE_PARENT = LR_SPVRE_MFMI
+                                              IT_PSCALE       = LS_MFMI-T_PSCALE
+                                    changing  CT_SPVRE        = CT_SPVRE ).
+    endloop.
+
+  endmethod.
+  method PREP_EVAL_WASTE.
+
+    data: LF_UNIT type ABAP_BOOL.
+    data: LT_RLDIM_OUT type ZVCXI_P5SP_TT_RLDIM.
+
+
+***----------------------------------------------------------------------------
+*** Find Unitizing Step
+    loop at IR_RTE_ARBPL->T_RTE_PSTEP into data(LR_RTE_PSTEP)
+                                      where TABLE_LINE->R_BLOBJ is instance of ZCL_VCXI_P5SR_BL_PSTEP_UNIT.
+      if LR_RTE_PSTEP->R_PSTEP->/VCXI/IF_CKX_OBJECT~GET_ID( ) eq ZCL_VCXI_P5SR_BL_PSTEP_UNIT=>C_IPSTP_UNIT.
+        LF_UNIT = ABAP_TRUE.
+        exit.
+      endif.
+    endloop.
+
+*** Get Roll Dimension
+    ME->GET_RLDIM_BY_RTE_ARBPL( exporting IR_RTE_ARBPL = IR_RTE_ARBPL
+                                importing ET_RLDIM_OUT = LT_RLDIM_OUT ).
+
+*** Prepare Machine Quantity Out for Conversion
+    data(LS_CALCV) = value ZVCXI_XCS_S_CALCV( CALCV     = IS_MQTYO-MQTYO
+                                              CALCV_UOM = IS_MQTYO-MQTYO_UOM ).
+
+    if LF_UNIT eq ABAP_TRUE.
+***   Convert to PC based on total Roll Length
+      if LS_CALCV-CALCV_UOM ne 'ST'.  "already converted by CONVERT_TO_MQTYO for last Work Center
+        LS_CALCV = ZCL_VCXI_P5SP_SERVICE=>CONV_L_TO_P( IS_CALCV = LS_CALCV
+                                                       IS_RLDIM = value #( S_RLETA = value #( LT_RLDIM_OUT[ 1 ]-S_RLETA optional ) ) ).
+      endif.
+    else.
+***   Convert to PC based on total Roll Length
+      if LS_CALCV-CALCV_UOM eq 'ST'.  "converted by previous Work Center
+        LS_CALCV = ZCL_VCXI_P5SP_SERVICE=>CONV_P_TO_L( IS_CALCV = LS_CALCV
+                                                       IS_RLDIM = value #( S_RLETA = value #( LT_RLDIM_OUT[ 1 ]-S_RLETA optional ) ) ).
+      endif.
+    endif.
+
+***----------------------------------------------------------------------------
+*** Standard Preparation
+    SUPER->PREP_EVAL_WASTE( exporting IR_RTE_ARBPL  = IR_RTE_ARBPL
+                                      IS_MQTYO      = value #( MQTYO     = LS_CALCV-CALCV
+                                                               MQTYO_UOM = LS_CALCV-CALCV_UOM )
+                            changing  CT_EVAL_WASTE = CT_EVAL_WASTE ).
+
+  endmethod.
+  method UPDATE_RHNDL.
+
+    data: LS_MFMI  type          ZVCXI_P5SR_S_MFMI.
+    data: LT_RLDIM_OUT type ZVCXI_P5SP_TT_RLDIM,
+          LT_RHNDL     type ZVCXI_PXSR_TT_RHNDL.
+    data: LR_RTE_ARBPL type ref to /VCXI/CL_VSMR_RTE_ARBPL,
+          LR_RTE_PSTEP type ref to /VCXI/CL_VSMR_RTE_PSTEP.
+    field-symbols: <T_MFMI> type standard table,
+                   <S_MFMI> type          ANY.
+
+
+*** Standard Roll Handling Update
+    SUPER->UPDATE_RHNDL( ).
+
+*** Forward Processing of Roll Dimension Changes
+    loop at ME->R_RTE_PRTE->T_RTE_ARBPL into LR_RTE_ARBPL.
+***   Adjust Number of Outs
+      ME->GET_RLDIM_BY_RTE_ARBPL( exporting IR_RTE_ARBPL = LR_RTE_ARBPL
+                                  importing ET_RLDIM_OUT = LT_RLDIM_OUT ).
+
+      clear LT_RHNDL.
+*{   REPLACE        HEDK927942                                        1
+*\      loop at LR_RTE_ARBPL->T_RTE_PSTEP into LR_RTE_PSTEP
+*\                                       where TABLE_LINE->R_BLOBJ is instance of ZIF_VCXI_PXSR_RHNDL.
+       DATA: LR_RHNDL TYPE REF TO ZIF_VCXI_PXSR_RHNDL.
+      loop at LR_RTE_ARBPL->T_RTE_PSTEP into LR_RTE_PSTEP.
+
+       TRY .
+         LR_RHNDL ?= LR_RTE_PSTEP->R_BLOBJ.
+      catch CX_SY_MOVE_CAST_ERROR.
+        continue.
+      ENDTRY.
+
+*}   REPLACE
+***     Update Number of Outs
+        LT_RHNDL = cast ZIF_VCXI_PXSR_RHNDL( LR_RTE_PSTEP->R_BLOBJ )->T_RHNDL.
+        loop at LT_RHNDL assigning field-symbol(<S_RHNDL>).
+          <S_RHNDL>-NOOUT = value #( LT_RLDIM_OUT[ SY-TABIX ]-NOOUT optional ).
+        endloop.
+        cast ZIF_VCXI_PXSR_RHNDL( LR_RTE_PSTEP->R_BLOBJ )->SET_RHNDL( IT_RHNDL     = LT_RHNDL
+                                                                      IR_RTE_ARBPL = LR_RTE_ARBPL ).
+      endloop.
+    endloop.
+
+*** Update outbound Roll Handling Information with updated Infos of Last Operation
+    if LT_RHNDL is not initial.
+      ME->SET_RHNDL_OUT( IT_RHNDL_OUT = LT_RHNDL ).
+    endif.
+
+*** Update Material Flow Material In with Roll Handling Infos
+    if ME->R_MFMI is bound.
+      assign ME->R_MFMI->* to <T_MFMI>.
+
+      data(LT_RHNDL_IN) = ME->GET_RHNDL_IN( ).
+      loop at <T_MFMI> assigning <S_MFMI>.
+        LS_MFMI = corresponding #( <S_MFMI> ).
+        LS_MFMI-S_RLETA = value #( LT_RHNDL_IN[ 1 ]-S_RLETA optional ).
+*{   REPLACE        HEDK927942                                        2
+*\        <S_MFMI> = corresponding #( base ( <S_MFMI> ) LS_MFMI ).
+          move-CORRESPONDING LS_MFMI to <S_MFMI> .
+*}   REPLACE
+      endloop.
+    endif.
+
+  endmethod.

@@ -1,0 +1,223 @@
+*&---------------------------------------------------------------------*
+*& Report  YRS_DOWNLOAD_TRANSPORT_REQUEST
+*&
+*&---------------------------------------------------------------------*
+
+report  YTR_REQUEST_DOWNLOAD.
+
+parameters: P_REQEST      type TRKORR obligatory,
+            P_FOLDER(255) type C lower case,
+            P_SEPR        obligatory.
+
+data: FOLDER        type STRING,
+      RETVAL        like table of DDSHRETVAL with header line,
+      FLDVALUE      like HELP_INFO-FLDVALUE,
+      TRANSDIR      type TEXT255,
+      FILENAME(255),
+      TRFILE(20)    type C,
+      DATATAB       type table of X with header line,
+      LEN           type I,
+      FLEN          type I.
+
+type-pools: SABC, STMS, TRWBO.
+
+initialization.
+  concatenate SY-SYSID 'K*' into P_REQEST.
+  if SY-OPSYS cs 'Win'.
+    P_SEPR = '\'.
+  else.
+    P_SEPR = '/'.
+  endif.
+*  call function 'WSAF_BUILD_SEPARATOR'
+*    importing
+*      SEPARATOR                  = P_SEPR
+*    exceptions
+*      SEPARATOR_NOT_MAINTAINED   = 1
+*      WRONG_CALL                 = 2
+*      WSAF_CONFIG_NOT_MAINTAINED = 3
+*      others                     = 4.
+
+  if SY-SUBRC ne 0.
+    message S001(00) with
+    'Unable to find out the separator symbol for the system.'(011).
+  endif.
+
+at selection-screen on value-request for P_REQEST.
+
+  data: TT_SYSTEM           type table of TMSCSYS with header line,
+        ES_SELECTED_REQUEST type TRWBO_REQUEST_HEADER,
+        ES_SELECTED_TASK    type TRWBO_REQUEST_HEADER,
+        IV_ORGANIZER_TYPE   type TRWBO_CALLING_ORGANIZER,
+        IS_SELECTION        type TRWBO_SELECTION.
+
+  IV_ORGANIZER_TYPE = 'W'.
+  IS_SELECTION-REQSTATUS = 'R'.
+
+  call function 'TR_PRESENT_REQUESTS_SEL_POPUP'
+    exporting
+      IV_ORGANIZER_TYPE   = IV_ORGANIZER_TYPE
+      IS_SELECTION        = IS_SELECTION
+    importing
+      ES_SELECTED_REQUEST = ES_SELECTED_REQUEST
+      ES_SELECTED_TASK    = ES_SELECTED_TASK.
+
+  P_REQEST = ES_SELECTED_REQUEST-TRKORR.
+
+at selection-screen on value-request for P_FOLDER.
+  data: TITLE type STRING.
+  TITLE = 'Select target folder'(005).
+
+  call method CL_GUI_FRONTEND_SERVICES=>DIRECTORY_BROWSE
+    exporting
+      WINDOW_TITLE    = TITLE
+    changing
+      SELECTED_FOLDER = FOLDER
+    exceptions
+      CNTL_ERROR      = 1
+      ERROR_NO_GUI    = 2
+      others          = 3.
+  call function 'CONTROL_FLUSH'
+    exceptions
+      CNTL_SYSTEM_ERROR = 1
+      CNTL_ERROR        = 2
+      others            = 3.
+
+  P_FOLDER = FOLDER.
+
+at selection-screen on P_REQEST.
+
+  data: REQUEST_INFO  type STMS_WBO_REQUEST,
+        REQUEST_INFOS type STMS_WBO_REQUESTS.
+
+  refresh REQUEST_INFOS.
+
+  call function 'TMS_MGR_READ_TRANSPORT_REQUEST'
+    exporting
+      IV_REQUEST                 = P_REQEST
+      IV_HEADER_ONLY             = 'X'
+    importing
+      ET_REQUEST_INFOS           = REQUEST_INFOS
+    exceptions
+      READ_CONFIG_FAILED         = 1
+      TABLE_OF_REQUESTS_IS_EMPTY = 2
+      SYSTEM_NOT_AVAILABLE       = 3
+      others                     = 4.
+  if SY-SUBRC <> 0.
+    message id SY-MSGID type SY-MSGTY number SY-MSGNO with SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  endif.
+
+  clear REQUEST_INFO.
+  read table REQUEST_INFOS into REQUEST_INFO index 1.
+  if SY-SUBRC ne 0 or REQUEST_INFO-E070-TRKORR is initial.
+    message E398(00) with 'Request'(006) P_REQEST 'not found'(007).
+  elseif REQUEST_INFO-E070-TRSTATUS ne 'R'.
+    message E398(00) with 'You must release request'(008) REQUEST_INFO-E070-TRKORR 'before downloading'(009).
+  endif.
+
+start-of-selection.
+  FOLDER = P_FOLDER.
+  concatenate P_REQEST+3(7) '.' P_REQEST(3) into TRFILE.
+
+  call function 'RSPO_R_SAPGPARAM'
+    exporting
+      NAME   = 'DIR_TRANS'
+    importing
+      VALUE  = TRANSDIR
+    exceptions
+      ERROR  = 0
+      others = 0.
+  perform COPY_FILE using 'cofiles' TRFILE.
+
+  TRFILE(1) = 'R'.
+
+  perform COPY_FILE using 'data' TRFILE.
+*  trfile(1) = 'D'.
+*  PERFORM copy_file USING 'data' trfile.
+*---------------------------------------------------------------------*
+* FORM copy_file *
+*---------------------------------------------------------------------*
+* --> SUBDIR * * --> FNAME *
+*---------------------------------------------------------------------*
+form COPY_FILE using SUBDIR FNAME.
+  data: AUTH_FILENAME type AUTHB-FILENAME,
+        GUI_FILENAME  type STRING.
+
+  concatenate TRANSDIR SUBDIR FNAME into FILENAME separated by P_SEPR.
+  refresh DATATAB.
+  clear FLEN.
+  AUTH_FILENAME = FILENAME.
+
+  call function 'AUTHORITY_CHECK_DATASET'
+    exporting
+      ACTIVITY         = SABC_ACT_READ
+      FILENAME         = AUTH_FILENAME
+    exceptions
+      NO_AUTHORITY     = 1
+      ACTIVITY_UNKNOWN = 2
+      others           = 3.
+  if SY-SUBRC <> 0.
+    format color col_negative.
+    write: / 'Read access denied. File'(001), FILENAME. format color off. exit.
+  endif.
+  open dataset FILENAME for input in binary mode.
+
+  if SY-SUBRC ne 0.
+    format color col_total.
+    write: / 'File open error'(010), FILENAME.
+    format color off.
+    exit.
+  endif.
+  do.
+    clear LEN.
+    read dataset FILENAME into DATATAB length LEN.
+    FLEN = FLEN + LEN.
+    if LEN > 0.
+      append DATATAB.
+    endif.
+    if SY-SUBRC ne 0.
+      exit.
+    endif.
+  enddo.
+
+  close dataset FILENAME.
+  concatenate P_FOLDER '\' FNAME into GUI_FILENAME.
+
+  call method CL_GUI_FRONTEND_SERVICES=>GUI_DOWNLOAD
+    exporting
+      BIN_FILESIZE            = FLEN
+      FILENAME                = GUI_FILENAME
+      FILETYPE                = 'BIN'
+    changing
+      DATA_TAB                = DATATAB[]
+    exceptions
+      FILE_WRITE_ERROR        = 1
+      NO_BATCH                = 2
+      GUI_REFUSE_FILETRANSFER = 3
+      INVALID_TYPE            = 4
+      NO_AUTHORITY            = 5
+      UNKNOWN_ERROR           = 6
+      HEADER_NOT_ALLOWED      = 7
+      SEPARATOR_NOT_ALLOWED   = 8
+      FILESIZE_NOT_ALLOWED    = 9
+      HEADER_TOO_LONG         = 10
+      DP_ERROR_CREATE         = 11
+      DP_ERROR_SEND           = 12
+      DP_ERROR_WRITE          = 13
+      UNKNOWN_DP_ERROR        = 14
+      ACCESS_DENIED           = 15
+      DP_OUT_OF_MEMORY        = 16
+      DISK_FULL               = 17
+      DP_TIMEOUT              = 18
+      FILE_NOT_FOUND          = 19
+      DATAPROVIDER_EXCEPTION  = 20
+      CONTROL_FLUSH_ERROR     = 21
+      others                  = 24.
+  if SY-SUBRC = 0.
+    write: / 'File'(002), FILENAME, 'downloaded. Length'(003), FLEN.
+  else.
+    format color col_negative.
+    write: / 'File download error. Filename:'(004), FILENAME.
+    format color off.
+  endif.
+
+endform. "copy_file

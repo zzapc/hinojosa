@@ -1,0 +1,617 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRMM0001_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  SACAR_DATOS
+*&---------------------------------------------------------------------*
+FORM sacar_datos .
+  DATA: lv_ablad TYPE ablad.
+  RANGES: sl_umbral FOR vttk-zzpeso_alb.
+
+*** INI FCARDONA 24.10.2022 - Unidades en KG
+
+  DATA: lv_mara_brgew TYPE brgew,
+        lv_mara_gewei TYPE gewei.
+
+*** FIN FCARDONA 24.10.2022 - Unidades en KG
+
+  SELECT SINGLE * FROM tvarvc
+    WHERE name EQ 'ZRMM0018_SEMAFORO'
+    INTO @DATA(ls_tvarvc).
+
+  IF sy-subrc EQ 0.
+    sl_umbral-sign = ls_tvarvc-sign.
+    sl_umbral-option = ls_tvarvc-opti.
+    sl_umbral-low = ls_tvarvc-low.
+    sl_umbral-high = ls_tvarvc-high.
+    APPEND sl_umbral.
+  ENDIF.
+
+* leemos transportes
+  IF s_lifex[] IS INITIAL.
+    SELECT * FROM vttk
+      WHERE tplst IN @s_tplst
+        AND tknum IN @s_tknum
+        AND signi IN @s_signi
+        AND erdat IN @s_erdat
+      INTO TABLE @DATA(t_vttk).
+  ELSE.
+    SELECT vbfa~vbeln FROM vbfa
+      INNER JOIN likp ON vbfa~vbelv EQ likp~vbeln
+      WHERE verur IN @s_lifex
+      INTO TABLE @DATA(t_vbeln).
+
+    IF t_vbeln[] IS NOT INITIAL.
+      SELECT * FROM vttk
+        INTO TABLE t_vttk
+        FOR ALL ENTRIES IN t_vbeln
+        WHERE tknum EQ t_vbeln-vbeln.
+    ENDIF.
+  ENDIF.
+
+  LOOP AT t_vttk INTO vttk.
+    CLEAR: gs_item, gs_header.
+
+    AUTHORITY-CHECK OBJECT 'V_VTTK_TDS'
+      ID 'ACTVT' FIELD '03'
+      ID 'TPLST' FIELD vttk-tplst.
+
+    IF sy-subrc NE 0.
+      CONTINUE.
+      MESSAGE 'Se visualizan únicamente los transportes para los que dispone autorización' TYPE 'S'.
+    ENDIF.
+
+    MOVE-CORRESPONDING vttk TO gs_header.
+
+    CALL FUNCTION 'MOVE_CHAR_TO_NUM'
+      EXPORTING
+        chr             = vttk-text2
+      IMPORTING
+        num             = gs_header-peso_ent
+      EXCEPTIONS
+        convt_no_number = 1
+        convt_overflow  = 2
+        OTHERS          = 3.
+
+    CALL FUNCTION 'MOVE_CHAR_TO_NUM'
+      EXPORTING
+        chr             = vttk-text3
+      IMPORTING
+        num             = gs_header-peso_sal
+      EXCEPTIONS
+        convt_no_number = 1
+        convt_overflow  = 2
+        OTHERS          = 3.
+
+    MOVE 'KG' TO gs_header-gewei.
+
+    CASE vttk-add02.
+      WHEN 'ZWM_RF_008'. " puerto
+        CLEAR lv_ablad.
+
+        WRITE vttk-tknum TO lv_ablad NO-ZERO.
+
+        SELECT * FROM mseg
+          WHERE budat_mkpf GE @vttk-erdat
+            AND bwart EQ '311'
+            AND werks EQ @vttk-tplst " asumimos de momento que pto.pl.tpte = centro
+            AND ablad EQ @lv_ablad
+            AND shkzg EQ 'S' " la posición de recepción
+          INTO TABLE @DATA(t_mseg).
+
+        LOOP AT t_mseg INTO mseg.
+          gs_item-tknum = gs_header-tknum.
+          MOVE-CORRESPONDING mseg TO gs_item.
+
+          SELECT SINGLE maktx FROM makt
+            INTO gs_item-maktx
+            WHERE matnr EQ gs_item-matnr
+              AND spras EQ sy-langu.
+
+          SELECT SINGLE licha FROM mch1
+            INTO gs_item-lichn
+            WHERE matnr EQ gs_item-matnr
+              AND charg EQ gs_item-charg.
+
+          SELECT SINGLE ebeln ebelp FROM ekbe
+            INTO (gs_item-ebeln, gs_item-ebelp)
+            WHERE matnr EQ gs_item-matnr
+              AND charg EQ gs_item-charg
+              AND bwart EQ '101'
+              AND werks EQ mseg-werks
+              AND bewtp EQ 'E'. "entrada mercancías
+
+          SELECT SINGLE mblnr mjahr xblnr_mkpf FROM mseg
+            INTO (gs_item-xblnr, gs_item-xjahr, gs_item-verur)
+            WHERE matnr EQ gs_item-matnr
+              AND charg EQ gs_item-charg
+              AND bwart EQ '101'
+              AND werks EQ gs_item-werks.
+
+          gs_header-verur = gs_item-verur.
+          IF gs_item-meins NE 'KG'.
+            MESSAGE 'Es necesario incorporar en el programa conversión de unidades, contacte con Sistemas' TYPE 'E'.
+          ELSE.
+            gs_header-peso_des = gs_header-peso_des + gs_item-menge.
+          ENDIF.
+
+          APPEND gs_item TO gt_item.
+          CLEAR gs_item.
+        ENDLOOP.
+
+      WHEN OTHERS. " resto: papeleras, etiquetables, no etiquetables
+        SELECT * FROM vbfa
+          WHERE vbeln EQ @vttk-tknum
+            AND vbtyp_n EQ '8' " transporte
+          INTO TABLE @DATA(t_vbfa).
+
+        IF sy-subrc EQ 0.
+          SELECT lips~vbeln, lips~posnr, lips~matnr, lips~arktx, lips~charg, lips~lichn,
+            lips~lfimg, lips~meins, lips~vrkme, lips~ntgew, lips~brgew, lips~gewei, " 62061 - cvivo
+            lips~vgbel, lips~vgpos, lips~werks
+            FROM lips
+            INNER JOIN vbup
+            ON lips~vbeln EQ vbup~vbeln
+            AND lips~posnr EQ vbup~posnr
+            FOR ALL ENTRIES IN @t_vbfa
+            WHERE lips~vbeln EQ @t_vbfa-vbelv " entrega
+              AND lips~lfimg GT 0
+              AND vbup~wbsta EQ 'C' " movimiento mercancías completo
+              INTO TABLE @DATA(t_deliv).
+
+          LOOP AT t_deliv INTO DATA(deliv).
+
+            SELECT SINGLE * FROM vbfa
+              WHERE vbelv EQ deliv-vbeln
+                AND posnv EQ deliv-posnr
+                AND vbtyp_n EQ 'R'. "documento material
+
+            MOVE-CORRESPONDING deliv TO gs_item.
+
+            MOVE deliv-vgbel TO gs_item-ebeln.
+            MOVE deliv-vgpos TO gs_item-ebelp.
+            MOVE deliv-arktx TO gs_item-maktx.
+*            MOVE deliv-lfimg TO gs_item-menge. " 62061 - cvivo
+
+*** INI FCARDONA 24.10.2022 - Unidades en KG
+
+*            "Comento por cambio de lógica
+*            MOVE deliv-brgew TO gs_item-menge. " 62061 - cvivo
+*            MOVE deliv-gewei TO gs_item-meins. " 62061 - cvivo
+
+*--> Volvemos a cambiar.
+*            SELECT SINGLE brgew gewei
+*              FROM mara
+*              INTO ( lv_mara_brgew, lv_mara_gewei )
+*             WHERE matnr EQ deliv-matnr.
+*
+*            IF ( sy-subrc EQ 0 AND lv_mara_brgew GT 0 ).
+*
+*              "Calculamos peso bruto
+*              gs_item-menge = deliv-lfimg * lv_mara_brgew.
+*              MOVE lv_mara_gewei TO gs_item-meins.
+*
+*            ELSE.
+*
+*              "Dejamos como antes.
+*              MOVE deliv-brgew TO gs_item-menge.
+*              MOVE deliv-gewei TO gs_item-meins.
+*
+*            ENDIF.
+
+*--> Volvemos a cambiar
+*            MOVE deliv-ntgew TO gs_item-menge.
+*            MOVE deliv-meins TO gs_item-meins.
+
+            CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+              EXPORTING
+                i_matnr                    = deliv-matnr
+                i_in_me                    = deliv-vrkme
+                i_out_me                   = deliv-meins
+                i_menge                    = deliv-lfimg
+              IMPORTING
+                E_MENGE                    = gs_item-menge
+              EXCEPTIONS
+                ERROR_IN_APPLICATION       = 1
+                ERROR                      = 2
+                OTHERS                     = 3
+                      .
+            IF sy-subrc <> 0.
+              MOVE deliv-brgew TO gs_item-menge. " 62061 - cvivo
+            ENDIF.
+
+            MOVE deliv-meins TO gs_item-meins.
+
+*** FIN FCARDONA 24.10.2022 - Unidades en KG
+
+            MOVE vbfa-vbeln TO gs_item-mblnr.
+            MOVE vbfa-mjahr TO gs_item-mjahr.
+
+            gs_item-tknum = gs_header-tknum.
+
+            AT NEW vbeln.
+              SELECT SINGLE * FROM likp
+                WHERE vbeln EQ deliv-vbeln.
+*              SELECT SUM( lfimg ) FROM lips
+*                INTO lips-lfimg
+*                WHERE vbeln EQ deliv-vbeln.
+*
+*              gs_header-peso_des = gs_header-peso_des + lips-lfimg.
+            ENDAT.
+
+            gs_header-peso_des = gs_header-peso_des + gs_item-menge.
+            MOVE likp-verur TO: gs_header-verur, gs_item-verur.
+
+            APPEND gs_item TO gt_item.
+            CLEAR: lips-lfimg, gs_item.
+          ENDLOOP.
+        ENDIF.
+    ENDCASE.
+
+    gs_header-dif_real = gs_header-peso_ent - gs_header-peso_des - gs_header-peso_sal.
+    gs_header-dif_teor = gs_header-peso_ent - gs_header-zzpeso_alb - gs_header-peso_sal.
+    gs_header-dif_alb = gs_header-peso_des - gs_header-zzpeso_alb.
+
+*   Modificamos el color del semáforo
+    IF gs_header-dif_real IN sl_umbral.
+      gs_header-icon_field = icon_green_light.
+    ELSE.
+      gs_header-icon_field = icon_red_light.
+    ENDIF.
+
+    APPEND: gs_header TO gt_header.
+  ENDLOOP.
+
+ENDFORM.                    " SACAR_DATOS
+*&---------------------------------------------------------------------*
+*&      Form  MOSTRAR_ALV
+*&---------------------------------------------------------------------*
+FORM mostrar_alv .
+
+  PERFORM init_fieldcat.
+  PERFORM init_layout.
+  PERFORM init_key.
+
+  IF p_total IS NOT INITIAL.
+    REFRESH gt_item.
+  ENDIF.
+
+  CALL FUNCTION 'REUSE_ALV_HIERSEQ_LIST_DISPLAY'
+    EXPORTING
+      i_callback_program      = gv_repid
+      is_layout               = gs_layout
+      it_fieldcat             = gt_fieldcat
+      i_save                  = 'A'
+      i_tabname_header        = 'GT_HEADER'
+      i_tabname_item          = 'GT_ITEM'
+      is_keyinfo              = gs_key
+      i_callback_user_command = 'USER_COMMAND'
+    TABLES
+      t_outtab_header         = gt_header
+      t_outtab_item           = gt_item
+    EXCEPTIONS
+      program_error           = 1
+      OTHERS                  = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+    WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " MOSTRAR_ALV
+
+*&---------------------------------------------------------------------*
+*&      Form  INIT_FIELDCAT
+*&---------------------------------------------------------------------*
+FORM init_fieldcat.
+
+
+
+*----------------------------------------- Header
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'ICON_FIELD'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'TKNUM'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-ref_tabname = 'VTTK'.
+  gs_fieldcat-hotspot = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'SIGNI'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-ref_tabname = 'VTTK'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'ERDAT'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-ref_tabname = 'VTTK'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'VERUR'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-ref_tabname = 'LIKP'.
+  gs_fieldcat-hotspot = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'TEXT4'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-ref_tabname = 'VTTK'.
+  gs_fieldcat-seltext_l   = 'Nombre del proveedor'.
+  gs_fieldcat-seltext_m   = 'Proveedor'.
+  gs_fieldcat-seltext_s   = 'Proveedor'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'PESO_ENT'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-ref_tabname = 'ZTMM0001'.
+  gs_fieldcat-seltext_l   = 'Peso entrada'.
+  gs_fieldcat-seltext_m   = 'Peso entrada'.
+  gs_fieldcat-seltext_s   = 'Peso entrada'.
+  gs_fieldcat-inttype  = 'p'.
+  gs_fieldcat-intlen  = '15'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'PESO_SAL'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-ref_tabname = 'ZTMM0001'.
+  gs_fieldcat-seltext_l   = 'Peso salida'.
+  gs_fieldcat-seltext_m   = 'Peso salida'.
+  gs_fieldcat-seltext_s   = 'Peso salida'.
+  gs_fieldcat-inttype  = 'p'.
+  gs_fieldcat-intlen  = '15'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'ZZPESO_ALB'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-ref_tabname = 'VTTK'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'PESO_DES'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-seltext_l   = 'Peso descargado'.
+  gs_fieldcat-seltext_m   = 'Peso descargado'.
+  gs_fieldcat-seltext_s   = 'Peso desc.'.
+  gs_fieldcat-inttype  = 'p'.
+  gs_fieldcat-intlen  = '15'.
+  gs_fieldcat-just = 'R'. "(R)ight (L)eft (C)ent.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'DIF_REAL'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-seltext_l   = 'Diferencia real'.
+  gs_fieldcat-seltext_m   = 'Dif. real'.
+  gs_fieldcat-seltext_s   = 'Dif. real'.
+  gs_fieldcat-inttype  = 'p'.
+  gs_fieldcat-intlen  = '15'.
+  gs_fieldcat-just = 'R'. "(R)ight (L)eft (C)ent.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'DIF_TEOR'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-seltext_l   = 'Diferencia teórica'.
+  gs_fieldcat-seltext_m   = 'Dif. teórica'.
+  gs_fieldcat-seltext_s   = 'Dif. teórica'.
+  gs_fieldcat-inttype  = 'p'.
+  gs_fieldcat-intlen  = '15'.
+  gs_fieldcat-just = 'R'. "(R)ight (L)eft (C)ent.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'DIF_ALB'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-seltext_l   = 'Diferencia albarán'.
+  gs_fieldcat-seltext_m   = 'Dif. albarán'.
+  gs_fieldcat-seltext_s   = 'Dif. albarán'.
+  gs_fieldcat-inttype  = 'p'.
+  gs_fieldcat-intlen  = '15'.
+  gs_fieldcat-just = 'R'. "(R)ight (L)eft (C)ent.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'GEWEI'.
+  gs_fieldcat-tabname     = 'GT_HEADER'.
+  gs_fieldcat-ref_tabname = 'ZTMM0001'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+*----------------------------------------- Item
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'TKNUM'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'VTTK'.
+  gs_fieldcat-no_out = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'MATNR'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'MSEG'.
+  gs_fieldcat-hotspot = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'MAKTX'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'MAKT'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'CHARG'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'LIPS'.
+  gs_fieldcat-hotspot = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'LICHN'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'LIPS'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'MENGE'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'MSEG'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'MEINS'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'MSEG'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'VBELN'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'LIPS'.
+  gs_fieldcat-hotspot = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'VERUR'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'LIKP'.
+  gs_fieldcat-hotspot = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'MBLNR'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'MSEG'.
+  gs_fieldcat-hotspot = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'MJAHR'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'MSEG'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'EBELN'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'MSEG'.
+  gs_fieldcat-hotspot = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+  CLEAR gs_fieldcat.
+  gs_fieldcat-fieldname   = 'EBELP'.
+  gs_fieldcat-tabname     = 'GT_ITEM'.
+  gs_fieldcat-ref_tabname = 'MSEG'.
+  gs_fieldcat-hotspot = 'X'.
+  APPEND gs_fieldcat TO gt_fieldcat.
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  INIT_KEY
+*&---------------------------------------------------------------------*
+FORM init_key.
+  gs_key-header01 = 'TKNUM'.
+  gs_key-item01   = 'TKNUM'.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  INIT_LAYOUT
+*&---------------------------------------------------------------------*
+FORM init_layout.
+  gs_layout-zebra        = 'X'.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  USER_COMMAND
+*&---------------------------------------------------------------------*
+FORM user_command USING r_ucomm LIKE sy-ucomm
+                        rs_selfield TYPE slis_selfield.
+
+  CLEAR: gs_header, gs_item.
+
+  IF rs_selfield-tabname EQ 'GT_HEADER'.
+    READ TABLE gt_header INTO gs_header INDEX rs_selfield-tabindex.
+  ELSEIF rs_selfield-tabname EQ 'GT_ITEM'.
+    READ TABLE gt_item INTO gs_item INDEX rs_selfield-tabindex.
+  ENDIF.
+
+  CASE r_ucomm.
+    WHEN '&IC1'.
+      CASE rs_selfield-fieldname.
+        WHEN 'MBLNR'.
+          CHECK gs_item-mblnr IS NOT INITIAL AND gs_item-mjahr IS NOT INITIAL.
+          CALL FUNCTION 'MIGO_DIALOG'
+            EXPORTING
+              i_action            = 'A04' "VISUALIZAR
+              i_refdoc            = 'R02' "DOCUMENTO DE MATERIAL
+              i_okcode            = 'OK_GO'
+              i_mblnr             = gs_item-mblnr
+              i_mjahr             = gs_item-mjahr
+            EXCEPTIONS
+              illegal_combination = 1
+              OTHERS              = 2.
+
+        WHEN 'EBELN' OR 'EBELP'.
+          CHECK gs_item-ebeln IS NOT INITIAL AND gs_item-ebelp IS NOT INITIAL.
+          CALL FUNCTION 'ME_DISPLAY_PURCHASE_DOCUMENT'
+            EXPORTING
+              i_ebeln = gs_item-ebeln
+              i_ebelp = gs_item-ebelp.
+
+        WHEN 'VERUR' OR 'VBELN'.
+          IF rs_selfield-tabname EQ 'GT_HEADER'.
+            READ TABLE gt_item INTO gs_item WITH KEY verur = gs_header-verur.
+          ENDIF.
+
+          IF gs_item-vbeln IS NOT INITIAL.
+            SET PARAMETER ID 'VL' FIELD gs_item-vbeln.
+
+            CALL FUNCTION 'WB2_IBD_DISPLAY'
+              EXPORTING
+                i_tew_type  = '0001'
+                i_step      = space
+                i_mode      = '0002'
+                i_pre_step  = space
+                action_mode = space
+                delivery    = gs_item-vbeln.
+
+          ELSEIF gs_item-xblnr IS NOT INITIAL. " es puerto
+            CALL FUNCTION 'MIGO_DIALOG'
+              EXPORTING
+                i_action            = 'A04' "VISUALIZAR
+                i_refdoc            = 'R02' "DOCUMENTO DE MATERIAL
+                i_okcode            = 'OK_GO'
+                i_mblnr             = gs_item-xblnr
+                i_mjahr             = gs_item-xjahr
+              EXCEPTIONS
+                illegal_combination = 1
+                OTHERS              = 2.
+          ENDIF.
+
+        WHEN 'MATNR'.
+          CHECK gs_item-matnr IS NOT INITIAL.
+          SET PARAMETER ID 'MAT' FIELD gs_item-matnr.
+          CALL TRANSACTION 'MM03' AND SKIP FIRST SCREEN.
+
+        WHEN 'TKNUM'.
+          CHECK gs_header-tknum IS NOT INITIAL.
+          SET PARAMETER ID 'TNR' FIELD gs_header-tknum.
+          CALL TRANSACTION 'VT03N' AND SKIP FIRST SCREEN.
+
+        WHEN 'CHARG'.
+          CHECK gs_item-matnr IS NOT INITIAL AND gs_item-charg IS NOT INITIAL AND gs_item-werks IS NOT INITIAL.
+          SET PARAMETER ID 'MAT' FIELD gs_item-matnr.
+          SET PARAMETER ID 'CHA' FIELD gs_item-charg.
+          SET PARAMETER ID 'WRK' FIELD gs_item-werks.
+          CALL TRANSACTION 'MSC3N' AND SKIP FIRST SCREEN.
+
+      ENDCASE.
+  ENDCASE.
+ENDFORM.

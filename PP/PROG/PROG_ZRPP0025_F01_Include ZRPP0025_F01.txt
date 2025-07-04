@@ -1,0 +1,343 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0025_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM obtener_datos .
+
+  DATA: t_aufm_completa  TYPE STANDARD TABLE OF aufm,
+        wa_aufm_completa TYPE                   aufm,
+        t_aufm           TYPE                   tty_aufm,
+        wa_aufm          TYPE LINE OF           tty_aufm.
+
+  DATA: t_componentes  TYPE         tty_componentes,
+        wa_componentes TYPE LINE OF tty_componentes.
+
+  DATA: t_aufk  TYPE STANDARD TABLE OF aufk,
+        wa_aufk TYPE                   aufk,
+        t_afko  TYPE STANDARD TABLE OF afko,
+        wa_afko TYPE                   afko,
+        t_resb  TYPE STANDARD TABLE OF resb,
+        wa_resb TYPE                   resb.
+
+
+  DATA: t_datos   TYPE TABLE OF zrspp0025_grid,
+        wa_datos  TYPE          zrspp0025_grid,
+        wa_datos1 TYPE          zrspp0025_grid.
+
+  DATA: num_reg TYPE sy-tabix.
+
+  FIELD-SYMBOLS: <wa_aufm>  TYPE LINE OF tty_aufm,
+                 <wa_datos> TYPE         zrspp0025_grid.
+
+
+
+  CLEAR: t_aufm_completa, t_aufk, t_aufm, t_afko, t_resb, t_componentes.
+  REFRESH: t_aufm_completa, t_aufk, t_aufm, t_afko, t_resb, t_componentes.
+
+* recuperamos las órdenes que sean de la clase t_aufk-aufnr
+  SELECT * FROM aufk
+    INTO TABLE t_aufk
+    WHERE aufnr IN so_aufnr AND
+          auart = 'ZI01'.
+
+  CHECK t_aufk[] IS NOT INITIAL.
+
+* recuperamos la información de la afko (donde encontramos el material de la cabecera de la orden)
+  SELECT * FROM afko
+    INTO TABLE t_afko
+    FOR ALL ENTRIES IN t_aufk
+    WHERE aufnr = t_aufk-aufnr AND
+          plnbez IN so_mat.
+
+  CHECK t_afko[] IS NOT INITIAL.
+
+* recuperamos la información de la reserva
+  SELECT * FROM resb
+    INTO TABLE t_resb
+    FOR ALL ENTRIES IN t_afko
+    WHERE aufnr = t_afko-aufnr  AND
+          rsnum IN so_rsnum.
+
+* montamos la tabla interna con los componentes de la orden
+  LOOP AT t_resb INTO wa_resb.
+    wa_componentes-aufnr = wa_resb-aufnr.
+    wa_componentes-matnr = wa_resb-matnr.
+    APPEND wa_componentes TO t_componentes.
+  ENDLOOP.
+
+  SORT t_componentes BY aufnr matnr.
+  DELETE ADJACENT DUPLICATES FROM t_componentes.
+
+* recuperamos los movimientos 531 y 261
+  SELECT * FROM aufm
+    INTO TABLE t_aufm_completa
+    FOR ALL ENTRIES IN t_afko
+     WHERE aufnr = t_afko-aufnr AND
+            werks = p_werks AND
+            budat IN so_budat AND
+            rsnum IN so_rsnum AND
+          ( bwart = '531' OR bwart = '532' OR bwart = '261' OR bwart = '262').
+
+  LOOP AT t_aufm_completa INTO wa_aufm_completa.
+    MOVE-CORRESPONDING wa_aufm_completa TO wa_aufm.
+    APPEND wa_aufm TO t_aufm.
+  ENDLOOP.
+
+  LOOP AT t_aufm ASSIGNING <wa_aufm>.
+    IF <wa_aufm>-bwart = '532' OR <wa_aufm>-bwart = '262'.
+      <wa_aufm>-dmbtr = ( -1 ) * <wa_aufm>-dmbtr.
+    ENDIF.
+    CLEAR: <wa_aufm>-bwart.
+  ENDLOOP.
+
+  SORT t_aufm BY aufnr werks rsnum rspos matnr budat.
+
+* montamos los datos en gti_datos
+  LOOP AT t_aufk INTO wa_aufk.
+    wa_datos-werks = wa_aufk-werks. "Centro
+    wa_datos-aufnr = wa_aufk-aufnr. "Orden de proceso
+
+    READ TABLE t_afko INTO wa_afko WITH KEY aufnr = wa_datos-aufnr.
+    wa_datos-plnbez = wa_afko-plnbez. "Material fabricado
+
+    LOOP AT t_componentes INTO wa_componentes WHERE aufnr = wa_datos-aufnr.
+      wa_datos-matnr = wa_componentes-matnr. "Componente
+
+      CLEAR: wa_datos-rfpos, wa_datos-rsnum, wa_datos-cant_reservada, wa_datos-um_reservada.
+*      READ TABLE t_aufm INTO wa_aufm WITH KEY aufnr = wa_datos-aufnr
+*                                              werks = wa_datos-werks
+*                                              rsnum = wa_afko-rsnum
+*                                              matnr = wa_datos-matnr.
+*      IF sy-subrc = 0.
+*        wa_datos-rsnum  = wa_afko-rsnum."Reserva
+*        wa_datos-rfpos = wa_aufm-rspos. "Posición Reserva
+
+      LOOP AT t_resb INTO wa_resb WHERE
+*                                          rsnum = wa_datos-rsnum AND
+*                                          rspos = wa_datos-rfpos AND
+                                        matnr = wa_datos-matnr AND
+                                        aufnr = wa_datos-aufnr.
+        wa_datos-rsnum  = wa_resb-rsnum."Reserva
+        wa_datos-rfpos = wa_resb-rspos. "Posición Reserva
+        wa_datos-cant_reservada = wa_datos-cant_reservada + wa_resb-erfmg. "Cantidad reservada
+        wa_datos-um_reservada = wa_resb-erfme.   "Unidad cantidad reservada
+      ENDLOOP.
+*      ENDIF.
+
+      APPEND wa_datos TO t_datos.
+    ENDLOOP.
+  ENDLOOP.
+
+  LOOP AT t_datos INTO wa_datos.
+    CLEAR: wa_datos1.
+    MOVE-CORRESPONDING wa_datos TO wa_datos1.
+
+    READ TABLE t_aufm INTO wa_aufm WITH KEY aufnr = wa_datos1-aufnr
+                                      werks = wa_datos1-werks
+                                      rsnum = wa_datos1-rsnum
+                                      rspos = wa_datos1-rfpos
+                                      matnr = wa_datos1-matnr.
+    IF sy-subrc = 0.
+      LOOP AT t_aufm INTO wa_aufm WHERE aufnr = wa_datos1-aufnr AND
+                                        werks = wa_datos1-werks AND
+                                        rsnum = wa_datos1-rsnum AND
+                                        rspos = wa_datos1-rfpos AND
+                                        matnr = wa_datos1-matnr.
+        wa_datos1-budat = wa_aufm-budat. "Fecha contabilización
+        wa_datos1-dmbtr = wa_aufm-dmbtr. "Importe
+        wa_datos1-waers = wa_aufm-waers. "Moneda
+        wa_datos1-cant_consumida = wa_aufm-erfmg. "Cantidad consumida
+        wa_datos1-um_consumida = wa_aufm-erfme. "Cantidad consumida
+        COLLECT wa_datos1 INTO gti_datos.
+
+        DESCRIBE TABLE gti_datos LINES num_reg.
+        wa_datos1-cant_reservada = wa_datos-cant_reservada.
+        MODIFY gti_datos FROM wa_datos1 INDEX num_reg TRANSPORTING cant_reservada.
+
+      ENDLOOP.
+    ELSE.
+      LOOP AT t_aufm INTO wa_aufm WHERE aufnr = wa_datos1-aufnr AND
+                                        werks = wa_datos1-werks AND
+*                                        rsnum = wa_datos1-rsnum AND
+*                                        rspos = wa_datos1-rfpos AND
+                                        matnr = wa_datos1-matnr.
+        wa_datos1-budat = wa_aufm-budat. "Fecha contabilización
+        wa_datos1-dmbtr = wa_aufm-dmbtr. "Importe
+        wa_datos1-waers = wa_aufm-waers. "Moneda
+        wa_datos1-cant_consumida = wa_aufm-erfmg. "Cantidad consumida
+        wa_datos1-um_consumida = wa_aufm-erfme. "Cantidad consumida
+        COLLECT wa_datos1 INTO gti_datos.
+
+        DESCRIBE TABLE gti_datos LINES num_reg.
+        wa_datos1-cant_reservada = wa_datos-cant_reservada.
+        MODIFY gti_datos FROM wa_datos1 INDEX num_reg TRANSPORTING cant_reservada.
+
+      ENDLOOP.
+    ENDIF.
+  ENDLOOP.
+
+* calculamos la Desviación
+  LOOP AT gti_datos ASSIGNING <wa_datos>.
+    <wa_datos>-desviacion = <wa_datos>-cant_reservada - <wa_datos>-cant_consumida.
+  ENDLOOP.
+
+ENDFORM.                    " OBTENER_DATOS
+*&---------------------------------------------------------------------*
+*&      Form  ALV_MOSTRAR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alv_mostrar .
+
+  DATA: lti_fieldcat TYPE lvc_t_fcat,
+        lti_excl     TYPE ui_functions.
+
+  DATA: ls_layout  TYPE lvc_s_layo,
+        ls_variant TYPE disvariant.
+
+  DATA: lv_repid TYPE syrepid.
+
+* Variante
+  lv_repid          = sy-repid.
+  ls_variant-report = lv_repid.
+
+* Preparamos el catálogo de campos
+  PERFORM prepare_fielcat USING    'ZRSPP0025_GRID'
+                          CHANGING lti_fieldcat.
+
+* Layout
+  ls_layout-cwidth_opt = 'X'.
+  ls_layout-sel_mode = 'A'.
+
+* Mostramos el ALV
+  CALL METHOD gcl_grid->set_table_for_first_display
+    EXPORTING
+      i_buffer_active      = ' '
+      i_bypassing_buffer   = 'X'
+      is_layout            = ls_layout
+      is_variant           = ls_variant
+      i_save               = 'A'
+      it_toolbar_excluding = lti_excl
+    CHANGING
+      it_outtab            = gti_datos
+      it_fieldcatalog      = lti_fieldcat.
+
+ENDFORM.                    " ALV_MOSTRAR
+*&---------------------------------------------------------------------*
+*&      Form  PREPARE_FIELCAT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_0035   text
+*      <--P_LTI_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM prepare_fielcat  USING    p_estruct
+                      CHANGING cti_fieldcat TYPE lvc_t_fcat.
+
+  DATA: ls_fcat TYPE lvc_s_fcat,
+        lv_ind  TYPE i.
+
+* Recuperamos el catálogo de campos
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name = p_estruct
+    CHANGING
+      ct_fieldcat      = cti_fieldcat.
+
+
+* Cambiamos campos del catálogo
+  LOOP AT cti_fieldcat INTO ls_fcat.
+    lv_ind = sy-tabix.
+
+    IF ls_fcat-fieldname = 'AUFNR'.
+      ls_fcat-hotspot = 'X'.
+    ENDIF.
+
+*    if ls_fcat-fieldname = 'RSNUM'.
+*      ls_fcat-NO_OUT = 'X'.
+*    ENDIF.
+*
+*    if ls_fcat-fieldname = 'RSPOS'.
+*      ls_fcat-NO_OUT = 'X'.
+*    ENDIF.
+
+    IF ls_fcat-fieldname = 'PLNBEZ'.
+      ls_fcat-coltext = text-000.
+      ls_fcat-scrtext_l = text-000.
+      ls_fcat-scrtext_m = text-000.
+      ls_fcat-scrtext_s = text-000.
+    ENDIF.
+
+    IF ls_fcat-fieldname = 'MATNR'.
+      ls_fcat-coltext = text-001.
+      ls_fcat-scrtext_l = text-001.
+      ls_fcat-scrtext_m = text-001.
+      ls_fcat-scrtext_s = text-001.
+    ENDIF.
+
+    IF ls_fcat-fieldname = 'CANT_RESERVADA'.
+      ls_fcat-coltext = text-002.
+      ls_fcat-scrtext_l = text-002.
+      ls_fcat-scrtext_m = text-002.
+      ls_fcat-scrtext_s = text-002.
+    ENDIF.
+
+    IF ls_fcat-fieldname = 'UM_RESERVADA'.
+      ls_fcat-coltext = text-003.
+      ls_fcat-scrtext_l = text-003.
+      ls_fcat-scrtext_m = text-003.
+      ls_fcat-scrtext_s = text-003.
+    ENDIF.
+
+    IF ls_fcat-fieldname = 'CANT_CONSUMIDA'.
+      ls_fcat-coltext = text-004.
+      ls_fcat-scrtext_l = text-004.
+      ls_fcat-scrtext_m = text-004.
+      ls_fcat-scrtext_s = text-004.
+    ENDIF.
+
+    IF ls_fcat-fieldname = 'UM_CONSUMIDA'.
+      ls_fcat-coltext = text-005.
+      ls_fcat-scrtext_l = text-005.
+      ls_fcat-scrtext_m = text-005.
+      ls_fcat-scrtext_s = text-005.
+    ENDIF.
+
+    IF ls_fcat-fieldname = 'DESVIACION'.
+      ls_fcat-coltext = text-006.
+      ls_fcat-scrtext_l = text-006.
+      ls_fcat-scrtext_m = text-006.
+      ls_fcat-scrtext_s = text-006.
+    ENDIF.
+
+
+*   Modificamos
+    MODIFY cti_fieldcat FROM ls_fcat INDEX lv_ind.
+  ENDLOOP.
+ENDFORM.                    " PREPARE_FIELCAT
+*&---------------------------------------------------------------------*
+*&      Form  INCIALIZACION_SEL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM incializacion_sel .
+
+SELECT SINGLE parva FROM usr05
+      INTO p_werks
+      WHERE bname = sy-uname AND
+      parid = 'WRK'.
+
+ENDFORM.                    " INCIALIZACION_SEL

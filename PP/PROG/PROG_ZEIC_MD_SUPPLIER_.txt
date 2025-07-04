@@ -1,0 +1,241 @@
+*----------------------------------------------------------------------*
+*   INCLUDE /COCKPIT/MD_SUPPLIER2                                      *
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  md_get_supplier_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_GT_SUPPLIER  text
+*----------------------------------------------------------------------*
+FORM md_get_supplier_data
+  TABLES   gt_supplier_tmp STRUCTURE gs_supplier_tmp
+           gt_supplier     STRUCTURE gs_supplier
+  USING    uptorows
+  CHANGING cb_exit_loop.
+
+  DATA:
+    li_lines TYPE i.
+
+  SELECT *
+         FROM /cockpit/vmde_s
+         INTO TABLE gt_supplier_tmp
+         UP TO uptorows ROWS
+         WHERE lifnr IN lifnr
+           AND land1 IN land1
+           AND ktokk IN ktokk
+           AND bukrs IN bukrs
+           AND loevm IN loevm
+           AND sperr IN sperr
+           AND lifnr > gs_sup_last_row-lifnr
+         ORDER BY lifnr land1 bukrs.
+  IF sy-subrc <> 0. cb_exit_loop = 'X'. EXIT. ENDIF.
+
+* Find last lifnr - new selection must start from saved lifnr
+  DESCRIBE TABLE gt_supplier_tmp LINES li_lines.
+  READ TABLE gt_supplier_tmp INTO gs_sup_last_row INDEX li_lines.
+
+* We need to process all entries of last lifnr in one batch.
+* Select above can skip some of them.
+  SELECT *
+        FROM /cockpit/vmde_s
+        APPENDING TABLE gt_supplier_tmp
+        WHERE lifnr = gs_sup_last_row-lifnr
+           AND land1 IN land1
+           AND ktokk IN ktokk
+           AND bukrs IN bukrs
+           AND loevm IN loevm
+           AND sperr IN sperr
+        ORDER BY lifnr land1 bukrs.
+
+  SORT gt_supplier_tmp BY lifnr land1 bukrs.
+  DELETE ADJACENT DUPLICATES FROM gt_supplier_tmp
+    COMPARING lifnr land1 bukrs.
+  SORT gt_supplier_tmp BY land1.
+  CLEAR:
+    gc_land1,
+    gc_landx.
+
+* Copy Supplier data to target table (EMEIC1301)
+  LOOP AT gt_supplier_tmp INTO gs_supplier_tmp.
+    CLEAR:
+      gs_supplier.
+
+*   see EBY8346-828 for more explainations EMEIC1337
+    IF gc_land1 NE gs_supplier_tmp-land1.
+      gc_land1 = gs_supplier_tmp-land1.
+      SELECT SINGLE landx FROM t005t
+                          INTO gc_landx
+                         WHERE land1 EQ gs_supplier_tmp-land1 AND
+                               spras EQ sy-langu.
+      IF sy-subrc NE 0.
+        SELECT SINGLE landx FROM t005t
+                            INTO gc_landx
+                           WHERE land1 EQ gs_supplier_tmp-land1 AND
+                                 spras EQ 'E'.
+        IF sy-subrc NE 0.
+          gc_landx = space.  " no translation found
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    MOVE-CORRESPONDING gs_supplier_tmp TO gs_supplier.
+    gs_supplier-landx = gc_landx.
+
+    APPEND gs_supplier TO gt_supplier.
+  ENDLOOP.
+
+ENDFORM.                     " md_get_supplier_data
+*&---------------------------------------------------------------------*
+*&      Form  md_add_supplier_xml_content
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_GT_SUPPLIER_TMP  text
+*      -->P_GT_SUPPLIER  text
+*      -->P_GT_XMLSTRINGS  text
+*      -->P_GC_HTML_CODEPG  text
+*      -->P_CORPGRID  text
+*      -->P_GC_S_FILE  text
+*----------------------------------------------------------------------*
+FORM md_add_supplier_xml_content
+  TABLES gt_supplier_tmp STRUCTURE gs_supplier_tmp
+         gt_supplier     STRUCTURE gs_supplier
+         gt_xmlstrings   STRUCTURE gs_xmlstring
+  USING gc_html_codepg
+           uptorows
+           corpgrid
+           ic_filename.
+
+  DATA:
+    lb_exit_loop LIKE boole-boole.
+
+  DO.
+
+*       Fetch Supplier data from DB
+    PERFORM md_get_supplier_data
+     TABLES   gt_supplier_tmp
+              gt_supplier
+     USING    uptorows
+     CHANGING lb_exit_loop.
+
+    IF lb_exit_loop = 'X'.
+      EXIT.
+    ENDIF.
+
+* Inic. Modif. AGV - Readsoft - Lexmark - 11.04.2017
+    SORT gt_supplier BY lifnr.
+    DELETE ADJACENT DUPLICATES FROM gt_supplier COMPARING lifnr.
+* Fin Modif. AGV - Readsoft - Lexmark - 11.04.2017
+
+*       Prepare XML tags for Supplier data
+    PERFORM md_prepare_supplier_xml
+            TABLES gt_xmlstrings
+                   gt_supplier
+            USING  gc_html_codepg
+                   corpgrid.
+
+*       Save XML content into file
+    PERFORM md_save_data_in_file
+      TABLES  gt_xmlstrings
+      USING   ic_filename.
+
+*       Release memory
+    REFRESH gt_xmlstrings.
+    REFRESH gt_supplier.
+
+  ENDDO.
+
+ENDFORM.                     " md_add_supplier_xml_content
+*---------------------------------------------------------------------*
+*      Form  MD_PREPARE_SUPPLIER_XML
+*---------------------------------------------------------------------*
+FORM md_prepare_supplier_xml
+     TABLES gt_xmlstrings
+            gt_supplier STRUCTURE gs_supplier
+     USING  gc_http_applsvr_codepage
+            lc_logsys.
+
+  DATA:
+    lc_xmltag(1024) TYPE         c,  "string,
+    ls_supplierdata LIKE LINE OF gt_supplier,
+    lc_blocked(1)   TYPE         c VALUE IS INITIAL,
+    lc_corpgrid(4)  TYPE         c.
+
+* Inic. Modif. AGV - Readsoft - Lexmark - 11.04.2017
+  CONSTANTS lc_corpgrid_1(4) TYPE c VALUE '0001'.
+* Fin Modif. AGV - Readsoft - Lexmark - 11.04.2017
+
+* Loop through Supplier Data
+  LOOP AT gt_supplier INTO ls_supplierdata.
+
+*   Set Corporate Group ID to Company Code value in case bukrschk
+*   checkbox on selection screen is set to true. Otherwise,
+*   take value from corpgrid field (also filled on sel. screen).
+    IF bukrschk = con_true.
+      lc_corpgrid = ls_supplierdata-bukrs.
+    ELSE.
+*     Remove special chars from ls_logsys
+      CALL FUNCTION '/COCKPIT/ENCODE_ENTITIES'  "Remove special chars
+        CHANGING
+          cc_string = lc_logsys.
+      lc_corpgrid = lc_logsys.
+    ENDIF.
+
+*   Encode special XML signs to HTML format (<,>," and &)
+    PERFORM md_encode_special_chars_s  CHANGING ls_supplierdata.
+
+*   Removing leading zeros
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = ls_supplierdata-lifnr
+      IMPORTING
+        output = ls_supplierdata-lifnr.
+
+*   XML tag preparation with Supplier Data
+    CLEAR lc_xmltag.
+    CONCATENATE
+      '<Supplier SupplierNumber="' ls_supplierdata-lifnr
+
+* Inic. Modif. AGV - Readsoft - Lexmark - 11.04.2017
+*      '" CorporateGroupID="' lc_corpgrid
+      '" CorporateGroupID="' lc_corpgrid_1
+* Fin Modif. AGV - Readsoft - Lexmark - 11.04.2017
+
+      '" Name1="' ls_supplierdata-name1
+      '" Name2="' ls_supplierdata-name2
+      '" POBox="' ls_supplierdata-pfach
+      '" Street="' ls_supplierdata-stras
+      '" PostalCode="' ls_supplierdata-pstlz
+      '" CountryCoded="' ls_supplierdata-intca
+      '" City="' ls_supplierdata-ort01
+      '" CountryName="' ls_supplierdata-landx
+      '" TelephoneNumber="' ls_supplierdata-telf1
+      '" FaxNumber="' ls_supplierdata-telfx
+      '" VATRegistrationNumber="' ls_supplierdata-stceg
+      '" TaxNumber1="' ls_supplierdata-stcd1
+      '" TaxNumber2="' ls_supplierdata-stcd2
+*      '" Region="' ls_supplierdata-regio
+      INTO  lc_xmltag.
+
+*   Logical check for blocked field
+    IF ls_supplierdata-loevm = con_true
+      OR ls_supplierdata-sperr = con_true.
+      lc_blocked = con_true.
+    ELSE.
+      lc_blocked = con_false.
+    ENDIF.
+
+*   Concatenate finishing
+    CONCATENATE lc_xmltag
+                '" Blocked="' lc_blocked
+                '" />'
+                INTO lc_xmltag.
+
+*   Appending of xmltag to strings table
+    APPEND lc_xmltag TO gt_xmlstrings.
+
+    CLEAR lc_corpgrid.
+  ENDLOOP.
+
+ENDFORM.                     " MD_PREPARE_SUPPLIER_XML

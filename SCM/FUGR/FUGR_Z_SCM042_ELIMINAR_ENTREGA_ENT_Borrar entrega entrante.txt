@@ -1,0 +1,238 @@
+FUNCTION z_scm042_eliminar_entrega_ent.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_VBELN_V) TYPE  VBELN_VL OPTIONAL
+*"     VALUE(I_VBELN_ENTRANTE) TYPE  VBELN_VL OPTIONAL
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_TT
+*"----------------------------------------------------------------------
+* JGM 02.2024 GAPCM042 Aplicativo Gestión de Desvíos:
+* Borrar Entrega Entrante.
+*
+* Para borrar la asignación de unidades de manipulación de la entrega entrante:
+* Referencia: BAPI_HU_DELETE_FROM_DEL (mismo efecto que: VL32N -> Embalar -> botón "Borrar un.manip.",
+* pero en lugar de hacer "hu_delete_hu", se usa la fm V51P_DELETE_RELATIONSHIP para
+* eliminar la asignación de HUs (sería similar al botón "Borrar asignación").
+* Esto ha sido algo enrevesado.
+*--------------------------------------------------------------------*
+  DATA: lt_return TYPE bapiret2_tt,
+        lt_hus    TYPE hum_exidv_t,
+        lt_venum  TYPE hum_venum_t.
+
+  DATA: lt_header TYPE hum_hu_header_t,
+        lt_high   TYPE hum_venum_t,
+        lt_items  TYPE hum_hu_item_t.
+  DATA: lt_messages TYPE  huitem_messages_t.
+  DATA: lt_prot     TYPE TABLE OF prott.
+
+  DATA: ls_likp TYPE  likpvb.
+  DATA: ls_object   TYPE hum_object,
+        ls_vbkok_wa TYPE vbkok.
+
+  DATA: ls_header_data_ib    TYPE bapiibdlvhdrchg,
+        ls_header_control_ib TYPE bapiibdlvhdrctrlchg,
+        lv_delivery_ib       TYPE bapiibdlvhdrchg-deliv_numb.
+
+  DATA: lv_error TYPE flag,
+        lv_msgno TYPE sy-msgno.
+
+  DATA: lr_type_error TYPE RANGE OF bapi_mtype.
+
+
+  "Inicio eliminar entrega entrante".
+  PERFORM fill_return USING 'S' 'ZSCM042' '048' space space space space CHANGING et_return.
+
+  lr_type_error = VALUE #( sign = 'I' option = 'EQ' ( low = 'E' ) ( low = 'A' ) ).
+
+  IF i_vbeln_entrante IS INITIAL.
+    "Buscar entrega entrante a partir de la entrega de salida:
+    SELECT SINGLE vbeln
+      INTO @DATA(lv_vbeln_n)  "Entrega entrante.
+      FROM vbfa
+      WHERE vbelv EQ @i_vbeln_v
+        AND vbtyp_n EQ '7'
+        AND vbtyp_v EQ 'J'.
+  ELSE.
+    lv_vbeln_n = i_vbeln_entrante.
+  ENDIF.
+
+  IF sy-subrc EQ 0.
+
+    "Para poder ELIMINAR la entrega entrante, PRIMERO hay que BORRAR LA ASIGNACIÓN de HUs que pueda tener.
+
+    "Datos HUs de la entrega entrante:
+    SELECT b~venum, b~exidv, b~vhilm,
+           a~vepos, a~vbeln, a~posnr, a~matnr, a~charg
+      INTO TABLE @DATA(lt_vekp)
+      FROM vepo AS a
+      INNER JOIN vekp AS b
+      ON a~venum EQ b~venum
+      WHERE a~vbeln EQ @lv_vbeln_n.
+
+    IF sy-subrc EQ 0.
+      CLEAR: lv_error.
+
+*      lt_hus    = VALUE #( FOR wa_vekp IN lt_vekp ( CORRESPONDING #( wa_vekp ) ) ). "exidv
+      lt_venum  = VALUE #( FOR wa_vekp IN lt_vekp ( CORRESPONDING #( wa_vekp ) ) ). "venum
+
+*§1: refresh of packing data in V51P
+      CALL FUNCTION 'HU_PACKING_REFRESH'.
+
+**    CALL FUNCTION 'LE_DELIVERY_REFRESH_BUFFER'
+**      EXCEPTIONS
+**        no_key_specified = 0
+**        OTHERS           = 0.
+
+*§3:  read the given delivery
+      "Carga datos de la entrega en tablas y variables globales para las siguientes funciones.
+      CALL FUNCTION 'HU_READ_DELIVERY_AND_INIT'
+        EXPORTING
+          if_delivery       = lv_vbeln_n
+          if_lock           = 'X'
+        IMPORTING
+          es_likp           = ls_likp
+        EXCEPTIONS
+          no_delivery_found = 1
+          posted            = 2
+          display_only      = 3
+          OTHERS            = 99.
+
+* in- or outbound delivery?
+      ls_object-objkey = lv_vbeln_n.
+
+      IF ls_likp-vbtyp CA '7Tg'.
+*   Inbound
+        ls_object-object = '03'.
+      ELSE.
+*   Outbound
+        ls_object-object = '01'.
+      ENDIF.
+
+*§4: read all HUs for given delivery
+      "Carga datos de las HUs de la entrega en tablas y variables globales para las siguientes funciones.
+      CALL FUNCTION 'HU_GET_HUS'
+        EXPORTING
+          if_lock_hus       = 'X'
+          if_with_text      = ' '
+          if_more_hus       = 'X'
+          is_objects        = ls_object
+        IMPORTING
+          et_header         = lt_header
+          et_items          = lt_items
+          et_highest_levels = lt_high
+        EXCEPTIONS
+          hus_locked        = 1
+          no_hu_found       = 2
+          fatal_error       = 3
+          OTHERS            = 99.
+
+      IF sy-subrc EQ 0.
+        "----------------------------
+        "Borrar la asignación de HUs:
+        "----------------------------
+        CALL FUNCTION 'V51P_DELETE_RELATIONSHIP'
+          EXPORTING
+            if_control  = 'X'
+            it_hus      = lt_venum
+          IMPORTING
+*           ET_NEW_HUS  =
+            et_messages = lt_messages
+          EXCEPTIONS
+            fatal_error = 1
+            OTHERS      = 2.
+
+        IF sy-subrc EQ 0.
+          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+            EXPORTING
+              wait = 'X'.
+        ELSE.
+          lv_error = 'X'.
+        ENDIF.
+
+      ENDIF.  "get_hus
+    ENDIF.  "select vekp-vepo
+
+    IF lv_error EQ 'X'.
+      "Error borrando asignaciones UMp en entrega entrante".
+      PERFORM fill_return USING 'E' 'ZSCM042' '049' lv_vbeln_n space space space CHANGING et_return.
+      RETURN.
+    ENDIF.
+
+*§7: update the delivery (incl. HU-update)
+    ls_vbkok_wa-vbeln = lv_vbeln_n.
+    ls_vbkok_wa-packing_final = 'X'.
+    ls_vbkok_wa-vbeln_vl = lv_vbeln_n.
+
+    "Actualizar los cambios de HUS en la entrega:
+    CALL FUNCTION 'WS_DELIVERY_UPDATE'
+      EXPORTING
+        vbkok_wa                     = ls_vbkok_wa
+        delivery                     = lv_vbeln_n
+        nicht_sperren                = 'X'
+        if_get_delivery_buffered     = 'X'
+        if_no_generic_system_service = 'X'
+      TABLES
+        prot                         = lt_prot
+      EXCEPTIONS
+        error_message                = 1
+        OTHERS                       = 2.
+    LOOP AT lt_prot INTO DATA(ls_prot)
+                    WHERE msgty CA 'AE'.
+      lv_msgno = ls_prot-msgno.
+      PERFORM fill_return USING ls_prot-msgty ls_prot-msgid lv_msgno
+                                ls_prot-msgv1 ls_prot-msgv2 ls_prot-msgv3 ls_prot-msgv4 CHANGING et_return.
+    ENDLOOP.
+    IF sy-subrc EQ 0.
+      RETURN.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+    ENDIF.
+
+    "--------------------------
+    "Segundo: Eliminar entrega.
+    "--------------------------
+    FREE lt_return.
+    ls_header_data_ib-deliv_numb     = lv_vbeln_n.
+    ls_header_control_ib-deliv_numb  = lv_vbeln_n.
+    ls_header_control_ib-dlv_del     = 'X'.
+
+    CALL FUNCTION 'BAPI_INB_DELIVERY_CHANGE'
+      EXPORTING
+        header_data    = ls_header_data_ib
+        header_control = ls_header_control_ib
+        delivery       = lv_delivery_ib
+      TABLES
+        return         = lt_return
+      EXCEPTIONS
+        error_message  = 1
+        OTHERS         = 2.
+
+    LOOP AT lt_return TRANSPORTING NO FIELDS WHERE type IN lr_type_error.
+      EXIT.
+    ENDLOOP.
+    IF sy-subrc EQ 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+
+      "Error eliminando entrega entrante:".
+      PERFORM fill_return USING 'E' 'ZSCM042' '037' lv_vbeln_n space space space CHANGING et_return.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+
+      "Eliminada entrega entrante".
+      PERFORM fill_return USING 'S' 'ZSCM042' '036' lv_vbeln_n space space space CHANGING et_return.
+    ENDIF.
+
+    "Mensajes de error de la bapi.
+    DELETE lt_return WHERE type NOT IN lr_type_error.
+    APPEND LINES OF lt_return TO et_return.
+  ELSE.
+    "No existe entrega entrante en flujo documentos entrega".
+    PERFORM fill_return USING 'E' 'ZSCM042' '020' i_vbeln_v space space space CHANGING et_return.
+  ENDIF.
+
+ENDFUNCTION.

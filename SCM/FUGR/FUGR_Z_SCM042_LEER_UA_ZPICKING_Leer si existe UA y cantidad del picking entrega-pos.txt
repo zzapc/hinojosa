@@ -1,0 +1,130 @@
+FUNCTION z_scm042_leer_ua_zpicking.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_VBELN) TYPE  VBELN_VL
+*"     VALUE(I_POSNR) TYPE  POSNR_VL
+*"     VALUE(I_UECHA) TYPE  UECHA OPTIONAL
+*"     VALUE(I_MATNR) TYPE  MATNR
+*"     VALUE(I_CHARG) TYPE  CHARG_D
+*"     VALUE(I_CANT_DESVIO) TYPE  ZSCM_DE_CANT_DESVIO
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_TT
+*"     VALUE(ET_EXIDV) TYPE  HUM_EXIDV_T
+*"----------------------------------------------------------------------
+* JGM 07.2024 GAPCM042 Aplicativo Gestión de Desvíos.
+* Lógica similar: Z_SCM042_DEVOLUCION_STOCK_WM
+*--------------------------------------------------------------------*
+  DATA: ls_hum_exidv TYPE LINE OF hum_exidv_t.
+
+  DATA: lv_vbeln        TYPE vbeln_vl,
+        lv_posnr        TYPE posnr_vl,
+        lv_sel          TYPE flag,    "Campo dummy select.
+        lv_menge_desvio TYPE zscm_de_cant_desvio,
+        lv_menge_sum    TYPE zswm_ui5_pick-menge.
+  DATA: lt_exidv TYPE hum_exidv_t.
+
+
+  FREE et_exidv.
+  IF i_vbeln IS NOT INITIAL AND i_posnr IS NOT INITIAL.
+
+    lv_vbeln = i_vbeln.
+    lv_posnr = i_posnr.
+
+    "En caso de posiciones con partición de lotes, para la tabla ZSWM_UI5_PICK
+    "se necesita saber la posición superior original.
+    IF i_uecha IS NOT INITIAL.
+      lv_posnr = i_uecha.
+    ENDIF.
+
+    IF i_matnr IS NOT INITIAL AND i_charg IS NOT INITIAL AND i_cant_desvio IS NOT INITIAL.
+
+      lv_menge_desvio = i_cant_desvio.
+      CLEAR: lv_menge_sum, lv_sel.
+
+      SELECT vbeln, posnr, etenr, exidv, menge, meins, @lv_sel AS sel
+        INTO TABLE @DATA(lt_zpick)
+        FROM zswm_ui5_pick
+        WHERE vbeln EQ @lv_vbeln
+          AND posnr EQ @lv_posnr
+          AND matnr EQ @i_matnr
+          AND charg EQ @i_charg
+          AND lvorm EQ @space.
+
+      IF sy-subrc EQ 0.
+        SORT lt_zpick BY menge DESCENDING.
+
+        "Existe al menos una UA de la misma cantidad del desvío? En caso que sí -> contar solo esa.
+        IF line_exists( lt_zpick[ menge = lv_menge_desvio ] ).
+          ASSIGN lt_zpick[ menge = lv_menge_desvio ] TO FIELD-SYMBOL(<fs_zpick_aux>).
+          IF sy-subrc EQ 0.
+            <fs_zpick_aux>-sel = 'X'.
+            DATA(lv_match_ok) = abap_true.
+          ENDIF.
+        ELSE.
+          "Podrían haber varias UA para completar el desvío -> sumar y completar.
+          "Considerar partición de lotes: leer picking solo de esas UAs, no de toda la posición, según cantidad a desviar.
+          LOOP AT lt_zpick ASSIGNING <fs_zpick_aux> WHERE menge LE lv_menge_desvio.
+            lv_menge_sum = lv_menge_sum + <fs_zpick_aux>-menge.
+            <fs_zpick_aux>-sel = 'X'.
+
+            IF lv_menge_sum EQ lv_menge_desvio.
+              lv_match_ok = abap_true.
+              EXIT.
+            ENDIF.
+            IF lv_menge_sum GT lv_menge_desvio.
+              "Excedido, hay que seguir probando con la siguiente, o bien no cuadra ninguna de las cantidades UAs para el desvío.
+              lv_menge_sum = lv_menge_sum - <fs_zpick_aux>-menge.
+              CLEAR <fs_zpick_aux>-sel.
+            ENDIF.
+          ENDLOOP.
+        ENDIF.
+
+      ELSE.
+        lv_sel = 'X'.
+        SELECT vbeln, posnr, etenr, exidv, menge, meins, @lv_sel AS sel
+            INTO TABLE @lt_zpick
+            FROM zswm_ui5_pick
+            WHERE vbeln EQ @lv_vbeln
+              AND posnr EQ @lv_posnr
+              AND lvorm EQ @space.
+      ENDIF.
+    ELSE.
+      lv_sel = 'X'.
+      SELECT vbeln, posnr, etenr, exidv, menge, meins, @lv_sel AS sel
+        INTO TABLE @lt_zpick
+        FROM zswm_ui5_pick
+        WHERE vbeln EQ @lv_vbeln
+          AND posnr EQ @lv_posnr
+          AND lvorm EQ @space.
+    ENDIF.
+
+    IF line_exists( lt_zpick[ sel = 'X' ] ) AND lv_match_ok EQ abap_true.
+      SORT lt_zpick BY vbeln posnr etenr.
+
+      LOOP AT lt_zpick INTO DATA(ls_zpick) WHERE sel EQ 'X'.
+        ls_hum_exidv-exidv = ls_zpick-exidv.
+        APPEND ls_hum_exidv TO lt_exidv.
+        CLEAR ls_hum_exidv.
+      ENDLOOP.
+
+      IF lt_exidv IS NOT INITIAL.
+        et_exidv = lt_exidv.
+
+        "UA leída de ZSWM_UI5_PICK y cantidad desvío correcta para entrega".
+        PERFORM fill_return USING 'S' 'ZSCM042' '057' lv_vbeln lv_posnr space space CHANGING et_return.
+      ELSE.
+        "No existe UA en ZSWM_UI5_PICK con cantidad desvío para entrega".
+        PERFORM fill_return USING 'E' 'ZSCM042' '058' lv_vbeln lv_posnr space space CHANGING et_return.
+      ENDIF.
+    ELSE.
+      "Error lectura UA en ZSWM_UI5_PICK entrega".
+      PERFORM fill_return USING 'E' 'ZSCM042' '059' lv_vbeln lv_posnr space space CHANGING et_return.
+      RETURN.
+    ENDIF.  "select
+  ELSE.
+    "Error lectura UA en ZSWM_UI5_PICK entrega".
+    PERFORM fill_return USING 'E' 'ZSCM042' '059' lv_vbeln lv_posnr space space CHANGING et_return.
+  ENDIF.
+
+ENDFUNCTION.

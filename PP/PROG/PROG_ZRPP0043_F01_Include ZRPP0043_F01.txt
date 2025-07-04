@@ -1,0 +1,834 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0043_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_RECETAS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM obtener_recetas .
+
+* MONTAMOS LA TABLA INTERNA CON LAS DISTINTAS ALTERNATIVAS PARA MONTAR
+* EL MATCHCODE PARA EL CAMPO ALTERNATIVA
+  CLEAR: pt_alternativas.
+  REFRESH: pt_alternativas.
+
+  LOOP AT gt_mast INTO wa_mast.
+    wa_alternativas-stlal =  wa_mast-stlal.
+    APPEND  wa_alternativas TO pt_alternativas.
+  ENDLOOP.
+
+
+** MONTAMOS LOS DATOS PARA CREACIÓN DE RECETAS
+*  LOOP AT gt_mast INTO wa_mast.
+*    wa_recetas-linea  = ''.
+*    wa_recetas-stlal =  wa_mast-stlal.
+*    wa_recetas-version_ppal = ''.
+*    wa_recetas-version = ''.
+*    wa_recetas-descripcion_version = ''.
+*    wa_recetas-modo = ''.
+*    wa_recetas-descripcion  = ''.
+*    wa_recetas-receta = ''.
+*    APPEND  wa_recetas TO gt_recetas.
+*  ENDLOOP.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_RECETAS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_recetas .
+  FIELD-SYMBOLS: <wa_recetas> TYPE LINE OF tty_recetas.
+
+  DATA: num_lines TYPE sy-tabix,
+        error type xfeld.
+
+  DESCRIBE TABLE gt_recetas LINES num_lines.
+  IF num_lines = 0.
+    MESSAGE e280(zpp). "No hay recetas para crear.
+  ELSE.
+
+    LOOP AT gt_recetas ASSIGNING <wa_recetas>.
+      IF <wa_recetas>-stlal IS   INITIAL OR
+         <wa_recetas>-linea IS  INITIAL OR
+         <wa_recetas>-modo IS  INITIAL OR
+         <wa_recetas>-version IS INITIAL.
+
+        MESSAGE e281(zpp). "No se puede crear la receta por falta de datos .
+*        gs_messages-type = 'E'.
+*        gs_messages-id = 'ZPP'.
+*        gs_messages-number = '281'. "No se puede crear la receta por falta de datos
+*        APPEND gs_messages TO gt_messages.
+
+      ELSE.
+        clear: error.
+
+*  * 1 - TIEMPOS
+        PERFORM tiempos USING <wa_recetas>
+                        CHANGING wa_tiempos
+                                 error.
+
+        check error is initial.
+
+*  * 2. CREACIÓN DE RECETAS, ASIGNACIÓN DE COMPONENTES A OPERACIONES
+*  *    Y CREACIÓN DE LA VERSIÓN DE FABRICACIÓN
+        PERFORM creacion_recetas USING wa_tiempos
+                                 CHANGING <wa_recetas> .
+
+        CHECK  <wa_recetas>-receta IS NOT INITIAL.
+
+** 3.   CLASIFICAR RECETA
+        PERFORM clasificar_receta USING  <wa_recetas>.
+      ENDIF.
+    ENDLOOP.
+
+    PERFORM mostrar_log.
+
+  ENDIF.
+
+  CLEAR: gt_messages.
+  REFRESH gt_messages.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  TIEMPOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_WA_RECETAS  text
+*      <--P_WA_TIEMPOS  text
+*----------------------------------------------------------------------*
+FORM tiempos  USING    wa_recetas TYPE tipo_recetas
+              CHANGING wa_tiempos TYPE tipo_tiempos
+                       error type xfeld.
+
+  DATA: wa_ztpp0021_inf TYPE  ztpp0021,
+        wa_ztpp0021_sup TYPE  ztpp0021,
+        lv_limit_inf    TYPE sy-tabix,
+        lv_limit_sup    TYPE sy-tabix,
+        wa_ztpp0021     TYPE ztpp0021,
+        wa_ztpp0019     TYPE ztpp0019.
+
+  DATA: lv_num_puestos_trabajo TYPE sy-tabix.
+
+  DATA: lv_text1 TYPE sta_text,
+        lv_text2 TYPE sta_text.
+
+  DATA: lv_extnumber TYPE balnrext.
+
+  CLEAR: wa_tiempos, wa_ztpp0019, wa_ztpp0021,
+         lv_num_puestos_trabajo.
+
+  DATA: lv_gramaje TYPE zgramaje.
+
+  SELECT SINGLE * FROM ztpp0019
+    INTO wa_ztpp0019
+    WHERE linea = wa_recetas-linea AND
+          werks = gv_werks AND
+          modo = wa_recetas-modo.
+
+  IF wa_ztpp0019-arbpl1 IS NOT INITIAL.
+    lv_num_puestos_trabajo = lv_num_puestos_trabajo + 1.
+  ENDIF.
+
+  IF wa_ztpp0019-arbpl2 IS NOT INITIAL.
+    lv_num_puestos_trabajo = lv_num_puestos_trabajo + 1.
+  ENDIF.
+
+
+* Buscamos los Tiempos y operarios para el gramaje en cuestión.
+* Si no existe para dicho gramaje, buscamos para el gramaje más próximo
+  CALL FUNCTION 'ZPP_GET_TIEMPOS'
+    EXPORTING
+      i_werks   = gv_werks
+      i_linea   = wa_recetas-linea
+      i_modo    = wa_recetas-modo
+      i_gramaje = gv_gramaje
+    IMPORTING
+      e_tiempos = wa_ztpp0021.
+
+  IF wa_ztpp0021-gramaje IS INITIAL.
+    error = 'X'.
+    MESSAGE w284(zpp) WITH wa_recetas-linea wa_recetas-modo. "No existe un registro válido para la línea & y modo &.
+
+*     añadimos el mensaje al log de la SLG1
+    lv_extnumber = 'Advertencia por gramaje no existente'.
+
+    gs_messages-type = 'W'.
+    gs_messages-id = 'ZPP'.
+    gs_messages-number = '284'.
+    gs_messages-message_v1 = wa_recetas-linea.
+    gs_messages-message_v2 = wa_recetas-modo.
+    gs_messages-message_v3 = ''.
+    gs_messages-message_v4 = ''.
+    APPEND gs_messages TO gt_messages.
+
+    CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+      EXPORTING
+        objeto    = 'ZCIP_VF_REC'
+        subobjeto = 'CIP_CR_VF_R'
+        mensajes  = gt_messages[]
+        extnumber = lv_extnumber.
+
+  ELSE.
+    IF gv_gramaje <> wa_ztpp0021-gramaje.
+*   ha habido un cambio de gramaje: emitimos un mensaje para que el usuario esté informado del cambio de gramaje
+      CONCATENATE 'Se toma el gramaje' wa_ztpp0021-gramaje 'como gramaje de cálculo al no haber registro válido'
+                  INTO lv_text1 SEPARATED BY space.
+      CONCATENATE 'para el gramaje' gv_gramaje
+              INTO lv_text2 SEPARATED BY space.
+
+      CALL FUNCTION 'POPUP_TO_INFORM'
+        EXPORTING
+          titel = 'Información sobre el gramaje'
+          txt1  = lv_text1
+          txt2  = lv_text2
+*         TXT3  = ' '
+*         TXT4  = ' '
+        .
+
+*     añadimos el mensaje al log de la SLG1
+      lv_extnumber = 'Advertencia por cambio de gramaje'.
+
+      gs_messages-type = 'W'.
+      gs_messages-id = 'ZPP'.
+      gs_messages-number = 0.
+      gs_messages-message_v1 = 'Se toma el gramaje'.
+      gs_messages-message_v2 = wa_ztpp0021-gramaje.
+      gs_messages-message_v3 = 'como gramaje de cálculo al no haber registro válido para el gramaje'.
+      gs_messages-message_v4 = gv_gramaje.
+      APPEND gs_messages TO gt_messages.
+
+      CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+        EXPORTING
+          objeto    = 'ZCIP_VF_REC'
+          subobjeto = 'CIP_CR_VF_R'
+          mensajes  = gt_messages[]
+          extnumber = lv_extnumber.
+    ENDIF.
+  ENDIF.
+
+  MOVE-CORRESPONDING wa_ztpp0021 TO wa_tiempos.
+
+
+  IF wa_tiempos IS NOT INITIAL.
+    wa_tiempos-puestos_trabajo = lv_num_puestos_trabajo.
+    wa_tiempos-arbpl1 = wa_ztpp0019-arbpl1.
+    wa_tiempos-arbpl2 = wa_ztpp0019-arbpl2.
+
+*   Tiempo MAQ (min) = (Unidades ctd base * peso (kg) * (tiempo tabla extrusiones (min) / 1000)
+    wa_tiempos-tiempo_maq = 1000 *  gv_peso * ( wa_ztpp0021-minmod / 1000 ).
+
+*   Tiempo MOD (min) = Tiempo MAQ (min) numero operarios (tabla Z)
+    wa_tiempos-tiempo_mod =  wa_tiempos-tiempo_maq * wa_ztpp0021-numoper.
+
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_VERSION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM crear_version USING wa_recetas TYPE tipo_recetas.
+*  DATA:  it_mkal_i    TYPE TABLE OF mkal,
+*         wa_mkal_i    TYPE mkal,
+*         it_mkal_u    TYPE TABLE OF mkal,
+*         it_mkal_d    TYPE TABLE OF  mkal,
+*         it_mkal_aend TYPE TABLE OF mkal_aend.
+*
+*  CLEAR: it_mkal_i, it_mkal_u, it_mkal_d, it_mkal_aend.
+*  REFRESH: it_mkal_i, it_mkal_u, it_mkal_d, it_mkal_aend.
+*
+*  wa_mkal_i-matnr = gv_matnr_int. "    (Material para el que se va a crear la versión)
+*  wa_mkal_i-werks = gv_werks. "              (Centro siempr = 400)
+*  wa_mkal_i-verid = wa_recetas-version. "               (Versión de producción)
+*  wa_mkal_i-bdatu  = '31/12/1999'. "                          (Validez hasta Fecha poner siempre = 31.12.9999)
+*  wa_mkal_i-adatu  = sy-datum. "                         (Fecha del dia actual)
+*  wa_mkal_i-stlal  = wa_recetas-stlal. "              (Alternativa de la BOM)
+*  wa_mkal_i-stlan  = '1'. "              (Utilización de la BOM siempre = 1)
+*  wa_mkal_i-plnty  = ''. "              (Tipo de hoja de ruta, recetas siempre = 2)
+*  wa_mkal_i-plnnr  = ''. "              (Grupo de recetas)
+*  wa_mkal_i-alnal  = ''. "              (Receta individual siempr = 1)
+*  wa_mkal_i-text1  = wa_recetas-descripcion. "              (Texto de la versión)
+*  APPEND wa_mkal_i TO it_mkal_i.
+*
+*  CALL FUNCTION 'CM_FV_PROD_VERS_DB_UPDATE'
+*    TABLES
+*      it_mkal_i    = it_mkal_i
+*      it_mkal_u    = it_mkal_u
+*      it_mkal_d    = it_mkal_d
+*      it_mkal_aend = it_mkal_aend.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CREACION_RECETAS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_WA_RECETAS  text
+*----------------------------------------------------------------------*
+FORM creacion_recetas  USING wa_tiempos TYPE tipo_tiempos
+                       CHANGING wa_recetas TYPE tipo_recetas.
+
+  DATA: lv_datum      TYPE sy-datum,
+        lv_tiempo_mod TYPE c LENGTH 10,
+        lv_tiempo_maq TYPE c LENGTH 10.
+
+  DATA: lv_extnumber TYPE balnrext.
+  DATA: lt_messages LIKE bapiret2 OCCURS 0.
+
+*  pasamos formato AAAAMMDD a DDMMAAAA.
+  CONCATENATE sy-datum+6(2) sy-datum+4(2) sy-datum(4) INTO lv_datum.
+  lv_tiempo_maq = wa_tiempos-tiempo_maq.
+  CONDENSE lv_tiempo_maq.
+  REPLACE '.' IN lv_tiempo_maq WITH ','.
+
+  lv_tiempo_mod = wa_tiempos-tiempo_mod.
+  CONDENSE lv_tiempo_mod.
+  REPLACE '.' IN lv_tiempo_mod WITH ','.
+
+  CLEAR: bdcdata.
+  REFRESH: bdcdata.
+
+  PERFORM bdc_dynpro      USING 'SAPLCPDI' '4000'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '/00'.
+  PERFORM bdc_field       USING 'RC271-PLNNR' ''.
+  PERFORM bdc_field       USING 'RC271-PLNAL' ''.
+  PERFORM bdc_field       USING 'RC27M-MATNR' gv_matnr_int.
+  PERFORM bdc_field       USING 'RC27M-WERKS' gv_werks.
+  PERFORM bdc_field       USING 'RC271-PROFIDNETZ' 'ZI01'.
+  PERFORM bdc_field       USING 'RC271-STTAG' lv_datum.
+**************************************************************
+
+  PERFORM bdc_dynpro      USING 'SAPLCPDA' '4210'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '/00'.
+  PERFORM bdc_field       USING 'PLKOD-WERKS' gv_werks.
+  PERFORM bdc_field       USING 'PLKOD-PLNAL' '1'.
+  PERFORM bdc_field       USING 'PLKOD-KTEXT' wa_recetas-descripcion. "'Plancha no manipulada - Prueba PPPI'.
+  PERFORM bdc_field       USING 'PLKOD-VERWE'  '1'.
+  PERFORM bdc_field       USING 'PLKOD-STATU' '4'.
+  PERFORM bdc_field       USING 'PLKOD-BMSCH' '1000'.
+  PERFORM bdc_field       USING 'PLKOD-MEINH' 'UN'.
+  PERFORM bdc_field       USING 'PLKOD-LOSBS' '99.999.999'.
+  PERFORM bdc_field       USING 'PLKOD-PLNME' 'UN'.
+
+
+**************************************************************
+
+  PERFORM bdc_dynpro      USING 'SAPLCPDA' '4210'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=VOUE'.
+  PERFORM bdc_field       USING 'PLKOD-WERKS' gv_werks.
+  PERFORM bdc_field       USING 'PLKOD-PLNAL' '1'.
+  PERFORM bdc_field       USING 'PLKOD-KTEXT' wa_recetas-descripcion. "'Plancha no manipulada - Prueba PPPI'.
+  PERFORM bdc_field       USING 'PLKOD-VERWE'  '1'.
+  PERFORM bdc_field       USING 'PLKOD-STATU' '4'.
+  PERFORM bdc_field       USING 'PLKOD-BMSCH' '1000'.
+  PERFORM bdc_field       USING 'PLKOD-MEINH' 'UN'.
+  PERFORM bdc_field       USING 'PLKOD-LOSBS' '99.999.999'.
+  PERFORM bdc_field       USING 'PLKOD-PLNME' 'UN'.
+
+
+**************************************************************
+
+
+  PERFORM bdc_dynpro      USING 'SAPLCPDI' '4400'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=ENT1'.
+*  PERFORM bdc_field       USING 'PPLPOD-PHSEQ(01)' ''.
+  PERFORM bdc_field       USING 'PLPOD-ARBPL(01)' wa_tiempos-arbpl1. "'EXTRUS01'.
+  PERFORM bdc_field       USING 'PLPOD-STEUS(01)' 'ZP01'.
+  PERFORM bdc_field       USING 'PLPOD-LTXA1(01)' 'Extrusión'.
+
+
+  PERFORM bdc_dynpro      USING 'SAPLCPDI' '4400'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=ENT1'.
+  PERFORM bdc_field       USING 'RC27X-ENTRY_ACT' '1'.
+  PERFORM bdc_field       USING 'PLPOD-PHFLG(02)' 'X'.
+  PERFORM bdc_field       USING 'PLPOD-PVZNR(02)' '0010'.
+  PERFORM bdc_field       USING 'PLPOD-PHSEQ(02)' 'Z2'.
+  PERFORM bdc_field       USING 'PLPOD-ARBPL(02)' '	  '.
+  PERFORM bdc_field       USING 'PLPOD-STEUS(02)' 'ZP01'.
+  PERFORM bdc_field       USING 'PLPOD-LTXA1(02)' 'Extrusión'.
+
+
+
+  PERFORM bdc_dynpro      USING 'SAPLCPDI' '4400'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=ENT1'.
+  PERFORM bdc_field       USING 'BDC_CURSOR' 'PLPOD-VGW05(02)'.
+  PERFORM bdc_field       USING 'RC27X-ENTRY_ACT' '1'.
+  PERFORM bdc_field       USING 'PLPOD-VGW01(02)'  lv_tiempo_mod.
+  PERFORM bdc_field       USING 'PLPOD-VGE01(02)' 'MIN'.
+  PERFORM bdc_field       USING 'PLPOD-VGW02(02)' lv_tiempo_maq.
+  PERFORM bdc_field       USING 'PLPOD-VGE02(02)' 'MIN'.
+  PERFORM bdc_field       USING 'PLPOD-VGW03(02)' lv_tiempo_maq.
+  PERFORM bdc_field       USING 'PLPOD-VGE03(02)' 'MIN'.
+  PERFORM bdc_field       USING 'PLPOD-VGW04(02)' lv_tiempo_maq.
+  PERFORM bdc_field       USING 'PLPOD-VGE04(02)' 'MIN'.
+  PERFORM bdc_field       USING 'PLPOD-VGW05(02)' ''.
+  PERFORM bdc_field       USING 'PLPOD-VGE05(02)' 'MIN'.
+
+
+**************************************************************
+  IF wa_tiempos-arbpl2 IS NOT INITIAL.
+    PERFORM bdc_dynpro      USING 'SAPLCPDI' '4400'.
+    PERFORM bdc_field       USING 'BDC_OKCODE' '=ENT1'.
+    PERFORM bdc_field       USING 'RC27X-ENTRY_ACT' '1'.
+    PERFORM bdc_field       USING 'PLPOD-ARBPL(03)' wa_tiempos-arbpl2 . "'COEX01'.
+
+
+    PERFORM bdc_dynpro      USING 'SAPLCPDI' '4400'.
+    PERFORM bdc_field       USING 'BDC_OKCODE'  '=ENT1'.
+    PERFORM bdc_field       USING 'RC27X-ENTRY_ACT' '1'.
+    PERFORM bdc_field       USING 'PLPOD-LTXA1(03)' 'Co-extrusión'.
+
+
+
+    PERFORM bdc_dynpro      USING 'SAPLCPDI' '4400'.
+    PERFORM bdc_field       USING 'BDC_OKCODE' '=ENT1'.
+    PERFORM bdc_field       USING 'RC27X-ENTRY_ACT' '1'.
+    PERFORM bdc_field       USING 'PLPOD-PHFLG(04)' 'X'.
+    PERFORM bdc_field       USING 'PLPOD-PVZNR(04)' '0030'.
+    PERFORM bdc_field       USING 'PLPOD-PHSEQ(04)' 'Z2'.
+    PERFORM bdc_field       USING 'PLPOD-ARBPL(04)' 'COEX01'.
+    PERFORM bdc_field       USING 'PLPOD-STEUS(03)' 'ZP01'.
+    PERFORM bdc_field       USING 'PLPOD-STEUS(04)' 'ZP01'.
+    PERFORM bdc_field       USING 'PLPOD-LTXA1(04)' 'Co-extrusión'.
+
+
+
+    PERFORM bdc_dynpro      USING 'SAPLCPDI' '4400'.
+    PERFORM bdc_field       USING 'BDC_OKCODE' '=ENT1'.
+    PERFORM bdc_field       USING 'RC27X-ENTRY_ACT' '1'.
+    PERFORM bdc_field       USING 'PLPOD-VGW01(04)' ''.
+    PERFORM bdc_field       USING 'PLPOD-VGE01(04)' 'MIN'.
+    PERFORM bdc_field       USING 'PLPOD-VGW02(04)' lv_tiempo_maq.
+    PERFORM bdc_field       USING 'PLPOD-VGE02(04)' 'MIN'.
+    PERFORM bdc_field       USING 'PLPOD-VGW03(04)' ''.
+    PERFORM bdc_field       USING 'PLPOD-VGE03(04)' 'MIN'.
+    PERFORM bdc_field       USING 'PLPOD-VGW04(04)' lv_tiempo_maq.
+    PERFORM bdc_field       USING 'PLPOD-VGE04(04)' 'MIN'.
+    PERFORM bdc_field       USING 'PLPOD-VGW05(04)' ''.
+    PERFORM bdc_field       USING 'PLPOD-VGE05(04)' 'MIN'.
+  ENDIF.
+
+
+****************************************************************
+  PERFORM bdc_dynpro      USING 'SAPLCPDI' '4400'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'
+                                '=OMBO'.
+  PERFORM bdc_field       USING 'RC27X-ENTRY_ACT' '1'.
+
+**************************************************************
+  PERFORM bdc_dynpro      USING 'SAPLCMFV' '0200'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' 'ENTR'.
+  PERFORM bdc_field       USING 'MKAL-VERID' wa_recetas-version. "'V888'.
+  PERFORM bdc_field       USING 'MKAL-TEXT1' wa_recetas-descripcion_version. "'Descripción versión'.
+  PERFORM bdc_field       USING 'MKAL-BSTMA' '99.999.999,000'.
+  PERFORM bdc_field       USING 'MKAL-ADATU' lv_datum. "'27.12.2017'.
+  PERFORM bdc_field       USING 'MKAL-BDATU' '31.12.9999'.
+  PERFORM bdc_field       USING 'MKAL-STLAL' wa_recetas-stlal. "'1'.
+  PERFORM bdc_field       USING 'MKAL-STLAN' '1'.
+
+**************************************************************
+  PERFORM bdc_dynpro      USING 'SAPLCMFV' '0200'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'  '=PRFG'.
+  PERFORM bdc_field       USING 'MKAL-VERID' wa_recetas-version. "'V888'.
+  PERFORM bdc_field       USING 'MKAL-TEXT1' wa_recetas-descripcion_version. "'Descripción versión'.
+  PERFORM bdc_field       USING 'MKAL-BSTMA' '99.999.999,000'.
+  PERFORM bdc_field       USING 'MKAL-ADATU' lv_datum. "'27.12.2017'.
+  PERFORM bdc_field       USING 'MKAL-BDATU' '31.12.9999'.
+  PERFORM bdc_field       USING 'MKAL-STLAL' wa_recetas-stlal. "'1'.
+  PERFORM bdc_field       USING 'MKAL-STLAN' '1'.
+
+**************************************************************
+  PERFORM bdc_dynpro      USING 'SAPLSPO1' '0600'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'  '=OPT1'.
+*  PERFORM bdc_field       USING 'BDC_SUBSCR'  'SAPLSPO1'.
+
+**************************************************************
+  PERFORM bdc_dynpro      USING 'SAPMSSY0' '120'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'  '=RW'.
+
+**************************************************************
+  PERFORM bdc_dynpro      USING 'SAPLCMFV' '0200'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=BACK'.
+  PERFORM bdc_field       USING 'MKAL-VERID' wa_recetas-version. "'V888'.
+  PERFORM bdc_field       USING 'MKAL-TEXT1' wa_recetas-descripcion_version. "'Descripción versión'.
+  PERFORM bdc_field       USING 'MKAL-BSTMA' '99.999.999,000'.
+  PERFORM bdc_field       USING 'MKAL-ADATU' lv_datum. "'27.12.2017'.
+  PERFORM bdc_field       USING 'MKAL-BDATU' '31.12.9999'.
+  PERFORM bdc_field       USING 'MKAL-STLAL' wa_recetas-stlal. "'1'.
+  PERFORM bdc_field       USING 'MKAL-STLAN' '1'.
+
+**************************************************************
+
+  PERFORM bdc_dynpro      USING 'SAPLCMDI' '4000'.
+*  BDC_CURSOR   STPOB-IDNRK(01)
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=MAAL'.
+
+  PERFORM bdc_dynpro      USING 'SAPLCMDI' '4000'.
+*   BDC_CURSOR   STPOB-IDNRK(01)
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=NEW'.
+
+**************************************************************
+
+  PERFORM bdc_dynpro      USING 'SAPLCM01' '5090'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=GOON'.
+  PERFORM bdc_field       USING 'RCM01-VORNR' '0020'.
+
+**************************************************************
+  PERFORM bdc_dynpro      USING 'SAPLCMDI' '4000'.
+  PERFORM bdc_field       USING 'BDC_OKCODE'  '=BU'.
+**************************************************************
+
+
+  CLEAR: i_messtab.
+  REFRESH: i_messtab.
+
+  CALL TRANSACTION 'C201' USING bdcdata MODE 'N'
+                          MESSAGES INTO i_messtab
+                          UPDATE 'S'.
+
+
+  DATA: wa_messtab TYPE bdcmsgcoll.
+  READ TABLE i_messtab INTO wa_messtab WITH KEY msgid = 'CV'  msgnr = '762' .
+  IF sy-subrc = 0.
+    wa_recetas-receta = wa_messtab-msgv1.
+    lv_extnumber = wa_messtab-msgv1.
+  ELSE.
+    CONCATENATE 'Error en al creación de la receta de la linea' wa_recetas-linea 'modo' wa_recetas-modo INTO lv_extnumber
+      SEPARATED BY space.
+  ENDIF.
+
+
+* MONTAMOS EL LOG EN LA SLG1
+  LOOP AT i_messtab INTO wa_messtab.
+    gs_messages-type = wa_messtab-msgtyp.
+    gs_messages-id = wa_messtab-msgid.
+    gs_messages-number = wa_messtab-msgnr.
+    gs_messages-message_v1 = wa_messtab-msgv1.
+    gs_messages-message_v2 = wa_messtab-msgv2.
+    gs_messages-message_v3 = wa_messtab-msgv3.
+    gs_messages-message_v4 = wa_messtab-msgv4.
+    APPEND gs_messages TO lt_messages.
+  ENDLOOP.
+
+
+
+  CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+    EXPORTING
+      objeto    = 'ZCIP_VF_REC'
+      subobjeto = 'CIP_CR_VF_R'
+      mensajes  = lt_messages[]
+      extnumber = lv_extnumber.
+
+
+  APPEND LINES OF lt_messages TO gt_messages.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  MOSTRAR_DATOS_0200
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM mostrar_datos_0200 .
+  DATA: ls_layout TYPE lvc_s_layo,
+        lt_fcat   TYPE lvc_t_fcat,
+        ls_fcat   TYPE lvc_s_fcat.
+
+  DATA: lt_tooltips TYPE lvc_t_qinf,
+        lt_toolb    TYPE ui_functions,
+        ls_toolb    TYPE ui_func.
+
+
+  IF gr_container_200 IS INITIAL. "IS NOT BOUND.
+    CREATE OBJECT gr_container_200
+      EXPORTING
+        container_name = 'CONTAINER_200'.
+
+    CREATE OBJECT gr_grid_200
+      EXPORTING
+        i_parent = gr_container_200.
+
+
+    PERFORM fieldcat_200 CHANGING lt_fcat.
+    PERFORM layout_200 CHANGING ls_layout.
+    PERFORM excluir_botones_200 CHANGING lt_toolb.
+
+
+    CALL METHOD gr_grid_200->set_table_for_first_display
+      EXPORTING
+        is_layout            = ls_layout
+        it_except_qinfo      = lt_tooltips
+        it_toolbar_excluding = lt_toolb
+        i_save               = 'A'
+      CHANGING
+        it_fieldcatalog      = lt_fcat
+        it_outtab            = gt_recetas.
+  ELSE.
+    CALL METHOD gr_grid_200->refresh_table_display.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  FIELDCAT_200
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LT_FCAT  text
+*----------------------------------------------------------------------*
+FORM fieldcat_200  CHANGING lt_fcat TYPE lvc_t_fcat.
+  DATA: ls_fcat TYPE lvc_s_fcat.
+
+  CLEAR: lt_fcat.
+  REFRESH: lt_fcat.
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name = 'ZEPP_ZRPP0043'
+*     i_client_never_display = 'X'
+*     i_bypassing_buffer     =
+    CHANGING
+      ct_fieldcat      = lt_fcat
+    EXCEPTIONS
+      OTHERS           = 3.
+
+  IF sy-subrc <> 0.
+
+  ELSE.
+    LOOP AT lt_fcat INTO ls_fcat.
+      CASE ls_fcat-fieldname.
+        WHEN 'NOMBRE_MODO'.
+          ls_fcat-coltext = text-001.
+          ls_fcat-scrtext_l = text-001.
+          ls_fcat-scrtext_m = text-001.
+          ls_fcat-scrtext_s  = text-001.
+
+        WHEN 'VERSION'.
+          ls_fcat-coltext = text-002.
+          ls_fcat-scrtext_l = text-002.
+          ls_fcat-scrtext_m = text-002.
+          ls_fcat-scrtext_s  = text-002.
+
+        WHEN 'DESCRIPCION_VERSION'.
+          ls_fcat-coltext = text-003.
+          ls_fcat-scrtext_l = text-003.
+          ls_fcat-scrtext_m = text-003.
+          ls_fcat-scrtext_s  = text-003.
+
+        WHEN 'RECETA'.
+          ls_fcat-coltext = text-004.
+          ls_fcat-scrtext_l = text-004.
+          ls_fcat-scrtext_m = text-004.
+          ls_fcat-scrtext_s  = text-004.
+
+        WHEN 'DESCRIPCION'.
+          ls_fcat-coltext = text-005.
+          ls_fcat-scrtext_l = text-005.
+          ls_fcat-scrtext_m = text-005.
+          ls_fcat-scrtext_s  = text-005.
+      ENDCASE.
+      MODIFY lt_fcat FROM ls_fcat.
+    ENDLOOP.
+
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  LAYOUT_200
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_LAYOUT  text
+*----------------------------------------------------------------------*
+FORM layout_200  CHANGING ls_layout TYPE lvc_s_layo.
+  ls_layout-zebra = 'X'.
+  ls_layout-cwidth_opt = 'X'.
+  ls_layout-sel_mode   = 'A'.
+
+*  ls_layout-ctab_fname = 'COLOR'.     "Enlazamos el campo en el layout
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  EXCLUIR_BOTONES_200
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LT_TOOLB  text
+*----------------------------------------------------------------------*
+FORM excluir_botones_200  CHANGING lt_toolb TYPE ui_functions.
+  DATA: ls_toolb    TYPE ui_func.
+
+  CLEAR:  lt_toolb.
+  REFRESH:  lt_toolb.
+
+  ls_toolb = cl_gui_alv_grid=>mc_fc_call_crbatch.
+  APPEND ls_toolb TO lt_toolb.
+
+  lt_toolb = gt_exc.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  DELETE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM delete .
+  LOOP AT gt_recetas INTO wa_recetas.
+    IF mark = 'X'.
+      DELETE gt_recetas FROM wa_recetas.
+      DESCRIBE TABLE gt_recetas LINES tc_recetas-lines.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CLASIFICAR_RECETA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_<WA_RECETAS>  text
+*----------------------------------------------------------------------*
+FORM clasificar_receta  USING wa_recetas TYPE tipo_recetas.
+
+  DATA: lv_objectkeynew    TYPE bapi1003_key-object,
+        lv_objecttablenew  TYPE bapi1003_key-objecttable,
+        lv_classnumnew     TYPE bapi1003_key-classnum,
+        lv_classtypenew    TYPE bapi1003_key-classtype,
+        lv_status          TYPE bapi1003_key-status,
+        t_allocvaluesnum   TYPE TABLE OF bapi1003_alloc_values_num,
+        t_allocvalueschar  TYPE TABLE OF bapi1003_alloc_values_char,
+        wa_allocvalueschar TYPE bapi1003_alloc_values_char,
+        t_allocvaluescurr  TYPE TABLE OF bapi1003_alloc_values_curr,
+        t_return           TYPE TABLE OF bapiret2,
+        wa_return          TYPE bapiret2.
+
+  DATA: lv_plnty TYPE plnty,
+        lv_alnal TYPE mkal-alnal.
+
+  DATA: lv_extnumber TYPE balnrext.
+
+  SELECT SINGLE plnty alnal FROM mkal
+    INTO (lv_plnty, lv_alnal)
+    WHERE plnnr = wa_recetas-receta.
+
+
+  CONCATENATE lv_plnty wa_recetas-receta lv_alnal INTO lv_objectkeynew.
+  lv_objecttablenew = 'PLKO'.
+  lv_classnumnew = 'Z_RECETAS_CIP'.
+  lv_classtypenew = '018'.
+  lv_status = '1'.
+
+  wa_allocvalueschar-charact = 'Z_CENTRO'.
+  wa_allocvalueschar-value_char = gv_werks.
+  APPEND  wa_allocvalueschar TO t_allocvalueschar.
+
+  wa_allocvalueschar-charact = 'Z_LINEA'.
+  wa_allocvalueschar-value_char = wa_recetas-linea.
+  APPEND  wa_allocvalueschar TO t_allocvalueschar.
+
+  wa_allocvalueschar-charact = 'Z_MODO'.
+  wa_allocvalueschar-value_char = wa_recetas-modo.
+  APPEND  wa_allocvalueschar TO t_allocvalueschar.
+
+
+  CALL FUNCTION 'BAPI_OBJCL_CREATE'
+    EXPORTING
+      objectkeynew    = lv_objectkeynew
+      objecttablenew  = lv_objecttablenew
+      classnumnew     = lv_classnumnew
+      classtypenew    = lv_classtypenew
+      status          = lv_status
+*     STANDARDCLASS   =
+*     CHANGENUMBER    =
+      keydate         = sy-datum
+*     NO_DEFAULT_VALUES       = ' '
+* IMPORTING
+*     CLASSIF_STATUS  =
+    TABLES
+      allocvaluesnum  = t_allocvaluesnum
+      allocvalueschar = t_allocvalueschar
+      allocvaluescurr = t_allocvaluescurr
+      return          = t_return.
+
+  READ TABLE t_return INTO wa_return WITH KEY type = 'E'.
+  IF sy-subrc <> 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+*     IMPORTING
+*       RETURN        =
+    .
+
+  ENDIF.
+
+* MONTAMOS EL LOG EN LA SLG1
+  IF t_return[] IS NOT INITIAL.
+    lv_extnumber = wa_recetas-receta.
+
+    CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+      EXPORTING
+        objeto    = 'ZCIP_VF_REC'
+        subobjeto = 'CIP_CR_VF_R'
+        mensajes  = t_return[]
+        extnumber = lv_extnumber.
+
+    APPEND LINES OF t_return TO gt_messages.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  MOSTRAR_LOG
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM mostrar_log .
+  IF gt_messages[] IS NOT INITIAL.
+    READ TABLE gt_messages INTO gs_messages WITH KEY type = ''.
+    IF sy-subrc <> 0.
+
+      CALL FUNCTION 'C14ALD_BAPIRET2_SHOW'
+        TABLES
+          i_bapiret2_tab = gt_messages.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  GET_MODOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_WA_RECETAS_LINEA  text
+*      -->P_GV_WERKS  text
+*      <--P_PT_MODOS  text
+*----------------------------------------------------------------------*
+FORM get_modos  USING    p_linea
+                         p_werks
+                CHANGING pt_modos .
+
+  DATA: lt_modos TYPE TABLE OF zvpp0019.
+
+
+  CLEAR: lt_modos.
+  REFRESH: lt_modos.
+
+  SELECT * FROM zvpp0019
+    INTO TABLE lt_modos
+    WHERE linea = p_linea AND
+          werks = p_werks.
+
+  pt_modos = lt_modos.
+ENDFORM.

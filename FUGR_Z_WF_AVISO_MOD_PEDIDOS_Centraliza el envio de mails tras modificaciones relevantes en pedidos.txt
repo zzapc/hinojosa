@@ -1,0 +1,237 @@
+FUNCTION Z_WF_AVISO_MOD_PEDIDOS.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(VBELN) TYPE  VBAK-VBELN
+*"     REFERENCE(TEST) TYPE  C DEFAULT ''
+*"----------------------------------------------------------------------
+  DATA: l_vbak TYPE vbak,
+        l_vbap TYPE vbap,
+        l_cdhdr TYPE cdhdr,
+        i_cdpos TYPE TABLE OF cdpos WITH HEADER LINE,
+        i_cdposf TYPE TABLE OF cdpos WITH HEADER LINE,
+        l_sem_old TYPE scal-week,
+        l_sem_new TYPE scal-week,
+        l_fecha TYPE d,
+        l_posnr TYPE vbap-posnr,
+        l_vbfa TYPE vbfa,
+        l_segundos TYPE i,
+        l_salir,
+        l_subclave TYPE ztemp-subclave,
+*        i_lotes TYPE TABLE OF zhist_lotes_ped WITH HEADER LINE,
+        l_hora TYPE sy-uzeit.
+
+  SELECT SINGLE * FROM vbak
+    INTO l_vbak
+   WHERE vbeln = vbeln.
+
+  CHECK sy-subrc = 0.
+
+*  PERFORM grabar_cambios_det_lotes USING vbeln.
+
+  DO 3 TIMES.
+    SELECT * FROM cdhdr
+      INTO l_cdhdr
+       UP TO 1 ROWS
+     WHERE objectclas = 'VERKBELEG'
+       AND objectid   = vbeln
+     ORDER BY changenr DESCENDING.
+    ENDSELECT.
+    IF l_cdhdr-udate < sy-datum OR
+     ( l_cdhdr-udate = sy-datum AND l_cdhdr-utime < sy-uzeit ).
+      EXIT.
+    ELSE.
+      WAIT UP TO 5 SECONDS.
+    ENDIF.
+  ENDDO.
+
+  CONCATENATE l_vbak-vbeln l_cdhdr-udate l_cdhdr-utime INTO l_subclave.
+  CLEAR l_salir.
+* Verifico si no he enviado antes un correo por ese cambio
+  l_salir = zcl_ap_temp=>existe_st( clave = 'AVISO_MOP' subclave = l_subclave ).
+
+* Si no lo he enviado, y es una modificación
+  IF ( l_salir IS INITIAL AND NOT l_vbak-aedat IS INITIAL ).
+    IF l_cdhdr-udate = sy-datum.
+      l_segundos = sy-uzeit - l_cdhdr-utime.
+* Sólo si el cambio está en los dos minutos previos, esto
+* es para impedir mandar el mensaje repetido si graban sin cambiar nada
+      IF l_segundos < 300.
+        SELECT * FROM  cdpos
+          INTO TABLE i_cdpos
+         WHERE objectclas  = l_cdhdr-objectclas
+           AND objectid    = l_cdhdr-objectid
+           AND changenr    = l_cdhdr-changenr
+           AND tabname    IN ('VBAK', 'VBAP', 'VBEP').
+        IF sy-subrc NE 0.
+          l_salir = 'X'.
+        ENDIF.
+      ELSE.
+        l_salir = 'X'.
+      ENDIF.
+    ELSE.
+      l_salir = 'X'.
+    ENDIF.
+  ENDIF.
+
+* Por si solo hubiese modificado la determinación de lotes.
+  IF l_cdhdr-utime IS INITIAL.
+    l_hora = sy-uzeit - 60.
+  ELSE.
+    l_hora = l_cdhdr-utime - 60.
+  ENDIF.
+*  SELECT * FROM zhist_lotes_ped
+*    INTO TABLE i_lotes
+*   WHERE vbeln = vbeln
+*     AND udate = sy-datum
+*     AND utime > l_hora.
+*
+*  IF l_salir = 'X'.
+*    IF NOT i_lotes[] IS INITIAL.
+*      CLEAR l_salir.
+*    ENDIF.
+*  ENDIF.
+
+
+  CHECK l_salir IS INITIAL OR test = 'X'.
+
+
+  SELECT * FROM  cdpos
+    INTO TABLE i_cdpos
+   WHERE objectclas  = l_cdhdr-objectclas
+     AND objectid    = l_cdhdr-objectid
+     AND changenr    = l_cdhdr-changenr
+     AND NOT tabname IN ('KONVC')
+     AND NOT fname IN ('CMPRE', 'CMPRE_FLT').
+
+  CHECK NOT i_cdpos[] IS INITIAL.
+
+*  LOOP AT i_cdpos WHERE tabname = 'VBAP' AND fname = 'KEY' AND chngind = 'I'.
+*    SELECT SINGLE * FROM vbap
+*      INTO l_vbap
+*     WHERE vbeln = i_cdpos-tabkey+3(10)
+*       AND posnr = i_cdpos-tabkey+13(6).
+*    IF l_vbap-erdat < sy-datum.
+*      DELETE i_cdpos.
+*    ENDIF.
+*  ENDLOOP.
+
+* PROCESO 01-Modificaciones de pedidos cuando..
+* Se trata de avisar de cambios realizados en los pedidos desde BO a Planificación y viceversa,
+* con objeto de conocer que se han modificado materiales, centros, fechas, cantidades, bloqueos de entrega,
+* posiciones nuevas, rechazadas y borradas.
+  REFRESH i_cdposf.
+  LOOP AT i_cdpos INTO i_cdposf WHERE ( tabname = 'VBEP' AND fname = 'EDATU' ) "Cambio en repartos
+                                   OR fname = 'WERKS'  "Centro
+                                   OR ( tabname = 'VBAP' AND chngind = 'I' )  "Nuevas posiciones
+                                   OR ( tabname = 'VBAP' AND chngind = 'U' AND
+                                         ( fname = 'ZZCAUSA_RETRASO'
+                                        OR fname = 'MATNR'
+                                        OR fname = 'ABGRU'
+                                        OR fname = 'KWMENG'
+                                        OR fname = 'LIFSK'
+                                        OR fname = 'FAKSK' ) )  "Posiciones modificadas
+                                   OR ( tabname = 'VBEP' AND chngind = 'U' AND
+                                         ( fname = 'WMENG' ) )
+*¿?                                   OR ( tabname = 'VBAP' AND chngind = 'D' )  "Posición borrada
+                                   OR fname = 'ABGRU'. "Posición rechazada
+
+* Si cambia la fecha de reparto, pero cae dentro de la misma semana no interesa
+    IF ( i_cdposf-tabname = 'VBEP' AND i_cdposf-fname = 'EDATU' ).
+      l_fecha = i_cdposf-value_old.
+      l_sem_old = zcl_ap_fechas=>get_semana( l_fecha ).
+      l_fecha = i_cdposf-value_new.
+      l_sem_new = zcl_ap_fechas=>get_semana( l_fecha ).
+      IF l_sem_old = l_sem_new.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    APPEND i_cdposf.
+  ENDLOOP.
+  IF NOT i_cdposf[] IS INITIAL.
+*    OR NOT i_lotes[] IS INITIAL.
+    CALL FUNCTION 'Z_WF_MAIL_MOD_PEDIDOS'
+      EXPORTING
+        proceso = '01'
+        vbak    = l_vbak
+        cdhdr   = l_cdhdr
+        test    = test
+      TABLES
+        i_cdpos = i_cdposf.
+*        i_lotes = i_lotes.
+  ENDIF.
+
+* PROCESO 02-Anticipos cuando se cambie el precio total del pedido'
+*  READ TABLE i_cdpos WITH KEY tabname = 'VBAK'
+*                              fname = 'NETWR'.
+**  IF sy-subrc = 0.
+*  IF l_vbak-netwr NE l_vbak-zznetwr.
+*    REFRESH i_cdposf.
+*    LOOP AT i_cdpos INTO i_cdposf WHERE ( tabname = 'VBAP' AND chngind = 'I' )  "Nuevas posiciones
+**¿?                                     OR ( tabname = 'VBAP' AND chngind = 'D' )  "Posición borrada
+*                                     OR ( tabname = 'VBAP' AND fname = 'NETPR' )
+*                                     OR ( tabname = 'VBEP' AND fname = 'BMENG' )
+*                                     OR fname = 'ABGRU'. "Posición rechazada
+*      APPEND i_cdposf.
+*    ENDLOOP.
+*    CALL FUNCTION 'Z_WF_MAIL_MOD_PED_ANTICIPOS'
+*      EXPORTING
+*        proceso = '09'
+*        vbak    = l_vbak
+*        cdhdr   = l_cdhdr
+*        test    = test
+*      TABLES
+*        i_cdpos = i_cdposf.
+
+* 10033 - Hacer que las modificaciones en el importe neto del pedido que tenga la facturación creada
+* lleguen hasta Contabilidad, una vez que el BO correspondiente haya anulado la factura y modificado
+* el importe.
+    REFRESH i_cdposf.
+    LOOP AT i_cdpos INTO i_cdposf WHERE ( tabname = 'VBAP' AND chngind = 'D' )  "Posición borrada
+                                     OR ( tabname = 'VBAP' AND fname = 'NETPR' )
+                                     OR ( tabname = 'VBEP' AND fname = 'BMENG' )
+                                     OR fname = 'ABGRU'. "Posición rechazada
+      l_posnr = i_cdposf-tabkey+13(6).
+      SELECT SINGLE * FROM vbfa
+        INTO l_vbfa
+       WHERE vbelv = l_vbak-vbeln
+         AND posnv = l_posnr
+         AND vbtyp_n = 'M'. "Factura.
+      IF sy-subrc = 0.
+        SELECT SINGLE * FROM vbfa
+          INTO l_vbfa
+         WHERE vbelv = l_vbak-vbeln
+           AND posnv = l_posnr
+           AND vbtyp_n = 'N'. "Anulación de Factura.
+        IF sy-subrc = 0.
+          SELECT SINGLE * FROM vbfa
+            INTO l_vbfa
+           WHERE vbelv = l_vbak-vbeln
+             AND posnv = l_posnr
+             AND vbtyp_n = '5'. "Factura intercompañia
+          IF sy-subrc = 0.
+            APPEND i_cdposf.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    IF NOT i_cdposf[] IS INITIAL.
+      CALL FUNCTION 'Z_WF_MAIL_MOD_PED_FACTURADO'
+        EXPORTING
+          proceso = '10'
+          vbak    = l_vbak
+          cdhdr   = l_cdhdr
+          test    = test
+        TABLES
+          i_cdpos = i_cdposf.
+    ENDIF.
+*  ENDIF.
+
+  zcl_ap_temp=>set_st( clave = 'AVISO_MOP' subclave = l_subclave valor1 = l_vbak-erdat ).
+  zcl_ap_temp=>borrar_antiguos( 'AVISO_MOP' ).
+
+
+
+ENDFUNCTION.

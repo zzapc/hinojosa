@@ -1,0 +1,335 @@
+FUNCTION zpd_wc_as_quan_mismatch.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(IS_HEADER) LIKE  /COCKPIT/SHDR_IF STRUCTURE
+*"        /COCKPIT/SHDR_IF
+*"     REFERENCE(IC_PROCESS) TYPE  /COCKPIT/DPROCESS_TYPE
+*"     REFERENCE(IC_WEBCYCLE_ID) LIKE  /COCKPIT/SWC_WEBCYCLE-WC_ID
+*"  EXPORTING
+*"     REFERENCE(EB_START_WF) TYPE  BOOLE-BOOLE
+*"  TABLES
+*"      IT_ITEM STRUCTURE  /COCKPIT/SITEM_IF
+*"      IT_ACCOUNT STRUCTURE  /COCKPIT/SACCT_IF
+*"      IT_TAX STRUCTURE  /COCKPIT/STAX_IF
+*"      ET_MESSAGES STRUCTURE  BAPIRET2 OPTIONAL
+*"  EXCEPTIONS
+*"      ERROR_OCCURED
+*"----------------------------------------------------------------------
+  INCLUDE: /cockpit/constants.
+  DATA:
+    ls_po_header      LIKE bapiekkol,
+    lt_po_item        LIKE TABLE OF bapiekpo WITH HEADER LINE,
+    lt_history_totals LIKE TABLE OF bapiekbes WITH HEADER LINE,
+    lp_total_quantity LIKE bapiekbes-deliv_qty,
+    lc_po_item        LIKE bapiekpo-po_item,
+    lc_item_po_unit   LIKE /cockpit/titem-po_unit,
+    ls_po_item        LIKE LINE OF lt_po_item,
+    BEGIN OF ls_last_item,
+      po_number    LIKE /cockpit/titem-po_number,
+      po_item      LIKE /cockpit/titem-po_item,
+      ref_doc_year LIKE /cockpit/titem-ref_doc_year,
+      ref_doc      LIKE /cockpit/titem-ref_doc,
+      ref_doc_it   LIKE /cockpit/titem-ref_doc_it,
+    END OF ls_last_item,
+    ls_ref_new       LIKE ls_last_item,
+    lb_new_po        LIKE boole-boole,
+    lc_po_number     LIKE bapiekkol-po_number,
+    lt_item          LIKE TABLE OF /cockpit/titem WITH HEADER LINE,
+    lb_merged        LIKE boole-boole,
+    lc_netwr         LIKE ekpo-netwr,
+    ln_qty           LIKE ekpo-menge,
+    lt_rbselbest     LIKE TABLE OF rbselbest WITH HEADER LINE,
+    lt_rbsellifs     LIKE TABLE OF rbsellifs WITH HEADER LINE,
+    lt_drseg         TYPE mmcr_tdrseg,
+    ls_drseg         TYPE mmcr_drseg,
+    ls_ekpo          LIKE ekpo,
+    lt_ekbez         LIKE ekbez OCCURS 0 WITH HEADER LINE,
+    lt_ekbe          LIKE ekbe OCCURS 0 WITH HEADER LINE,
+    lt_ekbes         LIKE ekbes OCCURS 0 WITH HEADER LINE,
+    lt_ekbnk         LIKE ekbnk OCCURS 0 WITH HEADER LINE,
+    lt_ekbz          LIKE ekbz OCCURS 0 WITH HEADER LINE,
+    lp_open_quantity LIKE bapiekbes-deliv_qty,
+    lb_lebre         LIKE ekpo-webre,
+    lv_bsart         LIKE ekko-bsart.
+
+
+* Check only for invoices
+  CHECK: is_header-invoice_ind EQ con_true,
+         is_header-fi_mm_flg   EQ con_type_mm.
+
+IF is_header-status     EQ 01 OR
+    is_header-status     EQ 02.
+
+
+* Map tables
+  CALL FUNCTION '/COCKPIT/MAP_EXTERN_TO_INTERN'
+    TABLES
+      i_tab_item_if = it_item
+      e_tab_item    = lt_item.
+
+
+* Perform check
+  SORT lt_item BY po_number po_item.
+  LOOP AT lt_item.
+
+
+
+*   No check when subsequent credit / debit or planned delivery costs
+    IF lt_item-po_number     IS INITIAL  OR
+       lt_item-po_item       IS INITIAL  OR
+       lt_item-tbtkz         EQ con_true OR
+       NOT lt_item-cond_type IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+*   Get details of this purchase order
+    IF lc_po_number NE lt_item-po_number.
+      lc_po_number = lt_item-po_number.
+      lb_new_po    = con_true.
+      CLEAR ls_po_header.
+      CALL FUNCTION '/COCKPIT/BAPI_PO_GETDETAIL'
+        EXPORTING
+          purchaseorder          = lc_po_number
+          history                = con_true
+        IMPORTING
+          po_header              = ls_po_header
+        TABLES
+          po_items               = lt_po_item
+          po_item_history_totals = lt_history_totals[]
+*         return                 = lt_return
+          et_messages            = et_messages
+        EXCEPTIONS
+          error_or_abort         = 1
+          OTHERS                 = 2.
+      IF sy-subrc NE 0.
+        CONTINUE.
+      ENDIF.
+*     PO doesn't exists, but an error occured somewhere else before
+      IF ls_po_header-po_number IS INITIAL.
+        CLEAR: lc_po_number, lc_po_item.
+        CONTINUE.
+      ENDIF.
+    ELSE.
+      lb_new_po = con_false.
+    ENDIF.
+
+    READ TABLE lt_po_item WITH KEY po_item = lt_item-po_item.
+    IF sy-subrc <> 0.
+*     Start WF?
+      CONTINUE.
+    ENDIF.
+
+*   no check for invoice plans
+    CALL FUNCTION 'ME_EKPO_SINGLE_READ'
+      EXPORTING
+        pi_ebeln = lt_po_item-po_number
+        pi_ebelp = lt_po_item-po_item
+      IMPORTING
+        po_ekpo  = ls_ekpo
+      EXCEPTIONS
+        OTHERS   = 0.
+    CHECK ls_ekpo-fplnr IS INITIAL.
+
+*   for service PO item check Srv based IV
+    IF lt_po_item-item_cat EQ '9'.
+      PERFORM get_flag_lebre IN PROGRAM /cockpit/saplcheck
+                             USING lt_po_item
+                             CHANGING lb_lebre.
+    ENDIF.
+
+*   QTY check only if Srv-based IV is active and no GR-based IV
+    IF lb_lebre EQ con_true AND lt_po_item-gr_basediv IS INITIAL.
+
+      IF NOT lt_po_item-pckg_no IS INITIAL AND lb_lebre EQ con_true.
+        CLEAR: lc_netwr, ln_qty.
+
+        PERFORM get_service_price_qty IN PROGRAM /cockpit/saplcheck
+                                      TABLES
+                                        lt_item
+                                      USING
+                                        lt_item
+                                        lt_po_item
+                                      CHANGING
+                                        lc_netwr
+                                        ln_qty.
+
+        IF NOT is_header-lfsnr IS INITIAL.
+          lt_rbsellifs-lfsnr = is_header-lfsnr.
+          COLLECT lt_rbsellifs.
+        ENDIF.
+        IF NOT is_header-po_number IS INITIAL.
+          lt_rbselbest-ebeln = is_header-po_number.
+          COLLECT lt_rbselbest.
+        ENDIF.
+        LOOP AT lt_item.
+          IF NOT lt_item-lfsnr IS INITIAL.
+            lt_rbsellifs-lfsnr = lt_item-lfsnr.
+            COLLECT lt_rbsellifs.
+          ENDIF.
+          IF NOT lt_item-po_number IS INITIAL.
+            lt_rbselbest-ebeln = lt_item-po_number.
+            COLLECT lt_rbselbest.
+          ENDIF.
+        ENDLOOP.
+
+        CALL FUNCTION '/COCKPIT/MIRO_ITEMS_GET'
+          EXPORTING
+            ic_comp_code  = is_header-comp_code
+            id_pstng_date = is_header-pstng_date
+            ib_selkz      = con_true
+*           is_header     = ls_header
+          TABLES
+            it_rbselbest  = lt_rbselbest
+            it_rbsellifs  = lt_rbsellifs
+            et_drseg      = lt_drseg
+            et_messages   = et_messages
+          EXCEPTIONS
+            error_occured = 1
+            error_message = 2
+            OTHERS        = 3.
+
+        LOOP AT lt_drseg INTO ls_drseg WHERE packno = lt_item-packno
+                          AND  introw = lt_item-introw.
+
+          lp_open_quantity = ls_drseg-menge.
+
+        ENDLOOP.
+        IF sy-subrc NE 0.
+          lp_open_quantity = ln_qty.
+        ENDIF.
+
+        lp_total_quantity = lt_item-quantity.
+*     Quantity on invoice is less than should be
+        IF lp_open_quantity LT lp_total_quantity.
+* START WF!
+          eb_start_wf = con_true.
+          EXIT.
+        ENDIF.
+
+      ENDIF.
+
+      CONTINUE.
+    ENDIF.
+
+*   No quantity expected if limit or service PO without Srv.-based IV
+    CHECK lt_po_item-item_cat NE '1'.
+    CHECK NOT ( lt_po_item-item_cat EQ '9' AND
+                lb_lebre EQ con_false ).
+*   No goods receipts expected
+    IF lt_po_item-gr_ind IS INITIAL AND
+       lt_po_item-item_cat NE '9'.
+      CLEAR lc_po_item.
+*     No special messages
+      CONTINUE.
+    ENDIF.
+
+*   No GR Based IV
+    IF lt_po_item-gr_basediv IS INITIAL.
+      READ TABLE lt_history_totals WITH KEY po_item = lt_item-po_item.
+*     No history for this position > no material had been posted, error!
+      IF sy-subrc NE 0.
+*       Or START WF?
+        CONTINUE.
+      ENDIF.
+      READ TABLE lt_po_item WITH KEY po_item = lt_item-po_item.
+*     Unit of PO item doesn't match with Unit of invoice item
+      IF lt_item-po_unit NE lt_po_item-unit.
+*       Or START WF?
+*        eb_start_wf = con_true.
+*        EXIT.
+        CONTINUE.
+      ENDIF.
+*     Calculate invoice quantity - total of positions
+      lp_open_quantity = lt_history_totals-deliv_qty
+                         - lt_history_totals-iv_qty.
+
+      IF lc_po_item NE lt_item-po_item OR lb_new_po EQ con_true.
+        lp_total_quantity = lt_item-quantity.
+      ELSE.
+        lp_total_quantity = lp_total_quantity + lt_item-quantity.
+      ENDIF.
+*     Save last position
+      lc_po_item = lt_item-po_item.
+*     for returns item switch negativ value into positiv
+      IF lt_item-retpo EQ con_true.
+        lp_open_quantity = lp_open_quantity * -1.
+      ENDIF.
+*     Quantity on invoice is less than should be
+      IF lp_open_quantity LT lp_total_quantity.
+*       Or START WF?
+        CONTINUE.
+      ENDIF.
+
+*   GR Based IV
+    ELSE.
+*     No check without reference document number
+      CLEAR lc_po_item.
+      CHECK NOT lt_item-ref_doc IS INITIAL.
+      IF NOT ( ls_last_item-po_number EQ lt_item-po_number AND
+               ls_last_item-po_item   EQ lt_item-po_item ).
+        MOVE-CORRESPONDING lt_item TO ls_last_item .
+        REFRESH: lt_ekbe, lt_ekbes, lt_ekbez, lt_ekbnk, lt_ekbz.
+        CALL FUNCTION 'ME_READ_HISTORY'
+          EXPORTING
+            ebeln  = lt_item-po_number
+            ebelp  = lt_item-po_item
+            webre  = lt_po_item-gr_basediv
+          TABLES
+            xekbe  = lt_ekbe
+            xekbes = lt_ekbes
+            xekbez = lt_ekbez
+            xekbnk = lt_ekbnk
+            xekbz  = lt_ekbz.
+      ENDIF.
+      READ TABLE lt_ekbez WITH KEY lfgja = lt_item-ref_doc_year
+                                   lfbnr = lt_item-ref_doc
+                                   lfpos = lt_item-ref_doc_it.
+      CHECK sy-subrc EQ 0.
+*     Calculate invoice quantity - total of GR
+      lp_open_quantity = lt_ekbez-wemng - lt_ekbez-remng.
+
+      MOVE-CORRESPONDING lt_item TO ls_ref_new.
+      IF ls_ref_new NE ls_last_item.
+        ls_last_item      = ls_ref_new.
+        lp_total_quantity = lt_item-quantity.
+      ELSE.
+        lp_total_quantity = lp_total_quantity + lt_item-quantity.
+      ENDIF.
+*     for returns item switch negativ value into positiv
+      IF lt_item-retpo EQ con_true.
+        lp_open_quantity = lp_open_quantity * -1.
+      ENDIF.
+*     Quantity on invoice is less than should be
+
+
+      IF lp_open_quantity LT lp_total_quantity.
+*       START WF
+        eb_start_wf = con_true.
+        EXIT.
+      ENDIF.
+
+    ENDIF.
+
+
+  ENDLOOP.
+  LOOP AT lt_item.
+*********************************
+    IF sy-tabix = 1.
+      SELECT SINGLE bsart FROM ekko
+      INTO lv_bsart WHERE
+      ebeln EQ lt_item-po_number .
+
+      IF lv_bsart <> 'ZPE2'.
+      eb_start_wf = con_false.
+      ENDIF.
+      EXIT.
+
+    ENDIF.
+**********************************
+  ENDLOOP.
+
+  ELSE. "STATUS 1 o 2
+    eb_start_wf = con_false.
+  ENDIF.
+ENDFUNCTION.

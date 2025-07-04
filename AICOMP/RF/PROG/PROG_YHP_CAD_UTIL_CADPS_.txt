@@ -1,0 +1,216 @@
+*&---------------------------------------------------------------------*
+*& Report YCADIF_TEST_CADPS
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+report YHP_CAD_UTIL_CADPS.
+
+data: LF_CUOBJ type CUOBJ.
+data: LR_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC,
+      LR_MSG      type ref to /VCXI/CL_CKXM_MESSAGE,
+      LR_SVC      type ref to /VCXI/CL_VKSRA_SVC,
+      LR_XML      type ref to CL_XML_DOCUMENT.
+
+parameters: PA_VBELN type VBELN obligatory memory id AGN,
+            PA_POSNR type POSNR obligatory default 10,
+            PA_CADPS type ZVCXI_PXS_CADPS default 'RD'.
+
+parameters: PA_SVCUI type ABAP_BOOL       as checkbox default ABAP_FALSE,
+            PA_FSIDA type ZVCXI_XCI_FSIDA as checkbox default ABAP_FALSE,
+            PA_TESTR type ABAP_BOOL       as checkbox default ABAP_TRUE.
+
+start-of-selection.
+
+  try.
+***------------------------------------------------------------------------------------------------
+***   Create Business Object
+      LR_BOB_SDOC = new #( ).
+
+***   Load existing Sales Document
+      LR_BOB_SDOC->INIT_FROM_DB( IF_VBELN      = PA_VBELN
+                                 IS_ORDER_VIEW = value #( HEADER     = ABAP_TRUE
+                                                          ITEM       = ABAP_TRUE
+                                                          SDSCHEDULE = ABAP_TRUE
+                                                          BUSINESS   = ABAP_TRUE
+                                                          PARTNER    = ABAP_TRUE
+                                                          SDCOND     = ABAP_TRUE
+                                                          CONFIGURE  = ABAP_TRUE ) ).
+      check LINE_EXISTS( LR_BOB_SDOC->T_VBAP[ POSNR = PA_POSNR ] ).
+
+***   Lock Sales Document
+      LR_BOB_SDOC->ENQUEUE( ).
+
+***------------------------------------------------------------------------------------------------
+***   Run Configuration of Item
+      LF_CUOBJ = LR_BOB_SDOC->RUN_CONFIG( IF_POSNR = PA_POSNR ).
+
+***   Get SmartVC API Instance
+      data(LF_GVCIN) = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LF_CUOBJ ).
+      LR_SVC = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = LF_GVCIN ).
+
+***   Set CAD Project Status (Run Configuration afterwards to ensure Routing Supervisor gets executed)
+      perform SET_CADPS using LR_SVC.
+      LR_SVC->UPDATE_DC( ).
+
+***#################################### Temp Fix ##################################################
+*** As RUN_CONFIG doesn't update the VC values if inconsistent. As the second CVC profile run
+*** doesn't recognice a change on SVC, the counter is not increased by SVC and LO-VC doesn't
+*** recognice a change.
+***################################################################################################
+***   Get Configuration
+      data(LS_CFGS_REFINST) = value #( LR_BOB_SDOC->T_CFGS_REFINST[ POSEX = PA_POSNR ] optional ).
+      check LS_CFGS_REFINST is not initial.
+
+      loop at LR_BOB_SDOC->T_CFGS_VALUE assigning field-symbol(<S_CFGS_VALUE>)
+                                        where CONFIG_ID = LS_CFGS_REFINST-CONFIG_ID
+                                         and  INST_ID   = LS_CFGS_REFINST-INST_ID.
+        data(LS_VALUE) = /VCXI/CL_VKCR_GATEWAY=>GET_VALUE( IF_GVCIN = LF_GVCIN
+                                                           IF_ATNAM = conv #( <S_CFGS_VALUE>-CHARC ) ).
+        case LS_VALUE-ATFOR.
+          when 'CHAR'.
+            <S_CFGS_VALUE> = corresponding #( base ( <S_CFGS_VALUE> ) LS_VALUE mapping VALUE = ATWRT ).
+        endcase.
+      endloop.
+***################################################################################################
+
+      LF_CUOBJ = LR_BOB_SDOC->RUN_CONFIG( IF_POSNR = PA_POSNR ).
+
+
+***   Call SmartVC UI to check current Status
+      if PA_SVCUI eq ABAP_TRUE.
+        LR_SVC = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LF_CUOBJ ) ).
+        LR_SVC->START_UI( ).
+        LR_SVC->UPDATE_DC( ).
+        LF_CUOBJ = LR_BOB_SDOC->RUN_CONFIG( IF_POSNR = PA_POSNR ).
+      endif.
+
+***   Create Integration Data for SmartVC
+      perform BUILD_IDAT using LR_BOB_SDOC PA_POSNR.
+
+***------------------------------------------------------------------------------------------------
+***   Change Sales Document
+      LR_MSG = LR_BOB_SDOC->SAVE( IF_TESTRUN = PA_TESTR ).
+
+***   Release Lock of Sales Docuemnt
+      LR_BOB_SDOC->DEQUEUE( ).
+
+      if LR_MSG is bound.
+        LR_MSG->DISPLAY_MSG( ).
+      endif.
+
+***   Show SmartVC after Sales Document Save
+      if PA_SVCUI eq ABAP_TRUE.
+        LR_SVC = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LF_CUOBJ ) ).
+        LR_SVC->START_UI( ).
+      endif.
+
+    catch /VCXI/CX_CKX into data(LR_CX_CKX).
+      LR_CX_CKX->SHOW_MESSAGE( ).
+  endtry.
+
+
+
+
+*&---------------------------------------------------------------------*
+*& Form BUILD_IDAT
+*&---------------------------------------------------------------------*
+*& Build Integration Data
+*&---------------------------------------------------------------------*
+form BUILD_IDAT  using    IR_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC
+                          IF_POSNR type POSNR
+                  raising /VCXI/CX_CKX.
+
+  data: LR_SVC      type ref to /VCXI/CL_VKSRA_SVC,
+        LR_IDAT_SVC type ref to ZCL_VCXI_XCI_IDAT_SVC,
+        LR_CUELMNT  type ref to /VCXI/CL_VKSC_CUELMNT,
+        LR_SVCEL    type ref to /VCXI/CL_VKSRA_SVC_ELEMENT,
+        LR_OBJECT   type ref to /VCXI/IF_CKX_OBJECT.
+
+*** Get SmartVC API Instance
+  LR_SVC = /VCXI/CL_VKSRA_SVC=>GET_INSTANCE( IF_GVCIN = /VCXI/CL_VKCR_GATEWAY=>GET_GVCIN_BY_CUOBJ( IF_CUOBJ = LR_BOB_SDOC->T_VBAP[ POSNR = IF_POSNR ]-CUOBJ ) ).
+
+*** Build Integration Data Service
+  LR_IDAT_SVC = ZCL_VCXI_XCI_IDAT_SVC=>CREATE( IS_CMPRK = LR_SVC->S_CMPRK
+                                               IF_IEALI = 'X_IDATSPV' ).
+
+*** Get Integration Data Supervisor
+  LR_CUELMNT = ZCL_VCXI_XCI_IDAT_SVC=>FIND_CUELMNT( IR_CUPRFL = LR_IDAT_SVC->R_CUPRFL
+                                                    IF_IEALI  = LR_IDAT_SVC->F_IEALI ).
+
+*** Get Root Elements
+  loop at LR_SVC->GET_SVC_ELEMENTS( IR_SVC_ELEMENT_PARENT = value #( ) ) into LR_OBJECT.
+    LR_SVCEL ?= LR_OBJECT.
+    check LR_SVCEL->IS_INUSE( ) eq ABAP_TRUE.
+
+*** Filter to Supervised Root Elements
+    clear LR_OBJECT.
+    loop at LR_CUELMNT->/VCXI/IF_VKSC_CUELMNT_SPV~T_SPVRT into LR_OBJECT.
+      if LR_OBJECT->GET_ID( ) ne LR_SVCEL->/VCXI/IF_CKX_OBJECT~GET_ID( ).
+        clear LR_OBJECT.
+      else.
+        exit.
+      endif.
+    endloop.
+    check LR_OBJECT is bound.
+
+*** Fill by SmartVC Element
+    LR_IDAT_SVC->FILL_BY_SVCEL( IF_IPARE   = value #( )
+                                IF_CPARE   = value #( )
+                                IR_SVC     = LR_SVC
+                                IR_SVCEL   = LR_SVCEL
+                                IR_CUELMNT = cast #( LR_OBJECT ) ).
+  endloop.
+
+*** Save Integration Data if requested
+  if PA_FSIDA eq ABAP_TRUE.
+    LR_IDAT_SVC->/VCXI/IF_CKX_OBJECT_ACTION~HANDLE_ACTION( IF_FCODE = ZCL_VCXI_XCI_IDAT_SVC=>C_FCODE_SAVE ).
+    write: |Integration Data { LR_IDAT_SVC->/VCXI/IF_CKX_OBJECT~GET_GUID( ) } was saved.|.
+    commit work.
+  endif.
+
+*** Set Integradion Data Number to Buffer for later processing
+  call function 'ZVCXI_XCC_IDAT_SET_NIDAT'
+    exporting
+      IF_POSNR = IF_POSNR
+      IF_NIDAT = conv ZVCXI_XCI_NIDAT( LR_IDAT_SVC->/VCXI/IF_CKX_OBJECT~GET_GUID( ) ).
+
+endform.
+
+*&---------------------------------------------------------------------*
+*& Form SET_CADPS
+*&---------------------------------------------------------------------*
+*& Set CAD Project Status
+*&---------------------------------------------------------------------*
+form SET_CADPS  using   IR_SVC type ref to /VCXI/CL_VKSRA_SVC
+                raising /VCXI/CX_CKX.
+
+  data: LF_ANSWER type C.
+  data: LT_SVCEL      type /VCXI/CKX_TT_OBJECT,
+        LT_CADPS_NEXT type ZVCXI_PXS_TT_CADPS.
+  data: LR_EA_CADIF_PRJ type ref to ZCL_VCXI_PXSS_EA_CADIF_PRJ.
+
+
+*** Get CAD Interface - Project
+  LT_SVCEL = IR_SVC->GET_SVC_ELEMENTS( IF_ID = 'CADIF_PRJ' ).
+  check LT_SVCEL is not initial.
+
+  LR_EA_CADIF_PRJ ?= cast /VCXI/CL_VKSRA_SVC_ELEMENT( LT_SVCEL[ 1 ] )->GET_CLSEA( ).
+  check LR_EA_CADIF_PRJ is bound.
+
+*** Set Ready for Design Status
+  LR_EA_CADIF_PRJ->GET_CADPS( importing ET_CADPS_NEXT = LT_CADPS_NEXT ).
+  if not LINE_EXISTS( LT_CADPS_NEXT[ TABLE_LINE = PA_CADPS ] ).
+    call function 'POPUP_TO_CONFIRM'
+      exporting
+        TEXT_QUESTION         = 'Status not defined as next Status. Continue?'
+        DISPLAY_CANCEL_BUTTON = ''
+      importing
+        ANSWER                = LF_ANSWER.
+    if LF_ANSWER ne '1'.
+      /VCXI/CX_CKX=>RAISE_CKX_BY_STRING( IF_STRING   = 'Canceled by User' ).
+    endif.
+  endif.
+
+  LR_EA_CADIF_PRJ->SET_CADPS( IF_CADPS = PA_CADPS ).
+
+endform.

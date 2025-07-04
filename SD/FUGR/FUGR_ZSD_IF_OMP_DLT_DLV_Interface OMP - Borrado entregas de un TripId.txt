@@ -1,0 +1,146 @@
+FUNCTION zsd_if_omp_dlt_dlv.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(VP_TRIPID) TYPE  ZIF_OMP_TRIPID
+*"     REFERENCE(VP_DOCNUM) TYPE  EDI_DOCNUM
+*"  EXPORTING
+*"     REFERENCE(TP_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+  "
+  " Buscamos el transporte creado, para quitar las entregas a borrar.
+  "
+
+  SELECT SINGLE *
+    FROM zssd_if_omp_tp
+    INTO @DATA(tl_transporte)
+    WHERE tripid = @vp_tripid AND
+          borrado = ''.
+
+  "
+  " Buscamos las entregas asociadas al transporte OMP
+  "
+  SELECT *
+    FROM zssd_if_omp_tp_d
+    INTO TABLE @DATA(tl_entregas)
+    WHERE tripid = @vp_tripid AND
+          borrado = ''.
+
+  CHECK sy-subrc = 0.
+
+  DATA: wl_header_data    TYPE bapiobdlvhdrchg,
+        wl_header_control TYPE bapiobdlvhdrctrlchg,
+        vl_delivery       TYPE bapiobdlvhdrchg-deliv_numb,
+        tl_return         TYPE bapiret2_t,
+        wl_return         LIKE LINE OF tl_return,
+        vl_error          TYPE flag.
+
+  DATA: tl_itemdata	      TYPE TABLE OF	bapishipmentitem,
+        tl_itemdataaction	TYPE TABLE OF	bapishipmentitemaction.
+
+  DATA: wl_headerdata       TYPE bapishipmentheader,
+        wl_headerdataaction TYPE bapishipmentheaderaction.
+
+  LOOP AT tl_entregas ASSIGNING FIELD-SYMBOL(<fs_entrega>).
+    "
+    " Quitamos la entrega del transporte.
+    "
+
+    CLEAR tl_return.
+
+    CLEAR: wl_headerdata, wl_headerdataaction.
+    wl_headerdata-shipment_num = tl_transporte-tknum.
+    wl_headerdata-status_plan = ''.
+    wl_headerdataaction-shipment_num = wl_headerdata-shipment_num.
+    wl_headerdataaction-status_plan = 'D'.
+
+    CLEAR tl_itemdata.
+    APPEND INITIAL LINE TO tl_itemdata ASSIGNING FIELD-SYMBOL(<fs_itemdata>).
+    <fs_itemdata>-delivery = <fs_entrega>-vbeln.
+    <fs_itemdata>-itenerary = '0001'.
+
+    CLEAR tl_itemdataaction.
+    APPEND INITIAL LINE TO tl_itemdataaction ASSIGNING FIELD-SYMBOL(<fs_itemdataaction>).
+    <fs_itemdataaction>-delivery = 'D'.
+    <fs_itemdataaction>-itenerary = 'D'.
+
+    CALL FUNCTION 'BAPI_SHIPMENT_CHANGE'
+      EXPORTING
+        headerdata       = wl_headerdata
+        headerdataaction = wl_headerdataaction
+      TABLES
+        itemdata         = tl_itemdata
+        itemdataaction   = tl_itemdataaction
+        return           = tl_return.
+
+**    APPEND LINES OF tl_return TO tp_return.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+    "
+    " La BAPI BAPI_SHIPMENT_CHANGE bloquea el transporte y todas las entregas asociadas
+    " por eso hacemos un ROLLBACK después de un COMMIT, para que se desbloqueen el
+    " transporte y todas las entregas asociadas.
+    "
+    " Al hacerlo después de un COMMIT no se pierde ningún cambio porque cancela la
+    " última LUW que empieze tras el último COMMIT, por lo que no cancela nada
+    "
+    "
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+
+    "
+    " Borramos la entrega.
+    "
+
+    CLEAR tl_return.
+
+    wl_header_data-deliv_numb = <fs_entrega>-vbeln..
+
+    wl_header_control-deliv_numb = <fs_entrega>-vbeln.
+    wl_header_control-dlv_del = 'X'.
+
+    vl_delivery = <fs_entrega>-vbeln.
+
+    CALL FUNCTION 'BAPI_OUTB_DELIVERY_CHANGE'
+      EXPORTING
+        header_data    = wl_header_data
+        header_control = wl_header_control
+        delivery       = vl_delivery
+      TABLES
+        return         = tl_return.
+
+    CLEAR vl_error.
+    LOOP AT tl_return INTO wl_return WHERE type <> 'S' AND type <> 'I'.
+      vl_error = 'X'.
+
+      APPEND INITIAL LINE TO tp_return ASSIGNING FIELD-SYMBOL(<fs_return>).
+      MOVE-CORRESPONDING wl_return TO <fs_return>.
+    ENDLOOP.
+
+***    APPEND LINES OF tl_return TO tp_return.
+    IF vl_error IS INITIAL.
+
+      UPDATE zssd_if_omp_tp_d
+      SET borrado = 'X'
+          docnum_borrado = vp_docnum
+          usumod = sy-uname
+          aedat = sy-datum
+          aezet = sy-uzeit
+      WHERE tripid = <fs_entrega>-tripid AND
+          vbeln = <fs_entrega>-vbeln.
+
+
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    ENDIF.
+
+  ENDLOOP.
+
+
+
+ENDFUNCTION.

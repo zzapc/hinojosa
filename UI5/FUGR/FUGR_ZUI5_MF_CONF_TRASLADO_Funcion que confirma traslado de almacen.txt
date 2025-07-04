@@ -1,0 +1,455 @@
+FUNCTION zui5_mf_conf_traslado.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(DATOS_CONF_TRASLADO) TYPE  ZUI5_DATOS_CONFIRMAR
+*"  EXPORTING
+*"     VALUE(O_BAPI_RETURN) TYPE  BAPIRET2
+*"----------------------------------------------------------------------
+
+  DATA: lv_almacen_origen        TYPE lgort_d,
+        lv_almacen_destino       TYPE lgort_d,
+        lv_centro_eti            TYPE werks,
+        lv_almacen_eti           TYPE lgort_d,
+        lv_clase_eti(4)          TYPE c,
+        lv_flag_error_origen(1)  TYPE c,
+        lv_flag_error_destino(1) TYPE c,
+        lv_codigo_lote(30)       TYPE c,
+        lv_ubicacion             TYPE atwrt,
+        lv_cod_ubicacion         TYPE atinn,
+        lv_material              TYPE matnr,
+        lv_clase_material        TYPE mtart,
+        lv_class_type            LIKE bapi1003_key-classnum,
+        lv_object_key            LIKE bapi1003_key-object,
+        lv_objeto(10)            TYPE c,
+        lv_objeto_aux(20)        TYPE c,
+        lv_tipo_material(1)      TYPE c,
+        lv_lote                  TYPE charg_d.
+
+  DATA: lt_goodsmvt_item      TYPE TABLE OF bapi2017_gm_item_create,
+        ls_goodsmvt_item      TYPE bapi2017_gm_item_create,
+        ls_goodsmvt_header    TYPE bapi2017_gm_head_01,
+        ls_goodsmvt_code      TYPE bapi2017_gm_code,
+        ls_allocvaluescharnew TYPE bapi1003_alloc_values_char,
+        lt_allocvaluescharnew TYPE TABLE OF bapi1003_alloc_values_char,
+        lt_allocvaluesnumnew  TYPE TABLE OF bapi1003_alloc_values_num,
+        lt_allocvaluescurrnew TYPE TABLE OF bapi1003_alloc_values_curr,
+        lt_return             TYPE TABLE OF bapiret2,
+        ls_return             TYPE bapiret2.
+
+*Ajustamos la ubicacion a la nomenclatura usada en SAP
+  SPLIT datos_conf_traslado-ubicacion AT '-' INTO lv_centro_eti lv_almacen_eti lv_clase_eti.
+  CLEAR: datos_conf_traslado-ubicacion.
+  CONCATENATE lv_centro_eti lv_almacen_eti lv_clase_eti INTO datos_conf_traslado-ubicacion SEPARATED BY '/'.
+
+*Comprobamos el tipo de etiqueta que se desea trasladar
+  CALL FUNCTION 'ZUI5_CHECK_TIPO'
+    EXPORTING
+      etiqueta       = datos_conf_traslado-etiqueta
+    IMPORTING
+      tipo_mercancia = lv_tipo_material
+      tipo_material  = lv_clase_material.
+
+*Comprobamos que almacen origen y destino existen
+  SELECT SINGLE lgort
+    INTO lv_almacen_origen
+    FROM t001l
+    WHERE werks = '4000' AND lgort = datos_conf_traslado-almacen.
+
+  IF sy-subrc <> 0.
+    lv_flag_error_origen = 'X'.
+  ENDIF.
+
+  SELECT SINGLE lgort
+  INTO lv_almacen_origen
+  FROM t001l
+  WHERE werks = '4000' AND lgort = datos_conf_traslado-almacen_dest.
+  IF sy-subrc <> 0.
+    lv_flag_error_destino = 'X'.
+  ENDIF.
+
+  IF lv_flag_error_origen = 'X'.
+
+*Si no existe el almacen origen mostramos un error
+    o_bapi_return-type = 'S'.
+    o_bapi_return-id = 'Z_WM'.
+    o_bapi_return-number = '003'.
+
+    CALL FUNCTION 'BAPI_MESSAGE_GETDETAIL'
+      EXPORTING
+        id         = o_bapi_return-id
+        number     = o_bapi_return-number
+        language   = sy-langu
+        textformat = 'ASC'
+      IMPORTING
+        message    = o_bapi_return-message.
+
+  ELSEIF lv_flag_error_destino = 'X'.
+
+*Si no existe el almacen destino mostramos un error
+    o_bapi_return-type = 'S'.
+    o_bapi_return-id = 'Z_WM'.
+    o_bapi_return-number = '004'.
+
+    CALL FUNCTION 'BAPI_MESSAGE_GETDETAIL'
+      EXPORTING
+        id         = o_bapi_return-id
+        number     = o_bapi_return-number
+        language   = sy-langu
+        textformat = 'ASC'
+      IMPORTING
+        message    = o_bapi_return-message.
+
+  ELSE.
+*Recuperamos el codigo de la ubicacion
+    SELECT SINGLE atinn
+      INTO lv_cod_ubicacion
+      FROM cabn
+      WHERE atnam = 'Z_UBICACION'.
+
+*Comprobamos que existe la ubicacion introducida
+    SELECT SINGLE atwrt
+    INTO lv_ubicacion
+    FROM cawn
+    WHERE atinn = lv_cod_ubicacion AND atwrt = datos_conf_traslado-ubicacion.
+    IF sy-subrc <> 0 AND datos_conf_traslado-almacen_dest = '1400' AND ( lv_clase_material = 'ZPMP' OR lv_clase_material = 'ZPLP').
+*Si no existe la ubicacion introducida mostraremos un error
+      o_bapi_return-type = 'S'.
+      o_bapi_return-id = 'Z_WM'.
+      o_bapi_return-number = '005'.
+
+      CALL FUNCTION 'BAPI_MESSAGE_GETDETAIL'
+        EXPORTING
+          id         = o_bapi_return-id
+          number     = o_bapi_return-number
+          language   = sy-langu
+          textformat = 'ASC'
+        IMPORTING
+          message    = o_bapi_return-message.
+      EXIT.
+    ENDIF.
+
+    SPLIT datos_conf_traslado-etiqueta AT ' ' INTO lv_material lv_objeto_aux.
+    CONDENSE lv_objeto_aux NO-GAPS.
+    lv_objeto = lv_objeto_aux(10).
+
+*Si la mercancia a trasladar es un lote o un material
+    IF lv_tipo_material = 'B' OR lv_tipo_material = 'C'.
+
+      IF lv_tipo_material = 'B'.
+        ls_goodsmvt_item-batch = lv_objeto.
+        ls_goodsmvt_item-move_batch = lv_objeto.
+      ENDIF.
+
+      CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+        EXPORTING
+          input  = lv_material
+        IMPORTING
+          output = lv_material.
+
+*Preparamos los datos de la mercancia a trasladar
+      IF datos_conf_traslado-almacen <> datos_conf_traslado-almacen_dest.
+        ls_goodsmvt_header-pstng_date = sy-datum.
+        ls_goodsmvt_header-doc_date = sy-datum.
+
+        ls_goodsmvt_code-gm_code = '04'.
+
+        ls_goodsmvt_item-material = lv_material.
+        ls_goodsmvt_item-plant = '4000'.
+        ls_goodsmvt_item-stge_loc = datos_conf_traslado-almacen.
+        ls_goodsmvt_item-move_type = '311'.
+        ls_goodsmvt_item-entry_qnt = datos_conf_traslado-cantidad.
+        ls_goodsmvt_item-move_stloc = datos_conf_traslado-almacen_dest.
+        APPEND ls_goodsmvt_item TO lt_goodsmvt_item.
+
+*Llamamos a la BAPI que genera el movimiento de material/lote
+        CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+          EXPORTING
+            goodsmvt_header = ls_goodsmvt_header
+            goodsmvt_code   = ls_goodsmvt_code
+*       IMPORTING
+*           GOODSMVT_HEADRET              =
+*           MATERIALDOCUMENT              =
+*           MATDOCUMENTYEAR =
+          TABLES
+            goodsmvt_item   = lt_goodsmvt_item
+            return          = lt_return.
+
+*Comprobamos si ha ocurrido algun error al realizar el traslado
+        READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+        IF sy-subrc = 0.
+          o_bapi_return-type = 'S'.
+          o_bapi_return-id = 'Z_WM'.
+          o_bapi_return-message = ls_return-message.
+
+          ROLLBACK WORK.
+          EXIT.
+        ENDIF.
+
+*Confirmamos el traslado
+        COMMIT WORK AND WAIT.
+
+      ENDIF.
+
+      IF lv_tipo_material = 'B'.
+*Si el almacen destino no es el 1400, limpiamos el campo ubicacion.
+        IF datos_conf_traslado-almacen_dest <> '1400'.
+          lv_ubicacion = ''.
+        ENDIF.
+
+*Recuperamos el tipo de material
+        SELECT SINGLE mtart
+          INTO lv_clase_material
+          FROM mara
+          WHERE matnr = lv_material.
+
+*Se realiza el cambio de ubicacion solo para los lotes con material tipo ZPMP Y ZPLP.
+        IF lv_clase_material = 'ZPMP' OR lv_clase_material = 'ZPLP'.
+
+          lv_object_key = lv_codigo_lote.
+
+*Preparamos los datos de entrada para la bapi encargada de modificar la ubicacion del lote
+          CONCATENATE lv_material lv_objeto INTO lv_object_key.
+          CONCATENATE 'Z_' lv_clase_material INTO lv_class_type.
+
+
+          CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+            EXPORTING
+              objectkey       = lv_object_key
+              objecttable     = 'MCH1'
+              classnum        = lv_class_type
+              classtype       = '023'
+              keydate         = sy-datum
+*             LANGUAGE        = SY-LANGU
+*         IMPORTING
+*             STATUS          =
+*             STANDARDCLASS   =
+            TABLES
+              allocvaluesnum  = lt_allocvaluesnumnew
+              allocvalueschar = lt_allocvaluescharnew
+              allocvaluescurr = lt_allocvaluescurrnew
+              return          = lt_return.
+
+          CLEAR: lt_return.
+
+          READ TABLE lt_allocvaluescharnew INTO ls_allocvaluescharnew WITH KEY charact = 'Z_UBICACION'.
+          IF sy-subrc = 0.
+            ls_allocvaluescharnew-value_neutral = lv_ubicacion.
+            ls_allocvaluescharnew-value_char = lv_ubicacion.
+            MODIFY lt_allocvaluescharnew FROM ls_allocvaluescharnew INDEX sy-tabix.
+          ELSE.
+            ls_allocvaluescharnew-value_neutral = lv_ubicacion.
+            ls_allocvaluescharnew-charact = 'Z_UBICACION'.
+            APPEND ls_allocvaluescharnew TO lt_allocvaluescharnew.
+          ENDIF.
+
+*Llamamos a la bapi encargada de modificar la ubicacion del lote
+          CALL FUNCTION 'BAPI_OBJCL_CHANGE'
+            EXPORTING
+              objectkey          = lv_object_key
+              objecttable        = 'MCH1'
+              classnum           = lv_class_type
+              classtype          = '023'
+              keydate            = sy-datum
+              status             = '1'
+*         IMPORTING
+*             CLASSIF_STATUS     =
+            TABLES
+              allocvaluescharnew = lt_allocvaluescharnew
+              allocvaluescurrnew = lt_allocvaluescurrnew
+              allocvaluesnumnew  = lt_allocvaluesnumnew
+              return             = lt_return.
+
+*Comprobamos si ha ocurrido algun error al modificar la ubicacion
+          READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+          IF sy-subrc = 0.
+            o_bapi_return-type = 'S'.
+            o_bapi_return-id = 'Z_WM'.
+            o_bapi_return-message = ls_return-message.
+            ROLLBACK WORK.
+            EXIT.
+          ENDIF.
+
+*Confirmamos el cambio de ubicacion de la mercancia
+          COMMIT WORK AND WAIT.
+        ENDIF.
+      ENDIF.
+    ELSE.
+
+      DATA :  lv_posted       TYPE sysubrc,
+              ls_mess         TYPE huitem_messages,
+              lt_mess         TYPE huitem_messages_t WITH HEADER LINE,
+              ls_emkpf        TYPE emkpf,
+              lt_move_to      TYPE hum_data_move_to_t,
+              lt_exidv        TYPE hum_exidv_t WITH HEADER LINE,
+              lv_exidv        TYPE exidv,
+              ls_move_to      TYPE hum_data_move_to,
+              ls_hu_items     TYPE hum_humseg,
+              lv_venum        TYPE vekp-venum,
+              gv_temp_message TYPE string.
+
+      DATA : lt_vepo TYPE TABLE OF vepo WITH HEADER LINE,
+             ls_vepo TYPE vepo.
+
+      lv_exidv = lv_objeto.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = lv_exidv
+        IMPORTING
+          output = lv_exidv.
+
+      SELECT SINGLE venum
+        INTO lv_venum
+        FROM vekp
+        WHERE exidv = lv_exidv.
+
+      SELECT * FROM vepo INTO TABLE lt_vepo
+        WHERE venum = lv_venum.
+
+      lt_exidv-exidv = lv_exidv.
+      APPEND lt_exidv.
+
+      LOOP AT lt_vepo.
+
+        CLEAR: ls_hu_items, ls_move_to.
+*** Move
+        ls_move_to-huwbevent = '0006'. " Process Indicator
+        ls_move_to-matnr     = lt_vepo-matnr. " Material Number
+        ls_move_to-lgort     = datos_conf_traslado-almacen_dest. "
+        ls_move_to-charg = lt_vepo-charg.
+        ls_move_to-werks = '4000'.
+        ls_move_to-grund     = ''. " Fixed Reason
+        ls_move_to-bwart     = '311'. " Movement Type
+
+        ls_hu_items-venum = lt_vepo-venum.
+        ls_hu_items-vepos = lt_vepo-vepos.
+
+        APPEND ls_hu_items TO ls_move_to-hu_items.
+        APPEND ls_move_to TO lt_move_to.
+
+      ENDLOOP.
+
+*** Refresh
+      CALL FUNCTION 'HU_PACKING_REFRESH'.
+      PERFORM refresh_change_stock(saplv51e).
+
+*Realizamos el movimiento de la HU
+      CALL FUNCTION 'HU_CREATE_GOODS_MOVEMENT'
+        EXPORTING
+*         IF_EVENT       =
+          if_simulate    = ' '
+          if_commit      = ' '
+*         IF_TCODE       = 'HUMO'
+*         IS_IMKPF       =
+          it_move_to     = lt_move_to[]
+          it_external_id = lt_exidv[]
+        IMPORTING
+          ef_posted      = lv_posted
+          es_message     = ls_mess
+          et_messages    = lt_mess[]
+          es_emkpf       = ls_emkpf.
+
+      IF NOT lv_posted = 1.
+        ROLLBACK WORK.
+
+        CALL FUNCTION 'HU_PACKING_REFRESH'.
+        CALL FUNCTION 'SERIAL_INTTAB_REFRESH'.
+
+      ELSE.
+*Confirmamos el traslado
+        COMMIT WORK AND WAIT.
+
+        LOOP AT lt_vepo INTO ls_vepo.
+
+*Si el almacen destino no es el 1400, limpiamos el campo ubicacion.
+          IF datos_conf_traslado-almacen_dest <> '1400'.
+            lv_ubicacion = ''.
+          ENDIF.
+
+          CLEAR: lt_return, lt_allocvaluescharnew.
+*Recuperamos el tipo de material
+          SELECT SINGLE mtart
+            INTO lv_clase_material
+            FROM mara
+            WHERE matnr = ls_vepo-matnr.
+
+          IF lv_clase_material = 'ZPMP' OR lv_clase_material = 'ZPLP'.
+
+            lv_object_key = ls_vepo-charg.
+
+*Preparamos los datos de entrada para la bapi encargada de modificar la ubicacion del lote
+            CONCATENATE ls_vepo-matnr ls_vepo-charg INTO lv_object_key.
+            CONCATENATE 'Z_' lv_clase_material INTO lv_class_type.
+
+            CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+              EXPORTING
+                objectkey       = lv_object_key
+                objecttable     = 'MCH1'
+                classnum        = lv_class_type
+                classtype       = '023'
+                keydate         = sy-datum
+*               LANGUAGE        = SY-LANGU
+*         IMPORTING
+*               STATUS          =
+*               STANDARDCLASS   =
+              TABLES
+                allocvaluesnum  = lt_allocvaluesnumnew
+                allocvalueschar = lt_allocvaluescharnew
+                allocvaluescurr = lt_allocvaluescurrnew
+                return          = lt_return.
+
+            CLEAR: lt_return.
+
+            READ TABLE lt_allocvaluescharnew INTO ls_allocvaluescharnew WITH KEY charact = 'Z_UBICACION'.
+            IF sy-subrc = 0.
+              ls_allocvaluescharnew-value_neutral = lv_ubicacion.
+              MODIFY lt_allocvaluescharnew FROM ls_allocvaluescharnew.
+            ELSE.
+              ls_allocvaluescharnew-value_neutral = lv_ubicacion.
+              ls_allocvaluescharnew-charact = 'Z_UBICACION'.
+              APPEND ls_allocvaluescharnew TO lt_allocvaluescharnew.
+            ENDIF.
+
+*Llamamos a la bapi encargada de modificar la ubicacion del lote
+            CALL FUNCTION 'BAPI_OBJCL_CHANGE'
+              EXPORTING
+                objectkey          = lv_object_key
+                objecttable        = 'MCH1'
+                classnum           = lv_class_type
+                classtype          = '023'
+                keydate            = sy-datum
+                status             = '1'
+*         IMPORTING
+*               CLASSIF_STATUS     =
+              TABLES
+                allocvaluescharnew = lt_allocvaluescharnew
+                allocvaluescurrnew = lt_allocvaluescurrnew
+                allocvaluesnumnew  = lt_allocvaluesnumnew
+                return             = lt_return.
+
+*Comprobamos si ha ocurrido algun error al modificar la ubicacion
+            READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+            IF sy-subrc = 0.
+              o_bapi_return-type = 'S'.
+              o_bapi_return-id = 'Z_WM'.
+              o_bapi_return-message = ls_return-message.
+
+              ROLLBACK WORK.
+              EXIT.
+            ENDIF.
+          ENDIF.
+
+          COMMIT WORK AND WAIT.
+
+        ENDLOOP.
+
+      ENDIF.
+
+    ENDIF.
+
+  ENDIF.
+
+
+
+ENDFUNCTION.

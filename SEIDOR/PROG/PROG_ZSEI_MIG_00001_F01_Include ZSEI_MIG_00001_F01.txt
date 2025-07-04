@@ -1,0 +1,560 @@
+*---------------------------------------------------------------------*
+*  Include           ZSEI_MIG_00001_F01
+*---------------------------------------------------------------------*
+
+*---------------------------------------------------------------------*
+* FORM get_data
+*---------------------------------------------------------------------*
+FORM get_data.
+
+  REFRESH: lt_alv.
+
+* Seleccion por cliente
+  SELECT *
+    INTO TABLE tl_kna1
+    FROM kna1
+   WHERE kunnr IN skunnr
+     AND lifnr IN slifnr.
+
+  IF tl_kna1[] IS NOT INITIAL.
+    SELECT *
+      INTO TABLE tl_knbk
+      FROM knbk
+       FOR ALL ENTRIES IN tl_kna1
+     WHERE kunnr = tl_kna1-kunnr.
+  ENDIF.
+
+  SELECT *
+    INTO TABLE tl_lfa1
+    FROM lfa1
+   WHERE lifnr IN slifnr
+     AND kunnr IN skunnr.
+
+  IF tl_lfa1[] IS NOT INITIAL.
+    SELECT *
+      INTO TABLE tl_knbk_prov
+      FROM lfbk
+       FOR ALL ENTRIES IN tl_lfa1
+     WHERE lifnr = tl_lfa1-lifnr.
+  ENDIF.
+
+* Rellenamos la tabla del ALV
+  SORT tl_lfa1 BY lifnr.
+
+  LOOP AT tl_kna1 INTO wa_kna1.
+
+    CLEAR: ls_alv.
+    MOVE-CORRESPONDING wa_kna1 TO ls_alv.
+
+*   Recogemos  cuentas clientes
+    LOOP AT tl_knbk INTO wa_knbk WHERE kunnr = wa_kna1-kunnr.
+
+      CLEAR: ls_alv-bvtyp, ls_alv-banks,ls_alv-bankl,ls_alv-bankn,ls_alv-bkont.
+
+      MOVE-CORRESPONDING wa_knbk TO ls_alv.
+      ls_alv-tipo = 'D'.
+      APPEND ls_alv TO lt_alv.
+
+    ENDLOOP.
+
+*   Recogemos los clientes/proveedor
+    READ TABLE tl_lfa1 INTO wa_lfa1 WITH KEY lifnr = wa_kna1-lifnr BINARY SEARCH.
+    IF sy-subrc EQ 0.
+
+*     Mostramos datos proveedor
+      CLEAR: ls_alv.
+      MOVE-CORRESPONDING wa_lfa1 TO ls_alv.
+*     Recupermaos cuentas proveedor
+      LOOP AT tl_knbk_prov INTO wa_knbk_prov WHERE lifnr = wa_kna1-lifnr.
+        CLEAR: ls_alv-bvtyp, ls_alv-banks, ls_alv-bankl, ls_alv-bankn, ls_alv-bkont.
+        ls_alv-tipo = 'K'.
+        MOVE-CORRESPONDING wa_knbk_prov TO ls_alv.
+        APPEND ls_alv TO lt_alv.
+*       Eliminamos de la tabla de proveedores porque ya esta metido
+        DELETE tl_lfa1 WHERE lifnr = wa_lfa1-lifnr.
+      ENDLOOP.
+    ENDIF.
+
+  ENDLOOP.
+
+* Rellenamos la tabla del ALV
+  LOOP AT tl_lfa1 INTO wa_lfa1.
+
+    CLEAR: ls_alv.
+    MOVE-CORRESPONDING wa_lfa1 TO ls_alv.
+
+    LOOP AT tl_knbk_prov INTO wa_knbk_prov WHERE lifnr = wa_lfa1-lifnr.
+      CLEAR: ls_alv-bvtyp, ls_alv-banks,ls_alv-bankl,ls_alv-bankn,ls_alv-bkont.
+      MOVE-CORRESPONDING wa_knbk_prov TO ls_alv.
+      ls_alv-tipo = 'K'.
+      APPEND ls_alv TO lt_alv.
+    ENDLOOP.
+
+  ENDLOOP.
+
+  SORT lt_alv BY kunnr lifnr tipo bankl.
+
+  IF p_fondo IS NOT INITIAL.
+
+*   Comprobación S/4HANA
+    PERFORM sapcore_info CHANGING lv_noseguir.
+
+    IF lv_noseguir IS INITIAL.
+
+      PERFORM generar_id.
+      PERFORM actualizar_registros.
+
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM user_command
+*---------------------------------------------------------------------*
+FORM user_command USING l_ucomm     LIKE sy-ucomm
+                        l_selfield  TYPE slis_selfield.
+
+  DATA:
+    vl_tabix   TYPE sy-tabix,
+    vl_gen(3),
+    kdy_val(8) VALUE '/130',
+    wg_grid    TYPE REF TO cl_gui_alv_grid.
+
+  l_selfield-refresh    = 'X'.
+  l_selfield-col_stable = 'X'.
+  l_selfield-row_stable = 'X'.
+
+  vl_date = sy-datum.
+  vl_time = sy-uzeit.
+
+  IF wg_grid IS INITIAL.
+    CALL FUNCTION 'GET_GLOBALS_FROM_SLVC_FULLSCR'
+      IMPORTING
+        e_grid = wg_grid.
+  ENDIF.
+
+  IF NOT wg_grid IS INITIAL.
+    CALL METHOD wg_grid->check_changed_data.
+  ENDIF.
+
+  CASE l_ucomm.
+    WHEN '&IC1'.
+      IF l_selfield-fieldname = 'KUNNR'.
+
+        READ TABLE lt_alv INTO ls_alv INDEX l_selfield-tabindex.
+        IF sy-subrc EQ 0.
+          IF ls_alv-kunnr IS NOT INITIAL.
+            SET PARAMETER ID 'KUN' FIELD ls_alv-kunnr.
+            CALL TRANSACTION 'XD03' AND SKIP FIRST SCREEN.
+          ENDIF.
+        ENDIF.
+
+      ELSEIF l_selfield-fieldname = 'LIFNR'.
+
+        READ TABLE lt_alv INTO ls_alv INDEX l_selfield-tabindex.
+        IF sy-subrc EQ 0.
+          IF ls_alv-lifnr IS NOT INITIAL.
+            SET PARAMETER ID 'LIF' FIELD ls_alv-lifnr.
+            SET PARAMETER ID 'KDY' FIELD kdy_val.
+            CALL TRANSACTION 'XK03' AND SKIP FIRST SCREEN.
+          ENDIF.
+        ENDIF.
+
+      ENDIF.
+
+    WHEN '&GEN'.
+      PERFORM sapcore_info CHANGING lv_noseguir.
+      PERFORM generar_id.
+
+    WHEN '&SAV'.
+
+      PERFORM sapcore_info CHANGING lv_noseguir.
+      PERFORM popup_to_confirm_step.
+
+      IF lv_ans EQ 'J'.
+*       Procesar cliente
+        PERFORM actualizar_registros.
+        PERFORM popup_to_display_text.
+      ENDIF.
+
+  ENDCASE.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM alv_layout
+*---------------------------------------------------------------------*
+FORM alv_layout.
+
+  gs_layout-zebra      = 'X'.
+  gs_layout-cwidth_opt = 'X'.
+  gs_layout-sel_mode   = 'A'.
+  gs_layout-box_fname  = 'SEL'.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM create_fieldcatalog
+*---------------------------------------------------------------------*
+FORM create_fieldcatalog USING  pt_table     TYPE ANY TABLE
+                                pi_tabname   TYPE slis_tabname
+                      CHANGING  pt_fieldcat  TYPE lvc_t_fcat.
+
+  DATA:
+    lr_tabdescr TYPE REF TO cl_abap_structdescr,
+    lr_data     TYPE REF TO data,
+    lt_dfies    TYPE ddfields,
+    ls_dfies    TYPE dfies,
+    ls_fieldcat TYPE lvc_s_fcat.
+
+  CLEAR pt_fieldcat.
+
+  CREATE DATA lr_data LIKE LINE OF pt_table.
+
+  lr_tabdescr ?= cl_abap_structdescr=>describe_by_data_ref( lr_data ).
+
+  lt_dfies = cl_salv_data_descr=>read_structdescr( lr_tabdescr ).
+
+  LOOP AT lt_dfies INTO    ls_dfies.
+
+    IF ls_dfies-fieldname = 'SEL'.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR ls_fieldcat.
+
+    MOVE-CORRESPONDING ls_dfies TO ls_fieldcat.
+
+    CASE ls_dfies-fieldname.
+      WHEN 'STATUS_GLOBAL'.
+        CONTINUE.
+      WHEN 'TIPO'.
+        ls_fieldcat-seltext    = TEXT-000. "'Tipo Dato'.
+        ls_fieldcat-scrtext_s  = ls_fieldcat-scrtext_m  = ls_fieldcat-scrtext_l  = TEXT-000. "'Tipo Dato'.
+      WHEN 'BVTYP_NEW'.
+        ls_fieldcat-coltext    = ls_fieldcat-seltext    = TEXT-004. "Calculado
+        ls_fieldcat-scrtext_s  = ls_fieldcat-scrtext_m  = ls_fieldcat-scrtext_l  = TEXT-004. "'Calculado'.
+        ls_fieldcat-edit       = 'X'.
+      WHEN OTHERS.
+        ls_fieldcat-seltext = ls_dfies-scrtext_l.
+
+    ENDCASE.
+
+    ls_fieldcat-tabname = pi_tabname.
+
+    APPEND ls_fieldcat TO pt_fieldcat.
+
+  ENDLOOP.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM alv_display
+*---------------------------------------------------------------------*
+FORM alv_display.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY_LVC'
+    EXPORTING
+      i_callback_program       = g_repid
+      i_callback_pf_status_set = 'STATUS_SET'
+      i_callback_user_command  = 'USER_COMMAND'
+      is_layout_lvc            = gs_layout
+      it_fieldcat_lvc          = gt_fieldcat
+      i_default                = 'X'
+      i_save                   = 'A'
+      is_variant               = gx_variant
+    TABLES
+      t_outtab                 = lt_alv[]
+    EXCEPTIONS
+      program_error            = 1
+      OTHERS                   = 2.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*      Form  STATUS_SET
+*---------------------------------------------------------------------*
+FORM status_set USING rt_extab TYPE slis_t_extab.
+
+  SET PF-STATUS 'ZSTANDARD'.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*      Form  f4_for_variant
+*---------------------------------------------------------------------*
+FORM f4_for_variant.
+
+  g_variant-report = sy-repid.
+
+  CALL FUNCTION 'LVC_VARIANT_F4'
+    EXPORTING
+      is_variant    = g_variant
+      i_save        = g_save
+    IMPORTING
+      e_exit        = g_exit
+      es_variant    = gx_variant
+    EXCEPTIONS
+      not_found     = 1
+      program_error = 2
+      OTHERS        = 3.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSE.
+    IF g_exit = space.
+      p_vari = gx_variant-variant.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+
+FORM pai_of_selection_screen.
+
+  IF p_string CA '0123456789'.
+
+*  'El string no puede contener números'
+    MESSAGE TEXT-900 TYPE 'E'.
+
+  ENDIF.
+
+  string = p_string.
+  lv_length = strlen( string ).
+
+  IF lv_length > 1.
+
+*  'El string debe contener únicamente dos carácteres'
+    MESSAGE TEXT-901 TYPE 'E'.
+
+  ELSEIF lv_length < 1.
+
+*   'El string debe contener únicamente dos carácteres'
+    MESSAGE TEXT-902 TYPE 'E'.
+
+  ENDIF.
+
+  IF NOT p_vari IS INITIAL.
+
+    gx_variant-report  = sy-repid.
+    gx_variant-variant = p_vari.
+
+    CALL FUNCTION 'LVC_VARIANT_EXISTENCE_CHECK'
+      EXPORTING
+        i_save     = g_save
+      CHANGING
+        cs_variant = gx_variant.
+
+    g_variant = gx_variant.
+
+  ELSE.
+
+    PERFORM variant_init.
+
+  ENDIF.
+
+ENDFORM.
+
+FORM variant_init.
+
+  CLEAR gx_variant.
+
+  g_repid           = sy-repid.
+  g_save            = 'A'.
+  gx_variant-report = g_repid.
+
+  CALL FUNCTION 'LVC_VARIANT_DEFAULT_GET'
+    EXPORTING
+      i_save        = g_save
+    CHANGING
+      cs_variant    = gx_variant
+    EXCEPTIONS
+      wrong_input   = 1
+      not_found     = 2
+      program_error = 3
+      OTHERS        = 4.
+  IF sy-subrc = 0.
+    p_vari = gx_variant-variant.
+  ENDIF.
+
+ENDFORM.
+
+FORM popup_to_confirm_step .
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM_STEP'
+    EXPORTING
+      defaultoption  = 'N'
+      textline1      = TEXT-903 "'Está a punto de realizar una ejecución de actualización.'
+      textline2      = TEXT-904 "'¿Desea continuar?'
+      titel          = TEXT-905 "'Advertencia'
+      start_column   = 25
+      start_row      = 6
+      cancel_display = ' '
+    IMPORTING
+      answer         = lv_ans.
+
+ENDFORM.
+
+FORM popup_to_display_text.
+
+  CALL FUNCTION 'POPUP_TO_DISPLAY_TEXT'
+    EXPORTING
+      titel        = TEXT-906 "'Información'
+      textline1    = TEXT-907 "'Ejecución de actualización completada.'
+      textline2    = ' '
+      start_column = 25
+      start_row    = 6.
+
+ENDFORM.
+
+FORM sapcore_info CHANGING p_noseguir.
+
+  CLEAR: p_noseguir.
+  DATA: tl_cvers TYPE TABLE OF cvers.
+
+  SELECT *
+    INTO TABLE tl_cvers
+    FROM cvers
+   WHERE component EQ 'S4CORE'.
+  IF sy-subrc EQ 0.
+    p_noseguir  = 'X'.
+    MESSAGE TEXT-908 TYPE 'E'.
+  ENDIF.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Form ACTUALIZAR_REGISTROS
+*---------------------------------------------------------------------*
+FORM actualizar_registros.
+
+* Actualizar iban cliente
+  LOOP AT lt_alv ASSIGNING <fs_alv> WHERE tipo = 'D' AND bvtyp_new IS NOT INITIAL.
+
+    UPDATE knbk SET bvtyp = <fs_alv>-bvtyp_new WHERE kunnr = <fs_alv>-kunnr
+                                                 AND banks = <fs_alv>-banks
+                                                 AND bankl = <fs_alv>-bankl
+                                                 AND bankn = <fs_alv>-bankn.
+  ENDLOOP.
+
+* Actualizar iban proveedor
+  LOOP AT lt_alv ASSIGNING <fs_alv> WHERE tipo = 'K' AND bvtyp_new IS NOT INITIAL.
+
+    UPDATE lfbk SET bvtyp = <fs_alv>-bvtyp_new WHERE lifnr = <fs_alv>-lifnr
+                                                 AND banks = <fs_alv>-banks
+                                                 AND bankl = <fs_alv>-bankl
+                                                 AND bankn = <fs_alv>-bankn.
+  ENDLOOP.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Form GENERAR_ID
+*---------------------------------------------------------------------*
+FORM generar_id.
+
+  DATA:
+    vl_tabix         TYPE sy-tabix,
+    vl_clie_anterior TYPE kunnr,
+    vl_prov_anterior TYPE lifnr,
+    vl_clv_anterior  TYPE bvtyp,
+    lv_bankl_ant     TYPE knbk-bankl,
+    lv_bankn_ant     TYPE knbk-bankn,
+    lv_banks_ant     TYPE knbk-banks,
+    lv_bkont_ant     TYPE knbk-bkont,
+    vl_gen(3).
+
+  SORT lt_alv BY kunnr lifnr banks bankl bankn bkont.
+
+* Generar id banco sequencial para proveedor y/o cliente sin relación
+  LOOP AT lt_alv ASSIGNING <fs_alv> WHERE sel IS NOT INITIAL AND bvtyp IS INITIAL.
+
+    IF <fs_alv>-kunnr IS NOT INITIAL AND <fs_alv>-lifnr IS INITIAL.
+
+      IF vl_clie_anterior = <fs_alv>-kunnr.
+*       Incrementamos contador
+        vl_gen = vl_gen + 1.
+      ELSE.
+*       ponemos a 1 el contador
+        vl_gen = '001'.
+*       y colocamos el cliente actual.
+        vl_clie_anterior = <fs_alv>-kunnr.
+*       Colocamos la id del banco actual.
+        vl_clv_anterior = <fs_alv>-bvtyp.
+      ENDIF.
+
+    ELSEIF <fs_alv>-kunnr IS INITIAL AND <fs_alv>-lifnr IS NOT INITIAL.
+
+      IF vl_prov_anterior = <fs_alv>-lifnr.
+*       incrementamos contador
+        vl_gen = vl_gen + 1.
+      ELSE.
+*       ponemos a 1 el contador
+        vl_gen = '001'.
+*       y colocamos el proveedor actual.
+        vl_prov_anterior = <fs_alv>-lifnr.
+*       Colocamos la id del banco actual.
+        vl_clv_anterior = <fs_alv>-bvtyp.
+      ENDIF.
+
+    ELSEIF <fs_alv>-kunnr IS NOT INITIAL AND <fs_alv>-lifnr IS NOT INITIAL.
+
+      IF vl_clie_anterior = <fs_alv>-kunnr AND vl_prov_anterior = <fs_alv>-lifnr.
+
+        IF <fs_alv>-bankl EQ lv_bankl_ant AND <fs_alv>-bankn EQ lv_bankn_ant AND <fs_alv>-banks EQ lv_banks_ant AND <fs_alv>-bkont EQ lv_bkont_ant.
+
+*           Si es la misma cuenta bancaria para el mismo cliente y proveedor no hacemos nada
+
+        ELSE.
+
+*         Incrementamos contador
+          vl_gen = vl_gen + 1.
+
+*         Datos banco
+          lv_bankl_ant =  <fs_alv>-bankl.
+          lv_bankn_ant =  <fs_alv>-bankn.
+          lv_banks_ant =  <fs_alv>-banks.
+          lv_bkont_ant =  <fs_alv>-bkont.
+
+        ENDIF.
+
+      ELSE.
+
+*       ponemos a 1 el contador
+        vl_gen = '001'.
+*       y colocamos el cliente actual.
+        vl_clie_anterior = <fs_alv>-kunnr.
+*       Colocamos la id del banco actual.
+        vl_clv_anterior = <fs_alv>-bvtyp.
+*       y colocamos el proveedor actual.
+        vl_prov_anterior = <fs_alv>-lifnr.
+
+*       Datos banco
+        lv_bankl_ant =  <fs_alv>-bankl.
+        lv_bankn_ant =  <fs_alv>-bankn.
+        lv_banks_ant =  <fs_alv>-banks.
+        lv_bkont_ant =  <fs_alv>-bkont.
+
+      ENDIF.
+
+    ENDIF.
+
+    IF vl_gen IS NOT INITIAL.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = vl_gen
+        IMPORTING
+          output = vl_gen.
+
+      IF p_string IS NOT INITIAL.
+        CONCATENATE p_string  vl_gen INTO <fs_alv>-bvtyp_new.
+      ENDIF.
+
+      <fs_alv>-sel = 'X'.
+
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.

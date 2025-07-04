@@ -1,0 +1,245 @@
+FUNCTION zswm_ui5_get_vhilm.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(MATNR) TYPE  MATNR
+*"     VALUE(WERKS) TYPE  WERKS_D OPTIONAL
+*"     VALUE(CHARG) TYPE  CHARG_D OPTIONAL
+*"     VALUE(VBTYP) TYPE  VBTYP OPTIONAL
+*"     VALUE(TXTGET) TYPE  FLAG OPTIONAL
+*"  EXPORTING
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_TT
+*"     VALUE(VHILM) TYPE  VHILM
+*"     VALUE(VHILM_MAKTX) TYPE  ZSWM_VHILM_MAKTX
+*"----------------------------------------------------------------------
+  RANGES: r_werks FOR mseg-werks,
+          r_charg FOR mseg-charg,
+          r_aufnr FOR mseg-aufnr.
+  DATA zswmvhilm TYPE zswmvhilm. " add jtm 31.10.2022
+  CASE vbtyp.
+*   Expediciones, aqui si que sabemos como se expidio o se expedirá el embalaje
+    WHEN 'T' OR 'J'.
+      IF werks IS NOT INITIAL.
+        r_werks+0(3) = 'IEQ'.
+        r_werks-low  = werks.
+        APPEND r_werks.
+      ENDIF.
+      IF charg IS NOT INITIAL.
+        r_charg+0(3) = 'IEQ'.
+        r_charg-low  = charg.
+        APPEND r_charg.
+      ENDIF.
+*     add jtm 31.10.2022 en algunos casos se cambia el material de embalaje en la expedición
+      SELECT SINGLE vhilm INTO vhilm FROM zswmvhilm                WHERE matnr EQ matnr
+                                                                     AND werks IN r_werks
+                                                                     AND charg IN r_charg
+                                                                     AND lvorm NE abap_true.
+      IF sy-subrc EQ 0 AND vhilm IS NOT INITIAL.
+            PERFORM get_ext_2 USING vhilm txtget CHANGING vhilm_maktx.
+      ELSE.
+*     fin de add jtm 31.10.2022
+
+*     fin de add jtm 31.10.2022
+        r_aufnr+0(3) = 'INE'. APPEND r_aufnr.
+
+* busco la OF que les dio de alta
+        SELECT * INTO TABLE @DATA(tt_mseg) FROM mseg WHERE matnr EQ @matnr
+                                                       AND werks IN @r_werks
+                                                       AND charg IN @r_charg
+                                                       AND aufnr IN @r_aufnr
+                                                       AND bwart EQ '101'.
+        IF sy-subrc NE 0.
+          SELECT * INTO TABLE tt_mseg FROM mseg WHERE matnr EQ matnr
+*                                           and werks in r_werks
+                                                  AND charg IN r_charg
+                                                  AND aufnr IN r_aufnr
+                                                  AND bwart EQ '101'.
+        ENDIF.
+        SORT tt_mseg BY aufnr.
+        DELETE ADJACENT DUPLICATES FROM tt_mseg COMPARING aufnr.
+        LOOP AT tt_mseg INTO DATA(rt_mseg).
+          SELECT SINGLE rsnum INTO @DATA(rsnum) FROM afko WHERE aufnr EQ  @rt_mseg-aufnr.
+          CHECK sy-subrc EQ 0
+            AND rsnum    IS NOT INITIAL.
+          SELECT  mara~matnr INTO vhilm UP TO 1 ROWS FROM resb INNER JOIN mara ON resb~matnr EQ mara~matnr WHERE rsnum EQ rsnum
+                                                                                                             AND mtart EQ 'ZPAL'.
+          ENDSELECT.
+          CHECK sy-subrc EQ 0
+            AND vhilm    IS NOT INITIAL.
+            PERFORM get_ext_2 USING vhilm txtget CHANGING vhilm_maktx.
+
+          EXIT.
+        ENDLOOP.
+        CHECK vhilm IS INITIAL.
+        DATA: object_key TYPE cuib_objkey.
+        object_key+0(18) = matnr.
+        object_key+18(4) = werks.
+*       add jtm 29.11.2022 RELOCATE
+        select SINGLE SOBSL into @data(SOBSL) from marc where matnr eq @matnr
+                                                          and werks eq @werks.
+        if SOBSL is not INITIAL.
+           select SINGLE WRK02 into @DATA(WRK02) from T460A where werks eq @werks
+                                                              and SOBSL eq @SOBSL.
+           if sy-subrc eq 0 and WRK02 is not INITIAL and WRK02 ne werks.
+          object_key+0(18) = matnr.
+          object_key+18(4) = WRK02.
+           endif.
+        endif.
+*       fin de add jtm 29.11.2022
+*  data: CUOBJ type CUOBJ.
+*  CUOBJ+0(14) = matnr+4(14).
+*  CUOBJ+14(4) = werks.
+        SELECT SINGLE * INTO @DATA(yhp_idx_td010) FROM yhp_idx_td010 WHERE object_type EQ 'MARC'
+                                                                       AND object_key  EQ @object_key.
+        IF sy-subrc EQ 0.
+          DATA tt_bom TYPE yhp_omp_tt_bom.
+          CALL FUNCTION 'YHP_OMP_INTERFACE'
+            EXPORTING
+              if_cuobj = yhp_idx_td010-cuobj
+            IMPORTING
+*             ET_TD100 =
+*             ET_TD101 =
+*             ET_TD110 =
+*             ET_TD111 =
+*             ET_TD130 =
+*             ET_TD131 =
+*             ET_TD140 =
+*             ET_TD150 =
+*             ET_TD151 =
+*             ET_TD310 =
+*             ET_TD400 =
+              et_bom   = tt_bom
+*             ET_RTE   =
+            .
+          LOOP AT tt_bom INTO DATA(rt_bom).
+            SELECT SINGLE mtart INTO @DATA(mtart) FROM mara WHERE matnr EQ @rt_bom-idnrk.
+            CHECK sy-subrc EQ 0
+              AND mtart    EQ 'ZPAL'.
+            MOVE rt_bom-idnrk TO vhilm.
+            PERFORM get_ext_2 USING vhilm txtget CHANGING vhilm_maktx.
+            EXIT.
+          ENDLOOP.
+        ENDIF.
+        CHECK vhilm IS INITIAL.
+
+*--> INI FCARDONA - 10.10.2024 No recupera palet desde configuración.
+
+        IF ( yhp_idx_td010-cuobj <> space ).
+
+          SELECT SINGLE pmatn
+            FROM yhp_idx_td160
+            INTO vhilm
+           WHERE cuobj = yhp_idx_td010-cuobj.
+
+          CHECK vhilm IS INITIAL.
+
+        ENDIF.
+
+*--> FIN FCARDONA - 10.10.2024 No recupera palet desde configuración.
+
+        DATA: rr_werks TYPE  range_t_werks,
+              rr_vhilm TYPE  zswm_vhilm_ranges_tt.
+* Si no hemos sacado nada de la lista ==> Lo sacamos del SET de datos
+        CALL FUNCTION 'ZSWM_SET_GET_VALUES'
+*   EXPORTING
+*     SHORTNAME                = 'ZSWM_PLANCHA'
+*     TT_SHORTNAME             =
+*     NO_AUTHORITY_CHECK       = 'X'
+*     LANGU                    = SYST-LANGU
+*     TT_FIELDNAME             =
+          IMPORTING
+            error    = error
+            tt_log   = tt_log
+*           TT_SET   =
+            rr_werks = rr_werks
+*           RR_PSTYV =
+*           RR_LGNUM =
+*           RR_BWLVS =
+            rr_vhilm = rr_vhilm.
+        CHECK error NE abap_true
+          AND werks IN rr_werks.
+
+        READ TABLE rr_vhilm INDEX 1 INTO DATA(rt_vhilm).
+        CHECK sy-subrc EQ 0.
+        MOVE rt_vhilm-low  TO vhilm.
+        PERFORM get_ext_2 USING vhilm txtget CHANGING vhilm_maktx.
+
+      ENDIF.
+    WHEN '7'.
+*     Las cosas que vienen de proveedor no sabemos como vienen
+      CALL FUNCTION 'ZSWM_SET_GET_VALUES'
+*   EXPORTING
+*     SHORTNAME                = 'ZSWM_PLANCHA'
+*     TT_SHORTNAME             =
+*     NO_AUTHORITY_CHECK       = 'X'
+*     LANGU                    = SYST-LANGU
+*     TT_FIELDNAME             =
+        IMPORTING
+          error    = error
+          tt_log   = tt_log
+*         TT_SET   =
+          rr_werks = rr_werks
+*         RR_PSTYV =
+*         RR_LGNUM =
+*         RR_BWLVS =
+          rr_vhilm = rr_vhilm.
+      CHECK error NE abap_true
+        AND werks IN rr_werks.
+
+      READ TABLE rr_vhilm INDEX 1 INTO rt_vhilm.
+      CHECK sy-subrc EQ 0.
+      MOVE rt_vhilm-low  TO vhilm.
+            PERFORM get_ext_2 USING vhilm txtget CHANGING vhilm_maktx.
+
+  ENDCASE.
+* add jtm 13.07.2022 validaciones material de embalaje
+  CHECK vhilm IS NOT INITIAL
+    AND error NE abap_true.
+  DATA matnr_vhilm TYPE matnr.
+  matnr_vhilm = vhilm.
+  CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+    EXPORTING
+      input        = matnr_vhilm
+    IMPORTING
+      output       = vhilm
+    EXCEPTIONS
+      length_error = 1
+      OTHERS       = 2.
+  IF sy-subrc <> 0.
+    MOVE abap_true TO error.
+    PERFORM mensaje USING 'E' sy-msgid sy-msgno sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 CHANGING tt_log[].
+    CLEAR vhilm.
+  ELSE.
+* 147	Material de embalaje & no existe
+* 148	Material de embalaje & no es &
+    SELECT SINGLE mtart INTO mtart FROM mara WHERE matnr EQ vhilm.
+    IF sy-subrc NE 0.
+      vhilm = |{ vhilm ALPHA = OUT }|.
+      PERFORM mensaje USING 'E' 'ZSWM_UI5' '147' vhilm space space space CHANGING tt_log[].
+      MOVE abap_true TO error.
+      CLEAR vhilm.
+    ELSEIF mtart NE 'ZPAL'.
+      vhilm = |{ vhilm ALPHA = OUT }|.
+      PERFORM mensaje USING 'E' 'ZSWM_UI5' '148' vhilm 'ZPAL' space space CHANGING tt_log[].
+      MOVE abap_true TO error.
+      CLEAR vhilm.
+    ENDIF.
+  ENDIF.
+  check vhilm_maktx is INITIAL.
+  PERFORM get_ext_2 USING vhilm txtget CHANGING vhilm_maktx.
+
+* fin de add jtm 13.07.2022 validaciones material de embalaje
+ENDFUNCTION.
+FORM get_ext_2 USING    vhilm
+                       txtget
+              CHANGING vhilm_maktx.
+  CHECK txtget EQ abap_true AND vhilm IS NOT INITIAL.
+  SELECT SINGLE maktx INTO vhilm_maktx FROM makt WHERE matnr EQ vhilm
+                                                   AND spras EQ sy-langu.
+  CHECK sy-subrc NE 0.
+  SELECT SINGLE maktx INTO vhilm_maktx FROM makt WHERE matnr EQ vhilm
+                                                   AND spras EQ 'S'. "sy-langu.'
+
+
+ENDFORM.

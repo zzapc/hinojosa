@@ -1,0 +1,266 @@
+*&---------------------------------------------------------------------*
+*& Report ZRDS_DELTALOAD
+*&
+*&---------------------------------------------------------------------*
+*& This report should be used in the context of the SAP business Suite
+*& Rapid Deployment Solution for Hybris Integration. It must be used in
+*& lieu of standard ALE transaction BD21 to send changes on ERP material
+*& and ERP Retail Artcles to the hybris system.
+*&---------------------------------------------------------------------*
+
+*report zrds_deltaload.
+*
+*constants lc_message_type type bdcps-mestype value 'MATMAS'. " for Retail this will be ARTMAS
+*
+*data lt_change_pointers type table of bdcp.
+*data lt_change_pointer_ids type table of bdicpident.
+*data lt_material_ids type range of bdcp-cdobjid.
+*
+*field-symbols <fs_change_pointer> like line of lt_change_pointers.
+*field-symbols <fs_change_pointer_id> like line of lt_change_pointer_ids.
+*field-symbols <fs_material_id> like line of lt_material_ids.
+*
+** Read standard change pointer table bdcp2
+** to get the MATMAS- or ARTMAS-relevant change pointers
+*call function 'CHANGE_POINTERS_READ'
+*  exporting
+*    message_type    = lc_message_type
+*  tables
+*    change_pointers = lt_change_pointers.
+*
+*if lt_change_pointers is initial.
+*  return.
+*endif.
+*
+** Prepare the list of material/article numbers
+*loop at lt_change_pointers assigning <fs_change_pointer>.
+*  append initial line to lt_material_ids assigning <fs_material_id>.
+*  <fs_material_id>-low = <fs_change_pointer>-cdobjid.
+*  <fs_material_id>-sign = 'I'.
+*  <fs_material_id>-option = 'EQ'.
+*endloop.
+*
+*delete adjacent duplicates from lt_material_ids.
+*sort lt_material_ids.
+*delete adjacent duplicates from lt_material_ids.
+*
+** Trigger initial load (e.g. BD10) for the list of IDs found
+*submit rbdsemat with matsel in lt_material_ids with mestyp = 'MATMAS' and return.
+*
+** Set all change pointers to "processed" after successfull execution of initial load
+*if sy-subrc eq 0.
+*  loop at lt_change_pointers assigning <fs_change_pointer>.
+*    append initial line to lt_change_pointer_ids assigning <fs_change_pointer_id>.
+*    <fs_change_pointer_id> = <fs_change_pointer>-cpident.
+*  endloop.
+*
+*  call function 'CHANGE_POINTERS_STATUS_WRITE'
+*    exporting
+*      message_type           = lc_message_type
+*    tables
+*      change_pointers_idents = lt_change_pointer_ids.
+*endif.
+
+REPORT zrds_deltaload.
+TABLES: bdcps, tbda2, mara, lfa1, marc, lfb1.
+DATA lc_message_type TYPE tbda2-mestyp." value 'MATMAS'. " for Retail this will be ARTMAS
+DATA: t_tipos LIKE tbda2 OCCURS 0 WITH HEADER LINE.
+DATA: ls_marc TYPE marc.
+DATA: ls_lfb1 TYPE lfb1.
+DATA: lv_index LIKE sy-tabix.
+
+* Pantalla de seleccion
+SELECT-OPTIONS: s_mesty FOR tbda2-mestyp OBLIGATORY.
+SELECT-OPTIONS: s_mtart FOR mara-mtart.
+SELECT-OPTIONS: s_ktokk FOR lfa1-ktokk.
+SELECT-OPTIONS: s_matnr FOR mara-matnr.
+SELECT-OPTIONS: s_MATKL for mara-MATKL.
+SELECT-OPTIONS: s_lifnr FOR lfa1-lifnr.
+SELECT-OPTIONS: s_bukrs FOR lfb1-bukrs.
+SELECT-OPTIONS: s_werks FOR marc-werks.
+
+
+DATA lt_change_pointers TYPE TABLE OF bdcp.
+DATA: lt_change_pointers_clas TYPE TABLE OF bdcp,
+      ls_change_pointers_clas TYPE          bdcp..
+DATA lt_change_pointer_ids TYPE TABLE OF bdicpident.
+DATA lt_material_ids TYPE RANGE OF bdcp-cdobjid.
+
+FIELD-SYMBOLS <fs_change_pointer> LIKE LINE OF lt_change_pointers.
+FIELD-SYMBOLS <fs_change_pointer_id> LIKE LINE OF lt_change_pointer_ids.
+FIELD-SYMBOLS <fs_material_id> LIKE LINE OF lt_material_ids.
+
+START-OF-SELECTION.
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE t_tipos
+  FROM tbda2 WHERE mestyp IN s_mesty
+             AND active = 'X'.
+  LOOP AT t_tipos.
+    lc_message_type = t_tipos-mestyp.
+* Read standard change pointer table bdcp2
+* to get the MATMAS- or ARTMAS-relevant change pointers
+    REFRESH: lt_change_pointers, lt_change_pointer_ids, lt_material_ids, lt_change_pointers_clas.
+    CALL FUNCTION 'CHANGE_POINTERS_READ'
+      EXPORTING
+        message_type    = lc_message_type
+      TABLES
+        change_pointers = lt_change_pointers.
+
+    IF lc_message_type = 'MATMAS'.
+
+      CALL FUNCTION 'CHANGE_POINTERS_READ'
+        EXPORTING
+          message_type    = 'CLFMAS'
+        TABLES
+          change_pointers = lt_change_pointers_clas.
+    ENDIF.
+
+    LOOP AT lt_change_pointers_clas INTO ls_change_pointers_clas
+                                    WHERE tabname = 'MARA'.
+      APPEND ls_change_pointers_clas TO lt_change_pointers.
+    ENDLOOP.
+
+    IF lt_change_pointers IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+* Prepare the list of material/article numbers
+
+    LOOP AT lt_change_pointers ASSIGNING <fs_change_pointer>.
+      lv_index = sy-tabix.
+
+      CASE lc_message_type.
+        WHEN 'MATMAS'.
+* SE FILTRA POR EL TIPO DE MATERIAL EN LA PANTALLA DE SELECCION
+* Y PARA LOS MATERIALES QUE ESTAN CREADOS EN MAS CENTROS A PARTE DEL 3000-PAPELERA
+          IF <fs_change_pointer>-cdobjcl = 'MATERIAL'.  "PARA DETECTAR EL MATMAS
+            CLEAR ls_marc.
+            SELECT SINGLE marc~matnr INTO ls_marc-matnr
+            FROM marc
+            INNER JOIN mara ON mara~matnr = marc~matnr
+            WHERE marc~matnr = <fs_change_pointer>-cdobjid
+            AND mara~mtart IN s_mtart
+            and mara~MATKL in s_MATKL
+            AND marc~matnr IN s_matnr
+* GST - 30/12/2015 ->
+            AND marc~werks IN s_werks.
+*          AND marc~werks <> '3000'.
+* GST - 30/12/2015 <-
+            IF sy-subrc = 0.
+              APPEND INITIAL LINE TO lt_material_ids ASSIGNING <fs_material_id>.
+              <fs_material_id>-low = <fs_change_pointer>-cdobjid.
+              <fs_material_id>-sign = 'I'.
+              <fs_material_id>-option = 'EQ'.
+            ELSE.
+              DELETE lt_change_pointers INDEX lv_index.
+            ENDIF.
+
+          ELSEIF <fs_change_pointer>-cdobjcl = 'CLASSIF'.  " PARA DETECTAR EL CLFMAS
+
+* COMO SE HA DECIDIDO ENVIAR LAS CARACTERISTICAS EN EL MATMAS EN LUGAR DEL IDOC DE CLASIFICACION HAY QUE ENGAÑAR AL PUNTERO DE MODIFICACION
+* PARA QUE ENVIE EL MATMAS
+            CLEAR ls_marc.
+            SELECT SINGLE marc~matnr INTO ls_marc-matnr
+            FROM marc
+            INNER JOIN mara ON mara~matnr = marc~matnr
+            WHERE marc~matnr = <fs_change_pointer>-tabkey+4
+            AND mara~mtart IN s_mtart
+            AND marc~matnr IN s_matnr
+* GST - 30/12/2015 ->
+            AND marc~werks IN s_werks.
+*          AND marc~werks <> '3000'.
+* GST - 30/12/2015 <-
+            IF sy-subrc = 0.
+              APPEND INITIAL LINE TO lt_material_ids ASSIGNING <fs_material_id>.
+              <fs_material_id>-low = <fs_change_pointer>-tabkey+4.
+              <fs_material_id>-sign = 'I'.
+              <fs_material_id>-option = 'EQ'.
+            ELSE.
+              DELETE lt_change_pointers INDEX lv_index.
+            ENDIF.
+
+          ENDIF.
+
+
+        WHEN 'CREMAS'.
+* SE FILTRA POR EL GRUPO DE CUENTAS DE LA PANTALLA DE SELECCION
+* Y PARA LOS PROVEEDORES QUE ESTAN CREADOS EN MAS SOCIEDADES A PARTE DEL 3000-PAPELERA
+          CLEAR ls_lfb1.
+          SELECT SINGLE lfb1~lifnr INTO ls_lfb1-lifnr
+          FROM lfb1
+          INNER JOIN lfa1 ON lfa1~lifnr = lfb1~lifnr
+          WHERE lfb1~lifnr = <fs_change_pointer>-cdobjid
+          AND lfb1~lifnr IN s_lifnr
+          AND lfa1~ktokk IN s_ktokk
+* GST - 30/12/2015 ->
+          AND lfb1~bukrs IN s_bukrs.
+*          AND lfb1~bukrs <> '3000'.
+* GST - 30/12/2015 <-
+          IF sy-subrc = 0.
+            APPEND INITIAL LINE TO lt_material_ids ASSIGNING <fs_material_id>.
+            <fs_material_id>-low = <fs_change_pointer>-cdobjid.
+            <fs_material_id>-sign = 'I'.
+            <fs_material_id>-option = 'EQ'.
+          ELSE.
+            DELETE lt_change_pointers INDEX lv_index.
+          ENDIF.
+
+        WHEN 'DEBMAS'.
+          APPEND INITIAL LINE TO lt_material_ids ASSIGNING <fs_material_id>.
+          <fs_material_id>-low = <fs_change_pointer>-cdobjid.
+          <fs_material_id>-sign = 'I'.
+          <fs_material_id>-option = 'EQ'.
+        WHEN OTHERS.
+      ENDCASE.
+
+*      APPEND INITIAL LINE TO lt_material_ids ASSIGNING <fs_material_id>.
+*      <fs_material_id>-low = <fs_change_pointer>-cdobjid.
+*      <fs_material_id>-sign = 'I'.
+*      <fs_material_id>-option = 'EQ'.
+    ENDLOOP.
+
+    DELETE ADJACENT DUPLICATES FROM lt_material_ids.
+    SORT lt_material_ids.
+    DELETE ADJACENT DUPLICATES FROM lt_material_ids.
+
+* EN CASO DE ESTAR VACIO SALTAMOS AL SIGUIENTE REGISTRO
+    IF lt_material_ids[] IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+
+
+* Trigger initial load (e.g. BD10) for the list of IDs found
+    CASE lc_message_type.
+      WHEN 'MATMAS' OR 'CLFMAS'.
+        SUBMIT rbdsemat WITH matsel IN lt_material_ids WITH mestyp = 'MATMAS' AND RETURN.
+      WHEN 'DEBMAS'.
+        SUBMIT rbdsedeb WITH selkunnr IN lt_material_ids WITH mestyp = 'DEBMAS' AND RETURN.
+      WHEN 'CREMAS'.
+        SUBMIT rbdsecre WITH sellifnr IN lt_material_ids WITH mestyp = 'CREMAS' AND RETURN.
+    ENDCASE.
+
+
+
+* Set all change pointers to "processed" after successfull execution of initial load
+*    if sy-subrc eq 0.
+    LOOP AT lt_change_pointers ASSIGNING <fs_change_pointer>.
+      APPEND INITIAL LINE TO lt_change_pointer_ids ASSIGNING <fs_change_pointer_id>.
+      <fs_change_pointer_id> = <fs_change_pointer>-cpident.
+    ENDLOOP.
+
+    CALL FUNCTION 'CHANGE_POINTERS_STATUS_WRITE'
+      EXPORTING
+        message_type           = lc_message_type
+      TABLES
+        change_pointers_idents = lt_change_pointer_ids.
+
+    IF lc_message_type = 'MATMAS'. "BORRAR LOS PUNTEROS DE MODIFICACION DEL CLFMAS
+
+      CALL FUNCTION 'CHANGE_POINTERS_STATUS_WRITE'
+        EXPORTING
+          message_type           = 'CLFMAS'
+        TABLES
+          change_pointers_idents = lt_change_pointer_ids.
+    ENDIF.
+*    endif.
+  ENDLOOP.

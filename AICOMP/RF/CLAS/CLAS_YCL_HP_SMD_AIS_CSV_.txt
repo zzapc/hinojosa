@@ -1,0 +1,387 @@
+
+class YCL_HP_SMD_AIS_CSV definition
+  public
+  final
+  create public .
+
+public section.
+
+  data T_LINES type /VCXI/CKX_TT_STRING .
+  data T_FIELDS type /VCXI/CKX_TT_STRING .
+  data T_TD01 type YHP_SMD_AIS_TT_TD01 .
+  data T_QUOT type YHP_SMD_AIS_TT_QUOT .
+  data F_DELIM type YHP_SMD_AIS_DELIM .
+  data F_LINEFEED type STRING .
+  data F_CURRENT_LINE type INT4 .
+
+  methods GET_FILE_DATA
+    importing
+      !IF_FPATH type YHP_SMD_AIS_FPATH
+    raising
+      /VCXI/CX_CKX .
+  methods SAVE_TO_DB
+    importing
+      !IF_COMMIT type ABAP_BOOL default ABAP_TRUE
+    returning
+      value(RF_FGUID) type SYSUUID_C22
+    raising
+      /VCXI/CX_CKX .
+  methods CONSTRUCTOR
+    importing
+      !IF_DELIM type YHP_SMD_AIS_DELIM default ';'
+      !IF_LINEFEED type CLIKE default CL_ABAP_CHAR_UTILITIES=>CR_LF
+      !IF_FGUID type SYSUUID_C22 optional
+    raising
+      /VCXI/CX_CKX .
+protected section.
+
+  methods ASSIGN_FIELD_VALUE
+    importing
+      !IF_FIELDNAME type FIELDNAME
+      !IF_FIELDINDEX type INT4
+    changing
+      !CS_DATASTRUCT type ANY .
+  methods CREATE_QUOT_TAB
+    raising
+      /VCXI/CX_CKX .
+  methods INIT
+    raising
+      /VCXI/CX_CKX .
+  methods LOAD_FROM_DB
+    importing
+      !IF_FGUID type SYSUUID_C22
+    raising
+      /VCXI/CX_CKX .
+  methods PREPARE_DB_DATA
+    importing
+      !IF_FGUID type SYSUUID_C22
+    returning
+      value(RS_TD01) type YHP_SMD_AIS_TD01
+    raising
+      /VCXI/CX_CKX .
+  methods READ_NEXT_LINE
+    returning
+      value(RF_READ_DONE) type ABAP_BOOL
+    raising
+      /VCXI/CX_CKX .
+private section.
+endclass. "YCL_HP_SMD_AIS_CSV definition
+class YCL_HP_SMD_AIS_CSV implementation.
+method ASSIGN_FIELD_VALUE.
+
+  field-symbols: <F_FIELD> type ANY.
+
+*** If Field Exists fill Field in Structure
+  if LINE_EXISTS( ME->T_FIELDS[ IF_FIELDINDEX ] ) and
+     ME->T_FIELDS[ IF_FIELDINDEX ] is not initial.
+    assign component IF_FIELDNAME of structure CS_DATASTRUCT to <F_FIELD>.
+    <F_FIELD> = ME->T_FIELDS[ IF_FIELDINDEX ].
+  endif.
+
+endmethod.
+method CONSTRUCTOR.
+
+  move IF_DELIM    to ME->F_DELIM.
+  move IF_LINEFEED to ME->F_LINEFEED.
+
+  ME->INIT( ).
+
+  if IF_FGUID is not initial.
+    ME->LOAD_FROM_DB( IF_FGUID = IF_FGUID ).
+  endif.
+
+endmethod.
+method CREATE_QUOT_TAB.
+
+  data: LF_INDEX type I.
+
+  data: LT_FIELD_VALS type /VCXI/CKX_TT_STRING.
+
+  field-symbols: <S_TD01>       type YHP_SMD_AIS_TD01,
+                 <S_QUOT>       type YHP_SMD_AIS_S_QUOT,
+                 <F_FIELD_VAL>  type /VCXI/CKX_STRING,
+                 <F_FIELD_QUOT> type ANY.
+
+  loop at ME->T_TD01 assigning <S_TD01> where PARENTID    is initial
+                                          and PARENTPOSID is initial
+                                          and CHILDID     is initial
+                                          and CHILDPOSID  is initial
+                                          and PARTY       is initial.
+
+    clear LF_INDEX.
+
+*** Create Value Tab
+    split <S_TD01>-LITXT at ME->F_DELIM into table LT_FIELD_VALS.
+
+*** Add Values
+    loop at LT_FIELD_VALS assigning <F_FIELD_VAL>.
+
+***   Skip Control Cells
+      if ( SY-TABIX mod 2 ) eq 1.
+        continue.
+      endif.
+
+      LF_INDEX = LF_INDEX + 1.
+
+***   Check Quotation Line Existance
+      read table ME->T_QUOT assigning <S_QUOT> index LF_INDEX.
+      if SY-SUBRC ne 0.
+        append initial line to ME->T_QUOT assigning <S_QUOT>.
+      endif.
+
+***   Transfer Value
+      assign component <S_TD01>-PARID of structure <S_QUOT> to <F_FIELD_QUOT>.
+      if SY-SUBRC eq 0 and <F_FIELD_QUOT> is assigned.
+        try.
+            <F_FIELD_QUOT> = <F_FIELD_VAL>.
+          catch CX_SY_CONVERSION_NO_NUMBER into data(LR_CX_SY).
+            refresh ME->T_QUOT.
+            /VCXI/CX_CKX=>RAISE_CKX_BY_PREVIOUS( LR_CX_SY ).
+        endtry.
+      else.
+        refresh ME->T_QUOT.
+        /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                              IF_MSGID = 'YHP_SMD_AIS'
+                                              IF_MSGNO = '006'
+                                              IF_MSGV1 = <S_TD01>-PARID ).
+      endif.
+
+***   Customer Number Fields
+      if <S_TD01>-PARID eq 'KUNAG' or
+         <S_TD01>-PARID eq 'KUNWE'.
+        call function 'CONVERSION_EXIT_ALPHA_INPUT'
+          exporting
+            INPUT  = <F_FIELD_QUOT>
+          importing
+            OUTPUT = <F_FIELD_QUOT>.
+      endif.
+
+    endloop.
+
+  endloop.
+
+endmethod.
+method GET_FILE_DATA.
+
+  data: LF_FPATH type STRING.
+
+  data: LT_DATA  type table of STRING,
+        LT_LINES type table of STRING.
+
+  field-symbols: <F_DATA> type STRING,
+                 <F_LINE> type STRING.
+
+  move IF_FPATH to LF_FPATH.
+
+*** Upload File Content in UTF-8
+  call method CL_GUI_FRONTEND_SERVICES=>GUI_UPLOAD
+    exporting
+      FILENAME                = LF_FPATH
+      CODEPAGE                = '4110' " UTF-8
+    changing
+      DATA_TAB                = LT_DATA
+    exceptions
+      FILE_OPEN_ERROR         = 1
+      FILE_READ_ERROR         = 2
+      NO_BATCH                = 3
+      GUI_REFUSE_FILETRANSFER = 4
+      INVALID_TYPE            = 5
+      NO_AUTHORITY            = 6
+      UNKNOWN_ERROR           = 7
+      BAD_DATA_FORMAT         = 8
+      HEADER_NOT_ALLOWED      = 9
+      SEPARATOR_NOT_ALLOWED   = 10
+      HEADER_TOO_LONG         = 11
+      UNKNOWN_DP_ERROR        = 12
+      ACCESS_DENIED           = 13
+      DP_OUT_OF_MEMORY        = 14
+      DISK_FULL               = 15
+      DP_TIMEOUT              = 16
+      NOT_SUPPORTED_BY_GUI    = 17
+      ERROR_NO_GUI            = 18
+      others                  = 19.
+  if SY-SUBRC ne 0.
+    /VCXI/CX_CKX=>RAISE_CKX_BY_SY( ).
+  endif.
+
+*** Transfer Content
+  refresh ME->T_LINES.
+
+  loop at LT_DATA assigning <F_DATA>.
+
+*** Split at Line Feed
+    split <F_DATA> at ME->F_LINEFEED into table LT_LINES.
+
+*** Add Lines
+    loop at LT_LINES assigning <F_LINE>.
+      if <F_LINE> ns ME->F_DELIM.
+        /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = 'E'
+                                              IF_MSGID = 'YHP_SMD_AIS'
+                                              IF_MSGNO = '005'
+                                              IF_MSGV1 = ME->F_DELIM ).
+      endif.
+*      check  <F_LINE> cs ME->F_DELIM.
+      append <F_LINE> to ME->T_LINES.
+    endloop.
+
+    clear LT_LINES.
+
+  endloop.
+
+endmethod.
+method INIT.
+
+  clear ME->T_LINES.
+
+endmethod.
+method LOAD_FROM_DB.
+
+*** Read Data
+  select *
+    into table ME->T_TD01
+    from YHP_SMD_AIS_TD01
+   where GUID = IF_FGUID.
+
+*** Create Quotation Table
+  ME->CREATE_QUOT_TAB( ).
+
+endmethod.
+method PREPARE_DB_DATA.
+
+  data: LF_INDEX type I,
+        LF_FIELD type STRING.
+
+*** General Data
+  RS_TD01-MANDT = SY-MANDT.
+  RS_TD01-GUID  = IF_FGUID.
+  RS_TD01-NOLIN = ME->F_CURRENT_LINE.
+
+*** Parameter Data from File
+  LF_INDEX = 1.
+  ME->ASSIGN_FIELD_VALUE( exporting IF_FIELDNAME  = 'PARENTID'
+                                    IF_FIELDINDEX = LF_INDEX
+                          changing  CS_DATASTRUCT = RS_TD01 ).
+
+  LF_INDEX = LF_INDEX + 1.
+  ME->ASSIGN_FIELD_VALUE( exporting IF_FIELDNAME  = 'PARENTPOSID'
+                                    IF_FIELDINDEX = LF_INDEX
+                          changing  CS_DATASTRUCT = RS_TD01 ).
+
+  LF_INDEX = LF_INDEX + 1.
+  ME->ASSIGN_FIELD_VALUE( exporting IF_FIELDNAME  = 'CHILDID'
+                                    IF_FIELDINDEX = LF_INDEX
+                          changing  CS_DATASTRUCT = RS_TD01 ).
+
+  LF_INDEX = LF_INDEX + 1.
+  ME->ASSIGN_FIELD_VALUE( exporting IF_FIELDNAME  = 'CHILDPOSID'
+                                    IF_FIELDINDEX = LF_INDEX
+                          changing  CS_DATASTRUCT = RS_TD01 ).
+
+  LF_INDEX = LF_INDEX + 1.
+  ME->ASSIGN_FIELD_VALUE( exporting IF_FIELDNAME  = 'PARTY'
+                                    IF_FIELDINDEX = LF_INDEX
+                          changing  CS_DATASTRUCT = RS_TD01 ).
+
+  LF_INDEX = LF_INDEX + 1.
+  ME->ASSIGN_FIELD_VALUE( exporting IF_FIELDNAME  = 'PARID'
+                                    IF_FIELDINDEX = LF_INDEX
+                          changing  CS_DATASTRUCT = RS_TD01 ).
+
+*** Parameter Values from File
+  LF_INDEX = LF_INDEX + 1.
+  do.
+
+    LF_INDEX = LF_INDEX + 1.
+
+*** If Field Exists fill Field in Structure
+    if LINE_EXISTS( ME->T_FIELDS[ LF_INDEX ] ).
+      LF_FIELD = ME->T_FIELDS[ LF_INDEX ].
+      concatenate RS_TD01-LITXT
+                  LF_FIELD
+             into RS_TD01-LITXT separated by ME->F_DELIM.
+    else.
+      exit.
+    endif.
+
+  enddo.
+
+*** Remove First Character - Delimiter
+  try.
+      RS_TD01-LITXT = RS_TD01-LITXT+1.
+
+    catch CX_SY_RANGE_OUT_OF_BOUNDS into data(LR_CX).
+      /VCXI/CX_CKX=>RAISE_CKX_BY_PREVIOUS( LR_CX ).
+  endtry.
+
+endmethod.
+method READ_NEXT_LINE.
+
+  data: LF_LINE   type STRING,
+        LF_STRLEN type I.
+
+  clear ME->T_FIELDS.
+
+*** Increase Index
+  ME->F_CURRENT_LINE = ME->F_CURRENT_LINE + 1.
+
+*** If Line Exists fill Field Buffer
+  if LINE_EXISTS( ME->T_LINES[ ME->F_CURRENT_LINE ] ).
+    LF_LINE = ME->T_LINES[ ME->F_CURRENT_LINE ].
+    split LF_LINE   at ME->F_DELIM into table ME->T_FIELDS.
+    move  ABAP_TRUE to RF_READ_DONE.
+    LF_STRLEN = STRLEN( LF_LINE ) - 1.
+    if LF_STRLEN            ge 0 and
+       LF_LINE+LF_STRLEN(1) eq ME->F_DELIM.
+      append initial line to ME->T_FIELDS.
+    endif.
+  endif.
+
+endmethod.
+method SAVE_TO_DB.
+
+  field-symbols: <S_TD01> type YHP_SMD_AIS_TD01.
+
+  check ME->T_LINES is not initial.
+
+  try.
+
+***   Generate GUID for File
+      RF_FGUID = CL_SYSTEM_UUID=>IF_SYSTEM_UUID_STATIC~CREATE_UUID_C22( ).
+
+    catch CX_UUID_ERROR into data(LR_CX_UUID).
+      /VCXI/CX_CKX=>RAISE_CKX_BY_PREVIOUS( IR_PREVIOUS = LR_CX_UUID ).
+
+  endtry.
+
+*** Reset Index
+  ME->F_CURRENT_LINE = 0.
+  refresh ME->T_TD01.
+
+*** Prepare Lines for DB
+  do.
+
+*** Read Line
+    if ME->READ_NEXT_LINE( ) eq ABAP_TRUE.
+
+***   Add New DB Line
+      append initial line to ME->T_TD01 assigning <S_TD01>.
+
+***   Prepare DB Data Structure
+      <S_TD01> = ME->PREPARE_DB_DATA( IF_FGUID = RF_FGUID ).
+
+    else.
+      exit.
+    endif.
+
+  enddo.
+
+*** Save to DB
+  insert YHP_SMD_AIS_TD01 from table ME->T_TD01.
+  if IF_COMMIT eq ABAP_TRUE.
+    commit work and wait.
+  endif.
+
+*** Create Quotation Table
+  ME->CREATE_QUOT_TAB( ).
+
+endmethod.

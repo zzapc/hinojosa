@@ -1,0 +1,242 @@
+FUNCTION zswm_ui5_ubicar_entrada_qrfc.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(LGNUM) TYPE  LGNUM OPTIONAL
+*"     VALUE(VBELN) TYPE  VBELN OPTIONAL
+*"     VALUE(AUFNR) TYPE  AUFNR OPTIONAL
+*"     VALUE(QRFC) TYPE  FLAG DEFAULT ''
+*"  EXPORTING
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_RETURN) TYPE  BAPIRET2_TT
+*"----------------------------------------------------------------------
+  DATA t_ltap_creat LIKE ltap_creat OCCURS 0 WITH HEADER LINE.
+  DATA t_ltap       LIKE ltap_vb    OCCURS 0 WITH HEADER LINE.
+  CLEAR t_ltap_creat[].
+  CLEAR t_ltap[].
+  clear: error, tt_return[].
+* QRFC-------------------------------------------*
+*  *Load class definition
+  CLASS /spe/cl_perf_tools DEFINITION LOAD.
+  DATA: lv_timestamp    TYPE timestampl,                     "v_n_1294611
+        lv_tstmp_char   TYPE c LENGTH 22,
+        lv_qname        TYPE trfcqnam,
+        lv_subkey       TYPE c LENGTH 47,
+        lv_tid          TYPE arfctid,
+        lv_org_tid      TYPE rfcchar24,
+        lf_wadat_ist(8) TYPE c,                             "v_n_1780263
+        ls_index        TYPE /spe/comm_data_key_fd,
+        lf_para         TYPE xfeld,
+        ls_return       TYPE bapiret2.                      "^_n_1780263
+* -----------------------------------------------*
+* -----------------------------------------------*
+* QRFC-------------------------------------------*
+  IF qrfc EQ abap_true.
+*    programa = abap_true.
+*   Set update task local to allow reprocessing of QRFCs
+    CALL METHOD /spe/cl_qrfc_services=>set_update_handling. "n_1495589
+* Logging of inbound call
+* Get transaction ID of call and queue name
+    CALL METHOD /spe/cl_qrfc_services=>get_current_tid_qname
+      IMPORTING
+        ev_tid     = lv_tid
+        ev_org_tid = lv_org_tid
+        ev_qname   = lv_qname.
+*SET parameter for performance trace via /SPE/IF_TRACE
+    CALL METHOD /spe/cl_perf_tools=>set_on
+      EXPORTING
+        iv_fmname = 'ZSWM_UI5_UBICAR_ENTRADA_QRFC'.
+
+  ENDIF.
+
+  DATA sw_find TYPE flag.
+
+  IF vbeln IS NOT INITIAL.
+*   Intentamos ubicar entrada entrega &.
+    PERFORM mensaje USING 'I' 'ZSWM_UI5' '198' vbeln space space space CHANGING tt_return[].
+    vbeln = |{ vbeln ALPHA = IN }|.
+  ELSEIF aufnr IS NOT INITIAL.
+*   Intentamos ubicar entrada subcontratación para orden &.
+    PERFORM mensaje USING 'I' 'ZSWM_UI5' '203' aufnr space space space CHANGING tt_return[].
+    aufnr = |{ aufnr ALPHA = IN }|.
+  ENDIF.
+
+  DO 10 TIMES.
+    CLEAR sw_find.
+    WAIT UP TO 1 SECONDS.
+    IF vbeln IS NOT INITIAL.
+      SELECT SINGLE COUNT( * ) FROM likp BYPASSING BUFFER WHERE vbeln EQ vbeln.
+    ELSE.
+      SELECT SINGLE COUNT( * ) FROM zswm_ui5_nlpla BYPASSING BUFFER WHERE lgnum EQ lgnum
+                                                                      AND aufnr EQ aufnr
+                                                                      AND pquit NE abap_true.
+    ENDIF.
+    CHECK sy-subrc EQ 0.
+    MOVE abap_true TO sw_find.
+    EXIT.
+  ENDDO.
+  IF sw_find NE abap_true.
+    move abap_true to error.
+    IF vbeln IS NOT INITIAL.
+*     La entrega & no existe.
+      PERFORM mensaje USING 'E' 'ZSWM_UI5' '199' vbeln space space space CHANGING tt_return[].
+    ELSEIF aufnr IS NOT INITIAL.
+*     No hay entradas para la orden &.
+      PERFORM mensaje USING 'E' 'ZSWM_UI5' '204' aufnr space space space CHANGING tt_return[].
+    ENDIF.
+  ELSE.
+*   El siguiente PERFOM revisa si existen o no las UAS a cambiar de ubicación.
+*   No da un ERROR, simplemente gana tiempo
+    PERFORM wait_existen_uas USING aufnr vbeln CHANGING tt_return error.
+
+    IF vbeln IS NOT INITIAL.
+      SELECT SINGLE vbtyp INTO @DATA(vbtyp) FROM likp WHERE vbeln EQ  @vbeln.
+      CASE vbtyp.
+        WHEN 'T'. " pedido de devolución
+          IF lgnum IS INITIAL.
+            SELECT * INTO @DATA(r_lips) FROM lips UP TO 1 ROWS WHERE vbeln EQ @vbeln
+                                    ORDER BY posnr ASCENDING.
+            ENDSELECT.
+            IF sy-subrc EQ 0.
+              SELECT SINGLE lgnum INTO lgnum FROM t320 WHERE werks EQ r_lips-werks.
+            ENDIF.
+          ENDIF.
+*         La entrega & es &
+
+          PERFORM mensaje USING 'I' 'ZSWM_UI5' '200' vbeln 'Devolución' space space CHANGING tt_return[].
+
+          SELECT * INTO TABLE @DATA(tt_vekp) FROM vekp WHERE vpobjkey EQ @vbeln
+                                                         AND status   NE '0060'.
+*          PERFORM wait_alta TABLES tt_vekp.
+
+          LOOP AT tt_vekp INTO DATA(rt_vekp).
+            CHECK rt_vekp-exidv2 IS NOT INITIAL.
+            PERFORM vekp_to_ltap TABLES t_ltap_creat  USING rt_vekp CHANGING tt_return[] error.
+            CHECK error EQ abap_true.
+            EXIT.
+          ENDLOOP.
+        WHEN '7'.
+          IF lgnum IS INITIAL.
+            SELECT SINGLE lgnum INTO lgnum FROM likp WHERE vbeln EQ vbeln.
+          ENDIF.
+
+*       La entrega & es &
+          PERFORM mensaje USING 'I' 'ZSWM_UI5' '200' vbeln 'Devolución' space space CHANGING tt_return[].
+          clear tt_vekp[].
+          SELECT * INTO TABLE tt_vekp FROM vekp WHERE vpobjkey EQ vbeln
+                                                  AND status   NE '0060'.
+*          PERFORM wait_alta TABLES tt_vekp.
+
+          LOOP AT tt_vekp INTO rt_vekp.
+            CHECK rt_vekp-exidv2 IS NOT INITIAL.
+            PERFORM vekp_to_ltap TABLES t_ltap_creat  USING rt_vekp CHANGING tt_return[] error.
+            CHECK error EQ abap_true.
+            EXIT.
+          ENDLOOP.
+          IF error NE abap_true AND t_ltap_creat[] IS INITIAL.
+            PERFORM zswm_ui5_nlpla_to_ltap TABLES t_ltap_creat USING lgnum aufnr vbeln CHANGING tt_return[] error.
+            IF t_ltap_creat[] IS INITIAL.
+*             La entrega & no tiene ubicaciones donde ubicar posteriormente.
+              PERFORM mensaje USING 'E' 'ZSWM_UI5' '205' vbeln space space space CHANGING tt_return[].
+              MOVE abap_true TO error.
+            ENDIF.
+          ENDIF.
+      ENDCASE.
+    ELSEIF aufnr IS NOT INITIAL.
+      IF lgnum IS INITIAL.
+        SELECT SINGLE werks INTO @DATA(werks) FROM caufv WHERE aufnr EQ @aufnr.
+        SELECT SINGLE lgnum INTO lgnum FROM t320 WHERE werks EQ werks.
+      ENDIF.
+      PERFORM zswm_ui5_nlpla_to_ltap TABLES t_ltap_creat USING lgnum aufnr vbeln CHANGING tt_return[] error.
+    ENDIF.
+    IF error NE abap_true AND t_ltap_creat[] IS NOT INITIAL.
+      CALL FUNCTION 'L_TO_CREATE_MULTIPLE'
+        EXPORTING
+          i_lgnum                = lgnum
+          i_bwlvs                = '999'
+*         I_BETYP                = ' '
+*         I_BENUM                = ' '
+*         I_LZNUM                = ' '
+*         I_NIDRU                = ' '
+*         I_DRUKZ                = ' '
+*         I_NOSPL                = ' '
+*         I_UPDATE_TASK          = ' '
+*         I_COMMIT_WORK          = 'X'
+*         I_BNAME                = SY-UNAME
+*         I_KOMPL                = 'X'
+*         I_SOLEX                = 0
+*         I_PERNR                = 0
+*         I_MINWM                = ' '
+*         I_AUSFB                = ' '
+*    IMPORTING
+*         E_TANUM                =
+        TABLES
+          t_ltap_creat           = t_ltap_creat
+*         T_LTAK                 =
+          t_ltap_vb              = t_ltap
+        EXCEPTIONS
+          no_to_created          = 1
+          bwlvs_wrong            = 2
+          betyp_wrong            = 3
+          benum_missing          = 4
+          betyp_missing          = 5
+          foreign_lock           = 6
+          vltyp_wrong            = 7
+          vlpla_wrong            = 8
+          vltyp_missing          = 9
+          nltyp_wrong            = 10
+          nlpla_wrong            = 11
+          nltyp_missing          = 12
+          rltyp_wrong            = 13
+          rlpla_wrong            = 14
+          rltyp_missing          = 15
+          squit_forbidden        = 16
+          manual_to_forbidden    = 17
+          letyp_wrong            = 18
+          vlpla_missing          = 19
+          nlpla_missing          = 20
+          sobkz_wrong            = 21
+          sobkz_missing          = 22
+          sonum_missing          = 23
+          bestq_wrong            = 24
+          lgber_wrong            = 25
+          xfeld_wrong            = 26
+          date_wrong             = 27
+          drukz_wrong            = 28
+          ldest_wrong            = 29
+          update_without_commit  = 30
+          no_authority           = 31
+          material_not_found     = 32
+          lenum_wrong            = 33
+          matnr_missing          = 34
+          werks_missing          = 35
+          anfme_missing          = 36
+          altme_missing          = 37
+          lgort_wrong_or_missing = 38
+          OTHERS                 = 39.
+
+      CASE sy-subrc.
+        WHEN 0.
+*         Creada tarea &/& para reubicar entrega &
+          READ TABLE t_ltap INDEX 1.
+          PERFORM mensaje USING 'I' 'ZSWM_UI5' '202' lgnum t_ltap-tanum vbeln space CHANGING tt_return[].
+        WHEN OTHERS.
+          PERFORM mensaje USING sy-msgty sy-msgid sy-msgno sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4  CHANGING tt_return[].
+          MOVE abap_true TO error.
+      ENDCASE.
+    ENDIF.
+  ENDIF.
+
+* QRFC-------------------------------------------*
+  IF qrfc EQ abap_true.
+* Error handling for BAPI_GOODSMVT_CREATE
+    CALL METHOD /spe/cl_qrfc_services=>end_queue_processing
+      EXPORTING
+        it_message        = tt_return
+      EXCEPTIONS
+        no_queue_detected = 0.
+*SET parameter for performance trace via /SPE/IF_TRACE
+    CALL METHOD /spe/cl_perf_tools=>set_off.
+
+  ENDIF.
+ENDFUNCTION.

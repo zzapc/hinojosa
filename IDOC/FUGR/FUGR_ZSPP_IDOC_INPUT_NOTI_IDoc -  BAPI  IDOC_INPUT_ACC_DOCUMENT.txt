@@ -1,0 +1,207 @@
+FUNCTION zspp_idoc_input_noti.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(INPUT_METHOD) LIKE  BDWFAP_PAR-INPUTMETHD
+*"     VALUE(MASS_PROCESSING) LIKE  BDWFAP_PAR-MASS_PROC
+*"  EXPORTING
+*"     VALUE(WORKFLOW_RESULT) LIKE  BDWF_PARAM-RESULT
+*"     VALUE(APPLICATION_VARIABLE) LIKE  BDWF_PARAM-APPL_VAR
+*"     VALUE(IN_UPDATE_TASK) LIKE  BDWFAP_PAR-UPDATETASK
+*"     VALUE(CALL_TRANSACTION_DONE) LIKE  BDWFAP_PAR-CALLTRANS
+*"  TABLES
+*"      IDOC_CONTRL STRUCTURE  EDIDC
+*"      IDOC_DATA STRUCTURE  EDIDD
+*"      IDOC_STATUS STRUCTURE  BDIDOCSTAT
+*"      RETURN_VARIABLES STRUCTURE  BDWFRETVAR
+*"      SERIALIZATION_INFO STRUCTURE  BDI_SER
+*"  EXCEPTIONS
+*"      WRONG_FUNCTION_CALLED
+*"----------------------------------------------------------------------
+
+*   ZSPPCL_NOTI101.
+
+  DATA wa_data TYPE z1sppidocnoti.
+  DATA lv_cantidad TYPE ru_lmnga.
+  DATA lv_datum TYPE datum.
+  DATA lv_time TYPE tims.
+  DATA lv_exidv TYPE zsppedexidv.
+  DATA: lv_procesado TYPE char1,
+        vt_return    TYPE ty_t_bapi_coru_return.
+
+*  RFNOFA
+*RFCODE
+*RFCAJA
+*RFMAQU
+*RFPICO
+*RFEMP
+*RFMUSR
+*RFMFMO
+*RFMHMO
+*PROCESADO
+
+  DATA(o_log) = NEW zcl_ap_log( object = 'IDOC'
+                                report = 'ZIF_PALETIZADORA'
+                                clave  = idoc_contrl-docnum ).
+
+  READ TABLE idoc_data INTO DATA(vw_idoc_data) WITH KEY segnam = 'Z1SPPIDOCNOTI'.
+  IF sy-subrc = 0.
+
+
+
+    wa_data = vw_idoc_data-sdata.
+    lv_cantidad = wa_data-rfcaja.
+    lv_datum = wa_data-rfmfmo.
+    lv_time = wa_data-rfmhmo.
+    lv_exidv = wa_data-rfcode+4. " SARCE 06.09.2022 11:27:15
+    lv_exidv = wa_data-rfcode. " SARCE 06.09.2022 11:27:15
+    lv_procesado = wa_data-procesado. " LRE 27.12.2022
+
+
+    o_log->log( msgty    = 'I'
+                message  = |Alta {  lv_exidv } por { lv_cantidad }|
+                msgv1    = lv_exidv
+                msgv2    = lv_cantidad
+                msgv3    = lv_datum
+                msgv4    = wa_data-rfemp ).
+
+
+*APC20241107 Si la cantidad es 0, devolvemos error directo
+    IF lv_cantidad = 0.
+      return_variables-wf_param      = 'ERROR_IDOCS'.
+      return_variables-doc_number = idoc_contrl-docnum.
+      APPEND return_variables.
+      idoc_status-docnum = idoc_contrl-docnum.
+      idoc_status-status = '51'.
+      idoc_status-msgty  = 'E'.
+      idoc_status-msgid  = 'FGD_CORE'.
+      idoc_status-msgno  = '003'. "La cantidad debe ser superior a 0
+      APPEND idoc_status.
+      RETURN.
+    ENDIF.
+
+    IF zcl_ap_utils=>bloquear_programa( cprog = 'IDOC_NOTI-' && wa_data-rfemp intentos = 1 espera = 1 ).
+      o_log->log( msgty    = 'I'
+                  message  = |Hay otro idoc del centro en proceso|
+                  msgv1    = lv_exidv
+                  msgv2    = lv_cantidad
+                  msgv3    = lv_datum
+                  msgv4    = wa_data-rfemp ).
+    ENDIF.
+
+* Verificamos si tenemos algún IDOC procesandose en el centro
+    DO.
+      DATA(l_seg) = zcl_ap_temp=>get_segundos_st( clave = 'IDOC_NOTI' subclave = wa_data-rfemp ).
+      IF l_seg > 5. "Como mucho esperamos 5 segundos.
+        EXIT.
+      ELSE.
+        WAIT UP TO 1 SECONDS.
+      ENDIF.
+    ENDDO.
+
+* Fijamos semáforo para indicar que queremos bloquear temporalmente el proceso de este IDOC hasta que se procese
+    zcl_ap_temp=>set_st( clave = 'IDOC_NOTI' subclave = wa_data-rfemp ).
+    COMMIT WORK AND WAIT.
+
+    DO 3 TIMES.
+      CLEAR vt_return.
+      CALL METHOD zsppcl_noti101=>notificacion_101
+        EXPORTING
+          i_docnum    = idoc_contrl-docnum
+          i_aufnr     = wa_data-rfnofa
+          i_yield     = lv_cantidad
+          i_matnr     = wa_data-rfefe
+*         i_werks     = wa_data-rfemp
+*         i_charg     = wa_data-
+*         i_meins     = 'ST'
+          i_exidv     = lv_exidv
+*         i_lgort     = wa_data-
+          i_postdate  = lv_datum
+          i_posttime  = lv_time
+          i_procesado = lv_procesado
+        IMPORTING
+          e_return    = vt_return
+*         e_mblnr     =
+*         e_mjahr     =
+        .
+
+      zcl_ap_utils=>desbloquear_programa( cprog = 'WF_MOD_ORD-' && wa_data-rfemp  ).
+      zcl_ap_temp=>delete_st( clave = 'IDOC_NOTI' subclave = wa_data-rfemp ).
+      COMMIT WORK AND WAIT.
+
+      DATA(l_error_bloqueo) = ' '.
+      LOOP AT vt_return ASSIGNING FIELD-SYMBOL(<msg>).
+        IF <msg>-message IS INITIAL OR ( <msg>-message CS ':' AND <msg>-message CS <msg>-id ).
+          MESSAGE ID <msg>-id TYPE 'S' NUMBER <msg>-number
+                  WITH <msg>-message_v1 <msg>-message_v2 <msg>-message_v3 <msg>-message_v4
+                  INTO <msg>-message.
+        ENDIF.
+
+        o_log->log( msgty    = <msg>-type
+                   msgv1    = lv_exidv
+                   msgv2    = lv_cantidad
+                   msgv3    = lv_datum
+                   msgv4    = wa_data-rfemp ).
+
+        IF <msg>-message CS 'ya la está tratando'.
+          l_error_bloqueo = 'X'.
+        ENDIF.
+      ENDLOOP.
+      IF l_error_bloqueo IS INITIAL.
+        EXIT.
+      ELSE.
+        WAIT UP TO 1 SECONDS.
+      ENDIF.
+    ENDDO.
+
+*    CALL METHOD zsppcl_noti101=>rework
+*      EXPORTING
+*        i_yield    = lv_cantidad
+*        i_aufnr    = wa_data-rfnofa
+*        i_werks    = wa_data-rfemp
+**        i_meins    =
+*        i_postdate = lv_datum
+*      IMPORTING
+*        e_return   = vt_return
+*        .
+    DELETE vt_return WHERE type = ' '.
+    READ TABLE vt_return INTO DATA(vw_return) WITH KEY type = 'E'.
+
+    IF sy-subrc = '0'.
+      return_variables-wf_param      = 'ERROR_IDOCS'.
+      return_variables-doc_number = idoc_contrl-docnum.
+      APPEND return_variables.
+      LOOP AT vt_return INTO vw_return WHERE type = 'E'.
+        idoc_status-docnum = idoc_contrl-docnum.
+        idoc_status-status = '51'.
+        idoc_status-msgty  = vw_return-type.
+        idoc_status-msgid  = vw_return-id.
+        idoc_status-msgno  = vw_return-number.
+        idoc_status-msgv1  = vw_return-message_v1.
+        idoc_status-msgv2  = vw_return-message_v2.
+        idoc_status-msgv3  = vw_return-message_v3.
+        idoc_status-msgv4  = vw_return-message_v4.
+        APPEND idoc_status.
+      ENDLOOP.
+      RETURN.
+    ELSE.
+      return_variables-wf_param      = 'PROCESSED_IDOCS'.
+      return_variables-doc_number = idoc_contrl-docnum.
+      APPEND return_variables.
+      LOOP AT vt_return INTO vw_return WHERE type NE 'E'.
+        idoc_status-docnum = idoc_contrl-docnum.
+        idoc_status-status = '53'.
+        idoc_status-msgty  = vw_return-type.
+        idoc_status-msgid  = vw_return-id.
+        idoc_status-msgno  = vw_return-number.
+        idoc_status-msgv1  = vw_return-message_v1.
+        idoc_status-msgv2  = vw_return-message_v2.
+        idoc_status-msgv3  = vw_return-message_v3.
+        idoc_status-msgv4  = vw_return-message_v4.
+        APPEND idoc_status.
+*        EXIT.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+ENDFUNCTION.

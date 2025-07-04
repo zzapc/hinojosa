@@ -1,0 +1,216 @@
+FUNCTION z_wf_acciones_mod_orden .
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(AUFNR) TYPE  AUFK-AUFNR
+*"----------------------------------------------------------------------
+  DATA: l_caufv TYPE caufv,
+        l_cdhdr TYPE cdhdr,
+        i_cdpos TYPE TABLE OF cdpos.
+
+  DATA(l_udate) = sy-datum.
+  DATA(l_utime) = sy-uzeit.
+
+* No queremos que haya dos WF con el mismo pedido a la vez
+  IF zcl_ap_utils=>bloquear_programa( cprog = 'WF_MOD_ORD-' && aufnr intentos = 5 espera = 1 ).
+    zcl_ap_log=>set_log( proceso = 'WF_MOD_ORD' clave = aufnr p1 = 'Existe otro WF activo' ).
+  ENDIF.
+
+  DO 5 TIMES.
+    SELECT SINGLE * FROM caufv
+      INTO CORRESPONDING FIELDS OF l_caufv
+     WHERE aufnr = aufnr.
+    IF sy-subrc NE 0.
+      WAIT UP TO 1 SECONDS.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDDO.
+  IF l_caufv IS INITIAL.
+    zcl_ap_log=>set_log( proceso = 'WF_MOD_ORD' clave = aufnr p1 = 'No existe orden. salimos' ).
+    RETURN.
+  ENDIF.
+
+  PERFORM buscar_cambios USING 'ZORDER' aufnr
+                  CHANGING l_cdhdr  i_cdpos.
+  IF sy-tcode IS INITIAL.
+    DATA(l_tcode) = l_cdhdr-tcode.
+  ELSE.
+    l_tcode = sy-tcode.
+  ENDIF.
+
+* En los logs, queremos el usuario de última modificación de la orden
+  IF NOT l_caufv-aenam IS INITIAL.
+    DATA(l_uname) = l_caufv-aenam.
+  ELSE.
+    l_uname = l_caufv-ernam.
+  ENDIF.
+
+  IF l_caufv-aedat IS INITIAL. "Creación de orden
+    IF NEW zhcl_core_wrk( )->es_full_sap_omp( l_caufv-werks ).
+      DATA: l_status     TYPE char20,
+            lt_prt_alloc TYPE cobai_t_prt_allocation,
+            lt_operation TYPE cobai_t_operation,
+            lt_header    TYPE cobai_t_header.
+
+      zcl_ap_cache=>get_cache( EXPORTING report = 'ZSPP_IDOC_ORDERS_STOPCODES'
+                                         clave = aufnr
+                               IMPORTING valores = lt_prt_alloc[]
+                                         valores2 = lt_operation[]
+                                         valores3 = lt_header[]
+                               ).
+      IF NOT lt_header IS INITIAL.
+        DELETE FROM zcache
+         WHERE report = 'ZSPP_IDOC_ORDERS_STOPCODES'
+           AND clave = aufnr.
+
+        CALL FUNCTION 'ZSPP_IDOC_ORDERS_STOPCODES'
+          EXPORTING
+            i_matnr  = l_caufv-plnbez
+            i_status = l_status
+            i_aufnr  = aufnr.
+*            it_mafs      = lt_prt_alloc
+*            it_operation = lt_operation
+*            it_header    = lt_header.
+
+        GET PARAMETER ID 'ZIDOC_DOCNUM' FIELD DATA(docnum).
+        IF NOT docnum IS INITIAL.
+          zcl_ap_log=>set_log( proceso = 'WF_MOD_ORD_IDOC' clave = aufnr uname = l_uname p1 = 'Se ha lanzado ZSPP_IDOC_ORDERS_STOPCODES y creado IDOC' p2 = docnum msgty = 'I' ).
+        ELSE.
+          GET PARAMETER ID 'ZIDOC_ERROR' FIELD DATA(error).
+          IF NOT error IS INITIAL.
+            zcl_ap_log=>set_log( proceso = 'WF_MOD_ORD_IDOC' clave = aufnr uname = l_uname p1 = 'Se ha lanzado ZSPP_IDOC_ORDERS_STOPCODES con error' p2 = error msgty = 'E' ).
+          ENDIF.
+        ENDIF.
+
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  DATA(o_pp) = NEW zhcl_pp_core( ).
+  o_pp->get_situacion_of( aufnr = aufnr
+                          tcode = 'WF_MOD_ORD' ).
+
+  SELECT zzvbeln AS vbeln FROM caufv
+    INTO TABLE @DATA(i_vbeln)
+   WHERE aufnr = @aufnr
+     AND zzvbeln NE ''.
+  SELECT kdauf AS vbeln FROM caufv
+    APPENDING CORRESPONDING FIELDS OF TABLE i_vbeln
+   WHERE aufnr = aufnr
+     AND kdauf NE ''.
+  IF NOT i_vbeln IS INITIAL.
+    DATA(l_ventas) = 'X'.
+  ENDIF.
+
+  SELECT zzsubco_ebeln AS vbeln FROM aufk
+   APPENDING CORRESPONDING FIELDS OF TABLE i_vbeln
+   WHERE aufnr = aufnr
+     AND zzsubco_ebeln NE ''.
+  IF sy-subrc = 0.
+    DATA(l_compras) = 'X'.
+  ENDIF.
+
+  IF NOT i_vbeln IS INITIAL.
+    DATA: r_vbeln TYPE RANGE OF vbeln_va.
+    LOOP AT i_vbeln ASSIGNING FIELD-SYMBOL(<vgbel>).
+      IF NOT line_exists( r_vbeln[ low = <vgbel>-vbeln ] ).
+        zcl_ap_log=>set_log( proceso = 'WF_MOD_ORD_Z360' clave = aufnr uname = l_uname p1 = 'Se van a actualizar estados de pedido:' p2 = <vgbel>-vbeln msgty = 'I' ).
+        APPEND VALUE #( option = 'EQ' sign = 'I' low = <vgbel>-vbeln ) TO r_vbeln.
+      ENDIF.
+    ENDLOOP.
+
+* Recuperamos datos de reparto para forzar actualización de tabla ZVBEP
+    DATA(o_sd) = NEW zhcl_sd_core( ).
+    DATA(i_rep) = o_sd->get_repartos( r_vbeln     = r_vbeln
+                                      historico = 'X'
+                                      add_pedidos_traslado = l_compras
+                                      add_pedidos_ventas = l_ventas
+                                      datos_medidas = ''
+                                      datos_interlocutores = ''
+                                      datos_stocks = 'X'
+                                      origen = 'WF_ORD' ).
+  ENDIF.
+
+  IF zcl_ap_exits=>exit_activa( 'ASB_OFS_CREACION_OF_ORDEN_SARRIA' ).
+    IF l_tcode NE 'CO01' AND l_caufv-erdat = sy-datum.
+      SELECT SINGLE aufnr FROM zwhs_cola
+        INTO l_caufv-aufnr
+       WHERE aufnr = aufnr.
+      IF sy-subrc NE 0.
+        l_tcode = 'CO01'.
+      ENDIF.
+    ENDIF.
+
+    IF ( l_tcode = 'CO01' OR  "Si es creación, sólo desde el estándar
+       ( NOT l_caufv-aenam IS INITIAL AND "En modificación sólo si se cambia fecha fin o cantidad
+         ( line_exists( i_cdpos[ fname = 'BDMNG' ] ) OR
+           line_exists( i_cdpos[ fname = 'GLTRP' ] )
+         )
+       ) OR l_caufv-loekz = 'X' "Se ha marcado orden para borrado
+      )  AND l_caufv-kdauf IS INITIAL.
+
+
+* En casos de la nueva fecha sea <= que la del sistema, no se cambia porque no admite fechas de inicio a pasado
+      ASSIGN i_cdpos[ fname = 'GLTRP' ] TO FIELD-SYMBOL(<fecha>).
+      IF sy-subrc = 0.
+        IF <fecha>-value_new <= sy-datum.
+          DATA(l_no_enviar) = 'X'.
+        ENDIF.
+      ENDIF.
+
+* En modificación no creamos OFs
+      IF l_tcode NE 'CO01'.
+        SELECT SINGLE aufnr FROM zwhs_cola
+          INTO l_caufv-aufnr
+         WHERE aufnr = aufnr.
+        IF sy-subrc NE 0.
+          l_no_enviar = 'X'.
+        ENDIF.
+      ENDIF.
+
+      IF l_no_enviar IS INITIAL.
+* Verificamos si tenemos que lanzar la creación del mensaje ´de Peris a Sarría
+        DATA: zwhs_mensaje TYPE zwhs_mensaje,
+              l_msg        TYPE bapi_msg,
+              zwhs_cola    TYPE zwhs_cola,
+              l_objkey     TYPE zwhs_clave.
+
+        l_objkey = aufnr.
+        CALL FUNCTION 'Z_ASB_OFS_OUT'
+          EXPORTING
+            objkey  = l_objkey
+            mensaje = zwhs_mensaje
+            var1    = 'TEST'
+          IMPORTING
+            message = l_msg
+          CHANGING
+            cola    = zwhs_cola.
+        IF l_msg = 'OK'.
+          zwhs=>genera_msg( EXPORTING objkey  = l_objkey
+                                      idmsg   = 'OFS'
+                                      tcode   = l_tcode
+                                      uname   = l_uname
+                            IMPORTING idcola  = DATA(l_idcola)
+                                      mensaje = l_msg ).
+          IF NOT l_idcola IS INITIAL.
+* Copiamos el log del mensaje para tenerlo también en ZLOG
+            SELECT tipo, mensaje FROM zwhs_log
+              INTO TABLE @DATA(i_log)
+             WHERE idcola = @l_idcola
+             ORDER BY PRIMARY KEY.
+            LOOP AT i_log ASSIGNING FIELD-SYMBOL(<log>).
+              zcl_ap_log=>set_log( proceso = 'WF_MOD_ORD_OFS' p1 = <log>-mensaje msgty = <log>-tipo ).
+            ENDLOOP.
+          ENDIF.
+        ELSE.
+          zcl_ap_log=>set_log( proceso = 'WF_MOD_ORD_OFS' p1 = 'No se genera OFS por' p2 = l_msg msgty = 'W' ).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  zcl_ap_utils=>desbloquear_programa( cprog = 'WF_MOD_ORD-' && aufnr  ).
+
+
+ENDFUNCTION.

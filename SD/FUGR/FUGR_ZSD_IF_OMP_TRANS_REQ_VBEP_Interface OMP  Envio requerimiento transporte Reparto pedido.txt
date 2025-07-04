@@ -1,0 +1,1293 @@
+FUNCTION zsd_if_omp_trans_req_vbep.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(VP_ACCION) TYPE  ZIF_OMP_TRANS_REQ_ACCION
+*"     VALUE(VP_VBELN) TYPE  VBELN_VA
+*"     VALUE(VP_POSNR) TYPE  POSNR_VA
+*"     VALUE(VP_ETENR) TYPE  ETENR
+*"     VALUE(WP_VBAK) TYPE  VBAK OPTIONAL
+*"     VALUE(WP_VBAP) TYPE  VBAPVB OPTIONAL
+*"     VALUE(WP_VBEP) TYPE  VBEPVB OPTIONAL
+*"     VALUE(TP_VBKD) TYPE  VA_VBKDVB_T OPTIONAL
+*"     VALUE(TP_VBPA) TYPE  VA_VBPAVB_T OPTIONAL
+*"     VALUE(TP_VBUK) TYPE  VA_VBUKVB_T OPTIONAL
+*"  EXPORTING
+*"     REFERENCE(VP_ENVIADO) TYPE  XFLAG
+*"     REFERENCE(VP_PROCESADO) TYPE  XFLAG
+*"----------------------------------------------------------------------
+  CONSTANTS: c_edi_extern TYPE edi_rcvpor VALUE 'OMP',
+             c_rcvprn     TYPE edi_rcvprn VALUE 'OMP',
+             c_ls_d       TYPE edi_rcvprt VALUE 'LS',
+             c_ls_r       TYPE edi_sndprt VALUE 'LS',
+             c_zmsg       TYPE edi_mestyp VALUE 'ZIF_OMP_TRANS_REQ',
+             c_idoctp     TYPE edi_idoctp VALUE 'ZIF_OMP_TRANS_REQ'.
+
+  DATA: vl_idoc_header       TYPE edidc,
+        tl_idoc_comm_control TYPE TABLE OF edidc,
+        ls_idoc_comm_control TYPE edidc,
+        tl_edidd             TYPE edidd_tt,
+        wl_edidd             TYPE edidd,
+        vl_segnum            TYPE edidd-segnum,
+        vl_psgnum            TYPE edidd-psgnum.
+
+  DATA: wl_zcaltemplate                TYPE zcaltemplate,
+        wl_zcaltemplatedata            TYPE zcaltemplatedata,
+        wl_zcaltemplatehour            TYPE zcaltemplatehour,
+        wl_zcaltemplatehourdata        TYPE zcaltemplatehourdata,
+        wl_zcctransportrequirement     TYPE zcctransportrequirement,
+        wl_zcctransportrequirementdata TYPE zcctransportrequirementdata,
+        wl_zcctransportrequirementdat2 TYPE zcctransportrequirementdat2,
+        wl_zcccustomer                 TYPE zcccustomer,
+        wl_zcccustomerdata             TYPE zcccustomerdata,
+        wl_zccdelivery                 TYPE zccdelivery,
+        wl_zccdeliverydata             TYPE zccdeliverydata,
+        wl_ztransportlocation          TYPE ztransportlocation,
+        wl_ztransportlocationdata      TYPE ztransportlocationdata.
+
+
+
+  DATA: rl_mtart         TYPE RANGE OF mara-mtart,
+        rl_auart         TYPE RANGE OF vbak-auart,
+        rl_vstel         TYPE RANGE OF vbap-vstel,
+        wl_mtart         LIKE LINE OF rl_mtart,
+        vl_cantidad_temp TYPE vbep-bmeng.
+
+  DATA: wl_adrc_sol        TYPE adrc,
+        wl_adrc_dest       TYPE adrc,
+        wl_adrc_puesto_exp TYPE adrc,
+        wl_t005t           TYPE t005t.
+
+  " Para que de tiempo a generar la OF
+  " RMM 10.05.24. No puedo esperar. Colapsa el servidor. Tienen pedidos con muchas posiciones.
+*  WAIT UP TO 10 SECONDS.
+  CLEAR vp_enviado.
+  vp_procesado = 'X'.
+  "***************************************************************************
+  "
+  " Recuperamos datos necesarios
+  "
+  "***************************************************************************
+  "
+  " Recuperamos datos del reparto.
+  "
+  IF wp_vbep IS INITIAL.
+    SELECT SINGLE *
+      FROM vbep
+      INTO wp_vbep
+      WHERE vbeln = vp_vbeln AND
+            posnr = vp_posnr AND
+            etenr = vp_etenr.
+
+
+    CHECK sy-subrc = 0.
+  ENDIF.
+  IF wp_vbep-vbeln IS INITIAL.
+    wp_vbep-vbeln = wp_vbak-vbeln.
+  ENDIF.
+
+  "
+  " Recuperamos datos de la posición.
+  "
+  IF wp_vbap IS INITIAL.
+    SELECT SINGLE *
+      FROM vbap
+      INTO wp_vbap
+      WHERE vbeln = vp_vbeln AND
+            posnr = vp_posnr.
+
+    CHECK sy-subrc = 0.
+  ENDIF.
+  IF wp_vbap-vbeln IS INITIAL.
+    wp_vbap-vbeln = wp_vbak-vbeln.
+  ENDIF.
+  "
+  " Recuperamos la cabecera del documento.
+  "
+  IF wp_vbak IS INITIAL.
+    SELECT SINGLE *
+     FROM vbak
+     INTO wp_vbak
+     WHERE vbeln = vp_vbeln.
+
+    CHECK sy-subrc = 0.
+  ENDIF.
+
+
+  IF tp_vbuk IS INITIAL.
+    SELECT *
+     FROM vbuk
+     INTO CORRESPONDING FIELDS OF TABLE tp_vbuk
+     WHERE vbeln = vp_vbeln.
+  ENDIF.
+
+  "
+  " Recuperamos datos del pedido.
+  "
+  DATA wl_vbkd TYPE vbkdvb.
+  CLEAR wl_vbkd.
+  IF tp_vbkd IS INITIAL.
+    SELECT SINGLE *
+      FROM vbkd
+      INTO CORRESPONDING FIELDS OF wl_vbkd
+      WHERE vbeln = vp_vbeln AND
+            posnr = vp_posnr.
+    IF sy-subrc <> 0.
+      SELECT SINGLE *
+        FROM vbkd
+        INTO CORRESPONDING FIELDS OF wl_vbkd
+        WHERE vbeln = vp_vbeln AND
+              posnr = '000000'.
+    ENDIF.
+  ELSE.
+    LOOP AT tp_vbkd ASSIGNING FIELD-SYMBOL(<fs_vbkd>) WHERE vbeln IS INITIAL.
+      <fs_vbkd>-vbeln = wp_vbak-vbeln.
+    ENDLOOP.
+
+    READ TABLE tp_vbkd INTO wl_vbkd WITH KEY vbeln = vp_vbeln posnr = vp_posnr.
+    IF sy-subrc <> 0.
+      READ TABLE tp_vbkd INTO wl_vbkd WITH KEY vbeln = vp_vbeln posnr = '000000'.
+    ENDIF.
+  ENDIF.
+
+  "
+  " Recuperamos el destinatario de la mercancía.
+  "
+  DATA wl_vbpa_dest TYPE vbpavb.
+  CLEAR wl_vbpa_dest.
+  IF tp_vbpa IS INITIAL.
+    SELECT SINGLE *
+      FROM vbpa
+      INTO CORRESPONDING FIELDS OF wl_vbpa_dest
+      WHERE vbeln = vp_vbeln AND
+            posnr = vp_posnr AND
+            parvw = 'WE'.
+    IF sy-subrc <> 0.
+      SELECT SINGLE *
+        FROM vbpa
+        INTO wl_vbpa_dest
+        WHERE vbeln = vp_vbeln AND
+              posnr = '000000' AND
+              parvw = 'WE'.
+    ENDIF.
+    IF sy-subrc <> 0.
+      CLEAR wl_vbpa_dest.
+    ENDIF.
+  ELSE.
+    LOOP AT tp_vbpa ASSIGNING FIELD-SYMBOL(<fs_vbpa>) WHERE vbeln IS INITIAL.
+      <fs_vbpa>-vbeln = wp_vbak-vbeln.
+    ENDLOOP.
+
+    READ TABLE tp_vbpa INTO wl_vbpa_dest WITH KEY vbeln = vp_vbeln posnr = vp_posnr parvw = 'WE'.
+    IF sy-subrc <> 0.
+      READ TABLE tp_vbpa INTO wl_vbpa_dest WITH KEY vbeln = vp_vbeln posnr = '000000' parvw = 'WE'.
+    ENDIF.
+  ENDIF.
+
+  SELECT SINGLE *
+    INTO wl_adrc_dest
+    FROM adrc
+    WHERE addrnumber = wl_vbpa_dest-adrnr.
+  IF sy-subrc <> 0.
+    CLEAR wl_adrc_dest.
+  ENDIF.
+  "
+  " Recuperamos el solicitante.
+  "
+  DATA wl_vbpa_sol TYPE vbpavb.
+  CLEAR wl_vbpa_sol.
+  IF tp_vbpa IS INITIAL.
+    SELECT SINGLE *
+      FROM vbpa
+      INTO CORRESPONDING FIELDS OF wl_vbpa_sol
+      WHERE vbeln = vp_vbeln AND
+            posnr = vp_posnr AND
+            parvw = 'AG'.
+    IF sy-subrc <> 0.
+      SELECT SINGLE *
+        FROM vbpa
+        INTO CORRESPONDING FIELDS OF wl_vbpa_sol
+        WHERE vbeln = vp_vbeln AND
+              posnr = '000000' AND
+              parvw = 'AG'.
+    ENDIF.
+    IF sy-subrc <> 0.
+      CLEAR wl_vbpa_sol.
+    ENDIF.
+  ELSE.
+    READ TABLE tp_vbpa INTO wl_vbpa_sol WITH KEY vbeln = vp_vbeln posnr = vp_posnr parvw = 'AG'.
+    IF sy-subrc <> 0.
+      READ TABLE tp_vbpa INTO wl_vbpa_sol WITH KEY vbeln = vp_vbeln posnr = '000000' parvw = 'AG'.
+    ENDIF.
+  ENDIF.
+
+  SELECT SINGLE *
+    INTO wl_adrc_sol
+    FROM adrc
+    WHERE addrnumber = wl_vbpa_dest-adrnr.
+  IF sy-subrc <> 0.
+    CLEAR wl_adrc_sol.
+  ENDIF.
+
+  "
+  " Recuperamos el comercial.
+  "
+  DATA wl_vbpa_comercial TYPE vbpavb.
+  CLEAR wl_vbpa_comercial.
+  IF tp_vbpa IS INITIAL.
+    SELECT SINGLE *
+      FROM vbpa
+      INTO CORRESPONDING FIELDS OF wl_vbpa_comercial
+      WHERE vbeln = vp_vbeln AND
+            posnr = vp_posnr AND
+            parvw = 'Y0'.
+    IF sy-subrc <> 0.
+      SELECT SINGLE *
+        FROM vbpa
+        INTO CORRESPONDING FIELDS OF wl_vbpa_comercial
+        WHERE vbeln = vp_vbeln AND
+              posnr = '000000' AND
+              parvw = 'Y0'.
+    ENDIF.
+    IF sy-subrc <> 0.
+      CLEAR wl_vbpa_comercial.
+    ENDIF.
+  ELSE.
+    READ TABLE tp_vbpa INTO wl_vbpa_comercial WITH KEY vbeln = vp_vbeln posnr = vp_posnr parvw = 'Y0'.
+    IF sy-subrc <> 0.
+      READ TABLE tp_vbpa INTO wl_vbpa_comercial WITH KEY vbeln = vp_vbeln posnr = '000000' parvw = 'Y0'.
+    ENDIF.
+  ENDIF.
+
+  "
+  " Obtener datos del material
+  "
+  SELECT SINGLE cuobj
+    INTO @DATA(vl_cuobj)
+    FROM marc
+    WHERE matnr EQ @wp_vbap-matnr AND
+          werks EQ @wp_vbap-werks.
+
+  IF sy-subrc <> 0.
+    CLEAR vl_cuobj.
+  ENDIF.
+
+  SELECT SINGLE *
+    INTO @DATA(wl_yhp_idx_td151)
+    FROM yhp_idx_td151
+    WHERE cuobj = @vl_cuobj AND
+          shuty = 'UNIT'.
+  IF sy-subrc <> 0.
+    CLEAR wl_yhp_idx_td151.
+  ENDIF.
+
+  SELECT SINGLE *
+    INTO @DATA(wl_yhp_idx_td151_container)
+    FROM yhp_idx_td151
+    WHERE cuobj = @vl_cuobj AND
+          shuty = 'CONTAINER'.
+  IF sy-subrc <> 0.
+    CLEAR wl_yhp_idx_td151_container.
+  ENDIF.
+
+  "
+  " Obtener registro info material
+  "
+  SELECT SINGLE *
+    FROM knmt
+    INTO @DATA(wl_knmt)
+    WHERE vkorg = @wp_vbak-vkorg AND
+          vtweg = @wp_vbak-vtweg AND
+          kunnr = @wp_vbak-kunnr AND "Solicitante
+          matnr = @wp_vbap-matnr.
+  IF sy-subrc <> 0.
+    SELECT SINGLE *
+      FROM knmt
+      INTO wl_knmt
+      WHERE vkorg = wp_vbak-vkorg AND
+            vtweg = wp_vbak-vtweg AND
+            kunnr = wl_vbpa_dest-kunnr AND " Destinatario
+            matnr = wp_vbap-matnr.
+  ENDIF.
+  IF sy-subrc <> 0.
+    CLEAR wl_knmt.
+  ENDIF.
+
+  "
+  " Obtener puesto de expedición
+  "
+  SELECT SINGLE *
+    FROM tvst
+    INTO @DATA(wl_tvst)
+    WHERE vstel = @wp_vbap-vstel.
+  IF sy-subrc <> 0.
+    CLEAR wl_tvst.
+  ENDIF.
+
+  SELECT SINGLE *
+    INTO wl_adrc_puesto_exp
+    FROM adrc
+    WHERE addrnumber = wl_tvst-adrnr.
+  IF sy-subrc <> 0.
+    CLEAR wl_adrc_puesto_exp.
+  ENDIF.
+
+  "***************************************************************************
+  "
+  " Validaciones previas
+  "
+  "***************************************************************************
+  "
+  " Buscamos el almacén WM asociado.
+  "
+  SELECT SINGLE *
+    FROM t320
+    INTO @DATA(wl_t320)
+    WHERE werks = @wp_vbap-werks AND
+          lgort = @wp_vbap-lgort.
+  IF sy-subrc <> 0.
+    SELECT SINGLE *
+      FROM t320
+      INTO wl_t320
+      WHERE werks = wp_vbap-werks.
+  ENDIF.
+  IF sy-subrc <> 0.
+    CLEAR wl_t320.
+  ENDIF.
+  "
+  " Configuración criterios selección.
+  "
+  DATA: wl_config_omp  TYPE zssd_if_omp_cfg,
+        rl_range_mtart TYPE efg_tab_ranges,
+        rl_range_auart TYPE efg_tab_ranges,
+        rl_range_vstel TYPE efg_tab_ranges.
+  CALL FUNCTION 'ZSD_IF_OMP_TRANS_GET_CONFG'
+    EXPORTING
+      vp_lgnum       = wl_t320-lgnum
+    IMPORTING
+      wp_config      = wl_config_omp
+      tp_range_mtart = rl_range_mtart
+      tp_range_auart = rl_range_auart
+      tp_range_vstel = rl_range_vstel
+    EXCEPTIONS
+      no_config      = 1
+      OTHERS         = 2.
+  " Validar que es del almacén wm que toca.
+  CHECK sy-subrc = 0.
+
+  " Validar que el tipo de documento es correcto.
+  rl_auart = rl_range_auart.
+  CHECK wp_vbak-auart IN rl_auart.
+
+  " validar que el puesto de expedición es el correcto
+  rl_vstel = rl_range_vstel.
+  CHECK wp_vbap-vstel IN rl_vstel.
+
+  " Validar que es del material que toca.
+  rl_mtart = rl_range_mtart.
+  SELECT SINGLE *
+    FROM mara
+    INTO @DATA(wl_mara)
+    WHERE matnr = @wp_vbap-matnr AND
+          mtart IN @rl_mtart.
+  CHECK sy-subrc = 0.
+
+  " Validar que hay cantidad confirmada: VBEP-BMENG.
+  CHECK wp_vbep-bmeng IS NOT INITIAL OR vp_accion = 'X'.
+
+  IF vp_accion = 'X' AND
+    wp_vbep-bmeng IS INITIAL AND
+    wp_vbep-wmeng IS NOT INITIAL.
+    " en este caso, mandamos cantidad pedida. No podemos mandar cantidad cero a OMP.
+    wp_vbep-bmeng = wp_vbep-wmeng.
+  ENDIF.
+
+  vl_segnum = 1.
+  CLEAR tl_edidd.
+  "***************************************************************************
+  "
+  " Generación datos. Calendario.
+  "
+  "***************************************************************************
+  IF vp_accion CO 'AMX'. " Para altas o modificaiones.
+    DATA tl_caltemplatehour TYPE TABLE OF zcaltemplatehourdata.
+    CLEAR wl_zcaltemplatedata.
+    CALL FUNCTION 'ZSD_IF_OMP_GET_CALENDAR'
+      EXPORTING
+        vp_kunnr           = wl_vbpa_dest-kunnr
+        vp_vbeln           = vp_vbeln
+        vp_posnr           = vp_posnr
+      IMPORTING
+        wp_caltemplate     = wl_zcaltemplatedata
+      TABLES
+        tp_caltemplatehour = tl_caltemplatehour.
+
+    CLEAR wl_zcaltemplate.
+    wl_zcaltemplate-operation = 'Replace'.
+
+    CLEAR: wl_edidd.
+    wl_edidd-sdata = wl_zcaltemplate.
+    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcaltemplate )->get_relative_name( ).
+    wl_edidd-segnum = vl_segnum.
+    vl_psgnum = vl_segnum.
+    ADD 1 TO vl_segnum.
+    APPEND wl_edidd TO tl_edidd.
+    CLEAR wl_zcaltemplate.
+
+    CLEAR: wl_edidd.
+    wl_edidd-sdata = wl_zcaltemplatedata.
+    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcaltemplatedata )->get_relative_name( ).
+    wl_edidd-segnum = vl_segnum.
+    wl_edidd-psgnum = vl_psgnum.
+    ADD 1 TO vl_segnum.
+    APPEND wl_edidd TO tl_edidd.
+
+    "
+    " Generación datos. Calendario. Horas.
+    "
+    LOOP AT tl_caltemplatehour ASSIGNING FIELD-SYMBOL(<fs_hour>).
+      CLEAR wl_zcaltemplatehour.
+      wl_zcaltemplatehour-operation = 'Replace'.
+
+      CLEAR: wl_edidd.
+      wl_edidd-sdata = wl_zcaltemplatehour.
+      wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcaltemplatehour )->get_relative_name( ).
+      wl_edidd-segnum = vl_segnum.
+      vl_psgnum = vl_segnum.
+      ADD 1 TO vl_segnum.
+      APPEND wl_edidd TO tl_edidd.
+      CLEAR wl_zcaltemplatehour.
+
+      CLEAR: wl_edidd.
+      wl_edidd-sdata = <fs_hour>.
+      wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcaltemplatehourdata )->get_relative_name( ).
+      wl_edidd-segnum = vl_segnum.
+      wl_edidd-psgnum = vl_psgnum.
+      ADD 1 TO vl_segnum.
+      APPEND wl_edidd TO tl_edidd.
+      CLEAR wl_zcaltemplatehourdata.
+    ENDLOOP.
+  ENDIF.
+  "***************************************************************************
+  "
+  " Generación datos. Transport location.
+  "
+  "***************************************************************************
+  "
+  " Origen.
+  "
+  IF vp_accion CO 'AMX'. " Para altas o modificaiones.
+    CLEAR wl_ztransportlocation.
+
+    wl_ztransportlocation-operation = 'Replace'.
+
+
+    CLEAR: wl_edidd.
+    wl_edidd-sdata = wl_ztransportlocation.
+    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_ztransportlocation )->get_relative_name( ).
+    wl_edidd-segnum = vl_segnum.
+    vl_psgnum = vl_segnum.
+    ADD 1 TO vl_segnum.
+    APPEND wl_edidd TO tl_edidd.
+
+    CLEAR wl_ztransportlocationdata.
+
+    CLEAR wl_ztransportlocationdata-costcode. " No relevante
+    CLEAR wl_ztransportlocationdata-defaulttransportleadtime. " No relevante
+    wl_ztransportlocationdata-label = wl_adrc_puesto_exp-city1.
+    CLEAR wl_ztransportlocationdata-latitude. " No relevante
+    CLEAR wl_ztransportlocationdata-longitude. " No relevante
+    IF wl_adrc_puesto_exp-country <> 'ES'.
+      CONCATENATE wl_adrc_puesto_exp-region wl_adrc_puesto_exp-country INTO wl_ztransportlocationdata-transportlocationgrpid.
+      CONCATENATE wl_adrc_puesto_exp-post_code1 wl_adrc_puesto_exp-country INTO wl_ztransportlocationdata-transportlocationid.
+    ELSE.
+      wl_ztransportlocationdata-transportlocationgrpid = wl_adrc_puesto_exp-region.
+      wl_ztransportlocationdata-transportlocationid = wl_adrc_puesto_exp-post_code1.
+    ENDIF.
+    IF wl_ztransportlocationdata-transportlocationgrpid(1) = '0'.
+      wl_ztransportlocationdata-transportlocationgrpid = wl_ztransportlocationdata-transportlocationgrpid+1.
+    ENDIF.
+    IF wl_ztransportlocationdata-transportlocationid(1) = '0'.
+      wl_ztransportlocationdata-transportlocationid = wl_ztransportlocationdata-transportlocationid+1.
+    ENDIF.
+
+
+
+    CLEAR: wl_edidd.
+    wl_edidd-sdata = wl_ztransportlocationdata.
+    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_ztransportlocationdata )->get_relative_name( ).
+    wl_edidd-segnum = vl_segnum.
+    wl_edidd-psgnum = vl_psgnum.
+    ADD 1 TO vl_segnum.
+    APPEND wl_edidd TO tl_edidd.
+
+
+    "
+    " Destino
+    "
+    CLEAR wl_ztransportlocation.
+    wl_ztransportlocation-operation = 'Replace'.
+
+    CLEAR: wl_edidd.
+    wl_edidd-sdata = wl_ztransportlocation.
+    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_ztransportlocation )->get_relative_name( ).
+    wl_edidd-segnum = vl_segnum.
+    vl_psgnum = vl_segnum.
+    ADD 1 TO vl_segnum.
+    APPEND wl_edidd TO tl_edidd.
+
+    CLEAR wl_ztransportlocationdata.
+    CLEAR wl_ztransportlocationdata-costcode. " No relevante
+    CLEAR wl_ztransportlocationdata-defaulttransportleadtime. " No relevante
+    wl_ztransportlocationdata-label = wl_adrc_dest-city1.
+    CLEAR wl_ztransportlocationdata-latitude. " No relevante
+    CLEAR wl_ztransportlocationdata-longitude. " No relevante
+
+    IF wl_adrc_dest-country <> 'ES'.
+      CONCATENATE wl_adrc_dest-region wl_adrc_dest-country INTO wl_ztransportlocationdata-transportlocationgrpid.
+      CONCATENATE wl_adrc_dest-post_code1 wl_adrc_dest-country INTO wl_ztransportlocationdata-transportlocationid.
+    ELSE.
+      wl_ztransportlocationdata-transportlocationgrpid = wl_adrc_dest-region.
+      wl_ztransportlocationdata-transportlocationid = wl_adrc_dest-post_code1.
+    ENDIF.
+    IF wl_ztransportlocationdata-transportlocationgrpid(1) = '0'.
+      wl_ztransportlocationdata-transportlocationgrpid = wl_ztransportlocationdata-transportlocationgrpid+1.
+    ENDIF.
+    IF wl_ztransportlocationdata-transportlocationid(1) = '0'.
+      wl_ztransportlocationdata-transportlocationid = wl_ztransportlocationdata-transportlocationid+1.
+    ENDIF.
+
+    CLEAR: wl_edidd.
+    wl_edidd-sdata = wl_ztransportlocationdata.
+    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_ztransportlocationdata )->get_relative_name( ).
+    wl_edidd-segnum = vl_segnum.
+    wl_edidd-psgnum = vl_psgnum.
+    ADD 1 TO vl_segnum.
+    APPEND wl_edidd TO tl_edidd.
+  ENDIF.
+  "***************************************************************************
+  "
+  " Generación datos. Requerimiento.
+  "
+  "***************************************************************************
+  CLEAR wl_zcctransportrequirement.
+  IF vp_accion CO 'AMXF'. " Para altas o modificaiones.
+    wl_zcctransportrequirement-operation = 'Replace'.
+  ELSE.
+    wl_zcctransportrequirement-operation = 'Delete'.
+  ENDIF.
+
+  CLEAR: wl_edidd.
+  wl_edidd-sdata = wl_zcctransportrequirement.
+  wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcctransportrequirement )->get_relative_name( ).
+  wl_edidd-segnum = vl_segnum.
+  vl_psgnum = vl_segnum.
+  ADD 1 TO vl_segnum.
+  APPEND wl_edidd TO tl_edidd.
+  CLEAR wl_zcctransportrequirement.
+
+  CLEAR wl_zcctransportrequirementdata.
+  IF vp_accion CO 'AMX'. " Para altas o modificaiones.
+    IF wp_vbap-grkor IS NOT INITIAL.
+      CONCATENATE wp_vbap-vbeln '.' wp_vbap-grkor INTO wl_zcctransportrequirementdata-assemblyid.
+    ENDIF.
+    wl_zcctransportrequirementdata-cleanupallowed = 'X'. " Siempre Sí
+    CLEAR wl_zcctransportrequirementdata-combinationrestriction. " No relevante
+*wl_zcctransportrequirementdata-COMMENTS. " Un texto del pedido. Se pasa a segmento de textos.
+    CLEAR wl_zcctransportrequirementdata-crane. " No relevante.
+    wl_zcctransportrequirementdata-cusarticlenr = wp_vbap-kdmat. " Material cliente.
+*wl_zcctransportrequirementdata-CUSCOMMENTS " Un texto del pedido.
+    wl_zcctransportrequirementdata-cusorderref = wl_vbkd-bstkd.
+    SELECT SINGLE name1
+      INTO wl_zcctransportrequirementdata-cussalesrep
+      FROM lfa1
+      WHERE lifnr = wl_vbpa_comercial-lifnr.
+    IF sy-subrc <> 0.
+      CLEAR wl_zcctransportrequirementdata-cussalesrep.
+    ENDIF.
+*    wl_zcctransportrequirementdata-customerid = wp_vbak-kunnr. " Solicitante.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = wp_vbak-kunnr
+      IMPORTING
+        output = wl_zcctransportrequirementdata-customerid.
+*    wl_zcctransportrequirementdata-deliveryid = wl_vbpa_dest-kunnr. " Destinatario.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = wl_vbpa_dest-kunnr
+      IMPORTING
+        output = wl_zcctransportrequirementdata-deliveryid.
+    " RMM 17.10.24 Cambiado
+    "    wl_zcctransportrequirementdata-disptransportlocationid = wl_adrc_puesto_exp-post_code1. " Localidad origen de la mercancía.
+    IF wl_adrc_puesto_exp-country <> 'ES'.
+      CONCATENATE wl_adrc_puesto_exp-post_code1 wl_adrc_puesto_exp-country INTO wl_zcctransportrequirementdata-disptransportlocationid.
+    ELSE.
+      wl_zcctransportrequirementdata-disptransportlocationid = wl_adrc_puesto_exp-post_code1.
+    ENDIF.
+    IF wl_zcctransportrequirementdata-disptransportlocationid(1) = '0'.
+      wl_zcctransportrequirementdata-disptransportlocationid = wl_zcctransportrequirementdata-disptransportlocationid+1.
+    ENDIF.
+    CLEAR wl_zcctransportrequirementdata-dlycomments. "No relevante.
+    wl_zcctransportrequirementdata-dlypriority = 0.
+
+    " RMM 17.10.24 Cambiado
+    " wl_zcctransportrequirementdata-dlytransportlocationid = wl_adrc_dest-post_code1. "Localidad destino de la mercancía.
+    IF wl_adrc_dest-country <> 'ES'.
+      CONCATENATE wl_adrc_dest-post_code1 wl_adrc_dest-country INTO wl_zcctransportrequirementdata-dlytransportlocationid.
+    ELSE.
+      wl_zcctransportrequirementdata-dlytransportlocationid = wl_adrc_dest-post_code1.
+    ENDIF.
+    IF wl_zcctransportrequirementdata-dlytransportlocationid(1) = '0'.
+      wl_zcctransportrequirementdata-dlytransportlocationid = wl_zcctransportrequirementdata-dlytransportlocationid+1.
+    ENDIF.
+
+    wl_zcctransportrequirementdata-dlywindow = wl_zcaltemplatedata-caltemplateid.
+    " Cambiado el 28.02.24 tras pruebas con usuarios.
+    " RMM 13.03.24. Lo dejamos como antes tras confirmar.
+*    CALL FUNCTION 'ZSD_IF_OMP_COMP_DATETIME'
+*      EXPORTING
+*        vp_fecha    = wp_vbep-lddat
+*        vp_hora     = wp_vbep-lduhr
+*      IMPORTING
+*        vp_datetime = wl_zcctransportrequirementdata-earliestdispdate.
+    " RMM 23.04.24 No mandamos esta fecha.
+    CLEAR wl_zcctransportrequirementdata-earliestdispdate.
+*    CALL FUNCTION 'ZSD_IF_OMP_COMP_DATETIME'
+*      EXPORTING
+*        vp_fecha    = wp_vbep-edatu
+*        vp_hora     = wp_vbep-ezeit
+*      IMPORTING
+*        vp_datetime = wl_zcctransportrequirementdata-earliestdispdate.
+    IF wp_vbap-zzfconfs IS NOT INITIAL.
+      " RMM 23.04.24 Lo ponemos en textos.
+      CONCATENATE wp_vbap-zzfconfs+6(2) '.' wp_vbap-zzfconfs+4(2) '.' wp_vbap-zzfconfs(4) INTO wl_zcctransportrequirementdata-cuscomments.
+*      CALL FUNCTION 'ZSD_IF_OMP_COMP_DATETIME'
+*        EXPORTING
+*          vp_fecha    = wp_vbap-zzfconfs
+*          vp_hora     = '000000'
+*        IMPORTING
+*          vp_datetime = wl_zcctransportrequirementdata-earliestdlydate.
+    ELSE.
+*      CLEAR wl_zcctransportrequirementdata-earliestdlydate.
+    ENDIF.
+
+  ENDIF.
+  CLEAR: wl_edidd.
+  " Quitar espacios campos numericos.
+  CONDENSE wl_zcctransportrequirementdata-dlypriority.
+  wl_edidd-sdata = wl_zcctransportrequirementdata.
+  wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcctransportrequirementdata )->get_relative_name( ).
+  wl_edidd-segnum = vl_segnum.
+  wl_edidd-psgnum = vl_psgnum.
+  ADD 1 TO vl_segnum.
+  APPEND wl_edidd TO tl_edidd.
+
+  CLEAR wl_zcctransportrequirementdat2.
+
+  DATA vl_vbeln TYPE vbep-vbeln.
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+    EXPORTING
+      input  = wp_vbep-vbeln
+    IMPORTING
+      output = vl_vbeln.
+
+
+  CONCATENATE vl_vbeln '.' wp_vbep-posnr '.' wp_vbep-etenr INTO wl_zcctransportrequirementdat2-transportrequirementid.
+  IF vp_accion CO 'AMX'. " Para altas o modificaiones.
+    " RMM 25.04.24 Nos quedamos con la última. No miramos status.
+    DATA wl_afpo TYPE afpo.
+    SELECT *
+      FROM afpo
+      INTO TABLE @DATA(tl_afpo)
+      WHERE kdauf = @wp_vbep-vbeln AND
+            kdpos = @wp_vbep-posnr
+      ORDER BY aufnr DESCENDING.
+    READ TABLE tl_afpo INTO wl_afpo INDEX 1.
+    IF sy-subrc = 0.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = wl_afpo-aufnr
+        IMPORTING
+          output = wl_zcctransportrequirementdat2-erpid.
+      wl_zcctransportrequirementdat2-goodsmanagement = 'MTO'.
+    ELSE.
+      "CONCATENATE vl_vbeln '.' wp_vbep-posnr '.' wp_vbep-etenr INTO wl_zcctransportrequirementdat2-erpid.
+      CLEAR wl_zcctransportrequirementdat2-erpid. " Visto en la reunión del 16.11.23
+      wl_zcctransportrequirementdat2-goodsmanagement = 'MTS'.
+      "
+      " 11.04.24 Nueva función pedida por Andrea.
+      "
+      IF wp_vbap-bedae = 'KSV'.
+        SELECT SINGLE *
+          FROM mska
+          INTO @DATA(wl_mska)
+          WHERE matnr = @wp_vbap-matnr AND
+                vbeln = @wp_vbap-vbeln AND
+                posnr = @wp_vbap-posnr.
+        IF sy-subrc = 0 AND wl_mska-charg IS NOT INITIAL.
+          wl_zcctransportrequirementdat2-erpid = wl_mska-charg.
+          wl_zcctransportrequirementdat2-goodsmanagement = 'MTO'.
+        ENDIF.
+      ENDIF.
+
+    ENDIF.
+    CLEAR wl_zcctransportrequirementdat2-forklift. " No relevante.
+    CLEAR wl_zcctransportrequirementdat2-fulfilled. " Por defecto NO
+    wl_zcctransportrequirementdat2-generatecandidates = 'X'. "Restauramos cambio. Carlos Asenjo 05.11.24 "Pedido por Carlos Asengo 29.10.24 Antes -> = 'X'. "Por defecto SI
+    wl_zcctransportrequirementdat2-goodsid = wp_vbap-matnr.
+*    wl_zcctransportrequirementdat2-goodsmanagement = 'MTO'. "Pdte revisar.
+    wl_zcctransportrequirementdat2-goodstype = wl_mara-mtart.
+    " Fecha final fabricación + días de ruta
+    CLEAR wl_zcctransportrequirementdat2-latestdispdate.
+**    CALL FUNCTION 'ZSD_IF_OMP_GET_LATESTDISPDATE'
+**      EXPORTING
+**        vp_vbeln    = wp_vbep-vbeln
+**        vp_posnr    = wp_vbep-posnr
+**      IMPORTING
+**        vp_datetime = wl_zcctransportrequirementdat2-latestdispdate.
+**    IF wl_zcctransportrequirementdat2-latestdispdate IS INITIAL.
+**
+**      CALL FUNCTION 'ZSD_IF_OMP_COMP_DATETIME'
+**        EXPORTING
+**          vp_fecha    = wp_vbep-edatu
+**          vp_hora     = wp_vbep-ezeit
+**        IMPORTING
+**          vp_datetime = wl_zcctransportrequirementdat2-latestdispdate.
+**
+**    ENDIF.
+    " RMM 23.04.24 No mandamos esta fecha.
+    CLEAR wl_zcctransportrequirementdat2-latestdispdate.
+
+    " Fecha de entrega.
+    CALL FUNCTION 'ZSD_IF_OMP_COMP_DATETIME'
+      EXPORTING
+        vp_fecha    = wp_vbep-edatu
+        vp_hora     = wp_vbep-ezeit
+      IMPORTING
+        vp_datetime = wl_zcctransportrequirementdat2-latestdlydate.
+
+    "
+    " RMM 10.04.24 Ya no hacemos estos tratamientos. Los repartos no se modificarán desde la OF
+    "
+*    IF wp_vbep-wmeng IS INITIAL. "Cantidad pedida
+*      " Es una línea de reparto añadida por el sistema por tema de fechas.
+*      " Intento buscar la línea origian y si la encuentro uso su EDATU.
+*      SELECT *
+*        FROM vbep
+*        INTO TABLE @DATA(tl_vbep_original)
+*        UP TO 1 ROWS
+*        WHERE vbeln = @wp_vbep-vbeln AND
+*              posnr = @wp_vbep-posnr AND
+*              bmeng = 0 AND
+*              wmeng = @wp_vbep-lmeng AND " Cantidad pedida del reparto original = cantidad necesidad del nuevo reparto.
+*              wadat <= @wp_vbep-wadat
+*        ORDER BY wadat DESCENDING.
+*      READ TABLE tl_vbep_original ASSIGNING FIELD-SYMBOL(<fs_vbep_original>) INDEX 1.
+*      IF sy-subrc = 0.
+*        CALL FUNCTION 'ZSD_IF_OMP_COMP_DATETIME'
+*          EXPORTING
+*            vp_fecha    = <fs_vbep_original>-edatu
+*            vp_hora     = <fs_vbep_original>-ezeit
+*          IMPORTING
+*            vp_datetime = wl_zcctransportrequirementdat2-latestdlydate.
+*      ENDIF.
+*    ENDIF.
+
+    CLEAR wl_zcctransportrequirementdat2-liftgate. "No relevante.
+    CLEAR wl_zcctransportrequirementdat2-loadingdirection. "No relevante.
+    CLEAR wl_zcctransportrequirementdat2-lockgroup. "No relevante.
+    CLEAR wl_zcctransportrequirementdat2-maxhufootprintlength. "No relevante.
+    CLEAR wl_zcctransportrequirementdat2-maxhufootprintwidth. "No relevante.
+    CLEAR wl_zcctransportrequirementdat2-maxhugrossheight. "No relevante.
+    CLEAR wl_zcctransportrequirementdat2-maxhugrossweight. "No relevante.
+    wl_zcctransportrequirementdat2-maxnofdeliveries = wp_vbap-antlf.
+    CLEAR wl_zcctransportrequirementdat2-maxnofpartialhus. " No relevante.
+    vl_cantidad_temp = wp_vbep-bmeng + ( wp_vbep-bmeng * wp_vbap-uebto / 100 ).
+    wl_zcctransportrequirementdat2-maxquantity  = vl_cantidad_temp.
+
+    CALL FUNCTION 'ZSD_IF_OMP_GET_UM'
+      EXPORTING
+        vp_meins = wp_vbep-vrkme
+      IMPORTING
+        vp_mseh6 = wl_zcctransportrequirementdat2-maxquantity_uom.
+    wl_zcctransportrequirementdat2-maxquantityperhu = '99999'. "Pdte.
+    CLEAR wl_zcctransportrequirementdat2-maxstacking. " No relevante.
+    vl_cantidad_temp = wp_vbep-bmeng - ( wp_vbep-bmeng * wp_vbap-untto / 100 ).
+    wl_zcctransportrequirementdat2-minquantity  = vl_cantidad_temp.
+
+    CALL FUNCTION 'ZSD_IF_OMP_GET_UM'
+      EXPORTING
+        vp_meins = wp_vbep-vrkme
+      IMPORTING
+        vp_mseh6 = wl_zcctransportrequirementdat2-minquantity_uom.
+
+    wl_zcctransportrequirementdat2-minquantityperhu = '0'.
+
+    "
+    " Ver si hay bloqueo entrega.
+    "
+    DATA: vl_bloqueo_entrega TYPE xflag,
+          vl_vtext           TYPE vtext.
+
+    CALL FUNCTION 'ZSD_IF_OMP_ES_BLOQ_ENTREGA'
+      EXPORTING
+        vp_lifsk   = wp_vbak-lifsk
+      IMPORTING
+        vp_bloqueo = vl_bloqueo_entrega
+        vp_vtext   = vl_vtext.
+
+    IF vl_bloqueo_entrega IS INITIAL.
+      "
+      " Comprobamos si el bloqueo está a nivel de reparto.
+      "
+      CALL FUNCTION 'ZSD_IF_OMP_ES_BLOQ_ENTREGA'
+        EXPORTING
+          vp_lifsk   = wp_vbep-lifsp
+        IMPORTING
+          vp_bloqueo = vl_bloqueo_entrega
+          vp_vtext   = vl_vtext.
+    ENDIF.
+
+    IF vl_bloqueo_entrega IS INITIAL.
+      CLEAR wl_zcctransportrequirementdat2-onhold.
+      CLEAR wl_zcctransportrequirementdat2-onholdreason.
+    ELSE.
+      wl_zcctransportrequirementdat2-onhold = 'X'.
+      wl_zcctransportrequirementdat2-onholdreason = vl_vtext.
+    ENDIF.
+    IF vp_accion = 'X'.
+      wl_zcctransportrequirementdat2-onhold = 'X'.
+      CLEAR wl_zcctransportrequirementdat2-onholdreason.
+      READ TABLE tp_vbuk ASSIGNING FIELD-SYMBOL(<fs_vbuk>) WITH KEY vbeln = wp_vbak-vbeln.
+      IF sy-subrc = 0 AND <fs_vbuk>-cmgst CA 'BC'.
+        wl_zcctransportrequirementdat2-onholdreason = 'Crédito Oper. no OK'.
+      ENDIF.
+    ENDIF.
+
+**    IF wp_vbak-lifsk IS INITIAL.
+**      CLEAR wl_zcctransportrequirementdat2-onhold.
+**      CLEAR wl_zcctransportrequirementdat2-onholdreason.
+**    ELSE.
+**      wl_zcctransportrequirementdat2-onhold = 'X'.
+**      SELECT SINGLE vtext
+**        FROM tvlst
+**        INTO wl_zcctransportrequirementdat2-onholdreason
+**        WHERE spras = sy-langu AND
+**        lifsp = wp_vbak-lifsk.
+**      IF sy-subrc <> 0.
+**        CLEAR wl_zcctransportrequirementdat2-onholdreason.
+**      ENDIF.
+**
+**
+**    ENDIF.
+    IF wl_yhp_idx_td151_container-laptr <= 1.
+      wl_zcctransportrequirementdat2-stackability = 'NO'.
+    ELSE.
+      wl_zcctransportrequirementdat2-stackability = 'YES'.
+    ENDIF.
+
+    wl_zcctransportrequirementdat2-targetquantity = wp_vbep-bmeng.
+    CALL FUNCTION 'ZSD_IF_OMP_GET_UM'
+      EXPORTING
+        vp_meins = wp_vbep-vrkme
+      IMPORTING
+        vp_mseh6 = wl_zcctransportrequirementdat2-targetquantity_uom.
+    wl_zcctransportrequirementdat2-targetquantityperhu = wl_yhp_idx_td151-tbqty.
+    IF wl_yhp_idx_td151-tbqty IS INITIAL.
+      DATA: lv_matnr  TYPE mara-matnr,
+            lv_in_me  LIKE  mara-meins,
+            lv_out_me LIKE  mara-meins,
+            lv_menge  LIKE  ekpo-menge.
+
+      lv_matnr = wp_vbap-matnr.
+      lv_in_me = 'PAL'.
+      lv_out_me = 'ST'.
+      lv_menge = 1.
+
+      CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+        EXPORTING
+          i_matnr              = lv_matnr
+          i_in_me              = lv_in_me
+          i_out_me             = lv_out_me
+          i_menge              = lv_menge
+        IMPORTING
+          e_menge              = lv_menge
+        EXCEPTIONS
+          error_in_application = 1
+          error                = 2
+          OTHERS               = 3.
+      IF sy-subrc <> 0.
+        CLEAR lv_menge.
+      ENDIF.
+      IF lv_menge <> 0.
+        wl_zcctransportrequirementdat2-targetquantityperhu = lv_menge.
+      ELSE.
+        wl_zcctransportrequirementdat2-targetquantityperhu = 500. " Solicitado por Carlos Asenjo 29.10.24
+      ENDIF.
+    ENDIF.
+    CALL FUNCTION 'ZSD_IF_OMP_GET_UM'
+      EXPORTING
+        vp_meins = wl_yhp_idx_td151-tbqty_uom
+      IMPORTING
+        vp_mseh6 = wl_zcctransportrequirementdat2-targetquantityperhu_uom.
+    IF wl_yhp_idx_td151-tbqty_uom IS INITIAL.
+      wl_zcctransportrequirementdat2-targetquantityperhu_uom = wl_zcctransportrequirementdat2-targetquantity_uom.
+    ENDIF.
+
+    CLEAR wl_zcctransportrequirementdat2-unloadingside. "No relevante.
+
+    IF wl_knmt-zzpalet_completo IS NOT INITIAL.
+      wl_zcctransportrequirementdat2-maxquantityperhu = wl_zcctransportrequirementdat2-targetquantityperhu.
+      wl_zcctransportrequirementdat2-minquantityperhu = wl_zcctransportrequirementdat2-targetquantityperhu.
+    ENDIF.
+    wl_zcctransportrequirementdat2-maxquantityperhu_uom = wl_zcctransportrequirementdat2-targetquantityperhu_uom.
+    wl_zcctransportrequirementdat2-minquantityperhu_uom = wl_zcctransportrequirementdat2-targetquantityperhu_uom.
+  ENDIF.
+  IF vp_accion = 'F'.
+    wl_zcctransportrequirementdat2-fulfilled = 'X'.
+  ENDIF.
+
+  CLEAR: wl_edidd.
+  " Quitar espacios campos numericos.
+  CONDENSE wl_zcctransportrequirementdat2-maxhufootprintlength.
+  CONDENSE wl_zcctransportrequirementdat2-maxhufootprintwidth.
+  CONDENSE wl_zcctransportrequirementdat2-maxhugrossheight.
+  CONDENSE wl_zcctransportrequirementdat2-maxhugrossweight.
+  CONDENSE wl_zcctransportrequirementdat2-maxnofdeliveries.
+  CONDENSE wl_zcctransportrequirementdat2-maxnofpartialhus.
+  CONDENSE wl_zcctransportrequirementdat2-maxquantity.
+  CONDENSE wl_zcctransportrequirementdat2-maxquantityperhu.
+  CONDENSE wl_zcctransportrequirementdat2-maxstacking.
+  CONDENSE wl_zcctransportrequirementdat2-minquantity.
+  CONDENSE wl_zcctransportrequirementdat2-minquantityperhu.
+  CONDENSE wl_zcctransportrequirementdat2-targetquantity.
+  CONDENSE wl_zcctransportrequirementdat2-targetquantityperhu.
+
+
+  wl_edidd-sdata = wl_zcctransportrequirementdat2.
+  wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcctransportrequirementdat2 )->get_relative_name( ).
+  wl_edidd-segnum = vl_segnum.
+  wl_edidd-psgnum = vl_psgnum.
+  ADD 1 TO vl_segnum.
+  APPEND wl_edidd TO tl_edidd.
+
+  "
+  " Guardamos textos.
+  "
+  IF vp_accion CO 'AMX'. " Para altas o modificaiones.
+    DATA: tl_lines  TYPE TABLE OF tline,
+          vl_name   TYPE thead-tdname,
+          vl_id     TYPE  thead-tdid,
+          vl_object TYPE thead-tdobject.
+
+
+
+    CONCATENATE vp_vbeln vp_posnr INTO vl_name.
+    vl_id = 'ZC03'.
+    vl_object = 'VBBP'.
+
+    CALL FUNCTION 'READ_TEXT'
+      EXPORTING
+*       CLIENT                  = SY-MANDT
+        id                      = vl_id
+        language                = sy-langu
+        name                    = vl_name
+        object                  = vl_object
+*       ARCHIVE_HANDLE          = 0
+*       LOCAL_CAT               = ' '
+*   IMPORTING
+*       HEADER                  =
+*       OLD_LINE_COUNTER        =
+      TABLES
+        lines                   = tl_lines
+      EXCEPTIONS
+        id                      = 1
+        language                = 2
+        name                    = 3
+        not_found               = 4
+        object                  = 5
+        reference_check         = 6
+        wrong_access_to_archive = 7
+        OTHERS                  = 8.
+    IF sy-subrc <> 0.
+      CLEAR tl_lines.
+    ENDIF.
+*****  IF tl_lines IS INITIAL.
+*****    vl_name = vp_vbeln.
+*****
+*****    CALL FUNCTION 'READ_TEXT'
+*****      EXPORTING
+******       CLIENT                  = SY-MANDT
+*****        id                      = 'ZC03'
+*****        language                = sy-langu
+*****        name                    = vl_name
+*****        object                  = 'VBBP'
+******       ARCHIVE_HANDLE          = 0
+******       LOCAL_CAT               = ' '
+******   IMPORTING
+******       HEADER                  =
+******       OLD_LINE_COUNTER        =
+*****      TABLES
+*****        lines                   = tl_lines
+*****      EXCEPTIONS
+*****        id                      = 1
+*****        language                = 2
+*****        name                    = 3
+*****        not_found               = 4
+*****        object                  = 5
+*****        reference_check         = 6
+*****        wrong_access_to_archive = 7
+*****        OTHERS                  = 8.
+*****    IF sy-subrc <> 0.
+*****      CLEAR tl_lines.
+*****    ENDIF.
+*****  ENDIF.
+
+    IF tl_lines IS NOT INITIAL.
+      DATA: wl_e1edkt1 TYPE e1edkt1,
+            wl_e1edkt2 TYPE e1edkt2.
+
+      CLEAR wl_e1edkt1.
+      wl_e1edkt1-tdid = vl_id.
+      wl_e1edkt1-tdobject = vl_object.
+      wl_e1edkt1-tdobname = vl_name.
+      wl_e1edkt1-tsspras = sy-langu.
+
+      CLEAR: wl_edidd.
+      wl_edidd-sdata = wl_e1edkt1.
+      wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_e1edkt1 )->get_relative_name( ).
+      wl_edidd-segnum = vl_segnum.
+      vl_psgnum = vl_segnum.
+      ADD 1 TO vl_segnum.
+      APPEND wl_edidd TO tl_edidd.
+
+      LOOP AT tl_lines ASSIGNING FIELD-SYMBOL(<fs_line>).
+        CLEAR wl_e1edkt2.
+        wl_e1edkt2-tdformat = <fs_line>-tdformat.
+        wl_e1edkt2-tdline = <fs_line>-tdline.
+
+        CLEAR: wl_edidd.
+        wl_edidd-sdata = wl_e1edkt2.
+        wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_e1edkt2 )->get_relative_name( ).
+        wl_edidd-segnum = vl_segnum.
+        vl_psgnum = vl_segnum.
+        ADD 1 TO vl_segnum.
+        APPEND wl_edidd TO tl_edidd.
+
+      ENDLOOP.
+
+    ENDIF.
+  ENDIF.
+
+  "***************************************************************************
+  "
+  " Generación datos. Customer.
+  "
+  "***************************************************************************
+  IF vp_accion CO 'AMX'. " Para altas o modificaiones.
+    CLEAR wl_zcccustomer.
+    wl_zcccustomer-operation = 'Replace'.
+
+    CLEAR: wl_edidd.
+    wl_edidd-sdata = wl_zcccustomer.
+    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcccustomer )->get_relative_name( ).
+    wl_edidd-segnum = vl_segnum.
+    vl_psgnum = vl_segnum.
+    ADD 1 TO vl_segnum.
+    APPEND wl_edidd TO tl_edidd.
+
+    SELECT SINGLE *
+      FROM t005t
+      INTO wl_t005t
+      WHERE spras = sy-langu AND
+            land1 = wl_adrc_sol-country.
+    IF sy-subrc <> 0.
+      CLEAR wl_t005t.
+    ENDIF.
+
+    CLEAR wl_zcccustomerdata.
+    CLEAR wl_zcccustomerdata-accountmgr.
+    CLEAR wl_zcccustomerdata-address. " = wl_adrc-STREET.
+    CLEAR wl_zcccustomerdata-comments.
+    CLEAR wl_zcccustomerdata-contactname.
+    CLEAR wl_zcccustomerdata-contacttel.
+    wl_zcccustomerdata-country = wl_t005t-landx.
+    CLEAR wl_zcccustomerdata-customergroup.
+*    wl_zcccustomerdata-customerid = wl_vbpa_sol-kunnr.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = wl_vbpa_sol-kunnr
+      IMPORTING
+        output = wl_zcccustomerdata-customerid.
+
+    CLEAR wl_zcccustomerdata-email.
+    CLEAR wl_zcccustomerdata-enterprisenr.
+    CLEAR wl_zcccustomerdata-fax.
+
+    SELECT SINGLE name1
+      INTO wl_zcccustomerdata-name
+      FROM kna1
+      WHERE kunnr = wl_vbpa_sol-kunnr.
+    IF sy-subrc <> 0.
+      CLEAR wl_zcccustomerdata-name.
+    ENDIF.
+    wl_zcccustomerdata-postzip = wl_adrc_sol-post_code1.
+    CLEAR wl_zcccustomerdata-tel.
+    wl_zcccustomerdata-town = wl_adrc_sol-city1.
+    CLEAR wl_zcccustomerdata-vat.
+
+    CLEAR: wl_edidd.
+    wl_edidd-sdata = wl_zcccustomerdata.
+    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zcccustomerdata )->get_relative_name( ).
+    wl_edidd-segnum = vl_segnum.
+    wl_edidd-psgnum = vl_psgnum.
+    ADD 1 TO vl_segnum.
+    APPEND wl_edidd TO tl_edidd.
+  ENDIF.
+  "***************************************************************************
+  "
+  " Generación datos. Delivery.
+  "
+  "***************************************************************************
+  IF vp_accion CO 'AMX'. " Para altas o modificaiones.
+    CLEAR wl_zccdelivery.
+    wl_zccdelivery-operation = 'Replace'.
+
+    CLEAR: wl_edidd.
+    wl_edidd-sdata = wl_zccdelivery.
+    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zccdelivery )->get_relative_name( ).
+    wl_edidd-segnum = vl_segnum.
+    vl_psgnum = vl_segnum.
+    ADD 1 TO vl_segnum.
+    APPEND wl_edidd TO tl_edidd.
+
+    SELECT SINGLE *
+      FROM t005t
+      INTO wl_t005t
+      WHERE spras = sy-langu AND
+            land1 = wl_adrc_dest-country.
+    IF sy-subrc <> 0.
+      CLEAR wl_t005t.
+    ENDIF.
+
+    CLEAR wl_zccdeliverydata.
+    wl_zccdeliverydata-address = wl_adrc_dest-street.
+    CLEAR wl_zccdeliverydata-comments.
+*    CLEAR wl_zccdeliverydata-condition.
+    wl_zccdeliverydata-condition = wp_vbak-vsbed. " Condiciones de expedición.
+    CLEAR wl_zccdeliverydata-contactname.
+    CLEAR wl_zccdeliverydata-contacttel.
+    wl_zccdeliverydata-country = wl_t005t-landx.
+*    wl_zccdeliverydata-deliveryid = wl_vbpa_dest-kunnr.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = wl_vbpa_dest-kunnr
+      IMPORTING
+        output = wl_zccdeliverydata-deliveryid.
+    CLEAR wl_zccdeliverydata-email.
+    CLEAR wl_zccdeliverydata-fax.
+
+    SELECT SINGLE name1
+      INTO wl_zccdeliverydata-name
+      FROM kna1
+      WHERE kunnr = wl_vbpa_dest-kunnr.
+    IF sy-subrc <> 0.
+      CLEAR wl_zccdeliverydata-name.
+    ENDIF.
+    wl_zccdeliverydata-postzip = wl_adrc_dest-post_code1.
+    CLEAR wl_zccdeliverydata-sender.
+    CLEAR wl_zccdeliverydata-specopening.
+    CLEAR wl_zccdeliverydata-tel.
+    wl_zccdeliverydata-town = wl_adrc_dest-city1.
+
+    CLEAR: wl_edidd.
+    wl_edidd-sdata = wl_zccdeliverydata.
+    wl_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wl_zccdeliverydata )->get_relative_name( ).
+    wl_edidd-segnum = vl_segnum.
+    wl_edidd-psgnum = vl_psgnum.
+    ADD 1 TO vl_segnum.
+    APPEND wl_edidd TO tl_edidd.
+  ENDIF.
+  "***************************************************************************
+  "
+  " Sacamos registro a la tabla de log.
+  "
+  "***************************************************************************
+  IF vp_accion = 'A'. " Para altas.
+    DATA: wl_if_omp_tr  TYPE zssd_if_omp_tr.
+    CLEAR wl_if_omp_tr.
+    wl_if_omp_tr-num_req = wl_zcctransportrequirementdat2-transportrequirementid.
+    wl_if_omp_tr-vbeln = vp_vbeln.
+    wl_if_omp_tr-posnr = vp_posnr.
+    wl_if_omp_tr-etenr = vp_etenr.
+    wl_if_omp_tr-usucre = sy-uname.
+    wl_if_omp_tr-erdat = sy-datum.
+    wl_if_omp_tr-erzet = sy-uzeit.
+
+    INSERT zssd_if_omp_tr FROM wl_if_omp_tr.
+  ENDIF.
+
+  "***************************************************************************
+  "
+  " Generamos IDOC
+  "
+  "***************************************************************************
+  CLEAR vl_idoc_header.
+  vl_idoc_header-mandt  = sy-mandt.
+  vl_idoc_header-direct = '1'.
+  vl_idoc_header-rcvpor = c_edi_extern.
+  vl_idoc_header-rcvprt = c_ls_d.
+  vl_idoc_header-rcvprn = c_rcvprn.
+  vl_idoc_header-sndprt = c_ls_r.
+  vl_idoc_header-sndprn = sy-uname.
+  vl_idoc_header-mestyp = c_zmsg.
+  vl_idoc_header-idoctp = c_idoctp.
+
+  SORT tl_edidd BY segnum ASCENDING.
+
+  CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE' "IN UPDATE TASK
+    EXPORTING
+      master_idoc_control            = vl_idoc_header
+    TABLES
+      communication_idoc_control     = tl_idoc_comm_control
+      master_idoc_data               = tl_edidd
+    EXCEPTIONS
+      error_in_idoc_control          = 1
+      error_writing_idoc_status      = 2
+      error_in_idoc_data             = 3
+      sending_logical_system_unknown = 4
+      OTHERS                         = 5.
+  IF sy-subrc <> 0.
+    CLEAR vp_procesado.
+*      "KO
+*      ls_return-type        = sy-msgty.
+*      ls_return-number      = sy-msgno.
+*      ls_return-id          = sy-msgid.
+*      ls_return-message_v1  = sy-msgv1.
+*      ls_return-message_v2  = sy-msgv2.
+*      ls_return-message_v3  = sy-msgv3.
+*      ls_return-message_v4  = sy-msgv4.
+*      APPEND ls_return TO lt_return.
+*    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSE.
+    vp_enviado = 'X'.
+*      "OK
+*      READ TABLE lt_idoc_comm_control INTO DATA(ls_control_record_out) INDEX 1.
+*      CHECK sy-subrc = 0.
+*      DATA(docnum) = ls_control_record_out-docnum.
+*      ls_return-type        = 'S'.
+*      ls_return-number      = '398'.
+*      ls_return-id          = '00'.
+*      ls_return-message_v1  = docnum.
+*      APPEND ls_return TO lt_return.
+*    MESSAGE 'Proceso terminado correctamente' TYPE 'I'.
+  ENDIF.
+
+* Hacemos un COMMIT para el Idoc
+*  CALL FUNCTION 'DEQUEUE_ALL'.
+*  COMMIT WORK AND WAIT.
+  " Comentado por ejecutarse en update task
+*  CALL FUNCTION 'DB_COMMIT'.
+*  CALL FUNCTION 'DEQUEUE_ALL'.
+
+ENDFUNCTION.

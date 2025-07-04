@@ -1,0 +1,816 @@
+FUNCTION ZSSD_IE5_PEDIDO_VTAS.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_VBELN) TYPE  VBELN
+*"     REFERENCE(I_POSNR) TYPE  POSNR OPTIONAL
+*"     REFERENCE(I_OK_DB) TYPE  FLAG DEFAULT 'X'
+*"  EXPORTING
+*"     REFERENCE(T_OUT) TYPE  /SEI/IE5_TT_FRA_VTA
+*"     REFERENCE(O_SUBRC) TYPE  SYST-SUBRC
+*"     REFERENCE(O_RETTX) TYPE  CHAR100
+*"----------------------------------------------------------------------
+
+  TYPES: BEGIN OF ty_vbrp,
+    vbeln TYPE vbeln,
+    posnr TYPE posnr,
+    matnr TYPE matnr,
+    fkimg TYPE fkimg,
+    vrkme TYPE vrkme,
+    ntgew TYPE ntgew,
+    brgew TYPE brgew,
+    gewei TYPE gewei,
+    fbuda TYPE fbuda,
+    vgbel TYPE vgbel,
+    vgpos TYPE vgpos,
+    aubel TYPE vbeln_va,
+    aupos TYPE posnr_va,
+    auref TYPE auref,
+    arktx TYPE arktx,
+    werks TYPE werks_d,
+    lgort TYPE lgort_d,
+    kunag TYPE kunag,
+    fkart TYPE fkart,
+    aland TYPE aland, " País de salida (país desde el cual se envía la mercancía)
+    lland_auft TYPE lland_auft. "pais receptor segun pedido
+
+  TYPES: END OF ty_vbrp.
+
+  DATA: tl_vbrp TYPE STANDARD TABLE OF ty_vbrp,
+        wl_vbrp TYPE ty_vbrp.
+
+  TYPES: BEGIN OF ty_likp,
+    vbeln TYPE vbeln,
+    kunnr TYPE kunnr.
+  TYPES END OF ty_likp.
+
+  DATA: tl_likp TYPE STANDARD TABLE OF ty_likp,
+        wl_likp TYPE ty_likp.
+
+  DATA: w_out TYPE /sei/ie5_s_fra_vta.
+
+
+  DATA: t_totales TYPE /sei/ie5_s_articulo,
+        t_detalle TYPE /sei/ie5_tt_articulo,
+*        w_detalle TYPE /sei/ie5_s_articulo,
+        w_detalle TYPE /sei/ie5_s_producto,
+        w_subrc   TYPE syst-subrc,
+        w_return  TYPE bapiret2_t.
+
+  DATA: lv_land1 TYPE LAND1,
+        lv_count TYPE land1.
+
+  DATA: i_material      TYPE  /sei/ie5_ed_matnr,
+        i_partner       TYPE  /sei/ie5_ed_lifnr,
+        i_tipo_partner  TYPE  /sei/ie5_ed_tipo_partner,
+        i_werks         TYPE  werks_d,
+        i_fecha         TYPE  /sei/ie5_ed_fecha,
+        i_cantidad      TYPE  /sei/ie5_ed_cantidad,
+        i_unidad        TYPE  meins,
+        i_leer_solo_comp  TYPE  flag.
+  DATA: i_konp          TYPE /sei/ie5_ed_tarifa,
+        i_fecha_ps      TYPE datum.
+
+  DATA: gt_tc001 TYPE STANDARD TABLE OF /sei/ie5_tc001,
+        wl_tc001 TYPE /sei/ie5_tc001,
+        ok_sal_tai(1).
+
+  DATA: o_mat_especial  TYPE  /sei/ie5_ed_material_especial,
+        o_exclusion     TYPE  /sei/ie5_ed_excl_doc.
+
+  RANGES: rg_posnr FOR vbrp-posnr.
+
+  DATA: o2_subrc        TYPE  syst-subrc,
+        o2_rettx        TYPE  char100,
+        o_id_regimen    TYPE  /sei/ie5_ed_regimen_fiscal,
+        o_denom_regimen TYPE  /sei/ie5_ed_denom_reg_fiscal,
+        o_regimen       TYPE  /sei/ie5_ed_tipo_regimen_vi.
+
+  DATA: i_f_alt TYPE flag,
+        i_fields TYPE STANDARD TABLE OF sval,
+        w_fields TYPE sval.
+  DATA: w2_out TYPE /sei/ie5_s_fra_vta.
+
+  DATA: w_pers_fra TYPE /sei/ie5_ed_hard_valor,
+        t_pers_fra TYPE /sei/ie5_tt_fra_vta,
+        wl_pers_fra TYPE /sei/ie5_s_fra_vta,
+        w_db_/sei/ie5_tp015 TYPE /sei/ie5_tp015.
+
+  DATA: is_producto_input TYPE  /sei/ie5_s_producto_in,
+        it_producto_input TYPE  /sei/ie5_tt_producto_in,
+        et_producto       TYPE  /sei/ie5_tt_producto,
+        o_tp011           TYPE TABLE OF /sei/ie5_tp011,
+        wal_tp011         TYPE /sei/ie5_tp011,
+        wl_bukrs          TYPE vkorg,
+        wl_flag           TYPE xfeld,
+        wl_im_sum         TYPE wdr_quan,
+        wl_im_sum_aux     TYPE wdr_quan.
+
+  DATA: lt_vbfa TYPE TABLE OF vbfa.
+
+
+  FIELD-SYMBOLS: <fsl_vbfa> TYPE vbfa.
+
+  CLEAR: wl_im_sum ,  wl_im_sum_aux .
+
+**********************************************************************
+  IF NOT i_posnr IS INITIAL.
+    rg_posnr-sign = 'I'.
+    rg_posnr-option = 'EQ'.
+    rg_posnr-low = i_posnr.
+    APPEND rg_posnr .
+  ENDIF.
+
+  "Sociedad de la factura
+
+  CLEAR wl_bukrs.
+  SELECT SINGLE bukrs
+    FROM vbrk
+    INTO wl_bukrs
+    WHERE vbeln = i_vbeln.
+
+  SELECT t0~vbeln, t0~posnr, t0~matnr, t0~KWMENG, t0~vrkme,
+    t0~ntgew, t0~brgew, t0~gewei, t1~audat, t0~vgbel, t0~vgpos,
+    t0~werks, t0~lgort, t1~kunnr, t1~AUART
+    INTO TABLE @DATA(tl_vbap)
+    FROM vbap AS t0
+    INNER JOIN vbak AS t1 ON t1~vbeln = t0~vbeln
+    WHERE t0~vbeln EQ @i_vbeln
+      AND t0~posnr IN @rg_posnr.
+
+  IF sy-subrc NE 0.
+    o_subrc = 4.
+    o_rettx = 'No existe pedido/posición'.
+    EXIT.
+  ENDIF.
+
+  "lectura de los regimenes fiscales VI y VII
+  SELECT id_regimen_fiscal denom_regimen tipo_regimen_anexo_vi
+         tipo_regimen_anexo_vii
+    FROM /sei/ie5_tc001
+    INTO CORRESPONDING FIELDS OF TABLE gt_tc001.
+
+  IF sy-subrc NE 0.
+    o_subrc = 4.
+    o_rettx = 'Falta Configuración de Régimen Anexos VI/VII'.
+    EXIT.
+  ENDIF.
+
+
+**********************************************************************
+**   PERSISTENCIA DE DATOS PARA FACTURAS DE VENTAS
+**   CON EL PARAMETRO IMPORT I_OK_DB Y EL PARAMETRO GLOBAL "GUARDAR_DATOS_FACTURA"
+**   DE LA TABLA  /SEI/IE5_HARD SE CONTROLA LA GRABACIÓN Y RECUPERACIÓN EN BD
+**   DE LA INFORMACIÓN DETERMINADA POR ESTE MF.
+**********************************************************************
+
+**  CLEAR w_pers_fra.
+**  SELECT SINGLE valor INTO w_pers_fra
+**    FROM /sei/ie5_hard
+**    WHERE tipoc EQ 'GUARDAR_DATOS_FACTURA'.
+**
+**  IF w_pers_fra = 'X'.
+**
+**    SELECT vbeln posnr line_id no_relev actividad id_regimen_fiscal kg_pnr
+**          im_imp tx_exe waers
+**    FROM /sei/ie5_tp015
+**    INTO CORRESPONDING FIELDS OF TABLE t_pers_fra
+**    WHERE vbeln EQ i_vbeln
+**      AND posnr IN rg_posnr.
+**
+**    IF sy-subrc = 0.
+**
+**      LOOP AT t_pers_fra INTO wl_pers_fra.
+**        CLEAR w_out.
+**        MOVE-CORRESPONDING wl_pers_fra TO w_out.
+**        APPEND w_out TO t_out.
+**      ENDLOOP.
+**
+**      o_rettx = 'DATOS DE /SEI/IE5_TP015'.
+**      EXIT.
+**
+**    ENDIF.
+**
+**  ENDIF.
+
+
+
+**********************************************************************
+
+
+
+**  "destintarios de mercancias de las entregas... podrian tener articulos especificos para partner
+**  SELECT t0~vbeln  t0~kunnr
+**  FROM likp AS t0
+**    INNER JOIN kna1 AS t1
+**    ON t1~kunnr = t0~kunnr
+**    INTO CORRESPONDING FIELDS OF TABLE tl_likp
+**    FOR ALL ENTRIES IN tl_vbrp
+**    WHERE t0~vbeln = tl_vbrp-vgbel.
+**
+**  IF sy-subrc = 0.
+**    SORT tl_likp BY vbeln.
+**    DELETE ADJACENT DUPLICATES FROM tl_likp COMPARING vbeln.
+**  ENDIF.
+
+
+
+  DATA: wo_subrc TYPE subrc,
+        wo_auart TYPE auart.
+
+**  "Extracción flujo de documentos mediante factura
+**  IF tl_vbrp IS NOT INITIAL.
+**    SELECT vbelv posnv vbeln posnn vbtyp_v
+**      FROM vbfa
+**      INTO CORRESPONDING FIELDS OF TABLE lt_vbfa
+**      FOR ALL ENTRIES IN tl_vbrp
+**      WHERE vbelv = tl_vbrp-aubel
+**        AND posnv = tl_vbrp-aupos
+**        AND vbeln = tl_vbrp-vbeln
+**        AND posnn = tl_vbrp-posnr.
+**  ENDIF.
+
+**  LOOP AT tl_vbrp INTO wl_vbrp.
+  LOOP AT tl_vbap INTO DATA(wl_vbap).
+
+    CLEAR: w_out, i_konp, wl_likp, wl_flag.
+    FREE: t_detalle, t_totales.
+    CLEAR: w_subrc, w_return, i_material, i_partner, i_fecha_ps,
+           i_fecha, i_cantidad, i_unidad, i_leer_solo_comp, wl_im_sum.
+
+*    "destinatario mcias
+**    READ TABLE tl_likp INTO wl_likp WITH KEY vbeln = wl_vbrp-vgbel.
+
+
+**********************************************************************
+** NO RELEVANCIA FORZADA SEGUN CRITERIOS VARIOS
+** SOLICITANTE DE FACTURA, CLASE DE FACTURA Y CLASE DE PEDIDO
+**********************************************************************
+    CLEAR: wo_subrc, wo_auart.
+
+*ENHANCEMENT-POINT /SEI/IE5_ENH_MF_FACT_VTAS_V2 SPOTS /SEI/IE5_ENH_BF_LEER_ART03 .
+
+*****************************************************************************************************************************************
+* Codigo nuevo determinacion clase pedido                                                                                               *
+*****************************************************************************************************************************************
+**    READ TABLE lt_vbfa ASSIGNING <fsl_vbfa> WITH KEY vbelv = wl_vbrp-aubel                                                             "*
+**                                                     posnv = wl_vbrp-aupos                                                             "*
+**                                                     vbeln = wl_vbrp-vbeln                                                             "*
+**                                                     posnn = wl_vbrp-posnr.                                                            "*
+**    IF ( sy-subrc EQ 0 ) AND ( <fsl_vbfa> IS ASSIGNED ) AND ( <fsl_vbfa>-vbtyp_v IS NOT INITIAL AND <fsl_vbfa>-vbtyp_v NE 'V') .       "*
+**                                                                                                                                       "*
+**      CLEAR wl_vbrp-auref.                                                                                                             "*
+**      SELECT SINGLE auart FROM vbak INTO wo_auart WHERE vbeln = wl_vbrp-aubel.                                                         "*
+**                                                                                                                                       "*
+**    ELSEIF ( sy-subrc EQ 0 ) AND ( <fsl_vbfa> IS ASSIGNED ) AND ( <fsl_vbfa>-vbtyp_v IS INITIAL or <fsl_vbfa>-vbtyp_v EQ 'V').         "*
+**                                                                                                                                       "*
+**      wl_vbrp-auref = 'X'.                                                                                                             "*
+**                                                                                                                                       "*
+**                                                                                                                                       "*
+**    ENDIF.                                                                                                                             "*
+                                                                                                                                       "*
+*****************************************************************************************************************************************
+* Codigo antiguo determinacion clase pedido                                                                                             *
+*****************************************************************************************************************************************
+*    IF wl_vbrp-auref NE 'X'.                                                                                                          "*
+*      SELECT SINGLE auart FROM vbak INTO wo_auart WHERE vbeln = wl_vbrp-aubel.                                                        "*
+*    ELSE.                                                                                                                             "*
+*      SELECT SINGLE bsart FROM ekko INTO wo_auart WHERE ebeln = wl_vbrp-aubel.                                                        "*
+*    ENDIF.                                                                                                                            "*
+*****************************************************************************************************************************************
+
+
+    CALL FUNCTION '/SEI/IE5_NO_RELEVANTE'
+      EXPORTING
+        i_kunnr   = wl_vbap-kunnr
+        i_auart   = wl_vbap-auart
+      IMPORTING
+        o_subrc   = wo_subrc
+      TABLES
+        it_fields = i_fields.
+
+
+    IF wo_subrc = 0.
+      w_out-no_relev = 'X'.
+      w_out-vbeln = wl_vbap-vbeln.
+      w_out-posnr = wl_vbap-posnr.
+      APPEND w_out TO t_out.
+      EXIT.
+    ENDIF.
+
+
+* Se marca no relevante si la Fecha de prestación de servicios es inferior al 01.01.2023 (Entrada en vigor del impuesto)
+    IF wl_vbap-audat LT '20230101'.
+      w_out-no_relev = 'X'.
+      w_out-vbeln = wl_vbap-vbeln.
+      w_out-posnr = wl_vbap-posnr.
+      APPEND w_out TO t_out.
+      EXIT.
+    ENDIF.
+
+    "Lectura de tarifa del impuesto
+**    i_fecha_ps = wl_vbrp-fbuda.
+    i_fecha_ps = wl_vbap-audat.
+    CALL FUNCTION '/SEI/IE5_LEER_TARIFA'
+      EXPORTING
+        i_date = i_fecha_ps
+      IMPORTING
+        o_konp = i_konp.
+
+
+
+    "lectura de la tabla /SEI/IE5_TP007: anula/excluye el documento para el impuesto
+    "                                    informa de un cambio de utilizacion
+    "puede estar informado:
+    " pedido de ventas y posicion
+    " pedido de compras y posicion (facturas IC)
+    CLEAR: o_mat_especial, o_exclusion.
+    CALL FUNCTION '/SEI/IE5_CAMBIO_EXCLUSION'
+      EXPORTING
+        i_aubel        = wl_vbap-vbeln
+        i_aupos        = wl_vbap-posnr
+      IMPORTING
+        o_mat_especial = o_mat_especial
+        o_exclusion    = o_exclusion.
+
+
+    i_material = wl_vbap-matnr.
+    i_partner = wl_vbap-kunnr.
+    i_tipo_partner = 'KU'.
+    i_werks        = wl_vbap-werks.
+    i_fecha        = wl_vbap-audat.
+    i_cantidad     = wl_vbap-KWMENG.
+    i_unidad       = wl_vbap-vrkme.
+
+
+
+**********************************************************************************************
+**********************************************************************************************
+* STOCK INICIAL
+**********************************************************************************************
+**********************************************************************************************
+
+    CLEAR is_producto_input.
+    is_producto_input-material        = i_material.
+    is_producto_input-ambito          =  'IEPNR'.
+    is_producto_input-partner         = i_partner.
+    is_producto_input-tipo_partner    = i_tipo_partner.
+    is_producto_input-cantidad        = i_cantidad.
+    is_producto_input-unidad          = i_unidad.
+    is_producto_input-werks           = i_werks.
+    is_producto_input-leer_solo_comp  = i_leer_solo_comp.
+    is_producto_input-fecha           = i_fecha.
+
+*ENHANCEMENT-POINT /SEI/IE5_ENH_MF_FACT_VTAS2_V2 SPOTS /SEI/IE5_ENH_BF_LEER_ART03 .
+
+    CALL FUNCTION '/SEI/IE5_ESTRUCTURA_PROD'
+      EXPORTING
+        is_producto_input = is_producto_input
+*       IT_PRODUCTO_INPUT =
+               I_LEER_IEP = 'X'
+      IMPORTING
+        et_producto       = et_producto
+        et_ret            = w_return
+        e_subrc           = w_subrc.
+**********************************************************************************************
+**********************************************************************************************
+
+*    CALL FUNCTION '/SEI/IE5_LEER_ARTICULO'
+*      EXPORTING
+*        i_material       = i_material
+**       I_AMBITO         = 'IEPNR'
+*        i_partner        = i_partner
+*        i_tipo_partner   = i_tipo_partner
+*        i_werks          = i_werks
+*        i_fecha          = i_fecha
+*        i_cantidad       = i_cantidad
+*        i_unidad         = i_unidad
+*        i_leer_solo_comp = i_leer_solo_comp
+*      IMPORTING
+*        o_aeat_table     = t_detalle
+*        o_aeat_totales   = t_totales
+*        o_subrc          = w_subrc
+*        o_return         = w_return
+*      TABLES
+*        i_fields         = i_fields.
+
+    IF w_subrc = 1 OR o_exclusion = 'X'.
+      "articulo no encontrado en el maestro
+      w_out-no_relev = 'X'.
+      w_out-vbeln = wl_vbap-vbeln.
+      w_out-posnr = wl_vbap-posnr.
+      APPEND w_out TO t_out.
+
+      CONTINUE.
+
+    ELSEIF NOT w_subrc IS INITIAL.
+      "error de conversion o eror interno en la funcion
+      o_subrc = 4.
+*      o_rettx = 'Error Interno lectura artículo ' && i_material. "problemas compatibilida V701.
+      CONCATENATE 'Error Interno lectura artículo' i_material INTO o_rettx SEPARATED BY space..
+
+
+    ELSE.
+
+      LOOP AT et_producto INTO w_detalle.
+*      LOOP AT t_detalle INTO w_detalle.
+
+
+
+**********************************************************************************************
+**********************************************************************************************
+* STOCK INICIAL                                                                              *
+**********************************************************************************************
+**********************************************************************************************
+        "Con cada componente leemos del stock inicial                                       "*
+**        FREE o_tp011.                                                                       "*
+**        CALL FUNCTION '/SEI/IE5_CAL_STK_INI'                                                "*
+**          EXPORTING                                                                         "*
+**            i_vbeln                   = wl_vbrp-vgbel                                       "*
+**            i_posnr                   = wl_vbrp-vgpos                                       "*
+**            i_bukrs                   = wl_bukrs                                            "*
+***       IMPORTING                                                                           "*
+***         KG_PLAST_NR_STK_INI       =                                                       "*
+**         TABLES                                                                             "*
+**           o_tp011                   = o_tp011                                              "*
+**            .                                                                               "*
+                                                                                            "*
+**********************************************************************************************
+**********************************************************************************************
+
+
+        CLEAR: ok_sal_tai, w_out, wl_flag, wl_im_sum.
+        CLEAR: o2_subrc, o2_rettx, o_id_regimen, o_denom_regimen, o_regimen.
+
+        w_out-actividad = w_detalle-origen.
+
+********************************************************************************************************************************************
+******************************************************************************************************************************************"*
+* STOCK INICIAL     - Version nueva   REL 20230201[Antes se usaba read_table en lugar de loop para leer stocks iniciales ]                "*
+******************************************************************************************************************************************"*
+******************************************************************************************************************************************"*
+* Restamos stock inicial si existiese .                                                                                                   "*
+                                                                                                                                          "*
+**        IF w_out-actividad = 'A'.  "Solo para a actividad Adquirentes                                                                     "*
+**                                                                                                                                          "*
+**          loop AT o_tp011 into wal_tp011 where componente       = w_detalle-matnr                                                         "*
+**                                           and       vbeln      = wl_vbrp-vgbel                                                           "*
+**                                           and       posnr      = wl_vbrp-vgpos.                                                          "*
+**                                                                                                                                          "*
+**                                                                                                                                          "*
+***           wl_flag = abap_true.                                                                                                          "*
+**                                                                                                                                          "*
+**            w_detalle-total_plastico_no_reciclado = w_detalle-total_plastico_no_reciclado - wal_tp011-cdad_plastico_nr.                   "*
+**                                                                                                                                          "*
+**            IF w_detalle-total_plastico_no_reciclado LT 0.                                                                                "*
+**              CLEAR w_detalle-total_plastico_no_reciclado.                                                                                "*
+**            ENDIF.                                                                                                                        "*
+**          endloop.                                                                                                                        "*
+**          IF sy-subrc NE 0.                                                                                                               "*
+**                                                                                                                                          "*
+**            loop at o_tp011 into wal_tp011 where componente       = w_detalle-matnr                                                       "*
+**                                             and       vbeln      = wl_vbrp-vgbel                                                         "*
+**                                             and       uecha      = wl_vbrp-vgpos.                                                        "*
+***           wl_flag = abap_true.                                                                                                          "*
+**                                                                                                                                          "*
+**              w_detalle-total_plastico_no_reciclado = w_detalle-total_plastico_no_reciclado - wal_tp011-cdad_plastico_nr.                 "*
+**                                                                                                                                          "*
+**              IF w_detalle-total_plastico_no_reciclado LT 0.                                                                              "*
+**                CLEAR w_detalle-total_plastico_no_reciclado.                                                                              "*
+**              ENDIF.                                                                                                                      "*
+**                                                                                                                                          "*
+**            endloop.                                                                                                                      "*
+**                                                                                                                                          "*
+**            IF sy-subrc NE 0.                                                                                                             "*
+**                                                                                                                                          "*
+**              loop at o_tp011 into wal_tp011 where componente        = w_detalle-matnr                                                    "*
+**                                               and        vbeln      = wl_vbrp-vgbel                                                      "*
+**                                               and        uepos      = wl_vbrp-vgpos.                                                     "*
+**                                                                                                                                          "*
+***           wl_flag = abap_true.                                                                                                          "*
+**                                                                                                                                          "*
+**                w_detalle-total_plastico_no_reciclado = w_detalle-total_plastico_no_reciclado - wal_tp011-cdad_plastico_nr.               "*
+**                                                                                                                                          "*
+**                IF w_detalle-total_plastico_no_reciclado LT 0.                                                                            "*
+**                  CLEAR w_detalle-total_plastico_no_reciclado.                                                                            "*
+**                ENDIF.                                                                                                                    "*
+**                                                                                                                                          "*
+**              endloop.                                                                                                                    "*
+**                                                                                                                                          "*
+**            ENDIF.                                                                                                                        "*
+**                                                                                                                                          "*
+**          ENDIF.                                                                                                                          "*
+**                                                                                                                                          "*
+**        ENDIF.                                                                                                                          "*
+********************************************************************************************************************************************
+******************************************************************************************************************************************"*
+* STOCK INICIAL     - Version antigua - REL 20230130[no valido acceder a las tablas con read table, hay que recorrerlas mediante loop]    "*
+******************************************************************************************************************************************"*
+******************************************************************************************************************************************"*
+*          READ TABLE o_tp011 INTO wal_tp011 WITH KEY componente = w_detalle-matnr                                                        "*
+*                                                     vbeln      = wl_vbrp-vgbel                                                          "*
+*                                                     posnr      = wl_vbrp-vgpos.                                                         "*
+*          IF sy-subrc EQ 0.                                                                                                              "*
+*                                                                                                                                         "*
+*                                                                                                                                         "*
+**           wl_flag = abap_true.                                                                                                         "*
+*                                                                                                                                         "*
+*            w_detalle-total_plastico_no_reciclado = w_detalle-total_plastico_no_reciclado - wal_tp011-cdad_plastico_nr.                  "*
+*                                                                                                                                         "*
+*            IF w_detalle-total_plastico_no_reciclado LT 0.                                                                               "*
+*              CLEAR w_detalle-total_plastico_no_reciclado.                                                                               "*
+*            ENDIF.                                                                                                                       "*
+*          ELSEIF sy-subrc NE 0.                                                                                                          "*
+*                                                                                                                                         "*
+*            READ TABLE o_tp011 INTO wal_tp011 WITH KEY componente = w_detalle-matnr                                                      "*
+*                                                       vbeln      = wl_vbrp-vgbel                                                        "*
+*                                                       uecha      = wl_vbrp-vgpos.                                                       "*
+*            IF sy-subrc EQ 0.                                                                                                            "*
+**           wl_flag = abap_true.                                                                                                         "*
+*                                                                                                                                         "*
+*              w_detalle-total_plastico_no_reciclado = w_detalle-total_plastico_no_reciclado - wal_tp011-cdad_plastico_nr.                "*
+*                                                                                                                                         "*
+*              IF w_detalle-total_plastico_no_reciclado LT 0.                                                                             "*
+*                CLEAR w_detalle-total_plastico_no_reciclado.                                                                             "*
+*              ENDIF.                                                                                                                     "*
+*                                                                                                                                         "*
+*            ELSEIF sy-subrc NE 0.                                                                                                        "*
+*                                                                                                                                         "*
+*              READ TABLE o_tp011 INTO wal_tp011 WITH KEY componente = w_detalle-matnr                                                    "*
+*                                                         vbeln      = wl_vbrp-vgbel                                                      "*
+*                                                         uepos      = wl_vbrp-vgpos.                                                     "*
+*              IF sy-subrc EQ 0.                                                                                                          "*
+**           wl_flag = abap_true.                                                                                                         "*
+*                                                                                                                                         "*
+*                w_detalle-total_plastico_no_reciclado = w_detalle-total_plastico_no_reciclado - wal_tp011-cdad_plastico_nr.              "*
+*                                                                                                                                         "*
+*                IF w_detalle-total_plastico_no_reciclado LT 0.                                                                           "*
+*                  CLEAR w_detalle-total_plastico_no_reciclado.                                                                           "*
+*                ENDIF.                                                                                                                   "*
+*                                                                                                                                         "*
+*              ENDIF.                                                                                                                     "*
+*                                                                                                                                         "*
+*            ENDIF.                                                                                                                       "*
+*                                                                                                                                         "*
+*          ENDIF.                                                                                                                         "*
+                                                                                                                                          "*
+                                                                                                                                          "*
+*        ENDIF.                                                                                                                           "*
+******************************************************************************************************************************************"*
+******************************************************************************************************************************************"*
+
+        CLEAR: lv_land1, lv_count.
+
+        w_out-kg_pnr = w_detalle-total_plastico_no_reciclado.
+
+        SELECT SINGLE LAND1 INTO lv_land1
+          FROM T001W
+          WHERE werks = wl_vbap-werks.
+
+        SELECT SINGLE country INTO lv_count
+          FROM kna1 AS k
+          INNER JOIN adrc AS a ON k~ADRNR = a~ADDRNUMBER
+          WHERE kunnr = wl_vbap-kunnr.
+
+        "75.d envio fuera del TAI (A)
+        IF lv_land1 EQ 'ES' "Pais centro
+          AND lv_count NE 'ES'. "Pais solicitante
+
+          CASE w_out-actividad.
+            WHEN 'A'. "adquiriente...regimen VII
+              READ TABLE gt_tc001 INTO wl_tc001 WITH KEY id_regimen_fiscal = '11'.
+              w_out-tx_exe = wl_tc001-denom_regimen.
+              w_out-id_regimen_fiscal = '11'.
+            WHEN 'F'. "fabricante ...regimen VI
+              READ TABLE gt_tc001 INTO wl_tc001 WITH KEY id_regimen_fiscal = '03'.
+              w_out-tx_exe = wl_tc001-denom_regimen.
+              w_out-id_regimen_fiscal = '03'.
+          ENDCASE.
+
+
+          ok_sal_tai = 'X'.
+          w_out-kg_pnr = w_detalle-total_plastico_no_reciclado.
+          w_out-vbeln = wl_vbap-vbeln.
+          w_out-posnr = wl_vbap-posnr.
+          COLLECT w_out INTO t_out.
+*          APPEND w_out TO t_out.
+          CONTINUE.
+
+        ENDIF.
+
+        CLEAR wl_tc001.
+
+        "material especial forzado por la tabla de documentos y cambios de uso/exclusiones
+        IF NOT o_mat_especial IS INITIAL.
+          w_detalle-iep_mat_espec = o_mat_especial.
+        ENDIF.
+
+
+        "no se trata de un envio fuera de TAI analizamos excepciones por uso (mat.espec) y clave de producto
+        IF NOT w_detalle-iep_mat_espec IS INITIAL AND ok_sal_tai IS INITIAL.
+
+          CASE w_out-actividad.
+
+
+            WHEN 'A'. "adquiriente...regimen VII ***********************************************
+
+
+              "CLEAR: o2_subrc, o2_rettx, o_id_regimen, o_denom_regimen, o_regimen.
+              CALL FUNCTION '/SEI/IE5_REGIMEN_FISCAL'
+                EXPORTING
+                  i_actividad     = w_out-actividad
+                  i_mat_espec     = w_detalle-iep_mat_espec
+                  i_clave_prod    = w_detalle-iep_claveprod
+                IMPORTING
+                  o_subrc         = o2_subrc
+                  o_rettx         = o2_rettx
+                  o_id_regimen    = o_id_regimen
+                  o_denom_regimen = o_denom_regimen
+                  o_tipo_regimen  = o_regimen.
+
+
+
+              IF o2_subrc IS INITIAL AND NOT o_regimen IS INITIAL.
+                CLEAR w_out-tx_exe.
+                IF w_out-tx_exe IS INITIAL.
+                  w_out-tx_exe = 'Ley 7/2022 Exen./No Suj.Art.:'.
+                ELSE.
+*                  w_out-tx_exe = w_out-tx_exe && ','. "problemas compatibilidad V701.
+                  CONCATENATE w_out-tx_exe ',' INTO w_out-tx_exe.
+                ENDIF.
+
+                REPLACE 'No sujeción artículo' INTO o_denom_regimen WITH ''.
+                REPLACE 'Exención artículo' INTO o_denom_regimen WITH ''.
+                REPLACE 'Ley 7/2022' INTO o_denom_regimen WITH ''.
+                CONDENSE o_denom_regimen.
+
+                CONCATENATE w_out-tx_exe o_denom_regimen INTO w_out-tx_exe SEPARATED BY space.
+
+                w_out-id_regimen_fiscal = o_id_regimen.
+
+              ENDIF.
+
+
+
+
+            WHEN 'F'. "fabricante ...regimen VI *****************************************************
+
+
+              "CLEAR: o2_subrc, o2_rettx, o_id_regimen, o_denom_regimen, o_regimen.
+              CALL FUNCTION '/SEI/IE5_REGIMEN_FISCAL'
+                EXPORTING
+                  i_actividad     = w_out-actividad
+                  i_mat_espec     = w_detalle-iep_mat_espec
+                  i_clave_prod    = w_detalle-iep_claveprod
+                IMPORTING
+                  o_subrc         = o2_subrc
+                  o_rettx         = o2_rettx
+                  o_id_regimen    = o_id_regimen
+                  o_denom_regimen = o_denom_regimen
+                  o_tipo_regimen  = o_regimen.
+
+              IF o2_subrc IS INITIAL AND NOT o_regimen IS INITIAL.
+                CLEAR w_out-tx_exe.
+                IF w_out-tx_exe IS INITIAL.
+                  w_out-tx_exe = 'Ley 7/2022 Exen./No Suj.Art.:'.
+                ELSE.
+*                  w_out-tx_exe = w_out-tx_exe && ','. "problemas compatibilidad V701
+                  CONCATENATE w_out-tx_exe ',' INTO w_out-tx_exe.
+                ENDIF.
+
+                REPLACE 'No sujeción artículo' INTO o_denom_regimen WITH ''.
+                REPLACE 'Exención artículo' INTO o_denom_regimen WITH ''.
+                REPLACE 'Ley 7/2022' INTO o_denom_regimen WITH ''.
+                CONDENSE o_denom_regimen.
+
+                CONCATENATE w_out-tx_exe o_denom_regimen INTO w_out-tx_exe SEPARATED BY space.
+
+                w_out-id_regimen_fiscal = o_id_regimen.
+
+              ENDIF.
+
+          ENDCASE.
+
+        ELSE.
+
+          w_out-id_regimen_fiscal = '01'.
+
+        ENDIF.
+
+
+
+
+        IF o_denom_regimen IS INITIAL AND ok_sal_tai IS INITIAL. "si hay excencion o no sujecion, no aplica importe
+
+*          w_out-im_imp = ( w_detalle-total_plastico_no_reciclado * i_konp-kbetr / i_konp-kpein ).
+
+          wl_im_sum = wl_im_sum + ( w_detalle-total_plastico_no_reciclado * i_konp-kbetr / i_konp-kpein ) .
+
+*          w_out-im_imp = wl_im_sum.
+
+        ELSEIF o_denom_regimen IS NOT INITIAL.
+
+          "Si el regimen fiscal viene relleno, limpiamos el plastico no reciclable porque estaría exento.
+
+          CLEAR wl_im_sum.
+
+        ENDIF.
+
+        w_out-waers = i_konp-konwa.
+
+        w_out-vbeln = wl_vbap-vbeln.
+        w_out-posnr = wl_vbap-posnr.
+        w_out-waers = 'EUR'.
+
+        READ TABLE t_out INTO w2_out WITH KEY vbeln = w_out-vbeln
+                                              posnr = w_out-posnr
+                                              no_relev = w_out-no_relev
+                                              actividad = w_out-actividad
+                                              id_regimen_fiscal = w_out-id_regimen_fiscal.
+        IF sy-subrc = 0.
+
+          w2_out-im_imp = w2_out-im_imp + wl_im_sum.
+*          w2_out-im_imp =  wl_im_sum.
+          w2_out-kg_pnr = w2_out-kg_pnr + w_out-kg_pnr .
+
+          MODIFY t_out FROM w2_out INDEX sy-tabix.
+
+        ELSE.
+
+          w_out-im_imp = wl_im_sum.
+
+          APPEND w_out TO t_out.
+
+        ENDIF.
+
+
+      ENDLOOP.
+    ENDIF.
+
+
+*  LOOP AT t_out into w_out where vbeln = wl_vbrp-vbeln
+*                             and posnr = wl_vbrp-posnr.
+*
+*
+*          IF w_out-kg_pnr is initial.
+*
+*              w_out-tx_exe   = 'Cantidad 0 por stock inicial'.
+*              w_out-no_relev = abap_true.
+*
+*              modify t_out from w_out index sy-tabix.
+*
+*          ENDIF.
+*
+*  ENDLOOP.
+
+
+  ENDLOOP.
+
+
+
+**********************************************************************
+** GRABAR EN BD SI PERSISTENCIA DATOS FACTURA ACTIVA
+**********************************************************************
+  "CONTROL LOCAL EN EL MF, POR SI ES UTILIZADO FUERA DEL ENTORNO DE IMPRESION DE FACTURAS.
+  "O DONDE NO INTERESE ACTUALIZAR TABLA DE PERSISTENCIA
+
+**  SORT t_out BY vbeln posnr.
+**
+**  DATA: w_pre_pos TYPE posnr,
+**        w_id TYPE mb_line_id.
+**
+**  IF i_ok_db = 'X' AND w_pers_fra = 'X'.
+**
+**    LOOP AT t_out INTO w_out.
+**      CLEAR w_db_/sei/ie5_tp015.
+**      MOVE-CORRESPONDING w_out TO w_db_/sei/ie5_tp015.
+**
+**      IF w_pre_pos IS INITIAL.
+**        w_pre_pos = w_out-posnr.
+**        w_id = 1.
+**      ELSE.
+**        IF w_pre_pos <> w_out-posnr.
+**          w_pre_pos =  w_out-posnr.
+**          w_id = 1.
+**        ELSE.
+**          ADD 1 TO w_id.
+**        ENDIF.
+**      ENDIF.
+**
+**      w_db_/sei/ie5_tp015-line_id = w_id.
+**      w_db_/sei/ie5_tp015-erdat = sy-datum.
+**      w_db_/sei/ie5_tp015-erzet = sy-uzeit.
+**      w_db_/sei/ie5_tp015-ernam = sy-uname.
+**      w_db_/sei/ie5_tp015-waers = 'EUR'.
+**
+**      MODIFY /sei/ie5_tp015 FROM w_db_/sei/ie5_tp015.
+**
+**
+**    ENDLOOP.
+**
+**
+**  ENDIF.
+
+
+
+ENDFUNCTION.

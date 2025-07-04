@@ -1,0 +1,719 @@
+
+class ZCL_HP_SHIPMENT definition
+  public
+  final
+  create public .
+
+public section.
+
+  types:
+    BEGIN OF ty_data,
+        shipment_header       TYPE vttk,
+        e_delivery_missing    TYPE rv56a-selkz,
+        shipment_items        TYPE vttp_tab,
+        shipment_segments     TYPE vtts_tab,
+        shipment_segment_item TYPE vtsp_tab,
+        delivery_headers      TYPE vtrlk_tab,
+        delivery_items        TYPE vtrlp_tab,
+      END OF ty_data .
+
+  data _TKNUM type TKNUM read-only .
+  data _T_SHIPMENT_DATA type TY_DATA read-only .
+  data _T_DELIVERIES type ZTT_OO_DELIVERIES read-only .
+
+  methods CONSTRUCTOR
+    importing
+      !I_TKNUM type TKNUM
+    raising
+      ZCX_EXCEPTION .
+  methods HAVE_DELIVERIES
+    returning
+      value(R_BOOL) type BOOLEAN .
+  methods HAVE_NOT_POSTED_DELIVERIES
+    returning
+      value(R_BOOL) type BOOLEAN .
+  methods GET_NOT_POSTED_DELIVERIES
+    returning
+      value(R_T_DELIVERIES) type ZTT_OO_DELIVERIES .
+  methods GET_DELIVERY
+    importing
+      !I_VBELN type VBELN
+    returning
+      value(R_O_DELIVERY) type ref to ZCL_HP_DELIVERY .
+  methods GET_DELIVERY_FROM_VERUR
+    importing
+      !I_VERUR type VERUR_VL
+    returning
+      value(R_O_DELIVERIES) type ZTT_OO_DELIVERIES .
+  methods UPDATE_HEADER_DATA
+    importing
+      !I_SHIPMENT_HEADER type BAPISHIPMENTHEADER
+      !I_SHIPMENT_HEADER_ACTIONS type BAPISHIPMENTHEADERACTION
+    raising
+      ZCX_EXCEPTION .
+  methods ADD_DELIVERY
+    importing
+      !I_O_DELIVERY type ref to ZCL_HP_DELIVERY
+    raising
+      ZCX_EXCEPTION .
+  methods FINALICE
+    raising
+      ZCX_EXCEPTION .
+  PROTECTED SECTION.
+private section.
+
+  class-data _C_CL_MSGID_LABEL type MSGID value 'ZCL_HP_SHIPMENT' ##NO_TEXT.
+  class-data _S_STATUS_A type BAPISHIPMENTCHANGEACTION value 'A' ##NO_TEXT.
+  class-data _S_STATUS_C type BAPISHIPMENTCHANGEACTION value 'C' ##NO_TEXT.
+
+  methods _READ_DATA .
+  methods _READ_SHIPMENT_DATA .
+  methods _LOAD_DELIVERIES_OO .
+  methods _CHANGE_SHIPMENT_ACTION
+    importing
+      !I_SHIPMENT_ACTIONS type ZST_SHIPMENT_ACTIONS
+    raising
+      ZCX_EXCEPTION .
+  methods _CHANGE_SHIPMENT
+    importing
+      !I_HEADER type BAPISHIPMENTHEADER optional
+      !I_HEADER_ACTIONS type BAPISHIPMENTHEADERACTION optional
+      !I_T_BAPISHIPMENTITEM type ZTT_BAPISHIPMENTITEM optional
+      !I_T_BAPISHIPMENTITEMACTION type ZTT_BAPISHIPMENTITEMACTION optional
+    raising
+      ZCX_EXCEPTION .
+  methods _FINALICE_DELIVERIES .
+endclass. "ZCL_HP_SHIPMENT definition
+class ZCL_HP_SHIPMENT implementation.
+METHOD _change_shipment.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+  DATA: lt_bapishipmentitem       TYPE ztt_bapishipmentitem,
+        lt_bapishipmentitemaction TYPE ztt_bapishipmentitemaction,
+        lt_bapiret2               TYPE bapiret2_t.
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** MOVE IMPORT DATA TO WORK DATA
+
+  MOVE-CORRESPONDING i_t_bapishipmentitem[] TO lt_bapishipmentitem[].
+  MOVE-CORRESPONDING i_t_bapishipmentitemaction[] TO lt_bapishipmentitemaction[].
+
+**** CHANGE SHIPMENT
+
+  CALL FUNCTION 'BAPI_SHIPMENT_CHANGE'
+    EXPORTING
+      headerdata       = i_header
+      headerdataaction = i_header_actions
+*     TECHNCONTROL     =
+    TABLES
+*     HEADERDEADLINE   =
+*     HEADERDEADLINEACTION       =
+      itemdata         = lt_bapishipmentitem
+      itemdataaction   = lt_bapishipmentitemaction
+*     STAGEDATA        =
+*     STAGEDATAACTION  =
+*     STAGEDEADLINE    =
+*     STAGEDEADLINEACTION        =
+*     ITEMONSTAGE      =
+*     ITEMONSTAGEACTION          =
+*     ADDRESS          =
+*     ADDRESSACTION    =
+*     HDUNHEADER       =
+*     HDUNHEADERACTION =
+*     HDUNITEM         =
+*     HDUNITEMACTION   =
+      return           = lt_bapiret2.
+
+  READ TABLE lt_bapiret2 INTO DATA(ls_bapiret2) WITH KEY type = 'E'.
+  IF ( sy-subrc EQ 0 ).
+
+    ROLLBACK WORK.
+    zcl_utils=>zif_msg_utils~s_launch_exception( i_textid = zcl_utils=>zif_msg_utils~s_create_raising_message( i_msgno = ls_bapiret2-number i_msgid = ls_bapiret2-id i_msgty = ls_bapiret2-type i_msgv1 = ls_bapiret2-message_v1 i_msgv2 =
+ls_bapiret2-message_v2 i_msgv3 = ls_bapiret2-message_v3 i_msgv4 = ls_bapiret2-message_v4 ) ).
+
+  ELSE.
+
+    COMMIT WORK AND WAIT.
+    me->_read_data( ).
+
+  ENDIF.
+
+ENDMETHOD.
+METHOD _change_shipment_action.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+  DATA: lt_bapiret2   TYPE bapiret2_t.
+
+  DATA: ls_header     TYPE bapishipmentheader,
+        ls_header_act TYPE bapishipmentheaderaction.
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** TKNUM
+
+  MOVE me->_tknum TO ls_header-shipment_num.
+  MOVE me->_tknum TO ls_header_act-shipment_num.
+
+**** FILL ACTION DATA
+
+*** STATUS PLAN
+
+  IF ( i_shipment_actions-status_plan IS NOT INITIAL ).
+    MOVE abap_true TO ls_header-status_plan.
+    MOVE i_shipment_actions-status_plan TO ls_header_act-status_plan.
+  ENDIF.
+
+*** STATUS CHECKIN
+
+  IF ( i_shipment_actions-status_checkin IS NOT INITIAL ).
+    MOVE abap_true TO ls_header-status_checkin.
+    MOVE i_shipment_actions-status_checkin TO ls_header_act-status_checkin.
+  ENDIF.
+
+*** STATUS LOAD START
+
+  IF ( i_shipment_actions-status_load_start IS NOT INITIAL ).
+    MOVE abap_true TO ls_header-status_load_start.
+    MOVE i_shipment_actions-status_load_start TO ls_header_act-status_load_start.
+  ENDIF.
+
+*** STATUS LOAD END
+
+  IF ( i_shipment_actions-status_load_end IS NOT INITIAL ).
+    MOVE abap_true TO ls_header-status_load_end.
+    MOVE i_shipment_actions-status_load_end TO ls_header_act-status_load_end.
+  ENDIF.
+
+*** STATUS STATUS COMPL
+
+  IF ( i_shipment_actions-status_compl IS NOT INITIAL ).
+    MOVE abap_true TO ls_header-status_compl.
+    MOVE i_shipment_actions-status_compl TO ls_header_act-status_compl.
+  ENDIF.
+
+*** STATUS SHPMNT START
+
+  IF ( i_shipment_actions-status_shpmnt_start IS NOT INITIAL ).
+    MOVE abap_true TO ls_header-status_shpmnt_start.
+    MOVE i_shipment_actions-status_shpmnt_start TO ls_header_act-status_shpmnt_start.
+  ENDIF.
+
+*** STATUS SHPMNT END
+
+  IF ( i_shipment_actions-status_shpmnt_end IS NOT INITIAL ).
+    MOVE abap_true TO ls_header-status_shpmnt_end.
+    MOVE i_shipment_actions-status_shpmnt_end TO ls_header_act-status_shpmnt_end.
+  ENDIF.
+
+**** CHANGE STATUSES
+
+  me->_change_shipment( i_header = ls_header i_header_actions = ls_header_act ).
+
+ENDMETHOD.
+METHOD _finalice_deliveries.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+  DATA: ls_actions TYPE zst_shipment_actions.
+
+  DATA: lv_message TYPE scx_attrname.
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**** SHIPMENT STATUS
+
+  IF ( me->_t_shipment_data-shipment_header-stten EQ zcl_hp_shipment=>_s_status_c ).
+    CLEAR lv_message.
+    MOVE text-002 TO lv_message.
+    zcl_utils=>zif_msg_utils~s_launch_exception( i_textid = zcl_utils=>zif_msg_utils~s_create_raising_message( i_msgno = '005' i_msgid = zcl_hp_shipment=>_c_cl_msgid_label i_msgty = 'E' i_message = lv_message ) ).
+  ENDIF.
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** LOOP DELIVERIES 2 POST
+
+  LOOP AT me->_t_deliveries INTO DATA(lo_delivery).
+
+    "Si no se instancia lanzo excepción
+    IF ( lo_delivery IS NOT BOUND ).
+      CLEAR lv_message.
+      MOVE text-001 TO lv_message.
+      zcl_utils=>zif_msg_utils~s_launch_exception( i_textid = zcl_utils=>zif_msg_utils~s_create_raising_message( i_msgno = '005' i_msgid = zcl_hp_shipment=>_c_cl_msgid_label i_msgty = 'E' i_message = lv_message ) ).
+    ENDIF.
+
+    IF ( lo_delivery->is_posted( ) EQ abap_false ).
+      lo_delivery->post( ).
+    ENDIF.
+
+  ENDLOOP.
+
+ENDMETHOD.
+METHOD _load_deliveries_oo.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+  DATA: lo_delivery TYPE REF TO zcl_hp_delivery.
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** CREATE OO
+
+  CLEAR: me->_t_deliveries[].
+
+  LOOP AT me->_t_shipment_data-delivery_headers INTO DATA(ls_delivery_header).
+
+    CLEAR: lo_delivery.
+
+    TRY .
+
+      lo_delivery = NEW zcl_hp_delivery( i_vbeln = ls_delivery_header-vbeln ).
+      APPEND lo_delivery TO me->_t_deliveries.
+
+    CATCH zcx_exception.
+      CONTINUE.
+    ENDTRY.
+
+  ENDLOOP.
+
+ENDMETHOD.
+METHOD _read_data.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** READ SHIPMENT DATA
+
+  me->_read_shipment_data( ).
+
+**** CREATE DELIVERY OBJECTS
+
+  me->_load_deliveries_oo( ).
+
+ENDMETHOD.
+METHOD _read_shipment_data.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** READ DATA
+
+  CALL FUNCTION 'RV_SHIPMENT_READ'
+    EXPORTING
+      shipment_number              = me->_tknum
+      option_items                 = abap_true
+      option_minimized_item_data   = abap_true
+      option_segments              = abap_true
+      option_sales_orders          = abap_true
+      option_export_data           = abap_true
+      option_delivery_lock         = abap_false "abap_true
+      option_ignore_missing_deliv  = abap_false "abap_true
+      option_delivery_headers_only = abap_false "abap_true
+      i_filter_type                = 'F'
+      i_language                   = sy-langu
+    IMPORTING
+      shipment_header              = me->_t_shipment_data-shipment_header
+      e_delivery_missing           = me->_t_shipment_data-e_delivery_missing
+    TABLES
+      shipment_items               = me->_t_shipment_data-shipment_items
+      shipment_segments            = me->_t_shipment_data-shipment_segments
+      shipment_segment_item        = me->_t_shipment_data-shipment_segment_item
+      delivery_headers             = me->_t_shipment_data-delivery_headers
+      delivery_items               = me->_t_shipment_data-delivery_items
+    EXCEPTIONS
+      not_found                    = 1
+      delivery_lock                = 2
+      delivery_missing             = 3
+      inconsistent_parameters      = 4
+      OTHERS                       = 5.
+  IF sy-subrc <> 0.
+*   Implement suitable error handling here
+  ENDIF.
+
+ENDMETHOD.
+METHOD add_delivery.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+  DATA: lt_bapishipmentitem       TYPE ztt_bapishipmentitem,
+        lt_bapishipmentitemaction TYPE ztt_bapishipmentitemaction.
+
+  DATA: ls_header                 TYPE bapishipmentheader,
+        ls_header_act             TYPE bapishipmentheaderaction,
+        ls_bapishipmentitem       TYPE bapishipmentitem,
+        ls_bapishipmentitemaction TYPE bapishipmentitemaction.
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**** IMPORT DATA
+
+  IF ( i_o_delivery IS NOT BOUND ).
+    zcl_utils=>zif_msg_utils~s_launch_exception( i_textid = zcl_utils=>zif_msg_utils~s_create_raising_message( i_msgno = '001' i_msgid = zcl_hp_shipment=>_c_cl_msgid_label i_msgty = 'E' ) ).
+  ENDIF.
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** FILL DATA
+
+*** HEADER
+
+  MOVE me->_tknum                                 TO ls_header-shipment_num.
+*  MOVE me->_t_shipment_data-shipment_header-add02 TO ls_header-suppl_2.
+
+*** HEADER ACTION
+
+*  MOVE me->_s_status_c TO ls_header_act-suppl_2.
+
+*** ITEM
+
+  MOVE i_o_delivery->_vbeln TO ls_bapishipmentitem-delivery.
+  APPEND ls_bapishipmentitem TO lt_bapishipmentitem.
+
+*** ITEM ACTION
+
+  MOVE me->_s_status_a TO ls_bapishipmentitemaction-delivery.
+  MOVE me->_s_status_a TO ls_bapishipmentitemaction-itenerary.
+  APPEND ls_bapishipmentitemaction TO lt_bapishipmentitemaction.
+
+**** ADD DELIVERY
+
+  me->_change_shipment( i_header = ls_header i_header_actions = ls_header_act i_t_bapishipmentitem = lt_bapishipmentitem i_t_bapishipmentitemaction = lt_bapishipmentitemaction ).
+
+**** UPDATE CLASS DATA
+
+  me->_read_data( ).
+
+ENDMETHOD.
+METHOD constructor.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+  DATA: lv_message  TYPE scx_attrname.
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**** IMPORT DATA
+
+*** NOT INITIAL
+
+  IF ( i_tknum IS INITIAL ).
+*    CLEAR: lv_message.
+*    MOVE text-001 TO lv_message. i_message = lv_message
+    zcl_utils=>zif_msg_utils~s_launch_exception( i_textid = zcl_utils=>zif_msg_utils~s_create_raising_message( i_msgno = '001' i_msgid = me->_c_cl_msgid_label i_msgty = 'E' ) ).
+  ENDIF.
+
+*** EXISTS
+
+  SELECT COUNT(*) UP TO 1 ROWS
+    FROM vttk
+   WHERE tknum EQ i_tknum.
+
+  IF ( sy-subrc NE 0 ).
+    zcl_utils=>zif_msg_utils~s_launch_exception( i_textid = zcl_utils=>zif_msg_utils~s_create_raising_message( i_msgno = '001' i_msgid = me->_c_cl_msgid_label i_msgty = 'E' ) ).
+  ENDIF.
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** TKNUM
+
+  MOVE i_tknum TO me->_tknum.
+
+**** READ DATA
+
+  me->_read_data( ).
+
+ENDMETHOD.
+METHOD finalice.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+  DATA: ls_actions TYPE zst_shipment_actions.
+
+  DATA: lv_message TYPE scx_attrname.
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** POST DELIVERIES
+
+  me->_finalice_deliveries( ).
+
+**** CLOSE SHIPMENT
+
+*** FILL DATA
+
+** PLAN
+
+  IF ( me->_t_shipment_data-shipment_header-stdis NE me->_s_status_c ).
+    MOVE me->_s_status_c TO ls_actions-status_plan.
+  ENDIF.
+
+** CHECKIN
+
+  IF ( me->_t_shipment_data-shipment_header-streg NE me->_s_status_c ).
+    MOVE me->_s_status_c TO ls_actions-status_checkin.
+  ENDIF.
+
+** LOAD START
+
+  IF ( me->_t_shipment_data-shipment_header-stlbg NE me->_s_status_c ).
+    MOVE me->_s_status_c TO ls_actions-status_load_start.
+  ENDIF.
+
+** LOAD END
+
+  IF ( me->_t_shipment_data-shipment_header-stlad NE me->_s_status_c ).
+    MOVE me->_s_status_c TO ls_actions-status_load_end.
+  ENDIF.
+
+** COMPLETED
+
+  IF ( me->_t_shipment_data-shipment_header-stabf NE me->_s_status_c ).
+    MOVE me->_s_status_c TO ls_actions-status_compl.
+  ENDIF.
+
+** SHIPMENT START
+
+  IF ( me->_t_shipment_data-shipment_header-sttbg NE me->_s_status_c ).
+    MOVE me->_s_status_c TO ls_actions-status_shpmnt_start.
+  ENDIF.
+
+** SHIPMENT END
+
+  IF ( me->_t_shipment_data-shipment_header-stten NE me->_s_status_c ).
+    MOVE me->_s_status_c TO ls_actions-status_shpmnt_end.
+  ENDIF.
+
+*** CLOSE
+
+  me->_change_shipment_action( i_shipment_actions = ls_actions ).
+
+ENDMETHOD.
+METHOD GET_DELIVERY.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** Compruebo las entregas si hay abiertas
+
+  LOOP AT me->_t_deliveries INTO DATA(lo_delivery).
+
+    IF ( lo_delivery IS BOUND ).
+
+      IF ( lo_delivery->_vbeln EQ i_vbeln ).
+        r_o_delivery ?= lo_delivery.
+        EXIT.
+      ENDIF.
+
+    ENDIF.
+
+  ENDLOOP.
+
+ENDMETHOD.
+METHOD GET_DELIVERY_FROM_VERUR.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** Compruebo las entregas si hay abiertas
+
+  "Recorremos las deliveries del transporte
+  LOOP AT me->_t_deliveries INTO DATA(lo_delivery).
+
+    IF ( lo_delivery IS BOUND ).
+
+      "Si coincide VERUR
+      IF ( lo_delivery->_s_data-s_delivery_header-verur EQ i_verur ).
+        APPEND lo_delivery TO r_o_deliveries.
+      ENDIF.
+
+    ENDIF.
+
+  ENDLOOP.
+
+ENDMETHOD.
+METHOD get_not_posted_deliveries.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** Compruebo las entregas si hay abiertas
+
+  LOOP AT me->_t_deliveries INTO DATA(lo_delivery).
+
+    IF ( lo_delivery IS BOUND ).
+
+      CHECK lo_delivery->is_posted( ) EQ abap_false.
+
+      APPEND lo_delivery TO r_t_deliveries.
+
+    ENDIF.
+
+  ENDLOOP.
+
+
+ENDMETHOD.
+METHOD have_deliveries.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+**********************************************************************
+* Validaciones^
+**********************************************************************
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** CHECK
+
+  IF ( lines( me->_t_deliveries ) GT 0 ).
+    MOVE abap_true TO r_bool.
+  ENDIF.
+
+ENDMETHOD.
+METHOD HAVE_NOT_POSTED_DELIVERIES.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+**********************************************************************
+* Validaciones^
+**********************************************************************
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** CHECK
+
+  IF ( lines( me->_t_deliveries ) GT 0 ).
+    MOVE abap_true TO r_bool.
+  ENDIF.
+
+ENDMETHOD.
+METHOD UPDATE_HEADER_DATA.
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+**** IMPORT DATA
+
+  IF ( i_shipment_header-shipment_num NE me->_tknum ).
+    zcl_utils=>zif_msg_utils~s_launch_exception( i_textid = zcl_utils=>zif_msg_utils~s_create_raising_message( i_msgno = '001' i_msgid = zcl_hp_shipment=>_c_cl_msgid_label i_msgty = 'E' ) ).
+  ENDIF.
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** UPDATE DATA
+
+  me->_change_shipment( i_header = i_shipment_header i_header_actions = i_shipment_header_actions ).
+
+ENDMETHOD.

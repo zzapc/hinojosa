@@ -1,0 +1,719 @@
+*----------------------------------------------------------------------*
+***INCLUDE ZRPP0037_F01.
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  ACTIVAR_FILTROS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM activar_filtros .
+  DATA: list         TYPE vrm_values,
+        value        TYPE vrm_value,
+        lt_return    TYPE bapiret2_t,
+        lv_char_name TYPE bapicharactkey-charactname,
+        lt_charact   TYPE STANDARD TABLE OF bapicharactvaluesdescr.
+
+  IF p_lib IS NOT INITIAL.
+    LOOP AT SCREEN.
+      IF ( screen-group1 = 'CAL' ) .
+        screen-active = 0.
+        MODIFY SCREEN.
+      ENDIF.
+    ENDLOOP.
+    PERFORM buscar_motivos.
+  ELSE.
+    LOOP AT SCREEN.
+      IF ( screen-group1 = 'LIB' ) .
+        screen-active = 0.
+        MODIFY SCREEN.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  VALIDAR_RADIO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM validar_datos_requeridos.
+  IF sy-ucomm = 'ONLI'.
+    IF so_werks-low IS INITIAL.
+      MESSAGE e242(zpp).
+    ELSEIF so_matnr-low IS INITIAL.
+      MESSAGE e242(zpp).
+    ELSEIF so_charg-low IS INITIAL.
+      MESSAGE e242(zpp).
+    ELSEIF p_clabs IS INITIAL.
+      MESSAGE e242(zpp).
+    ENDIF.
+    IF p_lib IS NOT INITIAL.
+      IF p_lgort IS INITIAL.
+        MESSAGE e242(zpp).
+      ENDIF.
+    ELSEIF p_cal IS NOT INITIAL.
+      IF so_lgort-low IS INITIAL.
+        MESSAGE e242(zpp).
+      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPROBAR_DATOS_SC
+*&---------------------------------------------------------------------*
+FORM comprobar_datos_sc.
+
+  DATA: lv_werks TYPE werks_d.
+
+  " Comprobamos Centro
+  IF so_werks-low IS NOT INITIAL.
+*    SELECT SINGLE werks FROM t001w
+*      INTO @DATA(l_aux)
+*      WHERE werks = @so_werks-low.
+
+
+    SELECT SINGLE werks FROM t001w
+      INTO lv_werks
+      WHERE werks = so_werks-low.
+
+    IF sy-subrc <> 0.
+      MESSAGE e000 WITH 'Centro ' so_werks-low ' no existe'.
+    ENDIF.
+  ENDIF.
+
+  " Comprobamos Material
+  IF so_matnr-low IS NOT INITIAL.
+    DATA: l_mtart TYPE mtart.
+
+    SELECT SINGLE mtart FROM mara
+      INTO l_mtart
+      WHERE matnr = so_matnr-low.
+
+*    SELECT SINGLE mtart FROM mara
+*      INTO @DATA(l_mtart)
+*      WHERE matnr = @so_matnr-low.
+
+    IF sy-subrc <> 0.
+      MESSAGE e000 WITH 'Material ' |{ so_matnr-low ALPHA = OUT }| ' no existe'.
+    ENDIF.
+  ENDIF.
+
+  " Comprobar Lote
+  IF so_charg-low IS NOT INITIAL.
+    DATA: l_charg TYPE charg_d.
+
+    SELECT SINGLE charg FROM mchb
+      INTO l_charg
+      WHERE charg = so_charg-low AND
+            matnr = so_matnr-low AND
+            werks = so_werks-low AND
+            clabs > 0.
+
+*    SELECT SINGLE charg FROM mchb
+*      INTO @DATA(l_charg)
+*      WHERE charg = @so_charg-low AND
+*            matnr = @so_matnr-low AND
+*            werks = @so_werks-low.
+*
+    IF sy-subrc NE 0.
+      MESSAGE e000 WITH 'Lote ' so_charg-low ' no existe para el material ' |{ so_matnr-low ALPHA = OUT }|.
+    ENDIF.
+  ENDIF.
+
+  "Comprobar almacén
+  IF so_lgort-low IS NOT INITIAL.
+*     SELECT SINGLE lgort FROM t001l
+*      INTO  @l_aux
+*      WHERE lgort = @so_lgort-low AND
+*            werks = @so_werks-low.
+
+    SELECT SINGLE lgort FROM t001l
+      INTO  lv_werks
+      WHERE lgort = so_lgort-low AND
+            werks = so_werks-low.
+
+    IF sy-subrc <> 0.
+      MESSAGE e000 WITH 'Almacén ' so_lgort-low ' no existe en el centro ' so_werks-low.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PROCESAR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM procesar .
+  CLEAR gs_data.
+  SET UPDATE TASK LOCAL.
+  PERFORM obtener_datos_origen CHANGING gs_data.
+  IF p_lib IS NOT INITIAL.
+    PERFORM traslado_a_calidad.
+  ELSEIF p_cal IS NOT INITIAL.
+    PERFORM traslado_desde_calidad.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  TRASLADO_A_CALIDAD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM traslado_a_calidad.
+  DATA: lv_subrc           TYPE sysubrc,
+        lv_nuevo_lote      TYPE bapibatchkey-batch,
+        lv_par1            TYPE char30,
+        lv_par2            TYPE char30,
+        lv_par3            TYPE char30,
+        lt_allocvaluesnum  TYPE STANDARD TABLE OF bapi1003_alloc_values_num,
+        lt_allocvalueschar TYPE STANDARD TABLE OF bapi1003_alloc_values_char,
+        ls_allocvalueschar TYPE bapi1003_alloc_values_char,
+        lv_zpmp            TYPE xfeld,
+        lv_zplp            TYPE xfeld,
+        lt_allocvaluescurr TYPE STANDARD TABLE OF bapi1003_alloc_values_curr.
+
+  IF p_clabs > gs_data-clabs.
+    MESSAGE s000 WITH 'La cantidad a trasladar ' p_clabs ' supera al stock ' gs_data-clabs DISPLAY LIKE 'E'.
+    EXIT.
+  ELSEIF p_clabs < gs_data-clabs.
+    PERFORM crear_nuevo_lote USING    p_lgort
+                             CHANGING lv_nuevo_lote
+                                      lv_subrc.
+  ENDIF.
+
+  IF lv_subrc IS INITIAL." AND lv_nuevo_lote IS NOT INITIAL.
+    PERFORM obtener_clasificacion  TABLES   lt_allocvaluesnum
+                                            lt_allocvalueschar
+                                            lt_allocvaluescurr
+                                   CHANGING lv_subrc.
+  ENDIF.
+
+  IF lv_subrc IS INITIAL.
+
+    IF lt_allocvalueschar IS NOT INITIAL.
+      DELETE lt_allocvalueschar WHERE charact = gc_un_esp_lote."'Z_UN_MED_ESP_LOTE'.
+    ENDIF.
+
+    IF p_lgort = gc_alm_int." Incidencias internas
+      ls_allocvalueschar-charact = 'Z_INC_PLANTA'.
+      ls_allocvalueschar-value_neutral = 'S'.
+      APPEND ls_allocvalueschar TO lt_allocvalueschar.
+    ELSEIF p_lgort = gc_alm_ext." Incidencias externas
+      ls_allocvalueschar-charact = 'Z_INC_EXTERNA'.
+      ls_allocvalueschar-value_neutral = 'S'.
+      APPEND ls_allocvalueschar TO lt_allocvalueschar.
+    ENDIF.
+    IF p_mot IS NOT INITIAL.
+      IF p_lgort = gc_alm_int." Incidencias internas
+        ls_allocvalueschar-charact = 'Z_RECH_PROD'.
+        ls_allocvalueschar-value_neutral = p_mot.
+        APPEND ls_allocvalueschar TO lt_allocvalueschar.
+      ELSEIF p_lgort = gc_alm_ext." Incidencias externas
+        ls_allocvalueschar-charact = 'Z_DEVOLUCION'.
+        ls_allocvalueschar-value_neutral = p_mot.
+        APPEND ls_allocvalueschar TO lt_allocvalueschar.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  IF lv_subrc IS INITIAL.
+    PERFORM modificar_clasificacion  TABLES lt_allocvaluesnum
+                                            lt_allocvalueschar
+                                            lt_allocvaluescurr
+                                      USING lv_nuevo_lote
+                                   CHANGING lv_subrc.
+  ENDIF.
+
+  IF lv_subrc IS INITIAL.
+    PERFORM traspaso_material USING     lv_nuevo_lote
+                                        p_lgort
+                              CHANGING  lv_subrc.
+  ENDIF.
+
+  IF lv_subrc IS INITIAL.
+    WRITE gs_data-matnr TO lv_par1.
+    IF lv_nuevo_lote IS INITIAL.
+      MESSAGE s247 WITH gs_data-charg lv_par1 p_lgort gs_data-werks.
+    ELSE.
+      MESSAGE s243 WITH lv_nuevo_lote lv_par1 p_lgort gs_data-werks.
+*     Imprimir etiqueta del nuevo lote
+      DATA: lv_mtart TYPE mtart.
+      SELECT SINGLE mtart
+        INTO lv_mtart
+        FROM mara
+        WHERE matnr = gs_data-matnr.
+*      SELECT SINGLE mtart
+*        INTO @DATA(lv_mtart)
+*        FROM mara
+*        WHERE matnr = @gs_data-matnr.
+
+      IF lv_mtart = 'ZPMP'.
+        CALL FUNCTION 'ZMFPM_ETIQUETAS'
+          EXPORTING
+            i_matnr = gs_data-matnr
+            i_charg = lv_nuevo_lote
+            i_lpm   = 'X'.
+      ELSEIF lv_mtart = 'ZPLP'.
+        CALL FUNCTION 'ZMFPM_ETIQUETAS'
+          EXPORTING
+            i_matnr = gs_data-matnr
+            i_charg = lv_nuevo_lote
+            i_pnm   = 'X'.
+      ELSEIF lv_mtart = 'ZWIP'.
+        CALL FUNCTION 'ZMFPM_ETIQUETAS'
+          EXPORTING
+            i_matnr = gs_data-matnr
+            i_charg = lv_nuevo_lote
+            i_lwip  = 'X'.
+      ENDIF.
+
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  TRASLADO_DESDE_CALIDAD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM traslado_desde_calidad.
+  DATA: lv_subrc           TYPE sysubrc,
+        lv_nuevo_lote      TYPE bapibatchkey-batch,
+        lv_par1            TYPE char30,
+        lv_par2            TYPE char30,
+        lv_par3            TYPE char30,
+        lt_allocvaluesnum  TYPE STANDARD TABLE OF bapi1003_alloc_values_num,
+        lt_allocvalueschar TYPE STANDARD TABLE OF bapi1003_alloc_values_char,
+        ls_allocvalueschar TYPE bapi1003_alloc_values_char,
+        lt_allocvaluescurr TYPE STANDARD TABLE OF bapi1003_alloc_values_curr.
+
+  IF so_lgort-low = gc_alm_ext OR so_lgort-low = gc_alm_int.
+    MESSAGE e000 WITH 'El lote ya está en calidad'.
+    EXIT.
+  ENDIF.
+
+  IF p_clabs > gs_data-clabs.
+    MESSAGE s000 WITH 'La cantidad a trasladar ' p_clabs ' supera al stock ' gs_data-clabs DISPLAY LIKE 'E'.
+    EXIT.
+  ELSEIF p_clabs < gs_data-clabs.
+    PERFORM crear_nuevo_lote USING    so_lgort-low
+                             CHANGING lv_nuevo_lote
+                                      lv_subrc.
+  ENDIF.
+
+  IF lv_subrc IS INITIAL." AND lv_nuevo_lote IS NOT INITIAL.
+    PERFORM obtener_clasificacion  TABLES   lt_allocvaluesnum
+                                            lt_allocvalueschar
+                                            lt_allocvaluescurr
+                                   CHANGING lv_subrc.
+  ENDIF.
+
+  IF lv_subrc IS INITIAL.
+    IF lt_allocvalueschar IS NOT INITIAL.
+      DELETE lt_allocvalueschar WHERE charact = gc_un_esp_lote."'Z_UN_MED_ESP_LOTE'.
+    ENDIF.
+
+* ini 26.01.2018 - cvivo - 46104 Control borrado características con motivo de traslado a calidad
+    IF gs_data-lgort = gc_alm_int AND p_bor IS NOT INITIAL." Incidencias internas
+      DELETE lt_allocvalueschar WHERE charact = 'Z_INC_PLANTA'.
+      DELETE lt_allocvalueschar WHERE charact = 'Z_RECH_PROD'.
+    ELSEIF p_lgort = gc_alm_ext AND p_bor IS NOT INITIAL." Incidencias externas
+      DELETE lt_allocvalueschar WHERE charact = 'Z_INC_EXTERNA'.
+      DELETE lt_allocvalueschar WHERE charact = 'Z_DEVOLUCION'.
+    ENDIF.
+  ENDIF.
+* fin 26.01.2018 - cvivo - 46104 Control borrado características con motivo de traslado a calidad
+
+  IF lv_subrc IS INITIAL.
+    PERFORM modificar_clasificacion  TABLES lt_allocvaluesnum
+                                            lt_allocvalueschar
+                                            lt_allocvaluescurr
+                                      USING lv_nuevo_lote
+                                   CHANGING lv_subrc.
+  ENDIF.
+
+  IF lv_subrc IS INITIAL.
+    PERFORM traspaso_material USING     lv_nuevo_lote
+                                        so_lgort-low
+                              CHANGING  lv_subrc.
+  ENDIF.
+
+  IF lv_subrc IS INITIAL.
+    WRITE gs_data-matnr TO lv_par1.
+    IF lv_nuevo_lote IS INITIAL.
+      MESSAGE s247 WITH gs_data-charg lv_par1 so_lgort-low gs_data-werks.
+    ELSE.
+      MESSAGE s243 WITH lv_nuevo_lote lv_par1 so_lgort-low gs_data-werks.
+
+      DATA: lv_mtart TYPE mtart.
+      SELECT SINGLE mtart
+        INTO lv_mtart
+        FROM mara
+        WHERE matnr = gs_data-matnr.
+
+      IF lv_mtart = 'ZPMP'.
+        CALL FUNCTION 'ZMFPM_ETIQUETAS'
+          EXPORTING
+            i_matnr = gs_data-matnr
+            i_charg = lv_nuevo_lote
+            i_lpm   = 'X'.
+      ELSEIF lv_mtart = 'ZPLP'.
+        CALL FUNCTION 'ZMFPM_ETIQUETAS'
+          EXPORTING
+            i_matnr = gs_data-matnr
+            i_charg = lv_nuevo_lote
+            i_pnm   = 'X'.
+      ELSEIF lv_mtart = 'ZWIP'.
+        CALL FUNCTION 'ZMFPM_ETIQUETAS'
+          EXPORTING
+            i_matnr = gs_data-matnr
+            i_charg = lv_nuevo_lote
+            i_lwip  = 'X'.
+      ENDIF.
+
+**     Imprimir etiqueta del nuevo lote
+*      CALL FUNCTION 'ZMFPM_ETIQUETAS'
+*        EXPORTING
+*          i_matnr = gs_data-matnr
+*          i_charg = lv_nuevo_lote.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  obtener_datos_origen
+*&---------------------------------------------------------------------*
+FORM obtener_datos_origen CHANGING ps_pp0037 TYPE zspp0037.
+
+*  DATA: lt_mchb TYPE TABLE OF mchb.
+
+  SELECT SINGLE a~matnr a~werks a~charg a~lgort a~clabs b~meins
+    INTO CORRESPONDING FIELDS OF ps_pp0037
+    FROM mchb AS a
+    INNER JOIN mara AS b ON a~matnr = b~matnr
+    WHERE a~matnr = so_matnr-low
+    AND   a~werks = so_werks-low
+    AND   a~charg = so_charg-low
+    AND   a~clabs > 0. "cgijon: 21.11.17
+
+  IF sy-subrc = 0.
+    IF ps_pp0037-clabs <= 0.
+      MESSAGE s000 WITH 'El lote no tiene stock libre' DISPLAY LIKE 'E'.
+      EXIT.
+    ENDIF.
+    PERFORM obtener_clase USING ps_pp0037-matnr
+                                ps_pp0037-charg
+                       CHANGING ps_pp0037-class.
+  ELSE.
+    MESSAGE s000 WITH 'No existe el lote solicitado' DISPLAY LIKE 'E'.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    " OBTENER_ALAMACENES
+
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_CLASE
+*&---------------------------------------------------------------------*
+FORM obtener_clase USING i_matnr
+                         i_lote
+                CHANGING o_class.
+
+  CALL FUNCTION 'QMSP_MATERIAL_BATCH_CLASS_READ'
+    EXPORTING
+      i_matnr                = i_matnr
+      i_charg                = i_lote
+      i_werks                = so_werks-low
+      i_mara_level           = ' '
+    IMPORTING
+      e_class                = o_class
+    EXCEPTIONS
+      no_class               = 1
+      internal_error_classif = 2
+      no_change_service      = 3
+      OTHERS                 = 4.
+
+ENDFORM.                    " OBTENER_CLASE
+
+*&---------------------------------------------------------------------*
+*&      Form  CREAR_NUEVO_LOTE
+*&---------------------------------------------------------------------*
+*       Crear nuevo lote con el material, centro, almacén destino
+*----------------------------------------------------------------------*
+FORM crear_nuevo_lote USING p_lgort
+                      CHANGING o_lote
+                               o_subrc.
+
+  DATA: lt_return TYPE TABLE OF bapiret2.
+
+  CALL FUNCTION 'BAPI_BATCH_CREATE'
+    EXPORTING
+      material             = gs_data-matnr
+      plant                = gs_data-werks
+      batchstoragelocation = p_lgort
+    IMPORTING
+      batch                = o_lote
+    TABLES
+      return               = lt_return.
+
+  " Nos quedamos solo con los errores en caso de tener
+  DELETE lt_return WHERE type NE 'E'.
+
+  IF lt_return IS INITIAL.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    o_subrc = 4.
+    CALL FUNCTION 'FINB_BAPIRET2_DISPLAY'
+      EXPORTING
+        it_message = lt_return.
+  ENDIF.
+
+ENDFORM.                    " CREAR_NUEVO_LOTE
+
+*&---------------------------------------------------------------------*
+*&      Form  TRASPASO_MATERIAL
+*&---------------------------------------------------------------------*
+*       Hacemos el movimiento de materiales de los lotes al nuevo lote
+*----------------------------------------------------------------------*
+FORM traspaso_material USING p_charg
+                             p_lgort
+                    CHANGING o_subrc.
+
+  DATA: ls_header TYPE bapi2017_gm_head_01,
+        ls_code   TYPE bapi2017_gm_code,
+        ls_item   TYPE bapi2017_gm_item_create.
+
+  DATA: lt_item   TYPE TABLE OF bapi2017_gm_item_create,
+        lt_return TYPE TABLE OF bapiret2.
+
+  DATA: l_materialdocument TYPE bapi2017_gm_head_ret-mat_doc,
+        l_matdocumentyear  TYPE bapi2017_gm_head_ret-doc_year.
+
+  " Montamos los datos de las diferentes estructuras de la BAPI
+
+  ls_header = VALUE #( pstng_date = sy-datum
+                       doc_date   = sy-datum ).
+
+  ls_code   = VALUE #( gm_code = '04' ).
+
+*  LOOP AT gti_datos ASSIGNING FIELD-SYMBOL(<ls_datos>).
+
+  ls_item   = VALUE #( material   = gs_data-matnr  " Material de origen
+                       plant      = gs_data-werks         " Centro
+                       stge_loc   = gs_data-lgort   " Almacén de origen
+                       batch      = gs_data-charg     " Lote origen
+                       move_type  = '309'
+                       entry_qnt  = p_clabs  " Cantidad a traspasar al megalote
+                       entry_uom  = gs_data-meins
+                       move_mat   = gs_data-matnr         " Material de destino
+                       move_plant = gs_data-werks         " Centro de destino
+                       move_stloc = p_lgort         " Almacén de destino
+                       move_batch = p_charg ).            " Lote de destino (Creado en BAPI_BATCH_CREATE)
+
+  APPEND ls_item TO lt_item.
+
+*  ENDLOOP.
+
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header  = ls_header
+      goodsmvt_code    = ls_code
+    IMPORTING
+      materialdocument = l_materialdocument
+      matdocumentyear  = l_matdocumentyear
+    TABLES
+      goodsmvt_item    = lt_item
+      return           = lt_return.
+
+  " Nos quedamos solo con los errores en caso de tener
+  DELETE lt_return WHERE type NE 'E'.
+
+  IF lt_return IS INITIAL.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    o_subrc = 4.
+    CALL FUNCTION 'FINB_BAPIRET2_DISPLAY'
+      EXPORTING
+        it_message = lt_return.
+  ENDIF.
+
+ENDFORM.                    " TRANSPASO_MATERIAL
+
+
+FORM obtener_clasificacion  TABLES pt_allocvaluesnum STRUCTURE bapi1003_alloc_values_num
+                                  pt_allocvalueschar STRUCTURE bapi1003_alloc_values_char
+                                  pt_allocvaluescurr STRUCTURE bapi1003_alloc_values_curr
+                            CHANGING o_subrc.
+
+  DATA: lt_return          TYPE                   bapiret2_t,
+        lt_allocvaluesnum  TYPE STANDARD TABLE OF bapi1003_alloc_values_num,
+        lt_allocvalueschar TYPE STANDARD TABLE OF bapi1003_alloc_values_char,
+        lt_allocvaluescurr TYPE STANDARD TABLE OF bapi1003_alloc_values_curr,
+        lv_object          TYPE                   bapi1003_key-object.
+
+  IF gs_data-class IS NOT INITIAL.
+
+    CONCATENATE gs_data-matnr gs_data-charg INTO lv_object.
+
+    CLEAR: pt_allocvaluesnum, pt_allocvalueschar, pt_allocvaluescurr, lt_return.
+
+    CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+      EXPORTING
+        objectkey       = lv_object "Material + Lote
+        objecttable     = 'MCH1'
+        classnum        = gs_data-class "
+        classtype       = '023'
+      TABLES
+        allocvaluesnum  = pt_allocvaluesnum
+        allocvalueschar = pt_allocvalueschar
+        allocvaluescurr = pt_allocvaluescurr
+        return          = lt_return.
+
+*    READ TABLE lt_return WITH KEY type = 'E' INTO ls_return.
+    DELETE lt_return WHERE type NE 'E'.
+
+    IF lt_return IS NOT INITIAL.
+      o_subrc = 4.
+      CALL FUNCTION 'FINB_BAPIRET2_DISPLAY'
+        EXPORTING
+          it_message = lt_return.
+    ENDIF.
+
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  BUSCAR_MOTIVOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM buscar_motivos .
+
+  DATA: list         TYPE vrm_values,
+        value        TYPE vrm_value,
+        lt_return    TYPE bapiret2_t,
+        lv_char_name TYPE bapicharactkey-charactname,
+        lt_charact   TYPE STANDARD TABLE OF bapicharactvaluesdescr.
+
+* Listado de motivos de traslado a calidad.
+  IF p_lib IS NOT INITIAL.
+    IF p_int IS NOT INITIAL.
+      p_lgort = gc_alm_int.
+    ELSEIF p_ext IS NOT INITIAL.
+      p_lgort = gc_alm_ext.
+    ENDIF.
+
+    IF p_lgort = gc_alm_int.
+      lv_char_name = 'Z_RECH_PROD'.
+    ELSEIF p_lgort = gc_alm_ext.
+      lv_char_name = 'Z_DEVOLUCION'.
+    ENDIF.
+    IF lv_char_name IS NOT INITIAL.
+      CALL FUNCTION 'BAPI_CHARACT_GETDETAIL'
+        EXPORTING
+          charactname        = lv_char_name
+          language           = sy-langu
+        TABLES
+          charactvaluesdescr = lt_charact
+          return             = lt_return.
+
+      IF lt_charact IS NOT INITIAL.
+        CLEAR: list.
+        LOOP AT lt_charact INTO DATA(ls_char).
+          value-key = ls_char-value_char.
+          value-text = ls_char-description.
+          APPEND value TO list.
+        ENDLOOP.
+        CALL FUNCTION 'VRM_SET_VALUES'
+          EXPORTING
+            id     = 'P_MOT'
+            values = list.
+      ENDIF.
+
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+
+FORM modificar_clasificacion  TABLES  pt_allocvaluesnum STRUCTURE bapi1003_alloc_values_num
+                                      pt_allocvalueschar STRUCTURE bapi1003_alloc_values_char
+                                      pt_allocvaluescurr STRUCTURE bapi1003_alloc_values_curr
+                               USING  p_nuevo_lote
+                            CHANGING  o_subrc.
+
+  DATA: lt_return TYPE                   bapiret2_t,
+        lv_object TYPE                   bapi1003_key-object.
+*
+  IF gs_data-class IS NOT INITIAL.
+    IF p_nuevo_lote IS NOT INITIAL.
+      CONCATENATE gs_data-matnr p_nuevo_lote INTO lv_object.
+    ELSE.
+      CONCATENATE gs_data-matnr gs_data-charg INTO lv_object.
+    ENDIF.
+
+    CALL FUNCTION 'BAPI_OBJCL_CHANGE'
+      EXPORTING
+        objectkey          = lv_object "Material + Lote
+        objecttable        = 'MCH1'
+        classnum           = gs_data-class
+        classtype          = '023'
+      TABLES
+        allocvaluesnumnew  = pt_allocvaluesnum
+        allocvaluescharnew = pt_allocvalueschar
+        allocvaluescurrnew = pt_allocvaluescurr
+        return             = lt_return.
+
+    DELETE lt_return WHERE type NE 'E'.
+
+    IF lt_return IS NOT INITIAL.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      o_subrc = 4.
+      CALL FUNCTION 'FINB_BAPIRET2_DISPLAY'
+        EXPORTING
+          it_message = lt_return.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = abap_true.
+    ENDIF.
+
+  ENDIF.
+ENDFORM.
+
+FORM initialization .
+  DATA: lv_atnam TYPE atnam.
+
+  SELECT SINGLE atnam
+    INTO lv_atnam
+    FROM ztpp0016
+    WHERE clave = gc_un_esp_lote.
+
+*  SELECT SINGLE atnam
+*    INTO @DATA(lv_atnam)
+*    FROM ztpp0016
+*    WHERE clave = @gc_un_esp_lote.
+
+  IF sy-subrc = 0.
+    gc_un_esp_lote = lv_atnam.
+  ENDIF.
+ENDFORM.

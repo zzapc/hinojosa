@@ -1,0 +1,445 @@
+class ZCL_FACT_SLK definition
+  public
+  inheriting from ZCL_AP_FACTURA_SD
+  final
+  create public .
+
+public section.
+
+  class-methods GET_CIF_CENTRO_DESTINO
+    importing
+      !WERKS type WERKS_D
+      !BUKRS type BUKRS
+    returning
+      value(CIF) type T001N-STCEG .
+  class-methods GET_VALOR_AZWA
+    importing
+      !VBELN type VBELN_VF
+      !POSNR type POSNR_VF
+    returning
+      value(VALOR) type VBRP-NETWR .
+  class-methods GET_PARTIDAS_FI_DP
+    importing
+      !VBELN type VBELN_VF
+      !POSNR type POSNR_VF
+    returning
+      value(I_BSEG_PROG) type SDDP_BSEG_PROV_T .
+  type-pools ABAP .
+  class-methods AUTOASIGNAR_ANTICIPOS
+    importing
+      !VBELN type VBELN_VF
+      !AUTO type ABAP_BOOL default ''
+    returning
+      value(I_ASIGNACION) type ZT_ASIG_ANT_FACT .
+  class-methods GET_DOC_PAGO
+    importing
+      !VBELN type VBELN
+      !BLART type BLART default 'Z6'
+    returning
+      value(BKPF) type BKPF .
+protected section.
+private section.
+endclass. "ZCL_FACT_SLK definition
+class ZCL_FACT_SLK implementation.
+METHOD autoasignar_anticipos.
+  DATA: l_valor_azwb TYPE konp-kbetr,
+        l_valor_asignacion TYPE konp-kbetr,
+        i_vbrp TYPE TABLE OF vbrp,
+        l_vbrp TYPE vbrp,
+        i_vbak TYPE TABLE OF vbak,
+        l_vbak TYPE vbak,
+        i_vbap TYPE TABLE OF vbap,
+        l_vbap TYPE vbap,
+        l_asignacion TYPE zasig_ant_fact,
+        i_ant_ped TYPE trty_bsid,
+        l_ant_ped TYPE bsid,
+        l_vbrk TYPE vbrk,
+        l_valor_ya_repartido TYPE bsid-wrbtr,
+        l_resto_por_repartir TYPE bsid-wrbtr,
+        l_bruto TYPE bsid-wrbtr,
+        l_iva TYPE bsid-wrbtr.
+
+  CLEAR i_asignacion.
+
+* Busco si tiene anticipos
+  l_valor_azwb = get_valor_condicion( vbeln = vbeln kschl = 'AZWB' ).
+  CHECK l_valor_azwb NE 0.
+
+  SELECT SINGLE * FROM vbrk
+    INTO l_vbrk
+   WHERE vbeln = vbeln.
+
+* Si está anulada, libero anticipos
+  IF l_vbrk-fksto = 'X'.
+    DELETE FROM zasig_ant_fact
+     WHERE vbeln = vbeln.
+    EXIT.
+  ENDIF.
+
+* Busco anticipos ya asignados.
+  SELECT * FROM zasig_ant_fact
+    INTO TABLE i_asignacion
+   WHERE vbeln = vbeln.
+
+* Si han puesto el literal NO es que no se imprimirá detalle de anticipos
+  LOOP AT  i_asignacion TRANSPORTING NO FIELDS WHERE belnr = 'NO'
+                                                  OR belnr = '0'
+                                                  OR belnr = '0000000000'.
+  endloop.
+  if sy-subrc = 0.
+    CLEAR i_asignacion.
+    EXIT.
+  endif.
+
+  CHECK sy-subrc NE 0 AND auto IS INITIAL.
+
+  CLEAR l_valor_asignacion.
+  LOOP AT i_asignacion INTO l_asignacion.
+    l_valor_asignacion = l_valor_asignacion + l_asignacion-wrbtr.
+  ENDLOOP.
+
+** Si ya está todo asignacion no seguimos
+**  CHECK l_valor_asignacion NE l_valor_azwb.
+
+* Si ya hay algo asignado, no seguimos...
+  CHECK l_valor_asignacion = 0.
+
+* Busco los pedidos origenes de esos anticipos
+  SELECT * FROM vbrp
+    INTO TABLE i_vbrp
+   WHERE vbeln = vbeln.
+
+  LOOP AT i_vbrp INTO l_vbrp WHERE NOT aubel IS INITIAL.
+    CLEAR l_vbap.
+    l_vbap-vbeln = l_vbrp-aubel.
+    l_vbap-posnr = l_vbrp-aupos.
+    COLLECT l_vbap INTO i_vbap.
+
+    CLEAR l_vbak.
+    l_vbak-vbeln = l_vbrp-aubel.
+    COLLECT l_vbak INTO i_vbak.
+  ENDLOOP.
+
+  DELETE FROM zasig_ant_fact WHERE vbeln = vbeln.
+
+  LOOP AT i_vbak INTO l_vbak.
+* Busco los anticipos del pedido a repartir
+    i_ant_ped = zcl_ped_sd=>get_anticipos_pedido( l_vbak-vbeln ).
+    DELETE i_ant_ped WHERE blart NE 'DP'.
+    SORT i_ant_ped BY budat.
+
+* Intento repartir por posición
+    LOOP AT i_vbrp INTO l_vbrp WHERE aubel = l_vbak-vbeln.
+      l_resto_por_repartir = get_valor_condicion( vbeln = vbeln posnr = l_vbrp-posnr kschl = 'AZWB' ).
+      l_resto_por_repartir = l_resto_por_repartir - l_valor_asignacion.
+
+      LOOP AT i_ant_ped INTO l_ant_ped WHERE posn2 = l_vbrp-aupos.
+        CLEAR l_asignacion.
+        l_asignacion-mandt = sy-mandt.
+        l_asignacion-vbeln = l_vbrp-vbeln.
+        l_asignacion-bukrs = l_vbrk-bukrs.
+        l_asignacion-belnr = l_ant_ped-belnr.
+        l_asignacion-gjahr = l_ant_ped-gjahr.
+        l_asignacion-buzei = l_ant_ped-buzei.
+        l_asignacion-mwskz = l_ant_ped-mwskz.
+        l_asignacion-waers = l_ant_ped-waers.
+
+* Verifico que el documento no se haya ya repartido
+        CLEAR l_valor_ya_repartido.
+        SELECT SUM( wrbtr ) FROM zasig_ant_fact
+          INTO l_valor_ya_repartido
+         WHERE bukrs = l_vbrk-bukrs
+           AND belnr = l_ant_ped-belnr
+           AND gjahr = l_ant_ped-gjahr
+           AND buzei = l_ant_ped-buzei.
+
+        l_bruto = l_ant_ped-wrbtr + l_ant_ped-wmwst.
+
+        IF l_bruto > l_valor_ya_repartido.
+          l_asignacion-wrbtr = l_bruto - l_valor_ya_repartido.
+          IF l_valor_ya_repartido = 0.
+            l_asignacion-base = l_ant_ped-wrbtr.
+          ENDIF.
+          IF l_resto_por_repartir >= l_asignacion-wrbtr.
+            l_resto_por_repartir = l_resto_por_repartir - l_asignacion-wrbtr.
+          ELSE.
+            l_asignacion-wrbtr = l_resto_por_repartir.
+            CLEAR l_resto_por_repartir.
+          ENDIF.
+
+          COLLECT l_asignacion INTO i_asignacion.
+          MODIFY zasig_ant_fact FROM TABLE i_asignacion.
+          IF l_resto_por_repartir IS INITIAL.
+            EXIT.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+
+* Si queda algo, intento repartir las de cabecera
+      IF l_resto_por_repartir > 0.
+        LOOP AT i_ant_ped INTO l_ant_ped WHERE posn2 = '000000'.
+          CLEAR l_asignacion.
+          l_asignacion-mandt = sy-mandt.
+          l_asignacion-vbeln = l_vbrp-vbeln.
+          l_asignacion-bukrs = l_vbrk-bukrs.
+          l_asignacion-belnr = l_ant_ped-belnr.
+          l_asignacion-gjahr = l_ant_ped-gjahr.
+          l_asignacion-buzei = l_ant_ped-buzei.
+          l_asignacion-mwskz = l_ant_ped-mwskz.
+          l_asignacion-waers = l_ant_ped-waers.
+
+* Verifico que el documento no se haya ya repartido
+          CLEAR l_valor_ya_repartido.
+          SELECT SUM( wrbtr ) FROM zasig_ant_fact
+            INTO l_valor_ya_repartido
+           WHERE bukrs = l_vbrk-bukrs
+             AND belnr = l_ant_ped-belnr
+             AND gjahr = l_ant_ped-gjahr
+             AND buzei = l_ant_ped-buzei.
+
+          l_bruto = l_ant_ped-wrbtr + l_ant_ped-wmwst.
+
+          IF l_bruto > l_valor_ya_repartido.
+            l_asignacion-wrbtr = l_bruto - l_valor_ya_repartido.
+            IF l_valor_ya_repartido = 0.
+              l_asignacion-base = l_ant_ped-wrbtr.
+            ENDIF.
+            IF l_resto_por_repartir >= l_asignacion-wrbtr.
+              l_resto_por_repartir = l_resto_por_repartir - l_asignacion-wrbtr.
+            ELSE.
+              l_asignacion-wrbtr = l_resto_por_repartir.
+              CLEAR l_resto_por_repartir.
+            ENDIF.
+            COLLECT l_asignacion INTO i_asignacion.
+            MODIFY zasig_ant_fact FROM TABLE i_asignacion.
+            IF l_resto_por_repartir IS INITIAL.
+              EXIT.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+* Si queda algo, intento repartir del resto de posiciones
+      IF l_resto_por_repartir > 0.
+        LOOP AT i_ant_ped INTO l_ant_ped WHERE posn2 NE '000000'
+                                           AND posn2 NE l_vbrp-aupos.
+          CLEAR l_asignacion.
+          l_asignacion-mandt = sy-mandt.
+          l_asignacion-vbeln = l_vbrp-vbeln.
+          l_asignacion-bukrs = l_vbrk-bukrs.
+          l_asignacion-belnr = l_ant_ped-belnr.
+          l_asignacion-gjahr = l_ant_ped-gjahr.
+          l_asignacion-buzei = l_ant_ped-buzei.
+          l_asignacion-mwskz = l_ant_ped-mwskz.
+          l_asignacion-waers = l_ant_ped-waers.
+
+* Verifico que el documento no se haya ya repartido
+          CLEAR l_valor_ya_repartido.
+          SELECT SUM( wrbtr ) FROM zasig_ant_fact
+            INTO l_valor_ya_repartido
+           WHERE bukrs = l_vbrk-bukrs
+             AND belnr = l_ant_ped-belnr
+             AND gjahr = l_ant_ped-gjahr
+             AND buzei = l_ant_ped-buzei.
+
+          l_bruto = l_ant_ped-wrbtr + l_ant_ped-wmwst.
+
+          IF l_bruto > l_valor_ya_repartido.
+            l_asignacion-wrbtr = l_bruto - l_valor_ya_repartido.
+            IF l_valor_ya_repartido = 0.
+              l_asignacion-base = l_ant_ped-wrbtr.
+            ENDIF.
+            IF l_resto_por_repartir >= l_asignacion-wrbtr.
+              l_resto_por_repartir = l_resto_por_repartir - l_asignacion-wrbtr.
+            ELSE.
+              l_asignacion-wrbtr = l_resto_por_repartir.
+              CLEAR l_resto_por_repartir.
+            ENDIF.
+            COLLECT l_asignacion INTO i_asignacion.
+            MODIFY zasig_ant_fact FROM TABLE i_asignacion.
+            IF l_resto_por_repartir IS INITIAL.
+              EXIT.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ENDLOOP.
+
+* Calculo la base
+    LOOP AT i_asignacion INTO l_asignacion.
+      l_iva = zcl_ap_doc_fi=>get_imp_iva_desde_bruto( mwskz = l_asignacion-mwskz
+                                                   wrbtr = l_asignacion-wrbtr ).
+      l_asignacion-base = l_asignacion-wrbtr - l_iva.
+      MODIFY i_asignacion FROM l_asignacion.
+      MODIFY zasig_ant_fact FROM l_asignacion.
+    ENDLOOP.
+
+  ENDLOOP.
+
+
+
+
+ENDMETHOD.
+METHOD get_cif_centro_destino.
+  DATA: l_pais_centro TYPE t001-land1.
+
+* Busco el país del centro
+  SELECT SINGLE land1 FROM t001w
+    INTO l_pais_centro
+   WHERE werks = werks.
+  IF sy-subrc = 0.
+* Obtengo CIF de la combinación sociedad/pais centro
+    SELECT SINGLE stceg FROM t001n
+      INTO cif
+     WHERE bukrs = bukrs
+       AND land1 = l_pais_centro
+       AND stceg NE ''.
+  ENDIF.
+
+  IF cif IS INITIAL.
+    SELECT SINGLE stceg FROM t001
+        INTO cif
+    WHERE bukrs = bukrs.
+  ENDIF.
+
+ENDMETHOD.
+METHOD get_doc_pago.
+  DATA: l_bkpf TYPE bkpf,
+        l_bseg TYPE bseg,
+        i_bseg TYPE bseg_t.
+
+  CLEAR bkpf.
+
+  l_bkpf = get_doc_fi( vbeln ).
+  CHECK NOT l_bkpf IS INITIAL.
+
+  SELECT SINGLE * FROM bseg
+    INTO l_bseg
+   WHERE bukrs = l_bkpf-bukrs
+     AND belnr = l_bkpf-belnr
+     AND gjahr = l_bkpf-gjahr
+     AND koart = 'D'
+     AND umskz = ''
+     AND augbl NE ''.
+  IF sy-subrc = 0.
+    i_bseg = zcl_ap_doc_fi=>get_utilizacion_pago( bukrs = l_bseg-bukrs
+                                               augbl = l_bseg-augbl
+                                               augdt = l_bseg-augdt
+                                               blart = blart
+                                               cliente = 'X' ).
+    read table i_bseg into l_bseg index 1.
+    if sy-subrc = 0.
+      select single * from bkpf
+        into bkpf
+       where bukrs = l_bseg-bukrs
+         and belnr = l_bseg-belnr
+         and gjahr = l_bseg-gjahr.
+    endif.
+  ENDIF.
+ENDMETHOD.
+METHOD get_partidas_fi_dp.
+  DATA: l_vbak TYPE vbak,
+        l_clientes TYPE sddp_customer_t,
+        l_vbrp       TYPE vbrp.
+
+  SELECT SINGLE * FROM vbrp
+    INTO l_vbrp
+   WHERE vbeln = vbeln
+     AND posnr = posnr.
+
+  IF NOT l_vbrp-aubel IS INITIAL.
+    SELECT SINGLE * FROM vbak
+      INTO l_vbak
+     WHERE vbeln = l_vbrp-aubel.
+
+    APPEND l_vbak-kunnr TO l_clientes.
+
+    get_valor_azwa( vbeln = vbeln posnr = posnr ).
+
+
+    CALL FUNCTION 'SD_DP_BSEGS_PROVIDING_BUILD'
+      EXPORTING
+        is_vbak      = l_vbak
+        it_customer  = l_clientes
+      IMPORTING
+        et_bseg_prov = i_bseg_prog.
+  ENDIF.
+
+ENDMETHOD.
+METHOD get_valor_azwa.
+  DATA: l_vbrp       TYPE vbrp,
+        ls_order_item TYPE  sddp_order_item,
+        l_return     TYPE  bapiret2.
+
+  constants: lc_diff_max                type komv-kwert value '5'.
+
+  DATA: lv_bseg_prov      TYPE sddp_order_item-bseg_prov_h.
+  DATA: lv_bseg_cons      TYPE sddp_order_item-bseg_cons_h.
+  DATA: lv_bseg_left      TYPE sddp_order_item-bseg_cons_h.
+  DATA: lv_brtwr          TYPE komp-brtwr.
+  data: lv_qty_open       type sddp_order_item-req_qty.
+  data: lv_diff           type komp-brtwr.
+
+  SELECT SINGLE * FROM vbrp
+    INTO l_vbrp
+   WHERE vbeln = vbeln
+     AND posnr = posnr.
+
+  IF NOT l_vbrp-aubel IS INITIAL.
+    CALL FUNCTION 'SD_DP_ORDER_ITEM_GET'
+      EXPORTING
+        iv_doc_number    = l_vbrp-aubel
+        iv_itm_number    = l_vbrp-aupos
+        iv_bill_doc      = l_vbrp-vbeln
+        iv_bill_doc_item = l_vbrp-posnr
+      IMPORTING
+        es_order_item    = ls_order_item
+        es_return        = l_return.
+
+
+
+    lv_bseg_prov = ls_order_item-bseg_prov_i
+                   + ls_order_item-bseg_prov_h.
+    lv_bseg_cons = ls_order_item-bseg_cons_i
+                   + ls_order_item-bseg_cons_h.
+    lv_bseg_left = lv_bseg_prov - lv_bseg_cons.
+    lv_brtwr     = l_vbrp-netwr + l_vbrp-mwsbp.
+
+
+
+*       We go for a proportional distribution. If the item
+*       is not rejected the expected quantity for which the
+*       down payment shall last is the original order quantity.
+*       If the item is rejected and billing is delivery related,
+*       the upper threshold is what has already been delivered.
+    lv_qty_open = ls_order_item-req_qty_open
+                - ls_order_item-inv_qty_cum_old.
+
+*       LV_BSEG_PROV is correct here. We calculate based on what is
+*       on the database, LV_BSEG_PROV and LV_QTY_OPEN are
+*       calculated based on the database state.
+*       LV_BSEG_LEFT = LV_BSEG_PROV - consumption in current run.
+    IF lv_qty_open > 0.
+      valor = lv_bseg_prov * l_vbrp-fkimg / lv_qty_open.
+    ENDIF.
+
+*       Remaining open amount is upper limit.
+    IF valor > lv_bseg_left.
+      valor = lv_bseg_left.
+    ELSE.
+      lv_diff = lv_bseg_left - valor.
+      IF lv_diff > 0 AND
+        lv_diff <= lc_diff_max.
+        valor = lv_bseg_left.
+      ENDIF.
+    ENDIF.
+
+*       Gross value of invoice item is upper limit.
+    IF valor > lv_brtwr.
+      valor = lv_brtwr.
+    ENDIF.
+
+  ENDIF.
+
+
+ENDMETHOD.

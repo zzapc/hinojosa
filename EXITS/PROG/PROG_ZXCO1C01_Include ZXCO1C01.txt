@@ -1,0 +1,473 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZXCO1C01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&       Class lcl_application
+*&---------------------------------------------------------------------*
+*        Text
+*----------------------------------------------------------------------*
+CLASS lcl_application DEFINITION.
+  PUBLIC SECTION.
+    METHODS:
+*     Evento para actualizar los datos antes de que se modifique la tabla
+      handle_data_changed
+                    FOR EVENT data_changed OF cl_gui_alv_grid
+        IMPORTING er_data_changed e_onf4
+                    e_onf4_before e_onf4_after e_ucomm,
+
+*     Evento para actualizar los datos después de que se modifique la tabla
+      handle_data_changed_finished
+                    FOR EVENT data_changed_finished OF cl_gui_alv_grid
+        IMPORTING e_modified et_good_cells,
+
+*     Evento control toolbar
+      handle_toolbar
+                    FOR EVENT toolbar OF cl_gui_alv_grid
+        IMPORTING e_object e_interactive,
+
+*     Control eventos
+      handle_user_command
+                    FOR EVENT user_command OF cl_gui_alv_grid
+        IMPORTING e_ucomm.
+ENDCLASS.                    "lcl_application DEFINITION
+
+
+*&---------------------------------------------------------------------*
+*&       Class (Implementation)  lcl_application
+*&---------------------------------------------------------------------*
+*        Text
+*----------------------------------------------------------------------*
+CLASS lcl_application IMPLEMENTATION.
+
+* Para los cambios (antes de que se modifique la tabla del ALV)
+  METHOD handle_data_changed.
+    DATA: ls_plpo TYPE plpo,
+          ls_del  TYPE ztpp0013,
+          lv_ind  TYPE i,
+          lv_pos  TYPE vornr,
+          lv_equi TYPE equnr.
+
+*   Controlamos que hay cambios
+    CHECK er_data_changed->mt_mod_cells IS NOT INITIAL.
+
+*   Vemos si se ha modificado la posición p el equipo
+    LOOP AT er_data_changed->mt_mod_cells INTO DATA(ls_cells) WHERE ( fieldname = 'EQUNR' OR fieldname = 'VORNR' )
+                                                AND value IS NOT INITIAL.
+*     Guardamos indice
+      lv_ind = sy-tabix.
+
+*     Leemos la posición de la tabla para coger los dos datos
+      READ TABLE gt_utillajes ASSIGNING FIELD-SYMBOL(<fs_utillajes>) INDEX ls_cells-row_id.
+      IF sy-subrc EQ 0.
+
+*       Limpiamos troquel y cliche
+        CLEAR: <fs_utillajes>-copiatro, <fs_utillajes>-juegocli.
+
+*       Miramos si estamos cambiando la posición
+        IF ls_cells-fieldname EQ 'VORNR'.
+          lv_pos = |{ ls_cells-value  ALPHA = IN }|.
+        ELSE.
+          lv_pos = <fs_utillajes>-vornr.
+        ENDIF.
+
+*       Miramos si estamos cambiando el equipo
+        IF ls_cells-fieldname EQ 'EQUNR'.
+          lv_equi = |{ ls_cells-value  ALPHA = IN }|.
+        ELSE.
+          lv_equi = <fs_utillajes>-equnr.
+        ENDIF.
+
+*       Controlamos que ambos datos estén informados
+        CHECK lv_equi IS NOT INITIAL AND lv_pos IS NOT INITIAL.
+
+*       Controlamos que el equipo sea correcto
+        SELECT SINGLE equnr, eqtyp FROM equi INTO @DATA(ls_equi)
+          WHERE equnr EQ @lv_equi.
+        IF sy-subrc NE 0." OR ls_equi-eqtyp NE <fs_utillajes>-eqtyp.
+*         Informamos que hay error.
+          DATA(lv_error) = '1'.
+        ELSE.
+*         Miramos tipo de operación
+          SELECT SINGLE b~vornr b~phseq b~steus
+            FROM          plas AS a
+            INNER JOIN    plpo AS b ON  a~plnty = b~plnty AND
+                                        a~plnnr = b~plnnr AND
+                                        a~plnkn = b~plnkn AND
+                                        a~zaehl = b~zaehl
+            INTO CORRESPONDING FIELDS OF ls_plpo
+            WHERE a~plnty = gs_header-plnty
+              AND a~plnnr = gs_header-plnnr
+              AND a~plnal = gs_header-plnal
+              AND ( b~phseq EQ 'Z4' OR b~phseq EQ 'Z5' )
+              AND b~vornr EQ lv_pos
+              AND b~phseq NE ''
+              AND a~loekz EQ ''.
+
+*         Miramos si coincide tipo de operación y tipo de equipo
+          IF ls_plpo-phseq EQ 'Z4' AND ls_equi-eqtyp NE 'T'." AND <fs_utillajes>-eqtyp IS NOT INITIAL.
+*           Informamos que hay error.
+            lv_error = '2'.
+          ELSEIF ls_plpo-phseq EQ 'Z5' AND ls_equi-eqtyp NE 'C'." AND <fs_utillajes>-eqtyp IS NOT INITIAL.
+*           Informamos que hay error.
+            lv_error = '2'.
+          ELSE.
+*           Informamos resto de campos de la linea
+            zcl_im_zworkorder_update=>fill_row_alv(
+              EXPORTING
+                is_plpo  =  ls_plpo
+                iv_equnr =  lv_equi
+              IMPORTING
+                es_alv   =  <fs_utillajes> ).
+
+*           Refrescamos tabla
+            CALL METHOD g_grid->refresh_table_display
+              EXCEPTIONS
+                finished = 1
+                OTHERS   = 2.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+*     Si ha habido error limpiamos
+      IF lv_error EQ '2'.
+*       Borramos posiciones de la tabla para que no cambie ALV con datos erroneos
+        DELETE er_data_changed->mt_mod_cells WHERE row_id EQ ls_cells-row_id.
+
+*       Lanzamos error
+        MESSAGE i248(zpp) DISPLAY LIKE 'E'.
+*       El tipo de operación no coincide con el tipo de equipo.
+      ELSEIF lv_error EQ '1'.
+*       Borramos posiciones de la tabla para que no cambie ALV con datos erroneos
+        DELETE er_data_changed->mt_mod_cells WHERE row_id EQ ls_cells-row_id.
+
+*       Lanzamos error
+        MESSAGE i259(zpp) DISPLAY LIKE 'E' WITH lv_equi.
+      ELSE.
+*       Informamos esa posición como borrada de la tabla sin modificar. Viene modificada por el F4.
+        READ TABLE zcl_im_zworkorder_update=>gt_zttpm0007 ASSIGNING <fs_utillajes> INDEX ls_cells-row_id.
+        IF sy-subrc EQ 0 AND sy-tcode EQ 'COR2'.
+          CLEAR ls_del.
+
+*         Informamos petición de borrado, fecha y hora
+          MOVE-CORRESPONDING gs_header      TO ls_del.
+          MOVE-CORRESPONDING <fs_utillajes> TO ls_del.
+          ls_del-zzptbo       = 'X'.
+          ls_del-zzfechaptbo  = sy-datum.
+          ls_del-zzhoraptbo   = sy-uzeit.
+
+*         Si la fecha de creación esta vacia la rellenamos
+          IF ls_del-zzfechas IS INITIAL.
+            ls_del-zzfechas  = sy-datum.
+            ls_del-zzhoraas  = sy-uzeit.
+          ENDIF.
+
+*         Añadimos a tabla de borrados
+          APPEND ls_del TO gt_borradas.
+        ENDIF.
+      ENDIF.
+
+*     Informamos tabla en memorida compartida de GF ZPP_CIPASI para informar dynpro
+      CALL FUNCTION 'ZPP_SET_UTILLAJES'
+        EXPORTING
+          it_zttpm0007 = gt_utillajes
+          it_borrados  = gt_borradas.
+
+*     Refrescamos tabla
+      CALL METHOD g_grid->refresh_table_display
+        EXCEPTIONS
+          finished = 1
+          OTHERS   = 2.
+    ENDLOOP.
+  ENDMETHOD.                    "handle_data_changed
+
+
+* Para los cambios (después de que se modifique la tabla del ALV)
+  METHOD handle_data_changed_finished.
+*    DATA: ls_plpo TYPE plpo,
+*          ls_del  TYPE ztpp0013.
+*
+**   Vemos si se ha modificado la posición p el equipo
+*    LOOP AT et_good_cells INTO DATA(ls_cells) WHERE ( fieldname = 'EQUNR' OR fieldname = 'VORNR' )
+*                                                AND value IS NOT INITIAL.
+*
+**     Informamos esa posición como borrada de la tabla sin modificar. Viene modificada por el F4.
+*      READ TABLE zcl_im_zworkorder_update=>gt_zttpm0007 ASSIGNING FIELD-SYMBOL(<fs_utillajes>) INDEX ls_cells-row_id.
+*      IF sy-subrc EQ 0 AND sy-tcode EQ 'COR2'.
+*        CLEAR ls_del.
+*
+**       Informamos petición de borrado, fecha y hora
+*        MOVE-CORRESPONDING gs_header      TO ls_del.
+*        MOVE-CORRESPONDING <fs_utillajes> TO ls_del.
+*        ls_del-zzptbo       = 'X'.
+*        ls_del-zzfechaptbo  = sy-datum.
+*        ls_del-zzhoraptbo   = sy-uzeit.
+*
+**       Si la fecha de creación esta vacia la rellenamos
+*        IF ls_del-zzfechas IS INITIAL.
+*          ls_del-zzfechas  = sy-datum.
+*          ls_del-zzhoraas  = sy-uzeit.
+*        ENDIF.
+*
+**       Añadimos a tabla de borrados
+*        APPEND ls_del TO gt_borradas.
+*      ENDIF.
+*
+**     Leemos la posición de la tabla para coger los dos datos
+*      READ TABLE gt_utillajes ASSIGNING <fs_utillajes> INDEX ls_cells-row_id.
+*      IF sy-subrc EQ 0.
+*
+**       Controlamos que se haya informado el equipo
+*        CHECK <fs_utillajes>-equnr IS NOT INITIAL.
+*
+**       Limpiamos troquel y cliche
+*        CLEAR: <fs_utillajes>-copiatro, <fs_utillajes>-juegocli.
+*
+**       Controlamos que el equipo sea correcto
+*        SELECT SINGLE equnr, eqtyp FROM equi INTO @DATA(ls_equi)
+*          WHERE equnr EQ @<fs_utillajes>-equnr.
+*        IF sy-subrc NE 0 OR ls_equi-eqtyp NE <fs_utillajes>-eqtyp.
+**         Informamos que hay error.
+*          DATA(lv_error) = '1'.
+*        ELSE.
+**         Miramos tipo de operación
+*          SELECT SINGLE b~vornr b~phseq b~steus
+*            FROM          plas AS a
+*            INNER JOIN    plpo AS b ON  a~plnty = b~plnty AND
+*                                        a~plnnr = b~plnnr AND
+*                                        a~plnkn = b~plnkn AND
+*                                        a~zaehl = b~zaehl
+*            INTO CORRESPONDING FIELDS OF ls_plpo
+*            WHERE a~plnty = gs_header-plnty
+*              AND a~plnnr = gs_header-plnnr
+*              AND a~plnal = gs_header-plnal
+*              AND ( b~phseq EQ 'Z4' OR b~phseq EQ 'Z5' )
+*              AND b~vornr EQ <fs_utillajes>-vornr
+*              AND b~phseq NE ''
+*              AND a~loekz EQ ''.
+*
+**         Miramos si coincide tipo de operación y tipo de equipo
+*          IF ls_plpo-phseq EQ 'Z4' AND <fs_utillajes>-eqtyp NE 'T' AND <fs_utillajes>-eqtyp IS NOT INITIAL.
+**           Informamos que hay error.
+*            lv_error = '2'.
+*          ELSEIF ls_plpo-phseq EQ 'Z5' AND <fs_utillajes>-eqtyp NE 'C' AND <fs_utillajes>-eqtyp IS NOT INITIAL.
+**           Informamos que hay error.
+*            lv_error = '2'.
+*          ELSEIF <fs_utillajes>-vornr IS NOT INITIAL AND <fs_utillajes>-eqtyp IS NOT INITIAL.
+**           Informamos resto de campos de la linea
+*            zcl_im_zworkorder_update=>fill_row_alv(
+*              EXPORTING
+*                is_plpo  =  ls_plpo
+*                iv_equnr =  <fs_utillajes>-equnr
+*              IMPORTING
+*                es_alv   =  <fs_utillajes> ).
+*
+**           Refrescamos tabla
+*            CALL METHOD g_grid->refresh_table_display
+*              EXCEPTIONS
+*                finished = 1
+*                OTHERS   = 2.
+*          ENDIF.
+*        ENDIF.
+*      ENDIF.
+*
+**     Si ha habido error limpiamos
+*      IF lv_error EQ '2'.
+*        CLEAR <fs_utillajes>.
+*
+**       Lanzamos error
+*        MESSAGE i248(zpp) DISPLAY LIKE 'E'.
+**       El tipo de operación no coincide con el tipo de equipo.
+*      ELSEIF lv_error EQ '1'.
+**       Lanzamos error
+*        MESSAGE i259(zpp) DISPLAY LIKE 'E' WITH <fs_utillajes>-equnr.
+*
+*        CLEAR <fs_utillajes>.
+*      ENDIF.
+*
+**     Informamos tabla en memorida compartida de GF ZPP_CIPASI para informar dynpro
+*      CALL FUNCTION 'ZPP_SET_UTILLAJES'
+*        EXPORTING
+*          it_zttpm0007 = gt_utillajes
+*          it_borrados  = gt_borradas.
+*
+**     Refrescamos tabla
+*      CALL METHOD g_grid->refresh_table_display
+*        EXCEPTIONS
+*          finished = 1
+*          OTHERS   = 2.
+*    ENDLOOP.
+  ENDMETHOD.                    "handle_data_changed
+
+  METHOD handle_toolbar.
+    DATA: ls_toolbar TYPE stb_button.
+
+    CLEAR ls_toolbar.
+    MOVE 'REMOVE' TO ls_toolbar-function.
+    MOVE icon_delete TO ls_toolbar-icon.
+    MOVE 'Borrar linea'(202) TO ls_toolbar-quickinfo.
+    APPEND ls_toolbar TO e_object->mt_toolbar.
+
+    CLEAR ls_toolbar.
+    MOVE 'UTILL' TO ls_toolbar-function.
+    MOVE icon_connect TO ls_toolbar-icon.
+    MOVE 'Sel Utillaje'(202) TO ls_toolbar-quickinfo.
+    APPEND ls_toolbar TO e_object->mt_toolbar.
+  ENDMETHOD.
+
+  METHOD handle_user_command.
+    DATA: lt_row TYPE lvc_t_row,
+          ls_row TYPE lvc_s_row,
+          ls_del TYPE ztpp0013.
+
+*   Chequeamos evento
+    CASE e_ucomm.
+      WHEN 'REMOVE'.
+*       Obtenemos líneas seleccionadas
+        g_grid->get_selected_rows(
+          IMPORTING
+            et_index_rows = lt_row ).
+
+*       Ordenamos decrecientemente
+        SORT lt_row BY index DESCENDING.
+
+*       Iteramos sobre todas las líneas a borrar
+        LOOP AT lt_row INTO ls_row.
+          READ TABLE gt_utillajes ASSIGNING FIELD-SYMBOL(<fs_utillajes>) INDEX ls_row-index.
+          IF sy-subrc EQ 0.
+*           Informamos petición de borrado, fecha y hora
+            MOVE-CORRESPONDING gs_header      TO ls_del.
+            MOVE-CORRESPONDING <fs_utillajes> TO ls_del.
+            ls_del-zzptbo       = 'X'.
+            ls_del-zzfechaptbo  = sy-datum.
+            ls_del-zzhoraptbo   = sy-uzeit.
+
+*           Si la fecha de creación esta vacia la rellenamos
+            IF ls_del-zzfechas IS INITIAL.
+              ls_del-zzfechas  = sy-datum.
+              ls_del-zzhoraas  = sy-uzeit.
+            ENDIF.
+
+*           Añadimos a tabla de borrados
+            APPEND ls_del TO gt_borradas.
+
+*           Borramos línea
+            DELETE gt_utillajes INDEX ls_row-index.
+          ENDIF.
+        ENDLOOP.
+      WHEN 'UTILL'.
+        DATA: lt_plpo     TYPE TABLE OF plpo,
+              ls_zspm0009 TYPE zspm0009.
+
+*       Obtenemos operaciones del material
+        SELECT b~vornr b~phseq b~steus
+          FROM          plas AS a
+          INNER JOIN    plpo AS b ON  a~plnty = b~plnty AND
+                                      a~plnnr = b~plnnr AND
+                                      a~plnkn = b~plnkn AND
+                                      a~zaehl = b~zaehl
+          INTO CORRESPONDING FIELDS OF TABLE lt_plpo
+          WHERE a~plnty = gs_header-plnty
+            AND a~plnnr = gs_header-plnnr
+            AND a~plnal = gs_header-plnal
+            AND b~phseq NE ''.
+        CHECK sy-subrc EQ 0.
+
+*       Informamos si hay troquelado
+        READ TABLE lt_plpo TRANSPORTING NO FIELDS WITH KEY phseq = 'Z4'.
+        IF sy-subrc EQ 0.
+          DATA(lv_troquelado) = 'X'.
+        ENDIF.
+
+*       Informamos si hay impresión
+        READ TABLE lt_plpo TRANSPORTING NO FIELDS WITH KEY phseq = 'Z5'.
+        IF sy-subrc EQ 0.
+          DATA(lv_impresion) = 'X'.
+        ENDIF.
+
+*       Obtenemos material ZPLP y Coproductos
+        zcl_im_zworkorder_update=>get_zplp_coproducts(
+          EXPORTING
+            is_caufvdb    = gs_header    " Document table structure of the order header
+          IMPORTING
+            ev_zplp       = DATA(lv_zplp) " Material ZPLP
+            et_coproducts = DATA(lt_copr) " Materiales Co-productos
+        ).
+
+*       Obtenemos copia de troqueles y juego de cliches
+        zcl_im_zworkorder_update=>get_ctro_jcli(
+          EXPORTING
+            is_caufvdb    = gs_header
+            iv_troquelado = lv_troquelado
+            iv_impresion  = lv_impresion
+            iv_zplp       = lv_zplp
+            it_coproducts = lt_copr
+          IMPORTING
+            et_zttpm0009   = DATA(lt_zttpm0009)    " Copia de troqueles y juego cliches
+        ).
+
+
+*       Controlamos si tenemos varías copias de troqueles
+        IF lines( lt_zttpm0009 ) > 1 AND gs_header-auart EQ 'ZC02'.
+*       Lanzamos POPUP para elección de copia de troquel
+          zcl_im_zworkorder_update=>display_popup_copiatro(
+            EXPORTING
+              it_zttpm0009 =  lt_zttpm0009   " Copia de troqueles
+            IMPORTING
+              es_copiatro  =  ls_zspm0009  " Copia de troqueles
+          ).
+        ELSEIF lines( lt_zttpm0009 ) EQ 0 AND gs_header-auart EQ 'ZC02'.
+          MESSAGE i249(zpp).
+*       No se han encontrado utillajes válidos.
+        ELSE.
+          READ TABLE lt_zttpm0009 INTO ls_zspm0009 INDEX 1.
+        ENDIF.
+
+*       Limpiamos tabla de utillajes si es COR1 si es COR2 ponemos como borrado
+        IF sy-tcode EQ 'COR2'.
+          zcl_im_zworkorder_update=>add_table_to_remove(
+            EXPORTING
+              is_caufvdb  = gs_header
+              it_table    = gt_utillajes
+            IMPORTING
+              et_borradas = DATA(lt_borradas) ).
+
+*         Añadimos líneas a tabla de borrados
+          APPEND LINES OF lt_borradas TO gt_borradas.
+        ENDIF.
+
+*       Limpiamos tabla de utillajes para informar las nuevas líneas
+        CLEAR gt_utillajes.
+
+*       Creamos tabla ALV
+        zcl_im_zworkorder_update=>create_table_alv(
+          EXPORTING
+            it_plpo     = lt_plpo
+            is_copiatro = ls_zspm0009
+          IMPORTING
+            et_alv      = gt_utillajes ).
+
+*       Informamos copia troqueles y juego cli
+        LOOP AT gt_utillajes ASSIGNING <fs_utillajes>.
+          MOVE-CORRESPONDING ls_zspm0009 TO <fs_utillajes>.
+
+*         Informamos utillajes para que se guarden en bbdd
+          aufk-zzcopiatro = ls_zspm0009-copiatro.
+          aufk-zzjuegocli = ls_zspm0009-juegocli.
+        ENDLOOP.
+
+      WHEN OTHERS.
+    ENDCASE.
+
+*   Informamos tabla en memorida compartida de GF ZPP_CIPASI para informar dynpro
+    CALL FUNCTION 'ZPP_SET_UTILLAJES'
+      EXPORTING
+        it_zttpm0007 = gt_utillajes
+        it_borrados  = gt_borradas.
+
+*   Refrescamos tabla
+    CALL METHOD g_grid->refresh_table_display
+      EXCEPTIONS
+        finished = 1
+        OTHERS   = 2.
+  ENDMETHOD.
+ENDCLASS.                    "lcl_application IMPLEMENTATION

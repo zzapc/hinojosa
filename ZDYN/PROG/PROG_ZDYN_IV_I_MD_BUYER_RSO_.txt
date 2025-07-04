@@ -1,0 +1,250 @@
+*----------------------------------------------------------------------*
+*   INCLUDE /COCKPIT/MD_BUYER2                                         *
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  md_add_buyer_xml_content
+*&---------------------------------------------------------------------*
+*       text test
+*----------------------------------------------------------------------*
+*      -->P_GT_BUYER_TMP  text
+*      -->P_GT_BUYER  text
+*      -->P_GT_XMLSTRINGS  text
+*      -->P_GC_HTML_CODEPG  text
+*      -->P_UPTOROWS  text
+*      -->P_CORPGRID  text
+*      -->P_GC_B_FILE  text
+*----------------------------------------------------------------------*
+FORM md_add_buyer_xml_content
+  TABLES   gt_buyer_tmp  STRUCTURE gs_buyer_tmp
+           gt_buyer      STRUCTURE gs_buyer
+           gt_xmlstrings STRUCTURE gs_xmlstring
+  USING    gc_html_codepg
+           uptorows
+           ic_filename.
+
+  DATA:
+    lb_exit_loop LIKE boole-boole.
+
+  DO.
+
+*       Fetch Buyer data from DB
+    PERFORM md_get_buyer_data
+     TABLES   gt_buyer_tmp
+              gt_buyer
+     USING    uptorows
+     CHANGING lb_exit_loop.
+
+    IF lb_exit_loop = 'X'. EXIT. ENDIF.
+
+*       Prepare XML tags for Supplier data
+    PERFORM md_prepare_buyer_xml
+            TABLES gt_xmlstrings
+                   gt_buyer
+            USING  gc_html_codepg.
+
+*       Save XML content into file
+    PERFORM md_save_data_in_file
+      TABLES  gt_xmlstrings
+      USING   ic_filename.
+
+*       Release memory
+    REFRESH gt_xmlstrings.
+    REFRESH gt_buyer.
+  ENDDO.
+
+ENDFORM.                    " md_add_buyer_xml_content
+*&---------------------------------------------------------------------*
+*&      Form  md_get_buyer_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_GT_BUYER_TMP  text
+*      -->P_GT_BUYER  text
+*      -->P_UPTOROWS  text
+*      <--P_LB_EXIT_LOOP  text
+*----------------------------------------------------------------------*
+FORM md_get_buyer_data
+  TABLES gt_buyer_tmp STRUCTURE gs_buyer_tmp
+         gt_buyer     STRUCTURE gs_buyer
+  USING    uptorows
+  CHANGING cb_exit_loop.
+
+
+  DATA:
+    li_lines         TYPE i.
+
+* Fetch Buyer (company code) data from DB
+  SELECT *
+         FROM /COCKPIT/VMDE_B
+         INTO TABLE gt_buyer_tmp
+         WHERE bukrs     IN bukrs
+           AND date_from LE sy-datlo
+           AND date_to   GE sy-datlo
+           AND bukrs > gs_buyer_last_row-bukrs
+         ORDER BY bukrs.
+  IF sy-subrc <> 0. cb_exit_loop = 'X'. EXIT. ENDIF.
+
+* Find last lifnr - new selection must start from saved lifnr
+  DESCRIBE TABLE gt_buyer_tmp LINES li_lines.
+  READ TABLE gt_buyer_tmp INTO gs_buyer_last_row INDEX li_lines.
+
+* We need to process all entries of last bukrs in one batch.
+* Select above can skip some of them.
+  SELECT *
+         FROM /COCKPIT/VMDE_B
+         APPENDING TABLE gt_buyer_tmp
+         WHERE bukrs     EQ gs_buyer_last_row-bukrs
+           AND date_from LE sy-datlo
+           AND date_to   GE sy-datlo
+         ORDER BY bukrs date_from date_to.
+
+  DELETE ADJACENT DUPLICATES FROM gt_buyer_tmp
+    COMPARING bukrs date_from date_to.
+
+  SORT gt_buyer_tmp BY land1.
+  CLEAR:
+    gc_land1,
+    gc_landx.
+
+* Copy Buyer data to target table (EMEIC1301)
+  LOOP AT gt_buyer_tmp INTO gs_buyer_tmp.
+    CLEAR:
+      gs_buyer.
+
+*   see EBY8346-828 for more explainations EMEIC1337
+    IF gc_land1 NE gs_buyer_tmp-land1.
+      gc_land1 = gs_buyer_tmp-land1.
+      SELECT SINGLE landx FROM t005t
+                          INTO gc_landx
+                         WHERE land1 EQ gs_buyer_tmp-land1 AND
+                               spras EQ sy-langu.
+      IF sy-subrc NE 0.
+        SELECT SINGLE landx FROM t005t
+                            INTO gc_landx
+                           WHERE land1 EQ gs_buyer_tmp-land1 AND
+                                 spras EQ 'E'.
+        IF sy-subrc NE 0.
+          gc_landx = space. " no translation found
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    MOVE-CORRESPONDING gs_buyer_tmp TO gs_buyer.
+    gs_buyer-landx = gc_landx.
+
+    APPEND gs_buyer TO gt_buyer.
+  ENDLOOP.
+
+ENDFORM.                    " md_get_buyer_data
+*---------------------------------------------------------------------*
+*      Form  MD_PREPARE_BUYER_XML
+*---------------------------------------------------------------------*
+FORM md_prepare_buyer_xml
+     TABLES gt_xmlstrings
+            gt_buyer STRUCTURE gs_buyer
+     USING  gc_http_applsvr_codepage.
+
+  DATA:
+    lc_xmltag(1024)     TYPE c, " TYPE string,
+    ls_buyerdata        LIKE LINE OF gt_buyer,
+    lc_telephone_number LIKE /cockpit/slic_messages-comp_text,
+    lr_convert          TYPE REF TO zdyn_iv_cl_prg_md_export_rso,
+    lc_fax_number       LIKE /cockpit/slic_messages-comp_text.
+
+  CREATE OBJECT lr_convert.
+
+* Loop through Supplier Data
+  LOOP AT gt_buyer INTO ls_buyerdata.
+
+*   Telephone number preparation
+    CONCATENATE ls_buyerdata-tel_number ls_buyerdata-tel_extens
+                INTO lc_telephone_number.
+    CALL FUNCTION '/COCKPIT/ENCODE_ENTITIES' "Remove special chars
+      CHANGING
+        cc_string = lc_telephone_number.
+
+*   Fax number preparation
+    CONCATENATE ls_buyerdata-fax_number ls_buyerdata-fax_extens
+                INTO lc_fax_number.
+    CALL FUNCTION '/COCKPIT/ENCODE_ENTITIES' "Remove special chars
+      CHANGING
+        cc_string = lc_fax_number.
+
+    IF bukrschk = con_true.
+*     If seperate files for buyers, keep the buyer name the same is in the file directory
+      lr_convert->replace_incorrect_dir_chars( CHANGING c_str = ls_buyerdata-butxt ).
+    ENDIF.
+
+*   Encode special XML signs to HTML format (<,>," and &)
+    PERFORM md_encode_special_chars_b
+      CHANGING ls_buyerdata.
+
+*   XML tag preparation with Supplier Data
+    CLEAR lc_xmltag.
+    CONCATENATE
+      '<Buyer>'
+      ' <Id></Id>'
+      ' <Name>' ls_buyerdata-butxt                    '</Name>'
+      ' <ExternalId>' ls_buyerdata-bukrs              '</ExternalId>'
+      ' <VatNumber>' ls_buyerdata-stceg               '</VatNumber>'
+      ' <AddressCountry>' ls_buyerdata-landx          '</AddressCountry>'
+      ' <AddressStreetAddress>' ls_buyerdata-street   '</AddressStreetAddress>'
+      ' <AddressPostcode>' ls_buyerdata-post_code1    '</AddressPostcode>'
+      ' <AddressCity>' ls_buyerdata-ort01             '</AddressCity>'
+      ' <PhoneNumber>' lc_telephone_number            '</PhoneNumber>'
+      ' <Fax>' lc_fax_number                          '</Fax>'
+      ' <AlternativeName1></AlternativeName1>'
+      ' <AlternativeName2></AlternativeName2>'
+      ' <AlternativeName3></AlternativeName3>'
+*     WN 15.01.2020: After discussin with Marcel - it is not requred to deliver those values
+*      ' <AlternativeName1>' ls_buyerdata-name2        '</AlternativeName1>'
+*      ' <AlternativeName2>' ls_buyerdata-name3        '</AlternativeName2>'
+*      ' <AlternativeName3>' ls_buyerdata-name4        '</AlternativeName3>'
+      ' <OrganizationNumber>' ls_buyerdata-bukrs      '</OrganizationNumber>'
+      ' <AddressState></AddressState>'
+      '</Buyer>'
+      INTO  lc_xmltag.
+
+*   Appending of xmltag to strings table
+    IF ls_buyerdata-date_from <= sy-datum AND
+       sy-datum               <= ls_buyerdata-date_to.
+      APPEND lc_xmltag TO gt_xmlstrings.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " MD_PREPARE_BUYER_XML
+
+FORM md_add_buyer_xml_header
+     TABLES gt_xmlstrings.
+
+  DATA:
+    lc_xmltag(1024)   TYPE c.
+
+  CLEAR lc_xmltag.
+
+  CONCATENATE
+    '<?xml version="1.0" encoding="' gc_html_codepg '"?>'
+    INTO lc_xmltag.
+
+  APPEND lc_xmltag
+    TO gt_xmlstrings.
+
+  APPEND '<Buyers xmlns:i="http://www.w3.org/2001/XMLSchema-instance">'
+    TO gt_xmlstrings.
+
+ENDFORM.
+
+FORM add_buyer_xml_footer
+  USING ic_filename.
+
+  DATA:
+    lt_xmlstrings LIKE gt_xmlstrings.
+
+  APPEND '</Buyers>' TO lt_xmlstrings.
+
+  PERFORM md_save_data_in_file
+    TABLES  lt_xmlstrings
+    USING   ic_filename.
+
+ENDFORM.                    " add_xml_footer

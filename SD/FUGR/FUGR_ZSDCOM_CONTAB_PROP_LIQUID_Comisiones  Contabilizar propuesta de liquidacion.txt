@@ -1,0 +1,567 @@
+FUNCTION zsdcom_contab_prop_liquid.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IS_PRLIQ) TYPE  ZSSDCOM_PRLIQCAB_KEY
+*"     VALUE(IT_SELEC) TYPE  ZTTSDCOM002_SEL OPTIONAL
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+  DATA: answer.
+
+  DATA: BEGIN OF ti_monedas OCCURS 0,
+          waerk TYPE waerk,
+        END OF ti_monedas.
+
+  DATA: lti_pos           TYPE TABLE OF ztsdcom_prliqpos,
+        lti_pos_comis     TYPE TABLE OF ztsdcom_prliqpos,
+        lti_pos_comis_ind TYPE TABLE OF ztsdcom_prliqpos,
+        lti_pos_comis_aux TYPE TABLE OF ztsdcom_prliqpos,
+        lti_comis         TYPE TABLE OF ztsdcom002,
+        lti_return        TYPE TABLE OF bapiret2,
+        lti_fields        TYPE TABLE OF sval.
+
+  DATA: ls_cab    TYPE ztsdcom_prliqcab,
+        ls_pos    TYPE ztsdcom_prliqpos,
+        ls_comis  TYPE ztsdcom002,
+        ls_return TYPE bapiret2,
+        ls_field  TYPE sval.
+
+  DATA: lv_belnr  TYPE belnr_d,
+        lv_gjahr  TYPE gjahr,
+        lv_return TYPE c,
+        lv_budat  TYPE budat,
+        lv_bldat  TYPE bldat,
+        lv_netwr  TYPE netwr_ap,
+        lv_waers  TYPE waers,
+        lv_xblnr  TYPE xblnr,
+        modific   TYPE flag,
+        conjunta  TYPE flag.
+
+  DATA: l_select  TYPE zssdcom002_sel.
+
+* Sacamos la cabecera de la liquidación
+  SELECT SINGLE * INTO ls_cab
+      FROM  ztsdcom_prliqcab
+      WHERE laufd = is_prliq-laufd
+      AND   laufi = is_prliq-laufi
+      AND   bukrs = is_prliq-bukrs.
+  IF sy-subrc <> 0.
+    CLEAR ls_return.
+    ls_return-id      = 'ZSDCOM'.
+    ls_return-type    = 'E'.
+    ls_return-number  = '018'.
+    APPEND ls_return TO et_return.
+    EXIT.
+  ENDIF.
+
+* Chequeamos que la propuesta no esté cerrada
+  IF ls_cab-zstat_liq = '02'.
+    CLEAR ls_return.
+    ls_return-id      = 'ZSDCOM'.
+    ls_return-type    = 'E'.
+    ls_return-number  = '025'.
+    APPEND ls_return TO et_return.
+    EXIT.
+  ENDIF.
+
+* Sacamos las posiciones de la liquidación
+  SELECT * INTO TABLE lti_pos
+      FROM ztsdcom_prliqpos
+      WHERE laufd     = is_prliq-laufd
+      AND   laufi     = is_prliq-laufi
+      AND   bukrs     = is_prliq-bukrs
+      AND   belnr_liq = space
+      AND   zstat_pos_liq = space
+      AND   checkbox  = 'X'.            "solo las marcadas
+
+* Chequeamos que la propuesta tiene posiciones
+  IF lti_pos[] IS INITIAL.
+    CLEAR ls_return.
+    ls_return-id      = 'ZSDCOM'.
+    ls_return-type    = 'W'.
+    ls_return-number  = '026'.
+    APPEND ls_return TO et_return.
+    EXIT.
+  ENDIF.
+
+* Sacamos una tabla con los comisionistas
+  LOOP AT lti_pos INTO ls_pos.
+    CLEAR ls_comis.
+    ls_comis-bukrs = ls_cab-bukrs.
+    ls_comis-lifnr = ls_pos-lifnr.
+    ls_comis-gsber = ls_pos-gsber.
+    COLLECT ls_comis INTO lti_comis.
+  ENDLOOP.
+
+* Sacamos la parametrización de cada comisionista
+  SELECT * INTO TABLE lti_comis
+      FROM  ztsdcom002
+      FOR ALL ENTRIES IN lti_comis
+      WHERE bukrs = ls_cab-bukrs
+      AND   lifnr = lti_comis-lifnr
+      AND   gsber = lti_comis-gsber.
+
+* Recorremos los comisionistas realizando un apunte para cada uno
+  LOOP AT lti_comis INTO ls_comis.
+
+    CLEAR modific.
+    CLEAR ti_monedas[].
+
+    READ TABLE it_selec INTO l_select WITH KEY lifnr = ls_comis-lifnr gsber = ls_comis-gsber.
+    IF sy-subrc = '0'.
+
+*   Sacamos una tabla con todas las posiciones del comisionista
+      REFRESH lti_pos_comis.
+      DATA v_waerk TYPE waerk.
+      CLEAR v_waerk.
+      CLEAR conjunta.
+
+      READ TABLE lti_pos INTO ls_pos WITH KEY bukrs = ls_comis-bukrs
+                                              lifnr = ls_comis-lifnr
+                                              gsber = ls_comis-gsber.
+      IF sy-subrc = 0.
+        v_waerk = ls_pos-waerk.
+        ti_monedas-waerk = v_waerk.
+        APPEND ti_monedas.
+      ENDIF.
+
+      LOOP AT lti_pos INTO ls_pos WHERE bukrs = ls_comis-bukrs
+                                  AND   lifnr = ls_comis-lifnr
+                                  AND   gsber = ls_comis-gsber.
+        "Chequear si existen facturas con moneda <> a la del comis.
+        IF ls_comis-waers <> ls_pos-waerk.
+          modific = 'X'.
+        ENDIF.
+        "Chequear si existen facturas con monedas diferentes
+        IF v_waerk <> ls_pos-waerk.
+          conjunta = 'X'.
+        ENDIF.
+
+        ti_monedas-waerk = ls_pos-waerk.
+        APPEND ti_monedas.
+
+        APPEND ls_pos TO lti_pos_comis.
+      ENDLOOP.
+
+      SORT ti_monedas BY waerk.
+      DELETE ADJACENT DUPLICATES FROM ti_monedas COMPARING waerk.
+
+      "Popup para elegir si Conjunta o Individual
+      CLEAR answer.
+      IF conjunta = 'X'.
+        CALL FUNCTION 'POPUP_TO_CONFIRM'
+          EXPORTING
+            text_question         = 'Elija tipo de Contabilización'
+            text_button_1         = 'Conjunta'
+            text_button_2         = 'Individual'
+            display_cancel_button = ' '
+          IMPORTING
+            answer                = answer.
+      ENDIF.
+
+      IF answer = '2'."Contabilizacion Individual cuando hay facturas en 2 monedas
+        LOOP AT ti_monedas WHERE waerk IS NOT INITIAL.
+          REFRESH lti_return.
+          IF ls_comis-tipol <> '00'.
+*         Cargamos los campos para la contabilización
+            REFRESH lti_fields.
+*         Comisionista
+            CLEAR ls_field.
+            ls_field-tabname    = 'LFA1'.
+            ls_field-fieldname  = 'LIFNR'.
+            ls_field-value      = ls_comis-lifnr.
+            ls_field-field_attr = '02'.
+            APPEND ls_field TO lti_fields.
+
+            CLEAR ls_field.
+            ls_field-tabname    = 'TGSB'.
+            ls_field-fieldname  = 'GSBER'.
+            ls_field-value      = ls_comis-gsber.
+            ls_field-field_attr = '02'.
+            APPEND ls_field TO lti_fields.
+
+*         Fecha de contabilización
+            CLEAR ls_field.
+            ls_field-tabname   = 'BKPF'.
+            ls_field-fieldname = 'BUDAT'.
+            ls_field-field_obl = 'X'.
+            APPEND ls_field TO lti_fields.
+
+*         Fecha de contabilización
+            CLEAR ls_field.
+            ls_field-tabname   = 'BKPF'.
+            ls_field-fieldname = 'BLDAT'.
+            ls_field-field_obl = 'X'.
+            APPEND ls_field TO lti_fields.
+
+*         Factura referencia
+            IF ls_comis-tipol = '01'.
+              CLEAR ls_field.
+              ls_field-tabname   = 'BKPF'.
+              ls_field-fieldname = 'XBLNR'.
+              ls_field-field_obl = 'X'.
+              APPEND ls_field TO lti_fields.
+            ENDIF.
+
+*         Moneda
+            CLEAR ls_field.
+            ls_field-tabname   = 'BKPF'.
+            ls_field-fieldname = 'WAERS'.
+            ls_field-field_obl = 'X'.
+            ls_field-field_attr = '02'.
+            ls_field-value = ti_monedas-waerk.
+            APPEND ls_field TO lti_fields.
+
+*         Diferencias
+            CLEAR ls_field.
+            ls_field-tabname   = 'VBAP'.
+            ls_field-fieldname = 'NETWR'.
+            ls_field-fieldtext = 'Diferencias'.
+            APPEND ls_field TO lti_fields.
+
+            CLEAR ls_field.
+            ls_field-tabname   = 'VBAP'.
+            ls_field-fieldname = 'WAERK'.
+            ls_field-field_attr = '04'.
+            ls_field-value = 'EUR'.
+            APPEND ls_field TO lti_fields.
+
+*         Llamamos a la función para pedir los campos de contabilización
+            CALL FUNCTION 'POPUP_GET_VALUES'
+              EXPORTING
+                popup_title     = text-p01
+              IMPORTING
+                returncode      = lv_return
+              TABLES
+                fields          = lti_fields
+              EXCEPTIONS
+                error_in_fields = 1
+                OTHERS          = 2.
+            IF sy-subrc <> 0 OR lv_return IS NOT INITIAL.
+              CLEAR ls_return.
+              ls_return-id          = 'ZSDCOM'.
+              ls_return-type        = 'E'.
+              ls_return-number      = '028'.
+              ls_return-message_v2  = ls_comis-lifnr.
+              APPEND ls_return TO et_return.
+              CONTINUE.
+            ENDIF.
+
+*       Recuperamos la fecha de contabilización y la referencia
+            READ TABLE lti_fields INTO ls_field WITH KEY fieldname = 'BUDAT'.
+            lv_budat = ls_field-value.
+            READ TABLE lti_fields INTO ls_field WITH KEY fieldname = 'XBLNR'.
+            lv_xblnr = ls_field-value.
+            READ TABLE lti_fields INTO ls_field WITH KEY fieldname = 'BLDAT'.
+            lv_bldat = ls_field-value.
+            READ TABLE lti_fields INTO ls_field WITH KEY fieldname = 'NETWR'.
+            lv_netwr = ls_field-value.
+            READ TABLE lti_fields INTO ls_field WITH KEY fieldname = 'WAERS'.
+            lv_waers = ls_field-value.
+
+            CLEAR: lti_pos_comis_ind[].
+            LOOP AT lti_pos_comis INTO ls_pos
+              WHERE waerk = ti_monedas-waerk.
+              APPEND ls_pos TO  lti_pos_comis_ind.
+            ENDLOOP.
+*         Llamamos a la función que contabiliza
+            CLEAR: lv_belnr, lv_gjahr, lti_return[].
+            CALL FUNCTION 'ZSDCOM_CONTAB_PROPLIQ_COMIS'
+              EXPORTING
+                is_comis  = ls_comis
+                i_budat   = lv_budat
+                i_xblnr   = lv_xblnr
+                it_pos    = lti_pos_comis_ind
+                i_bldat   = lv_bldat
+                i_difer   = lv_netwr
+                i_waers   = lv_waers
+              IMPORTING
+                e_belnr   = lv_belnr
+                e_gjahr   = lv_gjahr
+                et_return = lti_return.
+*         Cargamos la tabla de retorno
+            APPEND LINES OF lti_return TO et_return.
+          ENDIF.
+
+*       Comprobamos errores
+          DATA aux_subrc LIKE sy-subrc.
+          aux_subrc = 4.
+          READ TABLE lti_return INTO ls_return WITH KEY type = 'E'.
+          IF sy-subrc = 0.
+            aux_subrc = 0.
+          ELSE.
+            READ TABLE lti_return INTO ls_return WITH KEY type = 'A'.
+            IF sy-subrc = 0.
+              aux_subrc = 0.
+            ENDIF.
+          ENDIF.
+          IF aux_subrc <> 0 AND lv_belnr IS NOT INITIAL AND lv_belnr <> '$'.
+*         Marcamos las posiciones con el documento creado
+            LOOP AT lti_pos_comis_ind INTO ls_pos.
+
+              UPDATE ztsdcom_prliqpos SET belnr_liq = lv_belnr
+                                          gjahr_liq = lv_gjahr
+                  WHERE laufd = ls_pos-laufd
+                  AND   laufi = ls_pos-laufi
+                  AND   bukrs = ls_pos-bukrs
+                  AND   lifnr = ls_pos-lifnr
+                  AND   vbeln = ls_pos-vbeln
+                  AND   gjahr = ls_pos-gjahr
+                  AND   belnr = ls_pos-belnr
+                  AND   kschl = ls_pos-kschl
+                  AND   gsber = ls_pos-gsber.
+
+              DATA aux_ztsdcom_prliqpos TYPE ztsdcom_prliqpos.
+              SELECT SINGLE * INTO aux_ztsdcom_prliqpos FROM ztsdcom_prliqpos
+                WHERE laufd = ls_pos-laufd
+                  AND   laufi = ls_pos-laufi
+                  AND   bukrs = ls_pos-bukrs
+                  AND   lifnr = ls_pos-lifnr
+                  AND   vbeln = ls_pos-vbeln
+                  AND   gjahr = ls_pos-gjahr
+                  AND   belnr = ls_pos-belnr
+                  AND   kschl = ls_pos-kschl
+                  AND   gsber = ls_pos-gsber
+                  AND   checkbox  = space.
+              IF sy-subrc = 0.
+                UPDATE ztsdcom_pos SET laufd = space laufi = space
+                WHERE laufd = ls_pos-laufd
+                   AND   laufi = ls_pos-laufi
+                   AND   bukrs = ls_pos-bukrs
+                   AND   lifnr = ls_pos-lifnr
+                   AND   vbeln = ls_pos-vbeln
+                   AND   gjahr = ls_pos-gjahr
+                   AND   belnr_vf = ls_pos-belnr
+                   AND   kschl = ls_pos-kschl
+                   AND   gsber = ls_pos-gsber.
+              ENDIF.
+
+*           Eliminamos las posiciones de las propuestas
+              DELETE FROM ztsdcom_prliqpos
+                  WHERE laufd = ls_pos-laufd
+                  AND   laufi = ls_pos-laufi
+                  AND   bukrs = ls_pos-bukrs
+                  AND   lifnr = ls_pos-lifnr
+                  AND   vbeln = ls_pos-vbeln
+                  AND   gjahr = ls_pos-gjahr
+                  AND   belnr = ls_pos-belnr
+                  AND   kschl = ls_pos-kschl
+                  AND   gsber = ls_pos-gsber
+                  AND   checkbox  = space.
+            ENDLOOP.
+          ENDIF.
+        ENDLOOP.
+      ELSE.
+*   Llamamos a la función que contabiliza para un comisionista
+        REFRESH lti_return.
+        IF ls_comis-tipol <> '00'.
+*     Cargamos los campos para la contabilización
+          REFRESH lti_fields.
+*     Comisionista
+          CLEAR ls_field.
+          ls_field-tabname    = 'LFA1'.
+          ls_field-fieldname  = 'LIFNR'.
+          ls_field-value      = ls_comis-lifnr.
+          ls_field-field_attr = '02'.
+          APPEND ls_field TO lti_fields.
+
+          CLEAR ls_field.
+          ls_field-tabname    = 'TGSB'.
+          ls_field-fieldname  = 'GSBER'.
+          ls_field-value      = ls_comis-gsber.
+          ls_field-field_attr = '02'.
+          APPEND ls_field TO lti_fields.
+
+*     Fecha de contabilización
+          CLEAR ls_field.
+          ls_field-tabname   = 'BKPF'.
+          ls_field-fieldname = 'BUDAT'.
+          ls_field-field_obl = 'X'.
+          APPEND ls_field TO lti_fields.
+
+*     Fecha de documento
+          CLEAR ls_field.
+          ls_field-tabname   = 'BKPF'.
+          ls_field-fieldname = 'BLDAT'.
+          ls_field-field_obl = 'X'.
+          APPEND ls_field TO lti_fields.
+
+*     Factura referencia
+          IF ls_comis-tipol = '01'.
+            CLEAR ls_field.
+            ls_field-tabname   = 'BKPF'.
+            ls_field-fieldname = 'XBLNR'.
+            ls_field-field_obl = 'X'.
+            APPEND ls_field TO lti_fields.
+          ENDIF.
+
+*       Moneda
+          CLEAR ls_field.
+          ls_field-tabname   = 'BKPF'.
+          ls_field-fieldname = 'WAERS'.
+          ls_field-field_obl = 'X'.
+          ls_field-value = ls_comis-waers.
+*        JME 26.01.2018
+          APPEND ls_field TO lti_fields.
+*       diferencias
+          CLEAR ls_field.
+          ls_field-tabname   = 'VBAP'.
+          ls_field-fieldname = 'NETWR'.
+          ls_field-fieldtext = 'Diferencias'.
+          APPEND ls_field TO lti_fields.
+
+          CLEAR ls_field.
+          ls_field-tabname   = 'VBAP'.
+          ls_field-fieldname = 'WAERK'.
+          ls_field-field_attr = '04'.
+          ls_field-value = 'EUR'.
+          APPEND ls_field TO lti_fields.
+
+*       Llamamos a la función para pedir los campos de contabilización
+          CALL FUNCTION 'POPUP_GET_VALUES'
+            EXPORTING
+              popup_title     = text-p01
+            IMPORTING
+              returncode      = lv_return
+            TABLES
+              fields          = lti_fields
+            EXCEPTIONS
+              error_in_fields = 1
+              OTHERS          = 2.
+          IF sy-subrc <> 0 OR lv_return IS NOT INITIAL.
+            CLEAR ls_return.
+            ls_return-id          = 'ZSDCOM'.
+            ls_return-type        = 'E'.
+            ls_return-number      = '028'.
+            ls_return-message_v2  = ls_comis-lifnr.
+            APPEND ls_return TO et_return.
+            CONTINUE.
+          ENDIF.
+
+*       Recuperamos la fecha de contabilización y la referencia
+          READ TABLE lti_fields INTO ls_field WITH KEY fieldname = 'BUDAT'.
+          lv_budat = ls_field-value.
+          READ TABLE lti_fields INTO ls_field WITH KEY fieldname = 'XBLNR'.
+          lv_xblnr = ls_field-value.
+          READ TABLE lti_fields INTO ls_field WITH KEY fieldname = 'BLDAT'.
+          lv_bldat = ls_field-value.
+          READ TABLE lti_fields INTO ls_field WITH KEY fieldname = 'NETWR'.
+          lv_netwr = ls_field-value.
+          READ TABLE lti_fields INTO ls_field WITH KEY fieldname = 'WAERS'.
+          lv_waers = ls_field-value.
+
+*       Llamamos a la función que contabiliza
+          CALL FUNCTION 'ZSDCOM_CONTAB_PROPLIQ_COMIS'
+            EXPORTING
+              is_comis  = ls_comis
+              i_budat   = lv_budat
+              i_xblnr   = lv_xblnr
+              it_pos    = lti_pos_comis
+              i_bldat   = lv_bldat
+              i_difer   = lv_netwr
+              i_waers   = lv_waers
+            IMPORTING
+              e_belnr   = lv_belnr
+              e_gjahr   = lv_gjahr
+              et_return = lti_return.
+*       Cargamos la tabla de retorno
+          APPEND LINES OF lti_return TO et_return.
+        ENDIF.
+
+*   Comprobamos errores
+        DATA l_subrc LIKE sy-subrc.
+        l_subrc = 4.
+        READ TABLE lti_return INTO ls_return WITH KEY type = 'E'.
+        IF sy-subrc = 0.
+          l_subrc = 0.
+        ELSE.
+          READ TABLE lti_return INTO ls_return WITH KEY type = 'A'.
+          IF sy-subrc = 0.
+            l_subrc = 0.
+          ENDIF.
+        ENDIF.
+        IF l_subrc <> 0 AND lv_belnr IS NOT INITIAL AND lv_belnr <> '$'.
+*     Marcamos las posiciones con el documento creado
+          UPDATE ztsdcom_prliqpos SET belnr_liq = lv_belnr
+                                      gjahr_liq = lv_gjahr
+                                      zstat_pos_liq = 'X'
+              WHERE laufd = is_prliq-laufd
+              AND   laufi = is_prliq-laufi
+              AND   bukrs = is_prliq-bukrs
+              AND   lifnr = ls_comis-lifnr
+              AND   gsber = ls_comis-gsber.
+
+          DATA ti_ztsdcom_prliqpos TYPE TABLE OF ztsdcom_prliqpos WITH HEADER LINE.
+          CLEAR ti_ztsdcom_prliqpos[].
+          SELECT * INTO TABLE ti_ztsdcom_prliqpos FROM ztsdcom_prliqpos
+            WHERE laufd = is_prliq-laufd
+              AND   laufi = is_prliq-laufi
+              AND   bukrs = is_prliq-bukrs
+              AND   lifnr = ls_comis-lifnr
+              AND   gsber = ls_comis-gsber
+              AND   checkbox  = space.
+          IF sy-subrc = 0.
+            LOOP AT ti_ztsdcom_prliqpos.
+              UPDATE ztsdcom_pos SET laufd = space laufi = space
+              WHERE laufd = ti_ztsdcom_prliqpos-laufd
+                 AND   laufi = ti_ztsdcom_prliqpos-laufi
+                 AND   bukrs = ti_ztsdcom_prliqpos-bukrs
+                 AND   lifnr = ti_ztsdcom_prliqpos-lifnr
+                 AND   vbeln = ti_ztsdcom_prliqpos-vbeln
+                 AND   gjahr = ti_ztsdcom_prliqpos-gjahr
+                 AND   belnr_vf = ti_ztsdcom_prliqpos-belnr
+                 AND   kschl = ti_ztsdcom_prliqpos-kschl
+                 AND   gsber = ti_ztsdcom_prliqpos-gsber.
+            ENDLOOP.
+          ENDIF.
+*     Eliminamos las posiciones de las propuestas
+          DELETE FROM ztsdcom_prliqpos
+              WHERE laufd     = is_prliq-laufd
+              AND   laufi     = is_prliq-laufi
+              AND   bukrs     = is_prliq-bukrs
+              AND   lifnr     = ls_comis-lifnr
+              AND   gsber     = ls_comis-gsber
+              AND   checkbox  = space.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Comprobamos errores
+  DATA esubrc LIKE sy-subrc.
+  esubrc = 4.
+  READ TABLE et_return INTO ls_return WITH KEY type = 'E'.
+  IF sy-subrc = 0. esubrc = 0. ENDIF.
+  READ TABLE et_return INTO ls_return WITH KEY type = 'A'.
+  IF sy-subrc = 0. esubrc = 0. ENDIF.
+
+* Marcamos la propuesta de liquidación como contabilizada parcialmente
+  IF esubrc <> 0.
+    UPDATE ztsdcom_prliqcab SET zstat_liq = gc_liq_pcb
+        WHERE laufd = is_prliq-laufd
+        AND   laufi = is_prliq-laufi
+        AND   bukrs = is_prliq-bukrs.
+  ENDIF.
+
+* Hacemos el commit
+  COMMIT WORK AND WAIT.
+
+**  comprobamos que todas las posiciones de la propuesta estan contabilizadas
+*    SELECT * INTO TABLE lti_pos_comis_aux
+*      FROM ztsdcom_prliqpos
+*            WHERE laufd = is_prliq-laufd
+*            AND   laufi = is_prliq-laufi
+*            AND   bukrs = is_prliq-bukrs
+*            AND   ( zstat_pos_liq = space AND checkbox = 'X' ).
+*      IF sy-subrc <> 0.
+*        UPDATE ztsdcom_prliqcab SET zstat_liq = gc_liq_cb
+*            WHERE laufd = is_prliq-laufd
+*            AND   laufi = is_prliq-laufi
+*            AND   bukrs = is_prliq-bukrs.
+*      ENDIF.
+*
+** Hacemos el commit
+*      COMMIT WORK AND WAIT.
+
+ENDFUNCTION.

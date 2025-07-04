@@ -1,0 +1,405 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRMM0004
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT zrmm0004 LINE-SIZE 120 LINE-COUNT 65 NO STANDARD PAGE HEADING.
+
+TYPES bool TYPE c.
+CONSTANTS si TYPE bool VALUE 'X'.
+CONSTANTS no TYPE bool VALUE ''.
+
+TABLES mkpf.
+TABLES mseg.
+
+DATA gt_datos TYPE STANDARD TABLE OF zemm_doc_transport_alv.
+DATA gt_header TYPE slis_t_listheader.
+
+DATA g_werks TYPE werks_d.
+DATA g_bukrs TYPE bukrs.
+
+SELECTION-SCREEN BEGIN OF BLOCK blk1 WITH FRAME TITLE text-s01.
+SELECT-OPTIONS sbudat FOR mkpf-budat.
+SELECT-OPTIONS slifnri FOR mseg-lifnr.
+SELECT-OPTIONS slifnrm FOR mseg-lifnr.
+SELECT-OPTIONS smatnr FOR mseg-matnr.
+SELECT-OPTIONS swerks FOR mseg-werks OBLIGATORY.
+SELECT-OPTIONS slgort FOR mseg-lgort.
+SELECT-OPTIONS scharg FOR mseg-charg.
+SELECT-OPTIONS sxblnr FOR mkpf-xblnr.
+SELECTION-SCREEN END OF BLOCK blk1.
+
+AT SELECTION-SCREEN ON swerks.
+  PERFORM validar_centro.
+
+
+START-OF-SELECTION.
+  PERFORM seleccionar_datos.
+
+END-OF-SELECTION.
+  IF gt_datos[] IS INITIAL.
+    MESSAGE 'No se seleccionaron datos para los criterios indicados' TYPE 'I'.
+  ELSE.
+    PERFORM mostrar_listado.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  VALIDAR_CENTRO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM validar_centro .
+  DATA lw_t001w TYPE t001w.
+  DATA lt_t001w TYPE STANDARD TABLE OF t001w.
+
+  SELECT * INTO TABLE lt_t001w FROM t001w WHERE werks IN swerks.
+
+  LOOP AT lt_t001w INTO lw_t001w.
+
+    AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
+             ID 'ACTVT' FIELD '03'
+             ID 'WERKS' FIELD lw_t001w-werks.
+
+    IF sy-subrc <> 0.
+      MESSAGE e202(12) WITH lw_t001w-werks. "Sin autorización a visualizar documentos de material del centro.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " VALIDAR_CENTRO
+*&---------------------------------------------------------------------*
+*&      Form  SELECCIONAR_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM seleccionar_datos .
+  DATA lt_mkpf TYPE STANDARD TABLE OF mkpf.
+  DATA lw_mkpf TYPE mkpf.
+  DATA lt_mseg TYPE STANDARD TABLE OF mseg.
+  DATA lw_mseg TYPE mseg.
+  DATA lw_datos TYPE zemm_doc_transport_alv.
+  data lw_datos_aux type zemm_doc_transport_alv.
+  data l_tabix type sy-tabix.
+
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE lt_mkpf FROM mkpf
+    WHERE budat IN sbudat
+      AND xblnr IN sxblnr.
+
+  CHECK sy-subrc = 0.
+
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE lt_mseg
+    FROM mseg
+    FOR ALL ENTRIES IN lt_mkpf
+    WHERE mblnr = lt_mkpf-mblnr
+      AND mjahr = lt_mkpf-mjahr
+      AND lifnr IN slifnrm
+      AND matnr IN smatnr
+      AND werks IN swerks
+      AND lgort IN slgort
+      AND charg IN scharg
+      AND bwart IN ('101','102')
+      AND bnbtr > 0.
+
+  CHECK sy-subrc = 0.
+
+  SORT lt_mkpf BY mandt mblnr mjahr.
+  SORT lt_mseg BY mandt mblnr mjahr zeile.
+
+  LOOP AT lt_mkpf INTO lw_mkpf.
+    READ TABLE lt_mseg TRANSPORTING NO FIELDS
+                       WITH KEY mandt = sy-mandt
+                                mblnr = lw_mkpf-mblnr
+                                mjahr = lw_mkpf-mjahr
+                       BINARY SEARCH.
+    CHECK sy-subrc = 0.
+
+    CLEAR lw_datos.
+    lw_datos-mblnr = lw_mkpf-mblnr.
+    lw_datos-mjahr = lw_mkpf-mjahr.
+    lw_datos-budat = lw_mkpf-budat.
+    lw_datos-frbnr = lw_mkpf-frbnr.
+
+    LOOP AT lt_mseg INTO lw_mseg FROM sy-tabix.
+      IF lw_mseg-mblnr <> lw_mkpf-mblnr OR lw_mseg-mjahr <> lw_mkpf-mjahr.
+        EXIT.
+      ENDIF.
+
+      lw_datos-lifnr_m = lw_mseg-lifnr.
+      SELECT SINGLE name1 INTO lw_datos-name1_m FROM lfa1 WHERE lifnr = lw_mseg-lifnr.
+      lw_datos-ebeln = lw_mseg-ebeln.
+
+      PERFORM buscar_proveedor_costes USING lw_mseg-bukrs lw_mseg-mblnr lw_mseg-mjahr
+                                      CHANGING lw_datos-lifnr_i.
+      CHECK lw_datos-lifnr_i IS NOT INITIAL.
+      SELECT SINGLE name1 FROM lfa1 INTO lw_datos-name1_i WHERE lifnr = lw_datos-lifnr_i.
+
+* Falta por definir acceso a ZTMM0007 para obtener ZNUM_PESADA
+
+      lw_datos-bnbtr = lw_mseg-bnbtr.
+      lw_datos-waers = lw_mseg-waers.
+      lw_datos-dmbtr = lw_mseg-dmbtr.
+      lw_datos-pcomp = lw_mseg-dmbtr - lw_mseg-bnbtr.
+      lw_datos-menge = lw_mseg-menge.
+      lw_datos-meins = lw_mseg-meins.
+
+* Se acumula por los campos indicados en el READ TABLE.
+      READ TABLE gt_datos INTO lw_datos_aux WITH KEY lifnr_m = lw_datos-lifnr_m
+                                                     budat   = lw_datos-budat
+                                                     frbnr   = lw_datos-frbnr
+                                                     mblnr   = lw_datos-mblnr
+                                                     lifnr_i = lw_datos-lifnr_i.
+      IF sy-subrc <> 0.
+        APPEND lw_datos TO gt_datos.
+      ELSE.
+        l_tabix = sy-tabix.
+        ADD lw_datos_aux-bnbtr TO lw_datos-bnbtr.
+        ADD lw_datos_aux-dmbtr TO lw_datos-dmbtr.
+        ADD lw_datos_aux-pcomp TO lw_datos-pcomp.
+
+        MODIFY gt_datos FROM lw_datos INDEX l_tabix.
+      ENDIF.
+
+    ENDLOOP.
+
+  ENDLOOP.
+
+* Tomamos algunos datos del último registro tratado.
+  g_werks = lw_mseg-werks.
+  g_bukrs = lw_mseg-bukrs.
+
+ENDFORM.                    " SELECCIONAR_DATOS
+*&---------------------------------------------------------------------*
+*&      Form  BUSCAR_PROVEEDOR_COSTES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LW_MSEG_BUKRS  text
+*      -->P_LW_MSEG_MBLNR  text
+*      -->P_LW_MSEG_MJAHR  text
+*      <--P_LW_DATOS_LIFNR_I  text
+*----------------------------------------------------------------------*
+FORM buscar_proveedor_costes  USING    p_bukrs TYPE bukrs
+                                       p_mblnr TYPE mblnr
+                                       p_mjahr TYPE gjahr
+                              CHANGING p_lifnr TYPE lifnr.
+  DATA lw_bkpf TYPE bkpf.
+  DATA l_awkey TYPE awkey.
+
+  CLEAR p_lifnr.
+  CONCATENATE p_mblnr p_mjahr INTO l_awkey.
+  CONDENSE l_awkey NO-GAPS.
+
+  SELECT SINGLE * INTO lw_bkpf FROM bkpf
+    WHERE bukrs = p_bukrs
+      AND gjahr = p_mjahr
+      AND awkey = l_awkey.
+  CHECK sy-subrc = 0.
+
+  SELECT SINGLE lifnr INTO p_lifnr FROM bseg
+    WHERE belnr = lw_bkpf-belnr
+      AND gjahr = lw_bkpf-gjahr
+      AND bukrs = lw_bkpf-bukrs
+      AND lifnr IN slifnri
+      AND ktosl = 'FRE'.
+
+  CHECK sy-subrc = 0.
+
+ENDFORM.                    " BUSCAR_PROVEEDOR_COSTES
+*&---------------------------------------------------------------------*
+*&      Form  MOSTRAR_LISTADO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM mostrar_listado .
+  DATA ct_fieldcat TYPE slis_t_fieldcat_alv.
+  DATA lw_fcat TYPE slis_fieldcat_alv.
+
+  DATA l_title TYPE lvc_title.
+
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+*     I_PROGRAM_NAME   = I_PROGRAM_NAME
+*     I_INTERNAL_TABNAME           = I_INTERNAL_TABNAME
+      i_structure_name = 'ZEMM_DOC_TRANSPORT_ALV'
+*     I_CLIENT_NEVER_DISPLAY       = 'X'
+*     I_INCLNAME       = I_INCLNAME
+*     I_BYPASSING_BUFFER           = I_BYPASSING_BUFFER
+*     I_BUFFER_ACTIVE  = I_BUFFER_ACTIVE
+    CHANGING
+      ct_fieldcat      = ct_fieldcat
+* EXCEPTIONS
+*     INCONSISTENT_INTERFACE       = 1
+*     PROGRAM_ERROR    = 2
+*     OTHERS           = 3
+    .
+  IF sy-subrc <> 0.
+* Implement suitable error handling here
+  ENDIF.
+
+  LOOP AT ct_fieldcat INTO lw_fcat.
+    lw_fcat-ddictxt = 'M'.
+
+    CASE lw_fcat-fieldname.
+      WHEN 'LIFNR_M'.
+        lw_fcat-seltext_l = text-l01.
+        lw_fcat-seltext_m = text-m01.
+        lw_fcat-seltext_s = text-s01.
+        lw_fcat-key = si.
+      WHEN 'NAME1_M'.
+        lw_fcat-seltext_l = text-l02.
+        lw_fcat-seltext_m = text-m02.
+        lw_fcat-seltext_s = text-s02.
+        lw_fcat-emphasize = si.
+      WHEN 'BUDAT'.
+        lw_fcat-seltext_l = text-l03.
+        lw_fcat-seltext_m = text-m03.
+        lw_fcat-seltext_s = text-s03.
+        lw_fcat-key = si.
+      WHEN 'ZNUM_PESADA'.
+        lw_fcat-seltext_l = text-l04.
+        lw_fcat-seltext_m = text-m04.
+        lw_fcat-seltext_s = text-s04.
+        lw_fcat-key = si.
+      WHEN 'EBELN'.
+        lw_fcat-seltext_l = text-l05.
+        lw_fcat-seltext_m = text-m05.
+        lw_fcat-seltext_s = text-s05.
+      WHEN 'MBLNR'.
+        lw_fcat-seltext_l = text-l06.
+        lw_fcat-seltext_m = text-m06.
+        lw_fcat-seltext_s = text-s06.
+        lw_fcat-key = si.
+      WHEN 'LIFNR_I'.
+        lw_fcat-seltext_l = text-l07.
+        lw_fcat-seltext_m = text-m07.
+        lw_fcat-seltext_s = text-s07.
+        lw_fcat-key = si.
+      WHEN 'NAME1_I'.
+        lw_fcat-seltext_l = text-l08.
+        lw_fcat-seltext_m = text-m08.
+        lw_fcat-seltext_s = text-s08.
+        lw_fcat-emphasize = si.
+      WHEN 'FRBNR'.
+        lw_fcat-seltext_l = text-l09.
+        lw_fcat-seltext_m = text-m09.
+        lw_fcat-seltext_s = text-s09.
+      WHEN 'BNBTR'.
+        lw_fcat-seltext_l = text-l10.
+        lw_fcat-seltext_m = text-m10.
+        lw_fcat-seltext_s = text-s10.
+      WHEN 'PCOMP'.
+        lw_fcat-seltext_l = text-l11.
+        lw_fcat-seltext_m = text-m11.
+        lw_fcat-seltext_s = text-s11.
+      WHEN 'DMBTR'.
+        lw_fcat-seltext_l = text-l12.
+        lw_fcat-seltext_m = text-m12.
+        lw_fcat-seltext_s = text-s12.
+      WHEN OTHERS.
+    ENDCASE.
+    MODIFY ct_fieldcat FROM lw_fcat.
+  ENDLOOP.
+
+  l_title = 'Listado de Transportistas'.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+*     I_INTERFACE_CHECK      = ' '
+*     I_BYPASSING_BUFFER     = ' '
+*     I_BUFFER_ACTIVE        = ' '
+      i_callback_program     = sy-repid
+*     I_CALLBACK_PF_STATUS_SET          = ' '
+*     I_CALLBACK_USER_COMMAND           = ' '
+      i_callback_top_of_page = 'TOP_OF_PAGE'
+*     I_CALLBACK_HTML_TOP_OF_PAGE       = ' '
+*     I_CALLBACK_HTML_END_OF_LIST       = ' '
+*     I_STRUCTURE_NAME       = I_STRUCTURE_NAME
+*     I_BACKGROUND_ID        = ' '
+      i_grid_title           = l_title
+*     I_GRID_SETTINGS        = I_GRID_SETTINGS
+*     IS_LAYOUT              = IS_LAYOUT
+      it_fieldcat            = ct_fieldcat
+*     IT_EXCLUDING           = IT_EXCLUDING
+*     IT_SPECIAL_GROUPS      = IT_SPECIAL_GROUPS
+*     IT_SORT                = IT_SORT
+*     IT_FILTER              = IT_FILTER
+*     IS_SEL_HIDE            = IS_SEL_HIDE
+*     I_DEFAULT              = 'X'
+*     I_SAVE                 = ' '
+*     IS_VARIANT             = IS_VARIANT
+*     IT_EVENTS              = IT_EVENTS
+*     IT_EVENT_EXIT          = IT_EVENT_EXIT
+*     IS_PRINT               = IS_PRINT
+*     IS_REPREP_ID           = IS_REPREP_ID
+*     I_SCREEN_START_COLUMN  = 0
+*     I_SCREEN_START_LINE    = 0
+*     I_SCREEN_END_COLUMN    = 0
+*     I_SCREEN_END_LINE      = 0
+*     I_HTML_HEIGHT_TOP      = 0
+*     I_HTML_HEIGHT_END      = 0
+*     IT_ALV_GRAPHICS        = IT_ALV_GRAPHICS
+*     IT_HYPERLINK           = IT_HYPERLINK
+*     IT_ADD_FIELDCAT        = IT_ADD_FIELDCAT
+*     IT_EXCEPT_QINFO        = IT_EXCEPT_QINFO
+*     IR_SALV_FULLSCREEN_ADAPTER        = IR_SALV_FULLSCREEN_ADAPTER
+* IMPORTING
+*     E_EXIT_CAUSED_BY_CALLER           = E_EXIT_CAUSED_BY_CALLER
+*     ES_EXIT_CAUSED_BY_USER = ES_EXIT_CAUSED_BY_USER
+    TABLES
+      t_outtab               = gt_datos
+* EXCEPTIONS
+*     PROGRAM_ERROR          = 1
+*     OTHERS                 = 2
+    .
+  IF sy-subrc <> 0.
+* Implement suitable error handling here
+  ENDIF.
+
+ENDFORM.                    " MOSTRAR_LISTADO
+
+FORM top_of_page.
+  DATA lw_header TYPE slis_listheader.
+  DATA l_fecha_c(10) TYPE c.
+  DATA l_hora_c(10) TYPE c.
+  DATA l_logo(15) TYPE c.
+  DATA l_name1 TYPE name1.
+
+  CLEAR lw_header.
+  lw_header-typ = 'S'.
+  SELECT SINGLE name1 INTO l_name1 FROM t001w WHERE werks = g_werks.
+  CONCATENATE 'Centro: ' g_werks l_name1 INTO lw_header-info SEPARATED BY space.
+  APPEND lw_header TO gt_header.
+
+  CLEAR lw_header.
+  WRITE sy-datum TO l_fecha_c.
+  lw_header-typ = 'S'.
+  CONCATENATE 'Fecha: ' l_fecha_c INTO lw_header-info SEPARATED BY space.
+  APPEND lw_header TO gt_header.
+
+  CLEAR lw_header.
+  WRITE sy-uzeit TO l_hora_c.
+  lw_header-typ = 'S'.
+  CONCATENATE 'Hora: ' l_hora_c INTO lw_header-info SEPARATED BY space.
+  APPEND lw_header TO gt_header.
+
+  CONCATENATE 'ZLOGO_' g_bukrs '_ALV' INTO l_logo.
+  CONDENSE l_logo NO-GAPS.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      i_logo             = l_logo
+      it_list_commentary = gt_header.
+
+ENDFORM.

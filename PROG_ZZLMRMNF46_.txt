@@ -1,0 +1,1005 @@
+*&---------------------------------------------------------------------*
+*&  Include           LMRMNF46
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  complaint_process_PDF
+*       If i_print is not initial, the complaint letter will be printed
+*       into a PDF. Otherwise no printing is done; this option is used
+*       for the BAPI Complain of BUS2081.
+*&---------------------------------------------------------------------*
+FORM complaint_process_pdf USING s_objky TYPE typ_objky
+                                 i_print TYPE char01.
+
+  DATA: t_rseg     TYPE typ_tab_rseg,
+        t_txjcd    LIKE rseg-txjcd OCCURS 0,
+        s_rbkpv    TYPE mrm_rbkpv,
+        s_rseg     LIKE rseg,
+        c_service  TYPE c VALUE '9',
+        werks_prev LIKE rseg-werks,
+        x_auto     TYPE c,             "flag: automatically reduced?
+        x_txjcd    TYPE c,             "flag: jurisdiction code active?
+        diff       LIKE rseg-wrbtr.
+
+  DATA: BEGIN OF s_tax,
+           mwskz LIKE rbtx-mwskz,
+        END OF s_tax.
+
+  DATA: t_tax LIKE TABLE OF s_tax WITH KEY mwskz.
+
+* Check if the subroutine is called in update task.
+  CALL METHOD cl_system_transaction_state=>get_in_update_task
+    RECEIVING
+      in_update_task = gf_inupd.
+
+  PERFORM prepare_print.
+*
+  IF i_print IS NOT INITIAL.
+*   If the BAPI Complain is used, we do not need to initialize the PDF
+*    For the BAPI COMPLAINT the following routine is not needed.
+    PERFORM job_open_pdf CHANGING gs_itcpo.
+  ENDIF.
+
+*-------- read data ----------------------------------------------------
+  PERFORM dbtab_rbkpv_read USING s_objky-belnr
+                                 s_objky-gjahr
+                        CHANGING s_rbkpv.
+  MOVE-CORRESPONDING s_rbkpv TO rbkp.
+
+  IF ( rbkp-arkuen > 0 ).
+    x_auto = x.                        "invoice automatically reduced
+  ELSE.
+    x_auto = space.                    "invoice manually reduced
+  ENDIF.
+
+  PERFORM dbtab_t001g_read USING rbkp-bukrs
+                        CHANGING t001g.
+
+* CPD ?
+  IF NOT s_rbkpv-xcpdk IS INITIAL.
+    MOVE-CORRESPONDING s_rbkpv TO lfa1.
+    MOVE-CORRESPONDING s_rbkpv TO lfb1.
+  ELSE.
+    PERFORM dbtab_vfkred_read USING nast-parnr
+                                    rbkp-lifnr
+                                  rbkp-bukrs
+                         CHANGING lfa1
+                                  lfb1.
+  ENDIF.
+* read user data of clerk who posted invoice
+  PERFORM dbtab_addr3val_read USING rbkp-usnam
+                           CHANGING addr3_val
+                                    usr03.                  "USR0340A
+
+  PERFORM dbtab_t001_read  USING     rbkp-bukrs
+                           CHANGING  t001.
+
+  IF ( x_auto = space ).
+    PERFORM dbtab_rseg_read_complain USING rbkp-belnr
+                                           rbkp-gjahr
+                                  CHANGING t_rseg.
+  ENDIF.
+
+*Moving the address related fields:
+
+  PERFORM print_final_pdf.
+
+  PERFORM addr_texts_pdf.
+
+*moving info related fields..
+  PERFORM print_info_pdf.
+
+* tax jurisdiction code active?
+
+  CALL FUNCTION 'CHECK_JURISDICTION_ACTIVE'
+    EXPORTING
+      i_bukrs    = rbkp-bukrs
+    IMPORTING
+      e_isactive = x_txjcd.
+*----- output of header ------------------------------------------------
+
+  PERFORM print_repeat_pdf.
+
+
+
+  txjcd_x = x_txjcd.
+  auto_x = x_auto.
+  repeat_x = repeat.
+
+  CLEAR gf_cp_peinhprint.
+  PERFORM read_bestellposition_peinhprnt USING t_rseg
+                                         CHANGING gf_cp_peinhprint.
+
+
+*----- output of items -------------------------------------------------
+  IF ( x_auto = space ).
+    SORT t_rseg BY werks buzei.
+
+    LOOP AT t_rseg INTO rseg.          "for all items to be complained
+
+*     change of plant -> output of address of plant
+      IF ( sy-tabix = 1 ) OR           "first line in loop
+         ( rseg-werks <> werks_prev ). "plant changed
+        PERFORM dbtab_t001w_read USING rseg-werks
+                              CHANGING t001w.
+
+
+        MOVE-CORRESPONDING t001w TO gs_plants_t001w.
+        APPEND gs_plants_t001w TO gt_plants_t001w.
+      ENDIF.
+
+
+*     print item line
+      IF rseg-matnr NE space.
+        PERFORM read_materialtext USING rseg-matnr
+                                          nast-spras
+                                          t001-spras
+                                 CHANGING gf_cp_maktx.  "materialtext
+* provide global data of PO item (e.g. for price unit related print)
+        CALL FUNCTION 'ME_EKPO_SINGLE_READ'
+          EXPORTING
+            pi_ebeln         = rseg-ebeln
+            pi_ebelp         = rseg-ebelp
+          IMPORTING
+            po_ekpo          = ekpo
+          EXCEPTIONS
+            no_records_found = 1
+            OTHERS           = 2.
+        IF ( sy-subrc <> 0 ).
+          PERFORM protocol USING sy-msgid sy-msgty sy-msgno
+                                 sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+        ENDIF.
+
+      ELSE.
+        PERFORM read_bestellposition USING rseg-ebeln
+                                           rseg-ebelp
+                                  CHANGING gf_cp_maktx.   "Text
+      ENDIF.
+
+      IF ekpo-idnlf IS INITIAL.
+        PERFORM read_idnlf USING rseg-matnr
+                                 rbkp-lifnr
+                                 rbkp-filkd
+                        CHANGING gf_cp_idnlf. "material number of vendor
+      ELSE.
+        gf_cp_idnlf = ekpo-idnlf.
+      ENDIF.
+
+      PERFORM read_ean11 USING rseg-matnr
+                      CHANGING gf_cp_ean11.  "european article number
+
+      IF rseg-rbmng <> 0 AND rseg-menge <> 0.
+*       for non service based services with multiaccount assignment:
+        IF   rseg-pstyp = c_service
+         AND ekpo-lebre IS INITIAL.
+          rseg-rbmng = 1.
+          rseg-menge = 1.
+          rseg-bpmng = 1.
+          rseg-bprbm = 1.
+          MODIFY t_rseg FROM rseg TRANSPORTING rbmng menge.
+        ENDIF.
+        IF ekpo-peinh <> 0 AND rseg-bstme = rseg-bprme.
+*       possible changes of PEINH in PO are no problem because form
+*       presents prices always related to PEINH
+          gf_cp_rseg_price = rseg-wrbtr / rseg-menge * ekpo-peinh.
+          gf_cp_rseg_rbprc = rseg-rbwwr / rseg-rbmng * ekpo-peinh.
+        ELSEIF ekpo-peinh <> 0 AND rseg-bstme <> rseg-bprme.
+*       form presents prices in BPRME
+          gf_cp_rseg_price = rseg-wrbtr / rseg-bpmng * ekpo-peinh.
+          gf_cp_rseg_rbprc = rseg-rbwwr
+                             / ( rseg-bpmng * rseg-rbmng / rseg-menge )
+                             * ekpo-peinh.
+        ELSE.
+          gf_cp_rseg_price = rseg-wrbtr / rseg-menge.
+          gf_cp_rseg_rbprc = rseg-rbwwr / rseg-rbmng.
+        ENDIF.
+*     avoid zero division
+      ELSEIF rseg-rbmng = 0 AND rseg-menge = 0.
+        IF ekpo-peinh <> 0.
+          gf_cp_rseg_price = rseg-wrbtr * ekpo-peinh.
+          gf_cp_rseg_rbprc = rseg-rbwwr * ekpo-peinh.
+        ELSE.
+          gf_cp_rseg_price = rseg-wrbtr.
+          gf_cp_rseg_rbprc = rseg-rbwwr.
+        ENDIF.
+      ELSEIF rseg-rbmng = 0.
+        IF ekpo-peinh <> 0.
+          gf_cp_rseg_price = rseg-wrbtr / rseg-menge * ekpo-peinh.
+          gf_cp_rseg_rbprc = rseg-rbwwr / rseg-menge * ekpo-peinh.
+        ELSE.
+          gf_cp_rseg_price = rseg-wrbtr / rseg-menge .
+          gf_cp_rseg_rbprc = rseg-rbwwr / rseg-menge .
+        ENDIF.
+      ELSEIF rseg-menge = 0.
+        IF ekpo-peinh <> 0.
+          gf_cp_rseg_price = rseg-wrbtr / rseg-rbmng * ekpo-peinh.
+          gf_cp_rseg_rbprc = rseg-rbwwr / rseg-rbmng * ekpo-peinh.
+        ELSE.
+          gf_cp_rseg_price = rseg-wrbtr / rseg-rbmng .
+          gf_cp_rseg_rbprc = rseg-rbwwr / rseg-rbmng .
+        ENDIF.
+      ENDIF.
+
+      gf_cp_rseg_diff  = rseg-rbwwr - rseg-wrbtr.  "amount
+
+*     Get the complaint reason text in the current language.
+      PERFORM read_complaint_reason_text
+              USING    rseg-complaint_reason
+                       nast-spras
+              CHANGING gs_rm08nast_item_details-gf_cp_rseg_complaint_reason.
+
+
+*     print item
+
+***********************ITEM DETAILS****************************
+      MOVE: rseg-buzei           TO           gs_rm08nast_item_details-buzei,
+            rseg-matnr           TO           gs_rm08nast_item_details-matnr,
+            rseg-menge           TO           gs_rm08nast_item_details-menge,
+            rseg-bstme           TO           gs_rm08nast_item_details-bstme,
+            rseg-rbmng           TO           gs_rm08nast_item_details-rbmng,
+            gf_cp_rseg_price     TO           gs_rm08nast_item_details-gf_cp_rseg_price,
+            gf_cp_rseg_rbprc     TO           gs_rm08nast_item_details-gf_cp_rseg_rbprc,
+            gf_cp_rseg_diff      TO           gs_rm08nast_item_details-gf_cp_rseg_diff,
+            ekpo-peinh           TO           gs_rm08nast_item_details-peinh,
+            rseg-bprme           TO           gs_rm08nast_item_details-bprme,
+            gf_cp_idnlf          TO           gs_rm08nast_item_details-gf_cp_idnlf,
+            gf_cp_ean11          TO           gs_rm08nast_item_details-gf_cp_ean11,
+            rseg-mwskz           TO           gs_rm08nast_item_details-mwskz,
+            gf_cp_maktx          TO           gs_rm08nast_item_details-maktx,
+            gf_cp_peinhprint     TO           gs_rm08nast_item_details-gf_cp_peinhprint,
+            rseg-werks           TO           gs_rm08nast_item_details-werks,
+            rseg-complaint_reason TO          gs_rm08nast_item_details-complaint_reason.
+
+      APPEND gs_rm08nast_item_details TO gt_rm08nast_item_details.
+      CLEAR  gs_rm08nast_item_details.
+***********END of PDF conversion ,Date: 22/03/2006 ,C5075477
+*     keep current plant in mind
+      werks_prev = rseg-werks.
+
+    ENDLOOP.
+  ENDIF.
+*----- output of totals ------------------------------------------------
+*----- print net amount
+  IF ( x_auto = x ).
+    gf_cp_total_rkuen = rbkp-arkuen.
+  ELSE.
+    gf_cp_total_rkuen = rbkp-lieffn.
+  ENDIF.
+***********Start of PDF conversion ,Date: 22/03/2006 ,C5075477
+******************* NET TOTAL *******************************
+  MOVE: gf_cp_total_rkuen TO gs_netto_brutto-gf_cp_total_rkuen.
+***********END of PDF conversion ,Date: 22/03/2006 ,C5075477
+
+* ---- built up tax table for manual invoice reduction
+* In case one invoice item is reduced completely (rseg-wrbtr = 0 and
+* rseg-rbwwr <> 0) and the tax is calculated automatically table RBTX
+* does not contain the tax indicator (mwskz) of the completely reduced
+* invoice item (zero invoice item).
+* Therefore the internal tax table t_tax is built up based on the
+* tax indicator of table RSEG instead of using the information from
+* s_rbkpv_rbtx.
+  IF x_auto = SPACE.
+    LOOP AT t_rseg INTO s_rseg.
+      APPEND s_rseg-mwskz TO t_tax.
+    ENDLOOP.
+
+    SORT t_tax BY mwskz.
+    DELETE ADJACENT DUPLICATES FROM t_tax.
+  ENDIF.
+
+*----- print taxes (automatically reduced)
+  IF ( x_auto = x ).
+    LOOP AT s_rbkpv-rbtx INTO rbtx WHERE arkuen <> 0.
+
+      gf_cp_total_txbas = rbtx-arkuen.
+      gf_cp_total_txbtr = rbtx-arkuemw.
+
+      IF ( x_txjcd = x ).              "print without tax rate!
+
+****************Start of PDF conversion ,Date: 22/03/2006 ,C5075477
+*********************** TAX DETAILS *******************************
+        MOVE: gf_cp_total_txbas          TO gs_rm08nast_tax_details-gf_cp_total_txbas,
+              gf_cp_total_txbtr          TO gs_rm08nast_tax_details-gf_cp_total_txbtr.
+        APPEND gs_rm08nast_tax_details   TO gt_rm08nast_tax_details.
+        CLEAR gs_rm08nast_tax_details.
+
+      ELSE.                            "with tax rate
+
+        PERFORM get_tax_rate USING rbkp-bukrs
+                                   rbtx-mwskz
+                                   space
+                                   rbkp-waers
+                          CHANGING gf_cp_total_txrat.
+        MOVE 'X' TO x_txjcd.
+
+        MOVE:     gf_cp_total_txjcd TO gs_rm08nast_tax_details-gf_cp_total_txjcd,
+                  gf_cp_total_txrat TO gs_rm08nast_tax_details-gf_cp_total_txrat,
+                  gf_cp_total_txbas TO gs_rm08nast_tax_details-gf_cp_total_txbas,
+                  gf_cp_total_txbtr TO gs_rm08nast_tax_details-gf_cp_total_txbtr.
+
+*       Used for BAPI complain
+        MOVE:     rbtx-mwskz        TO gs_rm08nast_tax_details-gf_cp_total_taxcode.
+
+        APPEND    gs_rm08nast_tax_details TO gt_rm08nast_tax_details.
+        CLEAR     gs_rm08nast_tax_details .
+      ENDIF.
+
+
+    ENDLOOP.
+*----- print taxes (manually reduced + no tax jurisdiction code)
+  ELSEIF ( x_txjcd = space ).
+
+    LOOP AT t_tax INTO s_tax.
+*     get tax base amount
+      gf_cp_total_txbas = 0.
+      LOOP AT t_rseg INTO s_rseg
+                     WHERE mwskz = s_tax-mwskz.
+        diff = s_rseg-rbwwr - s_rseg-wrbtr.
+        ADD diff TO gf_cp_total_txbas.
+      ENDLOOP.
+
+*     do not print zero-line
+      IF ( gf_cp_total_txbas = 0 ).
+        CONTINUE.                      "-----^
+      ENDIF.
+
+*     get tax amount and rate and print them
+      PERFORM get_tax_amount_pdf USING rbkp
+                                   t001-xmwsn
+                                   s_tax-mwskz
+                                   space
+                                   rbkp-waers
+                                   'CP_TOTAL_TAXES'
+                          CHANGING gf_cp_total_txbas
+                                   gf_cp_total_txbtr
+                                   gf_cp_total_txrat.
+
+    ENDLOOP.
+*----- print taxes (manually reduced + tax jurisdiction code)
+  ELSE.
+
+    LOOP AT t_tax INTO s_tax.
+*     create table of jurisdiction codes
+      CLEAR t_txjcd.
+      LOOP AT t_rseg INTO s_rseg
+                     WHERE mwskz = s_tax-mwskz.
+        READ TABLE t_txjcd TRANSPORTING NO FIELDS
+                           FROM s_rseg-txjcd.
+        IF ( sy-subrc <> 0 ).
+          APPEND s_rseg-txjcd TO t_txjcd.
+        ENDIF.
+      ENDLOOP.
+
+      LOOP AT t_txjcd INTO gf_cp_total_txjcd.
+*       get tax base amount
+        gf_cp_total_txbas = 0.
+        LOOP AT t_rseg INTO s_rseg
+                       WHERE mwskz = s_tax-mwskz
+                         AND txjcd = gf_cp_total_txjcd.
+          diff = s_rseg-rbwwr - s_rseg-wrbtr.
+          ADD diff TO gf_cp_total_txbas.
+        ENDLOOP.
+
+*       do not print zero-line
+        IF ( gf_cp_total_txbas = 0 ).
+          CONTINUE.                    "-----^
+        ENDIF.
+
+*       get tax amount and rate and print them
+        PERFORM get_tax_amount_pdf USING rbkp
+                                     t001-xmwsn
+                                     s_tax-mwskz
+                                     gf_cp_total_txjcd
+                                     rbkp-waers
+                                     'CP_TOTAL_TAXES3'
+                            CHANGING gf_cp_total_txbas
+                                     gf_cp_total_txbtr
+                                    gf_cp_total_txrat.
+
+
+      ENDLOOP.
+    ENDLOOP.
+  ENDIF.
+
+*----- print gross amount
+
+  IF ( x_auto = x ).
+    gf_cp_total_rkueb = rbkp-arkuen + rbkp-arkuemw.
+  ELSE.
+    gf_cp_total_rkueb = rbkp-lieffn + rbkp-lieffmw.
+  ENDIF.
+
+******************* GROSS DETAILS ***************************
+  MOVE: gf_cp_total_rkueb TO gs_netto_brutto-gf_cp_total_rkueb.
+
+  IF i_print IS NOT INITIAL.
+*   If the BAPI Complain is used, we do not need to print the PDF
+***************************CALLING PDF FUNCTION MODULES******************
+**-------PDF JOB OPEN
+*    PERFORM job_open_pdf.
+*----GENERATING PDF FUNCTION MODULE
+    PERFORM print_pdf.
+  ENDIF.
+ENDFORM.                    "complaint_process_pdf
+
+*&---------------------------------------------------------------------*
+*&      Form  print_repeat_PDF
+*      ->REPEAT
+*&---------------------------------------------------------------------*
+FORM print_repeat_pdf .
+  DATA: *nast LIKE nast OCCURS 0.                           "#EC NEEDED
+* at least one message has vstat = 1 (several entries possible)
+  SELECT * INTO TABLE *nast FROM nast WHERE kappl = nast-kappl  "DR
+                                      AND   objky = nast-objky
+                                      AND   kschl = nast-kschl
+                                      AND   spras = nast-spras
+                                      AND   parnr = nast-parnr
+                                      AND   parvw = nast-parvw
+                                      AND   vstat = 1.
+  IF sy-subrc = 0.
+    MOVE 'X' TO repeat.
+  ENDIF.                          "REPEAT'. "element
+
+ENDFORM.                    " print_repeat_PDF
+
+*&---------------------------------------------------------------------*
+*&      Form  CALLPDF
+*&---------------------------------------------------------------------*
+* This form is included here only as empty body because it is not used
+* for the BAPI for complaint processing (as the rest of this include
+* LMRNMF46).
+FORM print_pdf .
+
+* Setting for sending document vai E-mail.
+  DATA:  lv_emailaddr       TYPE adr6-smtp_addr,
+         os_formout TYPE fpformoutput.
+
+* Setting for sending FAX
+  DATA : lv_cam_address         TYPE REF TO cl_cam_address_bcs,
+         lv_outputparams_fax    TYPE sfpoutpar,
+         lv_vend_cntry          TYPE lfa1-land1.
+
+* BCS data
+  DATA:
+    send_request    TYPE REF TO cl_bcs,
+    document        TYPE REF TO cl_document_bcs,
+    recipient       TYPE REF TO if_recipient_bcs,
+    bcs_exception   TYPE REF TO cx_bcs,
+    lv_sent_to_all  TYPE os_boolean,
+    lp_pdf_size     TYPE so_obj_len,
+    lv_subject      TYPE so_obj_des,
+    ls_tnati        TYPE tnati,                             "1524684
+    lv_add_nr       TYPE adr6-addrnumber.
+
+* Archiving specific data declaration "1489677
+  DATA: lv_pdf_size TYPE i,
+        lv_archiveformat LIKE toadd-doc_type,  "PDF or OTF
+        lv_documentclass LIKE toadv-doc_type.
+
+  CALL FUNCTION gv_fm_name
+    EXPORTING
+      /1bcdwb/docparams     = gs_fm_docparams
+      address               = gs_address
+      gs_options_info       = gs_options_info
+      rbkp_info             = gs_rbkp_info
+      bkpf_info             = gs_bkpf_info
+      lfa1_info             = gs_lfa1_info
+      lfb1_info             = gs_lfb1_info
+      t001_info             = gs_t001_info
+      tsad3t_info           = gs_tsad3t_info
+      addr3_val_info        = gs_addr3_val_info
+      t005_info             = gs_t005_info
+      adsmtp_info           = gs_adsmtp_info
+      rp_head               = gs_rp_head
+      rp_pos                = gt_rp_pos
+      netto_brutto          = gs_netto_brutto
+      plant_head            = gt_plants_t001w
+      item_details          = gt_rm08nast_item_details
+      tax_details           = gt_rm08nast_tax_details
+      tax_details_rap       = gt_tax_details_rap
+      payment_terms         = gt_payment_terms
+      x_auto                = auto_x
+      x_txjcd               = txjcd_x
+      gf_cp_peinhprint      = gf_cp_peinhprint
+      address_text          = gt_dynamic_text
+      repeat                = repeat_x
+      material_subtotals    = gt_material_subtotals
+      material_header       = gt_material_header
+      material_item         = gt_material_item
+      material_totals       = gs_material_totals
+      gt_purch_doc_item     = gt_purch_doc_item
+      gt_commu_str_bapiesll = gt_commu_str_bapiesll
+      gt_shipment_det       = gt_shipment_det
+      gt_shipcostdet_header = gt_shipcostdet_header
+      gt_shipcostdet_itetm  = gt_shipcostdet_itetm
+      gt_billplan_date      = gt_billplan_date
+      gt_return_del         = gt_return_del
+      gs_options            = gs_options_con
+      rbkp                  = rbkp
+      rseg                  = gt_rseg
+      gt_price_det_komvd    = gt_price_det
+      komk                  = komk
+      ekpo                  = ekpo
+      vttsf                 = vttsf
+    IMPORTING
+      /1bcdwb/formoutput    = os_formout
+    EXCEPTIONS
+      usage_error           = 1
+      system_error          = 2
+      internal_error        = 3
+      OTHERS                = 4.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  IF g_xscreen IS INITIAL AND
+      ( nast-nacha EQ 5 OR nast-nacha EQ 2 ) AND os_formout IS NOT INITIAL.
+
+* get default Email id from address no
+* When there is only one mail id then that will have default flag set
+    SELECT SINGLE smtp_addr FROM adr6 INTO lv_emailaddr WHERE addrnumber =  gs_address-adrnr
+                                                          AND flgdefault = abap_true.
+* Set FAX specific setting
+    IF nast-nacha EQ 5.
+      lv_outputparams_fax-telenum = gs_itcpo-tdtelenum.
+      lv_outputparams_fax-teleland = gs_itcpo-tdteleland.
+    ELSE.
+      IF nast-telfx NE space.
+        lv_outputparams_fax-telenum  = nast-telfx.
+        IF nast-tland IS INITIAL.
+          lv_outputparams_fax-teleland = gs_address-land1.
+        ELSE.
+          lv_outputparams_fax-teleland = nast-tland.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+
+
+    IF gf_comm_type EQ 'FAX' OR gf_comm_type EQ 'INT' OR nast-nacha EQ 2..
+* ------------ Call BCS interface ----------------------------------
+      TRY.
+*   ---------- create persistent send request ----------------------
+          send_request = cl_bcs=>create_persistent( ).
+
+*   ---------- add document ----------------------------------------
+*   get PDF xstring and convert it to BCS format
+          lp_pdf_size = xstrlen( os_formout-pdf ).
+          PERFORM xstring_to_solix
+                     USING
+                        os_formout-pdf.
+*Cover title                                                "1524684
+          IF nast-tdcovtitle IS NOT INITIAL.                "1524684
+            lv_subject = nast-tdcovtitle.                   "1524684
+          ELSE.                                             "1524684
+            SELECT SINGLE * FROM tnati INTO ls_tnati        "1524684
+                           WHERE spras EQ nast-spras        "1524684
+                                 AND kappl EQ nast-kappl    "1524684
+                                 AND kschl EQ nast-kschl.   "1524684
+            IF sy-subrc EQ 0.                               "1524684
+              lv_subject = ls_tnati-objdes.                 "1524684
+            ELSE.                                           "1524684
+              lv_subject = nast-objky+4(14).                "1524684
+            ENDIF.                                          "1524684
+          ENDIF.                                            "1524684
+
+          document = cl_document_bcs=>create_document(
+                i_type    = 'PDF' " cf. RAW, DOC
+                i_hex     = pdf_content
+                i_length  = lp_pdf_size
+                i_subject = lv_subject ).                   "#EC NOTEXT
+
+*   add document to send request
+          send_request->set_document( document ).
+*     --------- set sender ------------------------------------------
+*     note: this is necessary only if you want to set the sender
+*           different from actual user (SY-UNAME). Otherwise sender is
+*           set automatically with actual user.
+*
+*      sender = cl_sapuser_bcs=>create( sy-uname ).
+*      CALL METHOD send_request->set_sender
+*        EXPORTING i_sender = sender.
+*   ---------- add recipient (e-mail address) ----------------------
+
+          CASE nast-nacha.
+            WHEN 5.
+              IF gf_comm_type EQ 'INT'.
+*           add recipient (e-mail address)
+                recipient = recipient = cl_cam_address_bcs=>create_internet_address(
+                i_address_string = lv_emailaddr ).
+              ELSE.
+*           add recipient (fax address)
+                recipient = cl_cam_address_bcs=>create_fax_address(
+                                 i_country = lv_outputparams_fax-teleland
+                                 i_number  = lv_outputparams_fax-telenum ).
+              ENDIF.
+            WHEN 2.
+*           add recipient (fax address)
+              recipient = cl_cam_address_bcs=>create_fax_address(
+                               i_country = lv_outputparams_fax-teleland
+                               i_number  = lv_outputparams_fax-telenum ).
+          ENDCASE.
+
+*   add recipient to send request
+          send_request->add_recipient( i_recipient = recipient ).
+
+*   ---------- send document ---------------------------------------
+          lv_sent_to_all = send_request->send(
+              i_with_error_screen = 'X' ).
+* Issue message and COMMINT only if the subroutine is not called in update task
+          IF gf_inupd = 0.
+            IF lv_sent_to_all = 'X'.
+              MESSAGE i022(so).
+            ENDIF.
+
+*   ---------- explicit 'commit work' is mandatory! ----------------
+            COMMIT WORK.
+          ENDIF.
+* ------------------------------------------------------------------
+* *            exception handling
+* ------------------------------------------------------------------
+* * replace this very rudimentary exception handling
+* * with your own one !!!
+* ------------------------------------------------------------------
+        CATCH cx_bcs INTO bcs_exception.
+          MESSAGE e019 WITH bcs_exception->error_type.
+*     Sending fax/mail failed
+          EXIT.
+      ENDTRY.
+    ENDIF.
+  ENDIF.
+
+***********Start of Note chnages1489677*****************
+* Arching for adobe forms
+  IF nast-tdarmod = 2 OR  nast-tdarmod = 3.
+
+* Get the PDF length
+    lv_pdf_size = XSTRLEN( os_formout-pdf ).
+
+* defaults for archive
+    IF toa_dara-function = space.
+      toa_dara-function = 'DARA'.
+    ENDIF.
+*     which format to be used for archiving: OTF or PDF?
+    CALL FUNCTION 'ARCHIV_GET_PRINTFORMAT'
+      EXPORTING
+        application = 'PDF'
+      IMPORTING
+        printformat = lv_archiveformat.
+
+    IF lv_archiveformat EQ 'PDF'.
+      lv_documentclass = 'PDF'.
+
+      CALL FUNCTION 'ARCHIV_CREATE_OUTGOINGDOCUMENT'
+        EXPORTING
+          arc_p                    = arc_params
+          arc_i                    = toa_dara
+          pdflen                   = lv_pdf_size
+          documentclass            = lv_documentclass                "Since the output is in PDF document class is also PDF
+          document                 = os_formout-pdf
+        EXCEPTIONS
+          error_archiv             = 1
+          error_communicationtable = 2
+          error_connectiontable    = 3
+          error_kernel             = 4
+          error_parameter          = 5
+          OTHERS                   = 6.
+      CASE sy-subrc.
+        WHEN 0. " o.k.
+        WHEN 1. RAISE error_archiv.
+        WHEN 2. RAISE error_communicationtable.
+        WHEN 3. RAISE error_connectiontable.
+        WHEN 4. RAISE error_kernel.
+        WHEN 5. RAISE error_parameter.
+        WHEN 6. RAISE error_archiv. "?
+      ENDCASE.
+
+    ELSE.
+      " Other than PDF format raise error.
+      MESSAGE e789(po) WITH lv_archiveformat.
+    ENDIF.
+  ENDIF.
+***********End of Note chnages 1489677*****************
+
+*-------CLEARING THE STRUCTURE AND TABLE TYPE
+  CLEAR:  gs_address, gs_options_info, gs_rbkp_info, gs_bkpf_info, gs_lfa1_info, gs_lfb1_info,
+          gs_t001_info, gs_tsad3t_info, gs_addr3_val_info, gs_t005_info, gs_adsmtp_info, gs_rp_head,
+          gs_netto_brutto, gs_material_totals, gs_options_con, gf_cp_peinhprint.
+  REFRESH: gt_rp_pos, gt_plants_t001w, gt_rm08nast_item_details, gt_rm08nast_tax_details,
+           gt_tax_details_rap, gt_payment_terms, gt_dynamic_text, gt_material_subtotals,
+           gt_material_header, gt_material_item, gt_purch_doc_item, gt_commu_str_bapiesll,
+           gt_shipment_det, gt_shipcostdet_header, gt_shipcostdet_itetm, gt_billplan_date, gt_return_del.
+
+*----PDF JOB CLOSE
+  CALL FUNCTION 'FP_JOB_CLOSE'
+    EXCEPTIONS
+      usage_error    = 1
+      system_error   = 2
+      internal_error = 3
+      OTHERS         = 4.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " CALLPDF
+
+
+*&---------------------------------------------------------------------*
+*&      Form  get_tax_amount_pdf
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_RBKP  text
+*      -->P_T001_XMWSN  text
+*      -->P_RBTX_MWSKZ  text
+*      -->P_GF_CP_TOTAL_TXJCD  text
+*      -->P_RBKP_WAERS  text
+*      -->P_0882   text
+*      <--P_GF_CP_TOTAL_TXBAS  text
+*      <--P_GF_CP_TOTAL_TXBTR  text
+*      <--P_GF_CP_TOTAL_TXRAT  text
+*----------------------------------------------------------------------*
+FORM get_tax_amount_pdf USING p_rbkp LIKE rbkp
+                          p_xmwsn LIKE t001-xmwsn
+                          mwskz LIKE rbtx-mwskz
+                          txjcd LIKE rseg-txjcd
+                          waers LIKE rbkp-waers
+                          p_form_name LIKE itcce-tdevent
+                 CHANGING gf_cp_total_txbas LIKE bseg-wrbtr
+                          gf_cp_total_txbtr LIKE rbtx-wmwst
+                          gf_cp_total_txrat LIKE rtax1u15-msatz.
+
+  DATA: t_mwdat LIKE rtax1u15 OCCURS 0,
+        s_mwdat LIKE rtax1u15,
+        s_taxind TYPE taxind.
+  DATA: l_awtyp LIKE  acchd-awtyp,
+        l_awref LIKE  acchd-awref,
+        l_aworg LIKE  acchd-aworg .
+  DATA: lt_bkpf LIKE bkpf OCCURS 0 WITH HEADER LINE.
+  DATA: l_t169f LIKE t169f.
+  DATA: lt_abkpf LIKE abkpf OCCURS 0 WITH HEADER LINE.
+  DATA: lt_bseg LIKE bseg OCCURS 0 WITH HEADER LINE.
+  DATA: lt_bset LIKE bset OCCURS 0 WITH HEADER LINE.
+  DATA: l_skb1 LIKE skb1.
+  DATA: l_bseg_lieffmw LIKE rbkp-lieffmw.
+
+* manually reduced: no tax base and amount information on MM side
+* in case of discount and base amount for tax is net of discount
+  IF NOT p_rbkp-zbd1p IS INITIAL AND NOT p_xmwsn IS INITIAL.
+
+* determine reduction documenttype
+    CALL FUNCTION 'MRM_DBTAB_T169F_READ'
+      EXPORTING
+        i_tcode         = p_rbkp-tcode
+      IMPORTING
+        e_t169f         = l_t169f
+      EXCEPTIONS
+        entry_not_found = 1
+        OTHERS          = 2.
+    IF sy-subrc <> 0.
+      PERFORM protocol USING sy-msgid sy-msgty sy-msgno
+                             sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+* determine reduction document
+    l_awtyp = c_awtyp_rmrp.
+    l_awref = p_rbkp-belnr.
+    l_aworg = p_rbkp-gjahr.
+    CALL FUNCTION 'FI_DOCUMENT_READ'
+      EXPORTING
+        i_awtyp     = l_awtyp
+        i_awref     = l_awref
+        i_aworg     = l_aworg
+      TABLES
+        t_bkpf      = lt_bkpf
+      EXCEPTIONS
+        wrong_input = 1
+        not_found   = 2
+        OTHERS      = 3.
+    IF sy-subrc <> 0.
+      PERFORM protocol USING sy-msgid sy-msgty sy-msgno
+                             sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    READ TABLE lt_bkpf WITH KEY blart = l_t169f-blrek.
+    IF sy-subrc NE 0.
+      PERFORM protocol USING 'M8' 'E' 507
+                             sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    SELECT * FROM bseg INTO TABLE lt_bseg
+                        WHERE  bukrs = p_rbkp-bukrs
+                          AND  belnr = lt_bkpf-belnr
+                          AND  gjahr = lt_bkpf-gjahr.
+
+    SELECT * FROM bset INTO TABLE lt_bset
+                    WHERE  bukrs = p_rbkp-bukrs
+                    AND  belnr = lt_bkpf-belnr
+                    AND  gjahr = lt_bkpf-gjahr.
+
+
+    CLEAR l_bseg_lieffmw.
+    LOOP AT lt_bseg WHERE buzid = 'T'.
+      CASE lt_bseg-shkzg.
+        WHEN 'S'.
+          SUBTRACT lt_bseg-wrbtr FROM l_bseg_lieffmw.
+        WHEN 'H'.
+          ADD lt_bseg-wrbtr TO l_bseg_lieffmw.
+      ENDCASE.
+
+    ENDLOOP.
+
+*   items with taxrate = 0 do not have any BSEG-line with buzid = 'T'
+*   nevertheless they have BSET-items
+    IF sy-subrc NE 0.
+      LOOP AT lt_bset.
+        ADD lt_bset-fwste TO l_bseg_lieffmw.
+      ENDLOOP.
+*     tax treatment in Invoice Reduction may determine tax reduction
+*     in original document, then only MM knows tax part of vendor error
+      IF sy-subrc NE 0.
+        l_bseg_lieffmw = p_rbkp-lieffmw.
+      ENDIF.
+    ELSE.
+      l_bseg_lieffmw = abs( l_bseg_lieffmw ).
+    ENDIF.
+
+* check FI <-> MMIV
+    IF l_bseg_lieffmw NE p_rbkp-lieffmw.
+      PERFORM protocol USING 'M8' 'E' 268
+                             sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    READ TABLE lt_bseg WITH KEY buzid = 'T'
+                                mwskz = mwskz.
+    IF sy-subrc EQ 0.
+      gf_cp_total_txbas = lt_bseg-fwbas.
+      gf_cp_total_txbtr = lt_bseg-wrbtr.
+    ELSE.
+*     items with taxrate = 0 do not have any BSEG-line with buzid = 'T'
+*     it supposed that gf_cp_total_txbas is initialized by FORM
+*     COMPLAINT_PROCESS as sum of diff = s_rseg-rbwwr - s_rseg-wrbtr
+      CLEAR gf_cp_total_txbtr.
+    ENDIF.
+
+    READ TABLE lt_bset WITH KEY mwskz = mwskz.
+    IF sy-subrc EQ 0.
+      gf_cp_total_txrat = lt_bset-kbetr * 100 / 1000.
+    ELSE.
+*     e.g. tax treatment in Invoice Reduction: original document
+*     is handled below after next LOOP AT lt_bset
+      CLEAR gf_cp_total_txrat.
+    ENDIF.
+
+    CALL FUNCTION 'FI_TAX_INDICATOR_DATA'
+      EXPORTING
+        i_bukrs  = p_rbkp-bukrs
+        i_mwskz  = mwskz
+      IMPORTING
+        e_taxind = s_taxind
+      EXCEPTIONS
+        OTHERS   = 1.
+    IF ( sy-subrc <> 0 ).
+      PERFORM protocol USING sy-msgid sy-msgty sy-msgno
+                             sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    IF s_taxind-egrkz <> 'A' AND                           "1543271
+      s_taxind-egrkz <> c_egrkz_erwerbssteuer.
+      LOOP AT lt_bset WHERE mwskz = mwskz.
+
+* set global variables for printing
+****************Start of PDF conversion ,Date: 22/03/2006 ,C5075477
+
+        MOVE:       gf_cp_total_txjcd TO gs_rm08nast_tax_details-gf_cp_total_txjcd,
+                    gf_cp_total_txrat TO gs_rm08nast_tax_details-gf_cp_total_txrat,
+                    gf_cp_total_txbas TO gs_rm08nast_tax_details-gf_cp_total_txbas,
+                    gf_cp_total_txbtr TO gs_rm08nast_tax_details-gf_cp_total_txbtr.
+
+*       Used for BAPI complain
+        MOVE:       mwskz             TO gs_rm08nast_tax_details-gf_cp_total_taxcode.
+
+        APPEND gs_rm08nast_tax_details TO gt_rm08nast_tax_details.
+        CLEAR gs_rm08nast_tax_details.
+      ENDLOOP.
+
+*     e.g. tax treatment in Invoice Reduction: original document
+      IF sy-subrc NE 0 AND NOT p_rbkp-lieffmw IS INITIAL.
+        CALL FUNCTION 'CALCULATE_TAX_FROM_NET_AMOUNT'
+          EXPORTING
+            i_bukrs = p_rbkp-bukrs
+            i_mwskz = mwskz
+            i_txjcd = txjcd
+            i_waers = waers
+            i_wrbtr = gf_cp_total_txbas
+            i_zbd1p = p_rbkp-zbd1p
+          TABLES
+            t_mwdat = t_mwdat
+          EXCEPTIONS
+            OTHERS  = 1.
+        IF ( sy-subrc <> 0 ).
+          PERFORM protocol USING sy-msgid sy-msgty sy-msgno
+                                 sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+        ELSE.
+          LOOP AT t_mwdat INTO s_mwdat.
+            gf_cp_total_txbtr = s_mwdat-wmwst.
+            gf_cp_total_txrat = s_mwdat-msatz.
+            gf_cp_total_txbas = s_mwdat-kawrt.
+
+            MOVE:   gf_cp_total_txjcd TO gs_rm08nast_tax_details-gf_cp_total_txjcd,
+                    gf_cp_total_txrat TO gs_rm08nast_tax_details-gf_cp_total_txrat,
+                    gf_cp_total_txbas TO gs_rm08nast_tax_details-gf_cp_total_txbas,
+                    gf_cp_total_txbtr TO gs_rm08nast_tax_details-gf_cp_total_txbtr.
+
+*           Used for BAPI complain
+            MOVE:   mwskz             TO gs_rm08nast_tax_details-gf_cp_total_taxcode.
+
+            APPEND gs_rm08nast_tax_details TO gt_rm08nast_tax_details.
+            CLEAR gs_rm08nast_tax_details.
+
+
+          ENDLOOP.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+* in case of no discount OR Base amount for tax is gross
+  ELSE.
+
+    CALL FUNCTION 'CALCULATE_TAX_FROM_NET_AMOUNT'
+      EXPORTING
+        i_bukrs = p_rbkp-bukrs
+        i_mwskz = mwskz
+        i_txjcd = txjcd
+        i_waers = waers
+        i_wrbtr = gf_cp_total_txbas
+*       i_prsdt =
+      TABLES
+        t_mwdat = t_mwdat
+      EXCEPTIONS
+        OTHERS  = 1.
+    IF ( sy-subrc <> 0 ).
+      PERFORM protocol USING sy-msgid sy-msgty sy-msgno
+                             sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+* suche die EG-Kennzeichnung
+    CALL FUNCTION 'FI_TAX_INDICATOR_DATA'
+      EXPORTING
+        i_bukrs  = p_rbkp-bukrs
+        i_mwskz  = mwskz
+      IMPORTING
+        e_taxind = s_taxind
+      EXCEPTIONS
+        OTHERS   = 1.
+    IF ( sy-subrc <> 0 ).
+      PERFORM protocol USING sy-msgid sy-msgty sy-msgno
+                             sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    gf_cp_total_txbtr = 0.
+* Wenn EG-Kennzeichen auf Erwerbssteuer gesetzt, keine Steuern drucken.
+    IF s_taxind-egrkz <> 'A' AND                           "1543271
+      s_taxind-egrkz <> c_egrkz_erwerbssteuer.
+      LOOP AT t_mwdat INTO s_mwdat.
+* set global variables for printing
+        gf_cp_total_txbtr = s_mwdat-wmwst.
+        gf_cp_total_txrat = s_mwdat-msatz.
+        gf_cp_total_txbas = s_mwdat-kawrt.
+        MOVE: gf_cp_total_txjcd TO gs_rm08nast_tax_details-gf_cp_total_txjcd,
+              gf_cp_total_txrat TO gs_rm08nast_tax_details-gf_cp_total_txrat,
+              gf_cp_total_txbas TO gs_rm08nast_tax_details-gf_cp_total_txbas,
+              gf_cp_total_txbtr TO gs_rm08nast_tax_details-gf_cp_total_txbtr.
+
+*       Used for BAPI complain
+        MOVE: mwskz             TO gs_rm08nast_tax_details-gf_cp_total_taxcode.
+
+        APPEND gs_rm08nast_tax_details TO gt_rm08nast_tax_details.
+        CLEAR gs_rm08nast_tax_details.
+****************End of PDF conversion ,Date: 22/03/2006 ,C5075477
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "get_tax_amount_pdf

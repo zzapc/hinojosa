@@ -1,0 +1,785 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRSD0023
+*&
+*&---------------------------------------------------------------------*
+*& Creación Pedidos de Venta de Consigna
+*& Javier Calás. 13.09.22
+*&---------------------------------------------------------------------*
+REPORT zrsd0023.
+
+
+TABLES: sscrfields.
+
+"""""""""""""""""
+" Constantes
+"""""""""""""""""
+CONSTANTS: c_icon_inactivo TYPE icon_d VALUE icon_led_inactive,
+           c_icon_ok       TYPE icon_d VALUE icon_led_green,
+           c_icon_error    TYPE icon_d VALUE icon_led_red,
+           c_color_ok      TYPE char4  VALUE 'C500',
+           c_color_error   TYPE char4  VALUE 'C600'.
+
+
+CONSTANTS: cg_auart_positivo  TYPE auart VALUE 'ZKE',
+           cg_auart_negativo  TYPE auart VALUE 'ZG2',
+           cg_motivo_negativo TYPE bapisdhd1-ord_reason VALUE '402'.
+
+
+CONSTANTS: cg_alias_plantilla TYPE user_dir-aliass VALUE 'ZRSD0023'.
+
+
+"""""""""""""""""
+" Tipos de datos
+"""""""""""""""""
+TYPES: BEGIN OF st_lin_alv.
+         INCLUDE TYPE zrsd0023_s_alv.
+       TYPES END OF st_lin_alv.
+
+
+"""""""""""""""""
+" Includes
+"""""""""""""""""
+INCLUDE zseis_patron_alv.
+
+
+""""""""""""""""""""""
+" Pantalla de selección
+""""""""""""""""""""""
+SELECTION-SCREEN FUNCTION KEY 1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-b01.
+PARAMETERS: p_path   TYPE localfile.
+SELECTION-SCREEN END OF BLOCK b01.
+
+SELECTION-SCREEN BEGIN OF BLOCK b02 WITH FRAME TITLE text-b02.
+PARAMETERS: p_vkorg TYPE vkorg OBLIGATORY DEFAULT '2001',
+            p_vtweg TYPE vtweg OBLIGATORY DEFAULT '10',
+            p_spart TYPE spart OBLIGATORY DEFAULT '10'.
+SELECTION-SCREEN END OF BLOCK b02.
+
+""""""""""""""""""""""
+" Eventos
+""""""""""""""""""""""
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_path.
+  PERFORM f_f4_fichero USING p_path.
+
+
+AT SELECTION-SCREEN.
+  IF sy-ucomm = 'FC01'.
+    PERFORM f_descargar_plantilla.
+  ELSEIF sy-ucomm = 'ONLI' AND p_path IS INITIAL.
+    MESSAGE 'Debe indicar fichero excel' TYPE 'E'.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_F4_FICHERO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_PATH  text
+*----------------------------------------------------------------------*
+FORM f_f4_fichero  USING  p_path.
+  DATA: tl_file_table TYPE TABLE OF file_table,
+        vl_rc         TYPE i.
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      file_filter = 'Excel 2007-2021 (*.xlsx)|*.xlsx'
+    CHANGING
+      file_table  = tl_file_table
+      rc          = vl_rc.
+  READ TABLE tl_file_table ASSIGNING FIELD-SYMBOL(<fs_file_table>) INDEX 1.
+  IF sy-subrc = 0.
+    p_path = <fs_file_table>-filename.
+  ENDIF.
+ENDFORM.
+
+
+
+
+
+""""""""""""""""""""""
+"Rutinas
+""""""""""""""""""""""
+
+*&---------------------------------------------------------------------*
+*&      Form  f_initialization.
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_initialization.
+  sscrfields-functxt_01 = |{ icon_export } Descargar plantilla|.
+
+  vg_no_justif_cols = 'X'.
+  PERFORM f_config_dynpro USING '0100' 'CC_ALV' 'T0100' 'STA_0100' space space.
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_CREAR_CATALOGO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_crear_catalogo TABLES it_catalogo TYPE lvc_t_fcat USING vp_dynnr.
+
+  wa_layout-info_fname = 'COLOR'.
+  wa_layout-sel_mode = 'A'.
+
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = 'ZRSD0023_S_ALV'
+      i_bypassing_buffer     = 'X'
+    CHANGING
+      ct_fieldcat            = it_catalogo[]
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+  LOOP AT it_catalogo ASSIGNING FIELD-SYMBOL(<fs_catalogo>).
+    CASE <fs_catalogo>-fieldname.
+      WHEN 'ICON'.
+        <fs_catalogo>-icon      = 'X'.
+        <fs_catalogo>-outputlen = 6.
+      WHEN 'MSG_LOG'.
+        <fs_catalogo>-outputlen = 80.
+      WHEN 'KUNNR' OR 'WERKS' OR 'PROCESADO'.
+        DELETE it_catalogo. CONTINUE.
+    ENDCASE.
+  ENDLOOP.
+
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_START_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_llenar_datos TABLES tp_alv USING vp_dynpro.
+  DATA: tl_excel TYPE zrsd0023_t_excel.
+  DATA(tl_fieldcatalog) = zcl_excel_common=>get_fieldcatalog( tl_excel ).
+  TRY.
+      DATA(rl_excel_reader) = NEW zcl_excel_reader_2007( ).
+      DATA(rl_excel)        = rl_excel_reader->zif_excel_reader~load_file( p_path ).
+      DATA(rl_worksheet)    = rl_excel->get_active_worksheet( ).
+
+      DATA: vl_row    TYPE int4 VALUE 2,
+            vl_column TYPE int4 VALUE 1,
+            vl_value  TYPE zexcel_cell_value.
+
+
+      WHILE vl_row <= rl_worksheet->get_highest_row( ).
+        APPEND INITIAL LINE TO tl_excel ASSIGNING FIELD-SYMBOL(<fs_excel>).
+        WHILE vl_column <= rl_worksheet->get_highest_column( ).
+
+          rl_worksheet->get_cell( EXPORTING ip_column = vl_column
+                                            ip_row    = vl_row
+                                 IMPORTING ep_value = vl_value ).
+          READ TABLE tl_fieldcatalog ASSIGNING FIELD-SYMBOL(<fs_fieldcatalog>) INDEX vl_column.
+          IF sy-subrc = 0.
+            ASSIGN COMPONENT <fs_fieldcatalog>-fieldname OF STRUCTURE <fs_excel> TO FIELD-SYMBOL(<fs_campo>).
+          ENDIF.
+          IF sy-subrc = 0.
+            IF <fs_fieldcatalog>-abap_type = 'D'.
+              <fs_campo> = zcl_excel_common=>excel_string_to_date( vl_value ).
+            ELSE.
+              <fs_campo> = vl_value.
+            ENDIF.
+          ENDIF.
+
+          ADD 1 TO vl_column.
+        ENDWHILE.
+        vl_column = 1.
+        ADD 1 TO vl_row.
+      ENDWHILE.
+    CATCH zcx_excel INTO DATA(rl_zcx_excel).
+      MESSAGE rl_zcx_excel->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+  LOOP AT tl_excel ASSIGNING <fs_excel>.
+    CHECK <fs_excel>-destinatario IS NOT INITIAL.
+
+    APPEND INITIAL LINE TO it_alv ASSIGNING FIELD-SYMBOL(<fs_alv>).
+    <fs_alv>-icon         = c_icon_inactivo.
+    <fs_alv>-matnr_in     = <fs_excel>-material.
+    <fs_alv>-maktx        = <fs_excel>-material_description.
+    <fs_alv>-werks        = <fs_excel>-plant.
+    <fs_alv>-solicitante  = <fs_alv>-kunnr        = |{ <fs_excel>-vendor  ALPHA = IN }|.
+    <fs_alv>-target_qty   = <fs_excel>-quantity.
+    <fs_alv>-target_qu    = <fs_excel>-unit.
+    <fs_alv>-target_val   = <fs_excel>-amount.
+    <fs_alv>-currency     = <fs_excel>-currency.
+    <fs_alv>-charg        = <fs_excel>-batch.
+    <fs_alv>-destinatario = |{ <fs_excel>-destinatario  ALPHA = IN }|.
+    <fs_alv>-budat        = <fs_excel>-budat.
+  ENDLOOP.
+
+  IF it_alv IS NOT INITIAL.
+*    SELECT kunn2, kunnr
+*      INTO TABLE @DATA(tl_knvp)
+*      FROM knvp
+*      FOR ALL ENTRIES IN @it_alv
+*      WHERE parvw = 'WE' AND
+*            kunn2 = @it_alv-destinatario.
+*    LOOP AT it_alv ASSIGNING <fs_alv>.
+*      READ TABLE tl_knvp ASSIGNING FIELD-SYMBOL(<fs_knvp>) WITH KEY kunn2 = <fs_alv>-destinatario.
+*      IF sy-subrc = 0.
+*        <fs_alv>-solicitante = <fs_knvp>-kunnr.
+*      ENDIF.
+*    ENDLOOP.
+
+    "Buscamos material a partir del material cliente
+    SELECT vkorg, vtweg, kunnr, kdmat, matnr
+      INTO TABLE @DATA(tl_knmt)
+      FROM knmt
+      FOR ALL ENTRIES IN @it_alv
+      WHERE vkorg = @p_vkorg            AND
+            vtweg = @p_vtweg            AND
+            kunnr = @it_alv-solicitante AND
+            kdmat = @it_alv-matnr_in.
+    LOOP AT it_alv ASSIGNING <fs_alv>.
+      READ TABLE tl_knmt ASSIGNING FIELD-SYMBOL(<fs_knmt>) WITH KEY kdmat = <fs_alv>-matnr_in.
+      IF sy-subrc = 0.
+        <fs_alv>-matnr_out = <fs_knmt>-matnr.
+      ENDIF.
+    ENDLOOP.
+
+
+  ENDIF.
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  f_user_command
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_user_command USING vp_dynnr vp_okcode.
+  DATA vl_answer TYPE c.
+
+  CASE vp_dynnr.
+    WHEN '0100'.
+      CASE vp_okcode.
+        WHEN 'CREAR_PED'.
+          PERFORM f_user_command_crear_ped USING space.
+        WHEN 'TEST'.
+          PERFORM f_user_command_crear_ped USING 'X'.
+      ENDCASE.
+  ENDCASE.
+
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Module  pbo_9001  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE pbo_9001 OUTPUT.
+  SET PF-STATUS 'PBO_9001'.
+  SET TITLEBAR 'T9001'.
+ENDMODULE.
+
+
+*&---------------------------------------------------------------------*
+*&      Module  PAI_9001  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE pai_9001 INPUT.
+  PERFORM f_user_command USING '9001' okcode.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_USER_COMMAND_CREAR_PED
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_user_command_crear_ped USING vp_test TYPE xfeld.
+  r_alv->get_selected_rows( IMPORTING et_index_rows = DATA(tl_index_rows) ).
+  LOOP AT tl_index_rows ASSIGNING FIELD-SYMBOL(<fs_index_rows>).
+    READ TABLE it_alv ASSIGNING FIELD-SYMBOL(<fs_alv>) INDEX <fs_index_rows>-index.
+    IF sy-subrc <> 0 OR <fs_alv>-procesado = 'X'.
+      DELETE tl_index_rows. CONTINUE.
+    ENDIF.
+  ENDLOOP.
+
+  IF tl_index_rows IS INITIAL.
+    MESSAGE 'Debe seleccionar al menos una fila no tratada' TYPE 'I' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+  DATA vl_answer TYPE c.
+  IF vp_test = 'X'.
+    vl_answer = '1'.
+
+  ELSE.
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        text_question  = 'Se va a crear el pedido con las posiciones seleccionadas. ¿Desea continuar?'
+      IMPORTING
+        answer         = vl_answer
+      EXCEPTIONS
+        text_not_found = 1
+        OTHERS         = 2.
+  ENDIF.
+  IF vl_answer = '1'.
+    PERFORM f_crear_pedido USING  tl_index_rows vp_test.
+  ENDIF.
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_CREAR_PEDIDO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_crear_pedido USING tp_index_rows   TYPE lvc_t_row
+                          vp_test         TYPE xfeld.
+  CHECK tp_index_rows IS NOT INITIAL.
+
+  DATA: wl_order_header_in     TYPE bapisdhd1,
+        tl_order_partners      TYPE TABLE OF bapiparnr,
+        tl_order_items_in      TYPE TABLE OF bapisditm,
+        tl_order_schedules_in  TYPE TABLE OF bapischdl,
+        tl_order_conditions_in TYPE TABLE OF bapicond,
+        vl_salesdocument       TYPE bapivbeln-vbeln,
+        tl_return              TYPE TABLE OF bapiret2,
+        vl_itm_number          TYPE bapisditm-itm_number.
+
+  DATA: wl_sales_header_in     TYPE bapisdhead1,
+        tl_sales_items_in      TYPE TABLE OF bapisditem,
+        tl_sales_partners      TYPE TABLE OF bapipartnr,
+        tl_sales_schedules_in  TYPE TABLE OF bapischedule,
+        tl_sales_conditions_in TYPE TABLE OF bapicondition.
+
+
+
+  DATA vl_msg       TYPE text255 VALUE 'Proceso realizado. Revise mensajes en los registros de la tabla'.
+  DATA vl_tipo_msg  TYPE c       VALUE 'S'.
+  DATA vl_error     TYPE xfeld.
+  DATA vl_doc_type  LIKE wl_order_header_in-doc_type.
+
+  TYPES: BEGIN OF st_grupos,
+           doc_type     LIKE wl_order_header_in-doc_type,
+           destinatario TYPE zrsd0023_s_alv-destinatario,
+           solicitante  TYPE zrsd0023_s_alv-solicitante,
+           budat        TYPE zrsd0023_s_alv-budat,
+           filas_alv    LIKE it_alv,
+           indices_alv  TYPE STANDARD TABLE OF sy-tabix WITH DEFAULT KEY,
+         END OF st_grupos.
+  DATA: tl_grupos TYPE TABLE OF st_grupos.
+
+  DATA vl_tabix TYPE bapi_line.
+
+  LOOP AT it_alv ASSIGNING FIELD-SYMBOL(<fs_alv>).
+    vl_tabix = sy-tabix.
+
+    READ TABLE tp_index_rows TRANSPORTING NO FIELDS WITH KEY index = vl_tabix.
+    CHECK sy-subrc = 0.
+
+    vl_doc_type = COND #( WHEN <fs_alv>-target_val > 0 THEN cg_auart_positivo ELSE cg_auart_negativo ).
+
+
+    SELECT SINGLE vbak~vbeln
+      INTO @DATA(vl_vbeln)
+      FROM vbak INNER JOIN vbap ON vbap~vbeln = vbak~vbeln
+      WHERE vbak~auart = @vl_doc_type         AND
+            vbak~audat = @<fs_alv>-budat      AND
+            vbak~vkorg = @p_vkorg             AND
+            vbak~vtweg = @p_vtweg             AND
+            vbak~spart = @p_spart             AND
+            vbap~matnr = @<fs_alv>-matnr_out  AND
+            vbap~kdmat = @<fs_alv>-matnr_in.
+    IF sy-subrc = 0.
+      <fs_alv>-icon     = c_icon_error.
+      <fs_alv>-color    = c_color_error.
+      <fs_alv>-msg_log  = |Ya se ha creado el documento { vl_vbeln } para esta fecha y material|.
+      CONTINUE.
+    ENDIF.
+
+
+    READ TABLE tl_grupos ASSIGNING FIELD-SYMBOL(<fs_grupos>) WITH KEY doc_type      = vl_doc_type
+                                                                      destinatario  = <fs_alv>-destinatario
+                                                                      solicitante   = <fs_alv>-solicitante
+                                                                      budat         = <fs_alv>-budat.
+    IF sy-subrc <> 0 OR vp_test = 'X'.  "Para TEST no agrupamos, porque si hay error en una fila no comprueba la siguiente
+      APPEND INITIAL LINE TO tl_grupos ASSIGNING <fs_grupos>.
+      <fs_grupos>-doc_type      = vl_doc_type.
+      <fs_grupos>-destinatario  = <fs_alv>-destinatario.
+      <fs_grupos>-solicitante   = <fs_alv>-solicitante.
+      <fs_grupos>-budat         = <fs_alv>-budat.
+    ENDIF.
+    APPEND <fs_alv> TO <fs_grupos>-filas_alv.
+    APPEND vl_tabix TO <fs_grupos>-indices_alv.
+  ENDLOOP.
+
+
+
+
+  LOOP AT tl_grupos ASSIGNING <fs_grupos>.
+    CLEAR: vl_salesdocument, tl_return, vl_error.
+    CLEAR: wl_order_header_in, tl_order_items_in, tl_order_partners, tl_order_schedules_in, tl_order_conditions_in.
+    CLEAR: wl_sales_header_in, tl_sales_items_in, tl_sales_partners, tl_sales_schedules_in, tl_sales_conditions_in.
+
+    CLEAR vl_itm_number.
+
+
+    CASE <fs_grupos>-doc_type.
+      WHEN cg_auart_positivo.
+        "Cabecera.
+        wl_order_header_in-sales_org  = p_vkorg.
+        wl_order_header_in-distr_chan = p_vtweg.
+        wl_order_header_in-division   = p_spart.
+        wl_order_header_in-req_date_h = wl_order_header_in-doc_date = <fs_grupos>-budat.
+        WRITE <fs_grupos>-budat TO wl_order_header_in-purch_no_c DD/MM/YYYY.
+        wl_order_header_in-doc_type   = <fs_grupos>-doc_type.
+
+        "Interlocutores
+        tl_order_partners = VALUE #( ( partn_role = 'AG' partn_numb = <fs_grupos>-solicitante )
+                                     ( partn_role = 'WE' partn_numb = <fs_grupos>-destinatario )
+                                     ( partn_role = 'SB' partn_numb = <fs_grupos>-destinatario ) ).
+
+        LOOP AT <fs_grupos>-filas_alv ASSIGNING <fs_alv>.
+          APPEND INITIAL LINE TO tl_order_items_in ASSIGNING FIELD-SYMBOL(<fs_order_items_in>).
+          ADD 10 TO vl_itm_number.
+          <fs_order_items_in>-itm_number = vl_itm_number.
+          <fs_order_items_in>-cust_mat35 = <fs_alv>-matnr_in.
+          <fs_order_items_in>-material   = <fs_alv>-matnr_out.
+          <fs_order_items_in>-target_qty = <fs_alv>-target_qty.
+          <fs_order_items_in>-target_qu  = 'ST'.
+          <fs_order_items_in>-target_val = <fs_alv>-target_val.
+          <fs_order_items_in>-currency   = <fs_alv>-currency.
+          <fs_order_items_in>-batch      = <fs_alv>-charg.
+
+          APPEND INITIAL LINE TO tl_order_schedules_in ASSIGNING FIELD-SYMBOL(<fs_order_schedules_in>).
+          <fs_order_schedules_in>-itm_number  = <fs_order_items_in>-itm_number.
+          <fs_order_schedules_in>-sched_line  = '10'.
+          <fs_order_schedules_in>-req_qty     = <fs_alv>-target_qty.
+
+          APPEND INITIAL LINE TO tl_order_conditions_in ASSIGNING FIELD-SYMBOL(<fs_order_conditions_in>).
+          <fs_order_conditions_in>-itm_number = <fs_order_items_in>-itm_number.
+          <fs_order_conditions_in>-cond_type  = 'ZPN1'.
+          <fs_order_conditions_in>-currency   = <fs_alv>-currency.
+          <fs_order_conditions_in>-cond_value = abs( <fs_alv>-target_val ).
+          <fs_order_conditions_in>-condvalue  = abs( <fs_alv>-target_val ).
+        ENDLOOP.
+        CHECK tl_order_items_in IS NOT INITIAL.
+
+        CALL FUNCTION 'BAPI_SALESORDER_CREATEFROMDAT2'
+          EXPORTING
+            order_header_in     = wl_order_header_in
+            testrun             = vp_test
+          IMPORTING
+            salesdocument       = vl_salesdocument
+          TABLES
+            return              = tl_return
+            order_items_in      = tl_order_items_in
+            order_schedules_in  = tl_order_schedules_in
+            order_conditions_in = tl_order_conditions_in
+            order_partners      = tl_order_partners.
+
+      WHEN cg_auart_negativo.
+
+        "Cabecera.
+        CLEAR wl_sales_header_in.
+        wl_sales_header_in-sales_org  = p_vkorg.
+        wl_sales_header_in-distr_chan = p_vtweg.
+        wl_sales_header_in-division   = p_spart.
+        wl_sales_header_in-req_date_h = wl_sales_header_in-doc_date = <fs_grupos>-budat.
+        wl_sales_header_in-doc_type   = <fs_grupos>-doc_type.
+        wl_sales_header_in-ord_reason = cg_motivo_negativo.
+
+
+
+        tl_sales_partners = VALUE #( ( partn_role = 'AG' partn_numb = <fs_grupos>-solicitante )
+                                     ( partn_role = 'SP' partn_numb = <fs_grupos>-solicitante )
+                                     ( partn_role = 'WE' partn_numb = <fs_grupos>-destinatario )
+                                     ( partn_role = 'SB' partn_numb = <fs_grupos>-destinatario ) ).
+
+        LOOP AT <fs_grupos>-filas_alv ASSIGNING <fs_alv>.
+          APPEND INITIAL LINE TO tl_sales_items_in ASSIGNING FIELD-SYMBOL(<fs_sales_items_in>).
+          ADD 10 TO vl_itm_number.
+          <fs_sales_items_in>-itm_number = vl_itm_number.
+          <fs_sales_items_in>-cust_mat35 = <fs_alv>-matnr_in.
+          <fs_sales_items_in>-material   = <fs_alv>-matnr_out.
+          <fs_sales_items_in>-target_qty = <fs_alv>-target_qty.
+          <fs_sales_items_in>-target_qu  = 'ST'.
+          <fs_sales_items_in>-target_val = <fs_alv>-target_val.
+*          <fs_sales_items_in>-currency   = <fs_alv>-currency.
+          <fs_sales_items_in>-batch      = <fs_alv>-charg.
+
+          APPEND INITIAL LINE TO tl_sales_schedules_in ASSIGNING FIELD-SYMBOL(<fs_sales_schedules_in>).
+          <fs_sales_schedules_in>-itm_number  = <fs_sales_items_in>-itm_number.
+          <fs_sales_schedules_in>-sched_line  = '10'.
+          <fs_sales_schedules_in>-req_qty     = <fs_alv>-target_qty.
+
+          APPEND INITIAL LINE TO tl_sales_conditions_in ASSIGNING FIELD-SYMBOL(<fs_sales_conditions_in>).
+          <fs_sales_conditions_in>-itm_number = <fs_sales_items_in>-itm_number.
+          <fs_sales_conditions_in>-cond_type  = 'ZPN1'.
+          <fs_sales_conditions_in>-currency   = <fs_alv>-currency.
+          <fs_sales_conditions_in>-cond_value = abs( <fs_alv>-target_val ).
+          <fs_sales_conditions_in>-condvalue  = abs( <fs_alv>-target_val ).
+        ENDLOOP.
+        CHECK tl_sales_items_in IS NOT INITIAL.
+
+        CALL FUNCTION 'BAPI_SALESDOCU_CREATEFROMDATA1'
+          EXPORTING
+            sales_header_in     = wl_sales_header_in
+          IMPORTING
+            salesdocument_ex    = vl_salesdocument
+          TABLES
+            return              = tl_return
+            sales_items_in      = tl_sales_items_in
+            sales_partners      = tl_sales_partners
+            sales_schedules_in  = tl_sales_schedules_in
+            sales_conditions_in = tl_sales_conditions_in.
+    ENDCASE.
+
+    IF vp_test = 'X'.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    ENDIF.
+
+
+    DELETE tl_return WHERE type NA 'EA'.
+    IF tl_return IS NOT INITIAL. vl_error = 'X'. ENDIF.
+
+    LOOP AT <fs_grupos>-indices_alv ASSIGNING FIELD-SYMBOL(<fs_indice_alv>).
+      vl_tabix = sy-tabix.
+
+      IF <fs_grupos>-doc_type = cg_auart_positivo.
+        READ TABLE tl_order_items_in ASSIGNING <fs_order_items_in> INDEX vl_tabix.
+        CHECK sy-subrc = 0.
+        DATA(vl_posnr) = <fs_order_items_in>-itm_number.
+      ELSE.
+        READ TABLE tl_sales_items_in ASSIGNING <fs_sales_items_in> INDEX vl_tabix.
+        CHECK sy-subrc = 0.
+        vl_posnr = <fs_sales_items_in>-itm_number.
+      ENDIF.
+
+      READ TABLE it_alv ASSIGNING <fs_alv> INDEX <fs_indice_alv>.
+      CHECK sy-subrc = 0.
+
+      IF vl_error = 'X'.
+        <fs_alv>-icon     = c_icon_error.
+        <fs_alv>-color    = c_color_error.
+
+        READ TABLE tl_return ASSIGNING FIELD-SYMBOL(<fs_return>) WITH KEY parameter = 'SALES_ITEM_IN'
+                                                                          row   = vl_tabix.
+        IF sy-subrc <> 0 AND vp_test = space.
+          READ TABLE tl_return ASSIGNING <fs_return> WITH KEY row = 0.
+        ENDIF.
+        IF sy-subrc = 0.
+          <fs_alv>-msg_log  = <fs_return>-message.
+        ENDIF.
+
+      ELSE.
+        <fs_alv>-icon     = c_icon_ok.
+        IF vp_test = space.
+          <fs_alv>-procesado  = 'X'.
+          <fs_alv>-color      = c_color_ok.
+          <fs_alv>-vbeln      = vl_salesdocument.
+          <fs_alv>-posnr      = vl_posnr.
+          <fs_alv>-msg_log    = |Pedido { vl_salesdocument } creado|.
+        ELSE.
+          <fs_alv>-msg_log  = |No se han encontrado errores|.
+        ENDIF.
+
+      ENDIF.
+    ENDLOOP.  "Indices ALV
+
+    IF vp_test = 'X'.
+      "Desde la tabla VBEP, si el campo cantidad confirmada de esa posición (VBEP – BMENG) está confirmada, entonces la entrega se va a crear
+      "Habría que tener en cuenta que para un mismo pedido/posición puede haber más de un reparto (VBEP-ETENR) con que la cantidad pedido (VBEP – WMENG)
+      "sea igual que cantidad confirmada (VBEP – BMENG) la entrega se creará.
+
+      LOOP AT <fs_grupos>-indices_alv ASSIGNING <fs_indice_alv>.
+        READ TABLE it_alv ASSIGNING <fs_alv> INDEX <fs_indice_alv>.
+        CHECK sy-subrc = 0.
+
+        IF <fs_alv>-icon <> c_icon_error.
+          SELECT SUM( wmeng ) AS wmeng, SUM( bmeng ) AS bmeng
+            FROM vbep
+            WHERE vbeln = @<fs_alv>-vbeln AND
+                  posnr = @<fs_alv>-posnr
+            INTO (@DATA(vl_wmeng), @DATA(vl_bmeng)).
+          IF vl_wmeng > vl_bmeng.
+            <fs_alv>-icon     = c_icon_error.
+            <fs_alv>-color    = c_color_error.
+
+            <fs_alv>-msg_log  = |Cantidad pedida no confirmada completamente. No se va a crear la entrega|.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+    IF vl_error = space.
+      IF vp_test = space.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+        WAIT UP TO 1 SECONDS.
+
+        LOOP AT <fs_grupos>-indices_alv ASSIGNING <fs_indice_alv>.
+          READ TABLE it_alv ASSIGNING <fs_alv> INDEX <fs_indice_alv>.
+          CHECK sy-subrc = 0.
+
+          SELECT SINGLE vbeln , posnn
+            INTO (@<fs_alv>-vbeln_entrega, @<fs_alv>-posnr_entrega)
+            FROM vbfa
+            WHERE vbelv   = @<fs_alv>-vbeln AND
+                  posnv   = @<fs_alv>-posnr AND
+                  vbtyp_n = 'J'.
+        ENDLOOP.
+      ENDIF.
+
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      vl_msg      = 'Se han producido errores en el proceso. Revise mensajes'.
+      vl_tipo_msg = 'W'.
+    ENDIF.
+
+  ENDLOOP. "Grupos
+
+
+  r_alv->refresh_table_display( ).
+  MESSAGE vl_msg TYPE vl_tipo_msg.
+
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_DESCARGAR_PLANTILLA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_descargar_plantilla.
+
+  DATA: vl_filename	TYPE string,
+        vl_path	    TYPE string,
+        vl_fullpath	TYPE string.
+
+
+  cl_gui_frontend_services=>file_save_dialog(
+    EXPORTING
+      default_extension         = 'xlsx'
+      default_file_name         = 'Plantilla_pv_consigna'
+      file_filter               = 'Excel 2007-2021 (*.xlsx)|*.xlsx'
+    CHANGING
+      filename                  = vl_filename
+      path                      = vl_path
+      fullpath                  = vl_fullpath
+    EXCEPTIONS
+      cntl_error                = 1
+      error_no_gui              = 2
+      not_supported_by_gui      = 3
+      invalid_default_file_name = 4
+      OTHERS                    = 5 ).
+  CHECK sy-subrc = 0.
+
+
+  TYPES: t_line(1) TYPE x.
+  DATA: i_tab   TYPE STANDARD TABLE OF t_line,
+        i_wa(1) TYPE x.
+  DATA vl_path_backend TYPE string.
+
+
+
+  SELECT SINGLE dirname, aliass
+     INTO @DATA(wl_user_dir)
+     FROM user_dir
+     WHERE aliass = @cg_alias_plantilla.
+  IF sy-subrc <> 0.
+    MESSAGE 'No se ha parametrizado el directorio' TYPE 'E'.
+  ENDIF.
+
+  DATA tl_ficheros TYPE TABLE OF salfldir.
+  CALL FUNCTION 'RZL_READ_DIR_LOCAL'
+    EXPORTING
+      name               = CONV salfile-longname( wl_user_dir-dirname )
+    TABLES
+      file_tbl           = tl_ficheros
+    EXCEPTIONS
+      argument_error     = 1
+      not_found          = 2
+      no_admin_authority = 3
+      OTHERS             = 4.
+  IF sy-subrc <> 0.
+    MESSAGE |Error al acceder al directorio { wl_user_dir-dirname }| TYPE 'E'.
+  ENDIF.
+
+  LOOP AT tl_ficheros ASSIGNING FIELD-SYMBOL(<fs_ficheros>).
+    DATA(vl_fichero) = <fs_ficheros>-name.
+    TRANSLATE vl_fichero TO LOWER CASE.
+    IF vl_fichero CP '*.xlsx'.
+      vl_path_backend = wl_user_dir-dirname && '/' && vl_fichero.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+  IF vl_path_backend IS INITIAL.
+    MESSAGE 'No se ha encontrado la plantilla' TYPE 'E'.
+  ENDIF.
+
+  OPEN DATASET vl_path_backend FOR INPUT IN BINARY MODE.
+  IF sy-subrc <> 0.
+    MESSAGE 'Error al abrir el fichero' TYPE 'E'.
+  ENDIF.
+
+
+  DO.
+    CLEAR i_wa.
+    READ DATASET vl_path_backend INTO i_wa.
+    IF sy-subrc <> 0.
+      EXIT.
+    ELSE.
+      APPEND i_wa TO i_tab.
+    ENDIF.
+  ENDDO.
+  CLOSE DATASET vl_path_backend.
+  DATA: lv_fn TYPE string.
+
+  CALL METHOD cl_gui_frontend_services=>gui_download
+    EXPORTING
+      filename = vl_fullpath
+      filetype = 'BIN'
+      append   = ' '
+    CHANGING
+      data_tab = i_tab
+    EXCEPTIONS
+      OTHERS   = 24.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+      WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.

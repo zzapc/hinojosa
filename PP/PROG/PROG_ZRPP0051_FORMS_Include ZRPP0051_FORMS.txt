@@ -1,0 +1,1067 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0051_FORMS
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_CENTRO_USUARIO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM obtener_centro_usuario CHANGING p_centro.
+
+
+  DATA: l_parva TYPE xuvalue.
+
+  SELECT SINGLE parva INTO l_parva
+  FROM usr05
+  WHERE bname = sy-uname AND
+        parid = 'WRK'.
+
+  IF sy-subrc = 0.
+    p_centro = l_parva.
+  ELSE.
+    CLEAR p_centro.
+  ENDIF.
+
+  DATA ls_variant TYPE disvariant.
+
+  ls_variant = 'ZRPP0051'.
+  CALL FUNCTION 'REUSE_ALV_VARIANT_DEFAULT_GET'
+    EXPORTING
+      i_save     = 'A'
+    CHANGING
+      cs_variant = ls_variant
+    EXCEPTIONS
+      not_found  = 2.
+
+  IF sy-subrc EQ 0.
+    p_vari = ls_variant-variant.
+  ENDIF.
+
+ENDFORM.
+
+
+FORM obtener_datos.  "TABLES p_matkl
+*                    USING p_werks TYPE werks_b
+*                          p_lgort TYPE lgort_r
+*                          p_deci  TYPE char13.
+
+  PERFORM obtener_datos_stock_cabos TABLES gr_matkl "p_matkl
+                                    USING g_werks g_lgort g_deci.
+  IF it_stock_cabos IS INITIAL.
+    MESSAGE 'Sin datos para mostrar' TYPE 'S' DISPLAY LIKE 'E'.
+
+    LEAVE TO SCREEN 0.
+
+    RETURN.
+  ENDIF.
+
+  PERFORM obtener_datos_pedido_compra USING g_werks.
+  PERFORM obtener_datos_pedido_venta   USING g_werks.
+  PERFORM stock_assignment.
+
+ENDFORM.
+
+FORM obtener_datos_stock_cabos TABLES p_matkl
+                                USING p_werks TYPE werks_d
+                                      p_lgort TYPE lgort_d
+                                      p_deci  TYPE char13.
+
+  DATA: l_kunnr        TYPE kunnr,
+        where_cliente  TYPE STANDARD TABLE OF edpline,
+        ls_stock_cabos TYPE t_stock_cabos,
+        l_obj_key      TYPE ausp-objek.
+  DATA: lt_valuesnum  TYPE TABLE OF bapi1003_alloc_values_num,
+        lt_valueschar TYPE TABLE OF bapi1003_alloc_values_char,
+        lt_valuescurr TYPE TABLE OF bapi1003_alloc_values_curr,
+        lt_return     TYPE bapiret2_t.
+
+  FIELD-SYMBOLS: <stock_cabos> TYPE t_stock_cabos.
+
+  CLEAR l_kunnr.
+  CASE p_werks.
+    WHEN '3000'. l_kunnr = 'C3000'.
+    WHEN '3020'. l_kunnr = 'C3020'.
+    WHEN OTHERS.
+  ENDCASE.
+
+* Si nos informan el centro 3000 o 3020, filtraremos por su correspondiente lifnr,
+* en caso de que el centro sea otro, no se aplicará filtro por lifnr.
+*  CLEAR: "where_cliente[],
+*        it_matnr[].
+*  IF l_kunnr IS NOT INITIAL.
+*    APPEND ' xx~KUNNR = @L_KUNNR'       TO where_cliente.
+*  ENDIF.
+
+
+* Selección de los stocks de cabos que cumplen las siguientes propiedades:
+*   - Stocks de materiales del centro y almacén especificados en la pantallas de selección.
+*   - Stocks de materiales cuyo tipo de material es bobina (ZPAP).
+*   - Stocks de materiales cuyo grupo de artículos se encuentra dentro del rango especificado
+*     en la pantalla de selección.
+*   - Stocks de materiales cuyo ancho está comprendido entre 10 mm y 1340 mm.
+*   -
+  SELECT mc~matnr , mc~charg , mt~maktx ,mc~werks , mc~lgort , mc~clabs , ma~meins , ma~matkl , ma~zzancho
+    FROM mara AS ma
+    INNER JOIN makt AS mt ON ma~matnr = mt~matnr
+    INNER JOIN mchb AS mc ON ma~matnr = mc~matnr
+      INTO CORRESPONDING FIELDS OF TABLE @it_stock_cabos
+
+    WHERE ma~matkl IN @p_matkl AND
+          mc~werks = @p_werks  AND
+          mc~lgort = @p_lgort  AND
+          ma~mtart = 'ZPAP'    AND
+          ma~zzancho BETWEEN @c_ancho_min AND @c_ancho_max AND
+          mc~clabs > 0 " AND  " que tenga stock restante
+          ORDER BY mc~matnr , mc~charg
+    .
+
+
+  IF sy-subrc = 0.
+    LOOP AT it_stock_cabos ASSIGNING <stock_cabos>. " INTO ls_stock_cabos.
+
+      l_obj_key = |{ <stock_cabos>-matnr }{ <stock_cabos>-charg }|.
+
+      CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+        EXPORTING
+          objectkey       = l_obj_key
+          objecttable     = 'MCH1'
+          classnum        = 'Z_BOBINA'
+          classtype       = '023'
+        TABLES
+          allocvaluesnum  = lt_valuesnum
+          allocvalueschar = lt_valueschar
+          allocvaluescurr = lt_valuescurr
+          return          = lt_return.
+
+
+      IF line_exists( lt_return[ type = 'E' ] ).
+        CONTINUE.
+      ELSE.
+        TRY.
+            <stock_cabos>-dec_emp = lt_valueschar[ charact = 'LOBM_UDCODE' ]-value_char.
+          CATCH cx_sy_itab_line_not_found.
+        ENDTRY.
+
+        TRY.
+            <stock_cabos>-kunnr  = lt_valueschar[ charact = 'Z_CLIENTE' ]-value_char.
+          CATCH cx_sy_itab_line_not_found.
+        ENDTRY.
+
+* Si se ha informado decis.empleo como parametro de entrada, aplicaremos el filtro.
+        IF p_deci IS NOT INITIAL AND p_deci NE <stock_cabos>-dec_emp.
+          CLEAR <stock_cabos>-matnr.
+        ENDIF.
+
+
+        IF ( p_werks = '3000' AND <stock_cabos>-kunnr <> 'C3000' ) OR
+           ( p_werks = '3020' AND <stock_cabos>-kunnr <> 'C3020' ) .
+          CLEAR <stock_cabos>-matnr.
+        ENDIF.
+      ENDIF.
+
+
+
+    ENDLOOP.
+
+* Borramos registros con MATNR = blancos, registros que no cumplen las condiciones de entrada.
+    DELETE it_stock_cabos WHERE matnr IS INITIAL.
+
+  ENDIF.
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_DATOS_PEDIDO_COMPRA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM obtener_datos_pedido_compra USING p_werks TYPE werks_d.
+
+  FIELD-SYMBOLS : <fs_stocks> LIKE LINE OF it_stock_cabos.
+  DATA l_lifnr TYPE lifnr.
+  DATA: where_proveedor TYPE STANDARD TABLE OF edpline.
+
+  CLEAR l_lifnr.
+  CASE p_werks.
+    WHEN '3000'. l_lifnr = 'P3000'.
+    WHEN '3020'. l_lifnr = 'P3020'.
+    WHEN OTHERS.
+  ENDCASE.
+
+* Si nos informan el centro 3000 o 3020, filtraremos por su correspondiente lifnr,
+* en caso de que el centro sea otro, no se aplicará filtro por lifnr.
+  CLEAR where_proveedor[].
+  IF l_lifnr IS NOT INITIAL.
+    APPEND ' k~lifnr = @l_lifnr '       TO where_proveedor.
+  ENDIF.
+
+
+  SELECT p~ebeln , p~ebelp , p~matnr ,  p~matkl , p~menge , p~meins , k~zzsegcal
+    FROM ekko AS k
+    INNER JOIN ekpo AS p ON k~ebeln = p~ebeln
+    INTO CORRESPONDING FIELDS OF TABLE @it_pedcompra
+    FOR ALL ENTRIES IN @it_stock_cabos
+    WHERE (where_proveedor)  AND
+          k~bsart = 'ZINT' AND
+          k~zzsegcal IN ( '1' , '3' ) AND
+          p~loekz = ' '   AND
+          p~matnr = @it_stock_cabos-matnr AND
+          p~elikz = ' ' .
+
+* Asignamos a cada registro de stock, la calidad encontrada en el pedido de compra.
+  LOOP AT it_stock_cabos ASSIGNING <fs_stocks>.
+    READ TABLE it_pedcompra INTO DATA(ls_pedcompra)
+                            WITH KEY matnr = <fs_stocks>-matnr.
+    IF sy-subrc = 0.
+      <fs_stocks>-zzsegcal = ls_pedcompra-zzsegcal.
+    ENDIF.
+  ENDLOOP.
+
+  DATA lt_lips TYPE TABLE OF lips.
+
+  SELECT * FROM lips INTO TABLE lt_lips FOR ALL ENTRIES IN it_pedcompra
+                            WHERE pstyv NE 'ZLOT' AND
+                                  vgbel = it_pedcompra-ebeln AND
+                                  vgpos = it_pedcompra-ebelp .
+
+  FIELD-SYMBOLS: <ped_compra> LIKE LINE OF it_pedcompra.
+
+  LOOP AT it_pedcompra ASSIGNING <ped_compra>.
+
+    READ TABLE lt_lips INTO DATA(ls_lips) WITH KEY vgbel = <ped_compra>-ebeln
+                                                   vgpos = <ped_compra>-ebelp.
+    IF sy-subrc = 0.
+      <ped_compra>-lfimg  = ls_lips-lfimg.
+      <ped_compra>-menge  = ls_lips-kcmeng.
+      <ped_compra>-lfdat  = ls_lips-vfdat. " Fecha de entrega
+    ENDIF.
+
+
+  ENDLOOP.
+
+ENDFORM.
+
+
+
+FORM obtener_datos_pedido_venta USING p_werks TYPE werks_d.
+
+  FIELD-SYMBOLS: <fs_pedven> TYPE t_pedventa.
+
+  DATA l_vkorg TYPE vkorg.
+  DATA: where_orgven TYPE STANDARD TABLE OF edpline.
+
+  CLEAR l_vkorg.
+
+  CASE p_werks.
+    WHEN '3000' OR '3020'. l_vkorg = p_werks.
+    WHEN OTHERS.
+  ENDCASE.
+
+* Si nos informan el centro 3000 o 3020, filtraremos por su correspondiente org.ventas,
+* en caso de que el centro sea otro, no se aplicará filtro por org.ventas.
+  CLEAR where_orgven[].
+  IF l_vkorg IS NOT INITIAL.
+    APPEND ' k~vkorg = @l_vkorg '       TO where_orgven.
+  ENDIF.
+
+
+  SELECT p~vbeln , p~posnr , p~matnr , p~matkl , p~kwmeng ,
+         k~zzsegcal, k~kunnr , kna1~name1 ,k~vdatu
+    FROM vbak AS k
+    INNER JOIN vbap AS p ON k~vbeln = p~vbeln
+    INNER JOIN kna1      ON k~kunnr = kna1~kunnr
+    INTO CORRESPONDING FIELDS OF TABLE @it_pedventa
+    FOR ALL ENTRIES IN @it_stock_cabos
+    WHERE (where_orgven)
+      AND k~zzsegcal IN ( '1' , '3' )
+      AND p~abgru EQ ''
+      AND p~matnr = @it_stock_cabos-matnr
+    .
+
+  SELECT vbeln, posnr, lfsta INTO TABLE @DATA(lt_vbup) FROM vbup FOR ALL ENTRIES IN @it_pedventa
+                                                                      WHERE vbeln = @it_pedventa-vbeln.
+
+
+  SELECT vbeln, bstkd INTO TABLE @DATA(lt_vbkd) FROM vbkd FOR ALL ENTRIES IN @it_pedventa
+                                                                      WHERE vbeln = @it_pedventa-vbeln.
+
+  LOOP AT it_pedventa INTO DATA(ls_pedventa).
+    DATA(l_tabix) = sy-tabix.
+
+    READ TABLE lt_vbup INTO DATA(ls_vbup) WITH KEY vbeln = ls_pedventa-vbeln posnr = ls_pedventa-posnr.
+    IF sy-subrc EQ 0.
+      DATA(l_tabix_2) = sy-tabix.
+      IF ls_vbup-lfsta EQ 'C'."completada por entrega
+        DELETE: it_pedventa INDEX l_tabix,
+                lt_vbup     INDEX l_tabix_2.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+
+* Obtenemos los kilos pendientes de entregar.
+
+  DATA: lt_lips TYPE TABLE OF lips,ls_lips  TYPE lips.
+
+  DATA:BEGIN OF ls_likp,
+         vbeln TYPE  vbeln,
+         lfdat TYPE lfdat,
+       END OF ls_likp,
+       lt_likp LIKE STANDARD TABLE OF ls_likp.
+
+
+
+  SELECT * FROM lips INTO TABLE lt_lips FOR ALL ENTRIES IN it_pedventa
+                            WHERE pstyv NE 'ZLOT' AND
+                                  vgbel = it_pedventa-vbeln AND
+                                  vgpos = it_pedventa-posnr.
+  FIELD-SYMBOLS: <ped_venta> LIKE LINE OF it_pedventa.
+
+  SELECT * FROM likp INTO CORRESPONDING FIELDS OF TABLE lt_likp
+                     FOR ALL ENTRIES IN lt_lips
+                     WHERE vbeln = lt_lips-vbeln.
+
+  LOOP AT it_pedventa ASSIGNING <ped_venta>.
+
+    LOOP AT lt_lips INTO ls_lips WHERE vgbel = <ped_venta>-vbeln AND
+                                       vgpos = <ped_venta>-posnr.
+
+      ADD ls_lips-kcmeng TO <ped_venta>-kcmeng .
+
+    ENDLOOP.
+
+    READ TABLE lt_likp INTO ls_likp WITH KEY vbeln = <ped_venta>-vbeln.
+    IF sy-subrc EQ 0.
+      <ped_venta>-lfdat = ls_likp-lfdat.
+
+    ENDIF.
+
+    IF <ped_venta>-lfdat IS INITIAL.
+      <ped_venta>-lfdat = <ped_venta>-vdatu.
+    ENDIF.
+
+
+    READ TABLE lt_vbup INTO ls_vbup WITH KEY vbeln =  <ped_venta>-vbeln
+                                             posnr =  <ped_venta>-posnr.
+    IF sy-subrc EQ 0.
+      <ped_venta>-lfsta = ls_vbup-lfsta.
+    ENDIF.
+
+    READ TABLE lt_vbkd INTO DATA(ls_vbkd) WITH KEY vbeln = <ped_venta>-vbeln." posnr = ls_pedventa-posnr.
+    IF sy-subrc EQ 0.
+      <ped_venta>-bstkd = ls_vbkd-bstkd.
+    ENDIF.
+
+  ENDLOOP.
+
+
+ENDFORM.
+
+FORM stock_assignment.
+
+  DATA: gs_assignation LIKE LINE OF it_alv.
+
+  SORT: it_stock_cabos BY matnr charg zzsegcal ASCENDING,
+        it_pedventa    BY matnr lfdat ASCENDING,
+        it_pedcompra   BY matnr ASCENDING.
+
+  DATA l_acum LIKE mchb-clabs.
+*
+* La forma de calcular la disponibilidad de stocks de cabos será asignando a cada cabo un pedido/posición
+*abierta acorde con su calidad. Los cabos disponibles serán aquellos que queden sin asignar.
+
+* Para ello, para cada cabo le asignamos un pedido/posición acorde a su calidad, siempre y cuando los kg
+* pendientes de servir del pedido/posición menos los kg de cabos ya asignados previamente en esta operación
+* de asignación sean mayores que 0. Es decir, mientras quede un resto del pedido/posición seguimos asignando
+* un registro de stock de cabo; la última asignación se hace por exceso.
+
+* Para la asignación de cabos, ordenar los registros de stocks de cabos por material, lote y calidad
+* y los registros de pedido/posición por material y fecha de entrega.
+
+* Para cada lote de cabo con decisión de empleo A le asignamos un pedido/posición del mismo material
+* con calidad 1 o 3, siempre que los kg pendientes de servir del pedido/posición menos los kg de cabos
+* ya asignados previamente sean mayores que 0.
+
+* Para cada lote de cabo con decisión de empleo R le asignamos un pedido/posición del mismo material
+* con calidad 3, siempre que los kg pendientes de servir del pedido/posición menos los kg de cabos
+* ya asignados previamente sean mayores que 0.
+
+*En caso contrario, el cabo se considera disponible, es decir queda sin asignar contra un pedido/posición.
+
+
+  DATA:BEGIN OF ls_pedidos,
+         n_pedido         TYPE char10,
+         posnr            TYPE posnr,
+         zzsegcal         TYPE zcod_sc,
+         matnr            TYPE matnr,
+         cantidad_pedida  TYPE lfimg,
+         cantidad_servida TYPE lfimg,
+         lfsta            TYPE lfsta,
+         lfdat            TYPE lfdat,
+         bstkd            TYPE bstkd,
+       END OF ls_pedidos,
+       lt_pedidos LIKE STANDARD TABLE OF ls_pedidos.
+
+
+  LOOP AT it_pedcompra INTO DATA(ls_compras).
+    CLEAR ls_pedidos.
+
+    ls_pedidos-n_pedido         = ls_compras-ebeln.
+    ls_pedidos-posnr            = ls_compras-ebelp.
+    ls_pedidos-zzsegcal         = ls_compras-zzsegcal.
+    ls_pedidos-matnr            = ls_compras-matnr.
+    ls_pedidos-cantidad_pedida  = ls_compras-menge.
+    ls_pedidos-cantidad_servida = ls_compras-lfimg.
+    ls_pedidos-lfdat            = ls_compras-lfdat.
+    APPEND ls_pedidos TO lt_pedidos.
+  ENDLOOP.
+
+  LOOP AT it_pedventa INTO DATA(ls_ventas).
+    CLEAR ls_pedidos.
+
+    ls_pedidos-n_pedido = ls_ventas-vbeln.
+    ls_pedidos-posnr    = ls_ventas-posnr.
+    ls_pedidos-zzsegcal = ls_ventas-zzsegcal.
+    ls_pedidos-matnr    = ls_ventas-matnr.
+    ls_pedidos-cantidad_pedida = ls_ventas-kwmeng.
+    ls_pedidos-cantidad_servida = ls_ventas-kcmeng.
+    ls_pedidos-lfsta    = ls_ventas-lfsta.
+    ls_pedidos-lfdat    = ls_ventas-lfdat.
+    ls_pedidos-bstkd    = ls_ventas-bstkd.
+    APPEND ls_pedidos TO lt_pedidos.
+
+  ENDLOOP.
+
+
+  DATA l_add TYPE abap_bool.
+
+  LOOP AT lt_pedidos ASSIGNING FIELD-SYMBOL(<fs>).
+
+    CLEAR l_acum.
+    gv_remaining_stock = <fs>-cantidad_pedida - <fs>-cantidad_servida.
+
+    LOOP AT it_stock_cabos ASSIGNING <fs_stocks> WHERE matnr = <fs>-matnr  AND assigned = ' '.
+
+      IF ( <fs_stocks>-dec_emp  = 'DE       R' AND <fs>-zzsegcal = 3 ) OR
+         ( <fs_stocks>-dec_emp  = 'DE       A' AND <fs>-zzsegcal = 1   ).
+
+        CLEAR gs_assignation.
+        gs_assignation-meins  = 'KG'.
+
+
+
+        MOVE-CORRESPONDING <fs_stocks> TO gs_assignation.
+        MOVE-CORRESPONDING <fs> TO gs_assignation.
+
+        IF gs_assignation-kunnr IS NOT INITIAL.
+          SELECT SINGLE name1 FROM kna1 INTO gs_assignation-name1 WHERE kunnr = gs_assignation-kunnr.
+        ENDIF.
+
+        gs_assignation-vbeln = <fs>-n_pedido.
+        gs_assignation-posnr = <fs>-posnr.
+        gs_assignation-lfsta = <fs>-lfsta.
+        gs_assignation-lfdat = <fs>-lfdat.
+
+        ADD <fs_stocks>-clabs TO l_acum .
+
+        <fs_stocks>-assigned = 'X'.
+
+        gv_remaining_stock              = gv_remaining_stock - <fs_stocks>-clabs.
+*        gs_assignation-cantidad_servida = gs_assignation-cantidad_pedida - gv_remaining_stock  .
+        gs_assignation-cantidad_servida = <fs>-cantidad_servida.
+        gs_assignation-cantidad_pdte    = gv_remaining_stock.
+        gs_assignation-cantidad_acum    = l_acum.
+        gs_assignation-ind_cabo_disp    = 1.
+        gs_assignation-bstkd            = <fs>-bstkd.
+        APPEND gs_assignation TO it_alv.
+
+*        l_add = abap_true.
+
+        IF gv_remaining_stock <= '0'.
+*          CLEAR <fs_stocks>-assigned.
+          gs_assignation-cantidad_servida = <fs_stocks>-clabs + gv_remaining_stock.
+          <fs_stocks>-clabs = abs( gv_remaining_stock ).
+          EXIT.
+        ENDIF.
+
+      ENDIF.
+
+    ENDLOOP.
+*    IF l_add EQ abap_true.
+*      CLEAR gs_assignation.
+*
+*      APPEND gs_assignation TO it_alv.
+*      CLEAR l_add.
+*    ENDIF.
+
+  ENDLOOP.
+
+  LOOP AT it_stock_cabos ASSIGNING <fs_stocks> WHERE assigned = ' '.
+
+    CLEAR gs_assignation.
+
+    MOVE-CORRESPONDING <fs_stocks> TO gs_assignation.
+    IF gs_assignation-kunnr IS NOT INITIAL.
+      SELECT SINGLE name1 FROM kna1 INTO gs_assignation-name1 WHERE kunnr = gs_assignation-kunnr.
+    ENDIF.
+    gs_assignation-texto         = 'Cabo disponible'.
+    gs_assignation-ind_cabo_disp = 0.
+    APPEND gs_assignation TO it_alv. " gt_assignation.
+
+  ENDLOOP.
+
+ENDFORM.
+
+
+FORM obtener_decision_empleo_f4 CHANGING p_decis TYPE char13.
+
+  DATA ls_de TYPE qpk1cd.
+
+
+  CALL FUNCTION 'QPK1_GP_CODE_PICKUP'
+    EXPORTING
+      i_katalogart           = '3'
+      i_codegruppe           = 'DE'
+      i_code                 = '*'
+      i_sprache              = sy-langu
+    IMPORTING
+      e_qpk1cd               = ls_de
+    EXCEPTIONS
+      no_match_in_range      = 1
+      no_user_selection      = 2
+      no_authorization       = 3
+      no_selection_specified = 4
+      object_locked          = 5
+      lock_error             = 6
+      object_missing         = 7
+      code_deactivated       = 8
+      OTHERS                 = 9.
+  IF sy-subrc <> 0.
+    RETURN.
+  ENDIF.
+
+  CONCATENATE ls_de-codegruppe space ls_de-code INTO p_decis RESPECTING BLANKS.
+
+
+ENDFORM.
+
+FORM dar_formato_alv.
+
+  FIELD-SYMBOLS: <fs_assignation> LIKE LINE OF it_alv.
+*LOOP AT gt_assignation ASSIGNING <fs_assignation>.
+  LOOP AT it_alv ASSIGNING <fs_assignation>.
+
+    CLEAR:  gs_color,
+            gt_color.
+
+*    IF <fs_assignation>-vbeln IS NOT INITIAL AND <fs_assignation>-cantidad_pdte > 0.
+*      gs_color-color-col = '5'.
+*      gs_color-color-int = '1'.
+*      gs_color-color-inv = '1'.
+*      gs_color-fname = 'VBELN'.
+*      APPEND gs_color TO gt_color.
+*      gs_color-fname = 'POSNR'.
+*      APPEND gs_color TO gt_color.
+*    ENDIF.
+
+*    IF <fs_assignation>-cantidad_pdte CP '*.*-'.
+*
+*      gs_color-color-col = '3'.
+*      gs_color-color-int = '1'.
+*      gs_color-color-inv = '1'.
+*      gs_color-fname = 'LFIMG'.
+*      APPEND gs_color TO gt_color.
+*
+*    ENDIF.
+
+    IF <fs_assignation>-cantidad_pdte < 0 OR ( <fs_assignation>-cantidad_pdte = 0 AND <fs_assignation>-cantidad_servida > 0 ).
+
+      gs_color-color-col = '3'.
+      gs_color-color-int = '1'.
+      gs_color-color-inv = '1'.
+      gs_color-fname = 'CANTIDAD_PDTE'.
+      APPEND gs_color TO gt_color.
+
+    ENDIF.
+
+    IF <fs_assignation>-texto CS 'disponible'.
+
+      gs_color-color-col = '5'.
+      gs_color-color-int = '1'.
+      gs_color-color-inv = '1'.
+*      gs_color-fname = 'KWMENG'.
+      gs_color-fname = 'TEXTO'.
+      APPEND gs_color TO gt_color.
+    ELSEIF <fs_assignation>-texto CS 'pedido'.
+      gs_color-color-col = '3'.
+      gs_color-color-int = '1'.
+      gs_color-color-inv = '1'.
+*      gs_color-fname = 'KWMENG'.
+      gs_color-fname = 'TEXTO'.
+      APPEND gs_color TO gt_color.
+    ENDIF.
+
+    INSERT LINES OF gt_color INTO TABLE <fs_assignation>-colortab.
+  ENDLOOP.
+
+  gs_layout-ctab_fname = 'COLORTAB'.
+  TRY.
+      CALL METHOD cl_salv_table=>factory
+        EXPORTING
+          r_container  = gr_cont2
+        IMPORTING
+          r_salv_table = go_salv
+        CHANGING
+          t_table      = it_alv.
+    CATCH cx_salv_msg .
+  ENDTRY.
+
+
+  DATA(lo_layout) = go_salv->get_layout( ).
+  DATA    ls_key    TYPE salv_s_layout_key.
+  lo_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  ls_key-report = sy-repid.
+  lo_layout->set_key( ls_key ).
+  lo_layout->set_default( abap_true ).
+
+  IF go_salv IS BOUND.
+    go_salv->get_columns( )->get_column( 'CLABS' )->set_quantity_column( 'MEINS' ).
+
+    go_salv->get_columns( )->get_column( 'CANTIDAD_SERVIDA' )->set_quantity_column( 'MEINS' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_SERVIDA' )->set_long_text( 'Cant. Servida' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_SERVIDA' )->set_medium_text( 'Cant. Servida' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_SERVIDA' )->set_short_text( 'Cant. Serv' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_SERVIDA' )->set_zero( abap_true ).
+
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PEDIDA' )->set_quantity_column( 'MEINS' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PEDIDA' )->set_long_text('Cant. Pedida' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PEDIDA' )->set_medium_text('Cant. Pedida' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PEDIDA' )->set_short_text('Cant.Ped' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PEDIDA' )->set_zero( abap_false ).
+
+    go_salv->get_columns( )->get_column( 'DEC_EMP' )->set_long_text( 'Dec. Empleo' ).
+    go_salv->get_columns( )->get_column( 'ZZSEGCAL' )->set_long_text('Cód. Calidad' ).
+
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PDTE' )->set_long_text( 'Cant. Pendiente' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PDTE' )->set_medium_text( 'Cant. Pendiente' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PDTE' )->set_short_text( 'Cant.Pndt' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PDTE' )->set_zero( abap_false ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PDTE' )->set_quantity_column( 'MEINS' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_PDTE' )->set_sign( abap_true ).
+
+    go_salv->get_columns( )->get_column( 'CANTIDAD_ACUM' )->set_long_text( 'Cant. Acumulada' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_ACUM' )->set_medium_text( 'Cant. Acumulada' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_ACUM' )->set_short_text( 'Cant.Acum' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_ACUM' )->set_zero( abap_false ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_ACUM' )->set_quantity_column( 'MEINS' ).
+    go_salv->get_columns( )->get_column( 'CANTIDAD_ACUM' )->set_sign( abap_true ).
+
+    go_salv->get_columns( )->get_column( 'IND_CABO_DISP' )->set_long_text( 'Cabo.disp' ).
+    go_salv->get_columns( )->get_column( 'IND_CABO_DISP' )->set_medium_text( 'Cabo.disp' ).
+    go_salv->get_columns( )->get_column('IND_CABO_DISP' )->set_short_text( 'Cabo.disp' ).
+
+    go_salv->get_functions( )->set_all( abap_true ).
+    go_salv->get_columns( )->set_color_column( 'COLORTAB' ).
+    go_salv->get_columns( )->set_optimize( ).
+  ENDIF.
+
+*  IF top_container IS NOT BOUND.
+*    CREATE OBJECT top_container
+*      EXPORTING
+*        parent = cl_gui_container=>screen0
+*        side   = top_container->dock_at_top
+*        ratio  = 10.
+*  ENDIF.
+*
+*  TRY.
+*
+*      DATA: lo_cols_tab TYPE REF TO cl_salv_columns_table,
+*            lo_col_tab  TYPE REF TO cl_salv_column_table.
+*
+*      lo_cols_tab = go_salv->get_columns( ).
+*      lo_col_tab ?= lo_cols_tab->get_column( 'MATNR' ).
+*
+*      CALL METHOD lo_col_tab->set_cell_type
+*        EXPORTING
+*          value = if_salv_c_cell_type=>hotspot.
+*
+*    CATCH cx_salv_data_error.
+*  ENDTRY.
+
+  go_event = go_salv->get_event( ).
+  SET HANDLER lcl_handler=>on_double_click FOR go_event.
+  SET HANDLER lcl_handler=>on_link_click FOR go_event.
+*  SET HANDLER lcl_handler=>on_double_click FOR go_event.
+*  SET HANDLER lcl_handler=>on_link_click FOR go_event.
+*
+*  go_salv->display( ).
+
+ENDFORM.
+
+*FORM mostrar_alv.
+*  TRY.
+*      CALL METHOD cl_salv_table=>factory
+*        IMPORTING
+*          r_salv_table = go_salv
+*        CHANGING
+*          t_table      = it_alv.
+*    CATCH cx_salv_msg.
+*      MESSAGE text-002 TYPE 'E'.
+*  ENDTRY.
+*
+*  go_salv_functions = go_salv->get_functions( ).
+*
+*  go_salv_functions->set_all( 'X' ). " Enrique: hay que setear todas las funciones?
+*
+*  go_salv_columns = go_salv->get_columns( ).
+*
+*  PERFORM formatear_columnas.
+*
+*  PERFORM titular_alv.
+*
+*
+*  go_salv->display( ).
+*
+*ENDFORM.
+
+FORM titular_alv.
+
+  CREATE OBJECT gr_document.
+  gr_document->add_text_as_heading(
+    EXPORTING
+      text          = 'Parámetros seleccionados: '
+*    sap_color     =
+*    sap_fontstyle =
+*    heading_level = 3
+*    a11y_tooltip  =
+*  CHANGING
+*    document      =
+         ).
+
+  CALL METHOD gr_document->add_text
+    EXPORTING
+      text = g_titulo. "'<p>Texto normal</p>'.
+
+  CALL METHOD gr_document->display_document
+    EXPORTING
+      parent = gr_cont1.
+
+ENDFORM.
+
+FORM divide_screen.
+  TRY .
+      CREATE OBJECT gr_cont0
+        EXPORTING
+*         parent         = cl_gui_container=>default_screen
+          container_name = 'CNT'
+        EXCEPTIONS
+          OTHERS         = 1.
+      CREATE OBJECT gr_splitter
+        EXPORTING
+          parent            = gr_cont0
+          rows              = 2
+          columns           = 1
+        EXCEPTIONS
+          cntl_error        = 1
+          cntl_system_error = 2
+          OTHERS            = 3.
+      IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+      ENDIF.
+
+    CATCH cx_root.
+      BREAK-POINT.
+  ENDTRY.
+  gr_cont2 = gr_splitter->get_container(
+      row       = 2
+      column    = 1
+         ).
+  gr_cont1 = gr_splitter->get_container(
+      row       = 1
+      column    = 1
+         ).
+
+  CALL METHOD:
+    gr_splitter->set_row_height
+      EXPORTING
+        id = 1
+        height = 10,
+    gr_splitter->set_row_sash
+      EXPORTING
+        id = 1
+        type = 0
+        value = 0.
+
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+ENDFORM.
+
+FORM completar_titulo_alv USING p_werks TYPE werks_d
+                                 p_lgort TYPE lgort_d
+                                 p_deci  TYPE char13.
+  DATA: l_lines TYPE numc10.
+
+  CLEAR g_titulo.
+  g_titulo = |Centro: { p_werks } { '|' }  Almacén: { p_lgort }  |.
+
+  DESCRIBE TABLE gr_matkl LINES l_lines.
+
+* Evaluamos el nº de lineas de SO-MATKL, segun las lineas que contenga.
+  CASE l_lines.
+    WHEN 0. " cero lineas, no hay selección de Grupo Artículos.
+      g_titulo = |{ g_titulo } { '|' } Grupo Artículos: No informado |.
+
+    WHEN 1. " 1 linea, evaluaremos si se trata de un EQ or BT
+      READ TABLE gr_matkl INDEX 1 INTO gs_matkl.
+
+      IF gs_matkl-sign = 'I' AND gs_matkl-option = 'EQ'.
+        g_titulo = |{ g_titulo } { '|' } Grupo Artículos: { gs_matkl-low } |.
+      ELSEIF gs_matkl-sign = 'I' AND gs_matkl-option = 'BT'.
+        g_titulo = |{ g_titulo } { '|' } Grupo Artículos: { gs_matkl-low } - { gs_matkl-high }|.
+      ELSE.
+        g_titulo = |{ g_titulo } { '|' } Grupo Artículos: Varios |.
+      ENDIF.
+    WHEN OTHERS. " Si el SO contiene mas de 1 lineas informamos "Varios"
+      g_titulo = |{ g_titulo } { '|' } Grupo Artículos: Varios |.
+  ENDCASE.
+
+*Comprobamos si se informará la decisión de empleo.
+  IF p_deci IS NOT INITIAL.
+    g_titulo = |{ g_titulo } { '|' } Decisión de Empleo: { p_deci } |.
+  ELSE.
+    g_titulo = |{ g_titulo } { '|' } Decisión de Empleo: No informada |.
+  ENDIF.
+
+
+ENDFORM.
+
+FORM formatear_columnas.
+*
+**  PERFORM formatear_una_columna USING 'WERKS'            'Centro'          'Centro'.
+**  PERFORM formatear_una_columna USING 'LGORT'            'Almacén'         'Almacén'.
+**  PERFORM formatear_una_columna USING 'MATNR'            'Material'        'Material'.
+**  PERFORM formatear_una_columna USING 'MAKTX'            'Desc.Material'   'Desc.Material'.
+**  PERFORM formatear_una_columna USING 'LOTE'             'Lote'            'Lote'.
+**  PERFORM formatear_una_columna USING 'DEC_EMPLEO'       'Decis.Em.'       'Decis.Em'.
+**  PERFORM formatear_una_columna USING 'LABST'            'Stck Libr.'      'Stck Libr'.
+**  PERFORM formatear_una_columna USING 'IND_CABO_DISP'    'Ind.Cabo Dis.'   'Ind.Cabo Dis'.
+**  PERFORM formatear_una_columna USING 'KUNAG'            'Cliente'         'Cliente'.
+**  PERFORM formatear_una_columna USING 'NOM_CLI'          'Nom.Cli'         'Nom.Cli'.
+**  PERFORM formatear_una_columna USING 'CALIDAD_PEDIDO'   'Cod.Calid.P'     'Cod.Calid.P'.
+**  PERFORM formatear_una_columna USING 'VBELN'            'Pedido'          'Pedido'.
+**  PERFORM formatear_una_columna USING 'BSTNK'            'Pedido Cli'      'Pedido Cli'.
+**  PERFORM formatear_una_columna USING 'POS_PEDIDO'       'Pos.Pedido'      'Pos.Pedido'.
+**  PERFORM formatear_una_columna USING 'STAT_POS_PED'     'Stat.Pos.P'      'Stat.Pos.P'.
+**  PERFORM formatear_una_columna USING 'FECHA_ENTREGA'    'Fecha Entr'      'Fecha Entr'.
+**  PERFORM formatear_una_columna USING 'QUAN_PEDIDA'      'C.Pedida'        'C.Pedida'.
+**  PERFORM formatear_una_columna USING 'QUAN_SERV'        'C.Servida'       'C.Servida'.
+**  PERFORM formatear_una_columna USING 'QUAN_PEND'  'C.Pend.Asig'     'C.Pend.Asig'.
+*
+ENDFORM.
+
+
+*FORM  formatear_una_columna USING p_campo    TYPE lvc_fname
+*                                  p_title    TYPE lvc_tip
+*                                  p_long_txt TYPE scrtext_l .
+*
+*  TRY.
+*      go_salv_column = go_salv_columns->get_column( p_campo ).
+*      go_salv_column->set_tooltip( p_title ).
+*      go_salv_column->set_long_text( p_long_txt ).
+*
+*    CATCH cx_salv_not_found.
+*
+*  ENDTRY.
+*
+*ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_2000  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE status_2000 OUTPUT.
+  SET PF-STATUS 'STAT2000'.
+  SET TITLEBAR '2000'.
+  PERFORM status_200.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Form  STATUS_200
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM status_200 .
+  PERFORM obtener_datos. "TABLES p_matkl
+*                        USING  p_werks
+*                               p_lgort
+*                               p_deci.
+  PERFORM divide_screen.
+  PERFORM completar_titulo_alv USING  g_werks
+                                       g_lgort
+                                       g_deci.
+
+
+  PERFORM dar_formato_alv.
+
+  PERFORM titular_alv.
+
+  go_salv->display( ).
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_2000  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_2000 INPUT.
+  PERFORM user_command_200.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Form  USER_COMMAND_200
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM user_command_200 .
+  CASE sy-ucomm.
+    WHEN 'BACK'.
+      SET SCREEN 0.
+    WHEN OTHERS.
+  ENDCASE.
+ENDFORM.
+
+
+FORM dd_add_text USING p_do TYPE REF TO cl_dd_document.
+  DATA ta TYPE REF TO cl_dd_table_element.
+  DATA col1 TYPE REF TO cl_dd_area.
+  DATA col2 TYPE REF TO cl_dd_area.
+  DATA col3 TYPE REF TO cl_dd_area.
+  DATA col4 TYPE REF TO cl_dd_area.
+
+  DATA text TYPE sdydo_text_element.
+
+
+* create table
+  CALL METHOD p_do->add_table
+    EXPORTING
+      no_of_columns               = 4
+      cell_background_transparent = 'X'
+      border                      = '0'
+    IMPORTING
+      table                       = ta.
+
+* set columns
+  CALL METHOD ta->add_column
+    EXPORTING
+      width  = '20%'
+    IMPORTING
+      column = col1.
+  CALL METHOD ta->add_column
+    EXPORTING
+      width  = '50%'
+    IMPORTING
+      column = col2.
+
+  text = 'Interloc.comercial'.
+  CALL METHOD col1->add_text
+    EXPORTING
+      text         = text
+      sap_emphasis = cl_dd_area=>strong
+      sap_fontsize = cl_dd_area=>large.
+
+  text = 'C3020 CARTONAJES VEGABAJA, S.A.'.
+  CALL METHOD col2->add_text
+    EXPORTING
+      text         = text
+      sap_fontsize = cl_dd_area=>large.
+
+  ta->new_row( ).
+
+  text = 'Material'.
+  CALL METHOD col1->add_text
+    EXPORTING
+      text         = text
+      sap_emphasis = cl_dd_area=>strong
+      sap_fontsize = cl_dd_area=>large.
+
+  text = '000001011102002680 TL1 KRAFT REC. 200gr 2680mm'.
+  CALL METHOD col2->add_text
+    EXPORTING
+      text         = text
+      sap_fontsize = cl_dd_area=>large.
+
+ENDFORM.                    "dd_add_text
+
+** CLASS cl_my_event_handler IMPLEMENTATION.
+*CLASS cl_my_event_handler IMPLEMENTATION.
+*  METHOD use_new_resources.
+*    IF is_displayed = 'X'.
+** initialize document
+*      CALL METHOD do->initialize_document.
+** fill document
+*      PERFORM dd_add_text USING do.
+** merge document
+*      CALL METHOD do->merge_document.
+** display document
+*      CALL METHOD do->display_document
+*        EXPORTING
+*          reuse_control      = 'X'
+*          reuse_registration = 'X'.
+*    ENDIF.
+*  ENDMETHOD.                    "use_new_resources
+*ENDCLASS.                    "cl_my_event_handler IMPLEMENTATION
+*&---------------------------------------------------------------------*
+*&      Form  F4_FOR_VARIANT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f4_for_variant .
+
+  DATA ls_variant TYPE disvariant.
+
+  ls_variant-report = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant    = ls_variant
+*     I_TABNAME_HEADER          =
+*     I_TABNAME_ITEM            =
+*     IT_DEFAULT_FIELDCAT       =
+      i_save        = 'A'
+*     I_DISPLAY_VIA_GRID        = ' '
+    IMPORTING
+*     E_EXIT        =
+      es_variant    = ls_variant
+    EXCEPTIONS
+      not_found     = 1
+      program_error = 2
+      OTHERS        = 3.
+  IF sy-subrc <> 0.
+* Implement suitable error handling here
+    RETURN.
+  ENDIF.
+
+  p_vari = ls_variant-variant.
+
+ENDFORM.

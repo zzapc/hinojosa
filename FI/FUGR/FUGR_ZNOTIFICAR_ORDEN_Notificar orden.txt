@@ -1,0 +1,184 @@
+FUNCTION znotificar_orden.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  EXPORTING
+*"     VALUE(E_ERROR) TYPE  XFELD
+*"  TABLES
+*"      T_MESSAGES STRUCTURE  BAPIRET2
+*"  CHANGING
+*"     VALUE(DATOS) TYPE  ZDT_NOTRO_L
+*"----------------------------------------------------------------------
+  DATA: lv_aufnr TYPE aufnr.
+
+  DATA: lti_detail TYPE TABLE OF bapi_coru_return WITH HEADER LINE,
+        ls_detail  TYPE bapi_coru_return,
+        ls_return1 TYPE          bapiret1.
+
+  DATA: ls_return TYPE bapiret2.
+  DATA: ls_ret2 TYPE bapiret1.
+
+  DATA: lti_times   TYPE TABLE OF bapi_pi_timeticket1 WITH HEADER LINE,
+        lti_goodmov TYPE TABLE OF bapi2017_gm_item_create WITH HEADER LINE,
+        lti_link    TYPE TABLE OF bapi_link_conf_goodsmov WITH HEADER LINE.
+  DATA: ls_propose TYPE bapi_pp_conf_prop.
+
+
+  DATA: lv_gamng TYPE          gamng,
+        lv_rsnum TYPE          rsnum,
+        ls_resb  TYPE          resb,
+        lti_resb TYPE TABLE OF resb.
+
+  DATA: lv_extnumber TYPE balnrext.
+
+  DATA:  gs_messages TYPE bapiret2.
+
+  DATA: i_string      TYPE  char30,
+        ld_e_float    TYPE f,
+        ld_e_dec      TYPE string,
+        ld_e_decimals TYPE i.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = datos-ord_fab
+    IMPORTING
+      output = lv_aufnr.
+
+
+* Recuperamos los datos de la notificación
+  CLEAR: ls_return, lti_times.
+  lti_times-orderid        = lv_aufnr.
+  lti_times-phase          = '0040'.
+  lti_times-fin_conf       = '1'.
+  lti_times-plant          = datos-centro.
+
+  i_string = datos-peso.
+  CALL FUNCTION 'C14DG_CHAR_NUMBER_CONVERSION'
+    EXPORTING
+      i_string                   = i_string
+    IMPORTING
+      e_float                    = ld_e_float
+      e_dec                      = ld_e_dec
+      e_decimals                 = ld_e_decimals
+    EXCEPTIONS
+      wrong_characters           = 1
+      first_character_wrong      = 2
+      arithmetic_sign            = 3
+      multiple_decimal_separator = 4
+      thousandsep_in_decimal     = 5
+      thousand_separator         = 6
+      number_too_big             = 7
+      OTHERS                     = 8.
+  IF sy-subrc <> 0.
+*  Implement suitable error handling here
+  ELSE.
+    lti_times-yield          = ld_e_dec.
+  ENDIF.
+  lti_times-conf_quan_unit = 'KG'.
+  lti_times-clear_res      = 'X'.
+  APPEND lti_times.
+
+  CLEAR ls_propose.
+  ls_propose-goodsmovement = 'X'.
+*  ls_propose-quantity = 'X'.
+  ls_propose-activity = 'X'.
+  ls_propose-personnel = 'X'.
+  CLEAR ls_ret2.
+
+* Recuperamos los datos de la BAPI que notifica
+  CALL FUNCTION 'BAPI_PROCORDCONF_GET_TT_PROP'
+    EXPORTING
+      propose            = ls_propose
+    IMPORTING
+      return             = ls_ret2
+    TABLES
+      timetickets        = lti_times
+      goodsmovements     = lti_goodmov
+      link_conf_goodsmov = lti_link.
+
+  LOOP AT lti_times.
+    lti_times-exec_fin_date   = sy-datum. "DATOS-FECHA_INSERCION.
+    lti_times-exec_fin_time   = sy-uzeit. "DATOS-HORA_INSERCION.
+
+    SELECT SINGLE ftrmi FROM afko
+      INTO lti_times-exec_start_date
+      WHERE aufnr = datos-ord_fab.
+
+    lti_times-conf_activity1 = (  lti_times-conf_activity1 * ld_e_dec ) /  lti_times-yield.
+    lti_times-conf_activity2 = (  lti_times-conf_activity2 * ld_e_dec ) /  lti_times-yield.
+    lti_times-conf_activity3 = datos-peso.
+    lti_times-yield = datos-peso.
+
+    MODIFY lti_times.
+  ENDLOOP.
+
+  " Recuperamos la reserva y la cantidad total para calcular la proporción:
+  CLEAR: lv_gamng, lv_rsnum.
+  SELECT SINGLE gamng rsnum INTO (lv_gamng, lv_rsnum)
+    FROM caufv
+    WHERE aufnr =  lv_aufnr.
+
+  REFRESH: lti_resb.
+  CLEAR: lti_resb, ls_resb.
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE lti_resb
+    FROM resb
+    WHERE rsnum = lv_rsnum
+    AND rgekz = 'X'.
+
+  LOOP AT lti_goodmov.
+    CLEAR ls_resb.
+    READ TABLE lti_resb INTO ls_resb WITH KEY rsnum = lti_goodmov-reserv_no
+                                              rspos = lti_goodmov-res_item
+                                              matnr = lti_goodmov-material
+                                              werks = lti_goodmov-plant.
+    IF ls_resb IS NOT INITIAL.
+      lti_goodmov-entry_qnt = ( ls_resb-bdmng * ld_e_dec ) / lv_gamng.
+      MODIFY lti_goodmov.
+    ENDIF.
+  ENDLOOP.
+
+  CALL FUNCTION 'BAPI_PROCORDCONF_CREATE_TT'
+*   EXPORTING
+*     POST_WRONG_ENTRIES             = '0'
+*     TESTRUN                        =
+    IMPORTING
+      return             = ls_return1
+    TABLES
+      timetickets        = lti_times
+      goodsmovements     = lti_goodmov
+      link_conf_goodsmov = lti_link
+*     CHARACTERISTICS_WIPBATCH       =
+*     LINK_CONF_CHAR_WIPBATCH        =
+      detail_return      = lti_detail.
+
+  READ TABLE lti_detail INTO ls_detail WITH KEY type = 'E'.
+  IF sy-subrc = 0.
+
+    e_error = 'X'.
+
+    LOOP AT lti_detail INTO ls_detail.
+      MOVE-CORRESPONDING ls_detail TO gs_messages.
+      APPEND gs_messages TO t_messages.
+    ENDLOOP.
+
+
+    CLEAR lv_extnumber.
+    CONCATENATE 'Orden' datos-ord_fab INTO lv_extnumber SEPARATED BY space.
+
+    CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+      EXPORTING
+        objeto    = 'ZSAP_MES'
+        subobjeto = 'ZNOTIF_ORDEN'
+        mensajes  = t_messages[]
+        extnumber = lv_extnumber.
+
+
+
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+  ENDIF.
+
+
+
+ENDFUNCTION.

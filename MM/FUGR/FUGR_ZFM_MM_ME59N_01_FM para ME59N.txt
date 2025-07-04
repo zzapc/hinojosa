@@ -1,0 +1,530 @@
+FUNCTION zfm_mm_me59n_01.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_VARIANT) TYPE  VARIANT
+*"  TABLES
+*"      T_EBAN STRUCTURE  EBAN
+*"      T_EBANX STRUCTURE  EBANX
+*"----------------------------------------------------------------------
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+  TYPES: tt_eban TYPE TABLE OF eban.
+
+  DATA: BEGIN OF ls_r_menge,
+          sign   TYPE sign,
+          option TYPE option,
+          low    TYPE menge_d,
+          high   TYPE menge_d,
+        END OF ls_r_menge.
+
+  DATA: lt_r_menge LIKE TABLE OF ls_r_menge.
+
+  DATA: ls_ztmm0036 TYPE ztmm0036.
+
+  DATA: lt_set_lines TYPE TABLE OF rgsbv,
+        ls_set_line  TYPE rgsbv,
+        lv_setvalmin TYPE setvalmin.
+
+  DATA: t_eban_aux TYPE eban.
+
+  DATA: lv_aufnr TYPE aufnr,
+        lv_vbeln TYPE vbeln,
+        lv_vbelp TYPE vbelp.
+
+  DATA: "ls_pp_order_objects   TYPE bapi_pp_order_objects,            "FCARDONA 05.05.2023
+        "lt_pp_order_operation TYPE TABLE OF bapi_order_operation1,   "FCARDONA 05.05.2023
+        "ls_pp_order_operation TYPE bapi_order_operation1,            "FCARDONA 05.05.2023
+        "lt_pp_order_component TYPE TABLE OF bapi_order_component,    "FCARDONA 05.05.2023
+        "ls_pp_order_component TYPE bapi_order_component,             "FCARDONA 05.05.2023
+*       lt_bapiret2           LIKE bapiret2,                          "FCARDONA 05.05.2023
+        ls_bapiret2           TYPE bapiret2.
+
+  DATA: lv_newmenge       TYPE kstbm,
+        lv_po_menge       TYPE menge_d,
+        lv_pv_menge       TYPE menge_d,
+        lv_of_menge       TYPE menge_d,
+        lv_of_menge_scrap TYPE menge_d.
+
+  DATA: lo_utils_mto TYPE REF TO zcl_utils_mto,
+        lo_utils_pp  TYPE REF TO zcl_utils_pp.
+
+  FIELD-SYMBOLS: <ft_eban>  TYPE tt_eban,
+                 <fs_eban>  TYPE eban,
+                 <fs_ebanx> TYPE ebanx.
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+*** T_EBAN IS NOT INITIAL
+
+  CHECK lines( t_eban ) GT 0.
+
+*** T_EBANX IS NOT INITIAL
+
+  CHECK lines( t_ebanx ) GT 0.
+
+*** REPORT AND VARIANT EXISTS
+
+  SELECT COUNT(*)
+    FROM varid
+   WHERE report   EQ lc_me59n_report
+     AND variant  EQ i_variant.
+
+*--> FCARDONA 05.05.2023 - Corregir creación de pedidos contra PV ya creados.
+
+*  CHECK sy-subrc EQ 0. "Comento por nueva lógica
+
+  IF ( sy-subrc NE 0 ).
+
+    SELECT *
+      FROM tvarvc
+      INTO @DATA(ls_tvarvc)
+     WHERE name EQ @lc_me59n_auto_01.
+
+      IF ( ls_tvarvc-high EQ abap_true ).
+
+        LOOP AT t_eban.
+
+          IF ( t_eban-werks EQ ls_tvarvc-low ).
+
+            "En este caso no hay que crear pedido de compras.
+            "Actuamos sobre tabla de solpeds.
+            DELETE t_eban[]   WHERE banfn = t_eban-banfn AND bnfpo = t_eban-bnfpo.
+            DELETE t_ebanx[]  WHERE banfn = t_eban-banfn AND bnfpo = t_eban-bnfpo.
+
+          ENDIF.
+
+        ENDLOOP.
+
+      ENDIF.
+
+    ENDSELECT.
+
+  ENDIF.
+
+*<-- FCARDONA 05.05.2023 - Corregir creación de pedidos contra PV ya creados.
+
+*** VARIANT REGISTERED IN SET
+
+  "Obtenemos los tipos de material compatibles desde el set de datos
+  CALL FUNCTION 'G_SET_FETCH'
+    EXPORTING
+      langu              = 'S'
+      no_authority_check = abap_true
+      setnr              = lc_me59n_setnr_01
+    TABLES
+      set_lines_basic    = lt_set_lines
+    EXCEPTIONS
+      no_authority       = 1
+      set_is_broken      = 2
+      set_not_found      = 3
+      OTHERS             = 4.
+
+  MOVE i_variant TO lv_setvalmin.
+  READ TABLE lt_set_lines INTO ls_set_line WITH KEY from = lv_setvalmin.
+  CHECK sy-subrc EQ 0.
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+**** CASE -> Según VARIANT-TITLE
+
+  CASE ls_set_line-title.
+
+    WHEN 'SEMI'.
+
+*** SEMITERMINADOS
+
+      "Se quiere no crear pedidos con picos. Por tanto sumamos una merma a los pedidos.
+      "Cuando hay un pedido de ventas asociado, obtenemos la OF asociada y le sumamos la merma de esta.
+      "Cuando no hay un pedido de ventas asociado, obtenemos la merma por escalado (tabla ZTMM0036)
+
+      ASSIGN ('(SAPLME59)T_EBAN[]') TO <ft_eban>.
+      CHECK <ft_eban> IS ASSIGNED.
+
+      LOOP AT t_eban.
+
+*--> FCARDONA 05.05.2023 - Corregir creación de pedidos contra PV ya creados.
+
+***""""""""""""""""""""""""""""""""""" COMENTAMOS POR NUEVA lÖGICA
+***
+**** MODIFICACIÓN CANTIDADES
+***
+***        EBKN, obtengo OF
+***        SELECT SINGLE aufnr, vbeln, vbelp
+***          FROM ebkn
+***          INTO ( @lv_aufnr, @lv_vbeln, @lv_vbelp )
+***         WHERE banfn EQ @t_eban-banfn
+***           AND bnfpo EQ @t_eban-bnfpo.
+***
+***        IF ( lv_aufnr IS INITIAL AND lv_vbeln IS NOT INITIAL ).
+***
+***          SELECT SINGLE aufk~aufnr
+***            FROM aufk
+***            INTO lv_aufnr
+***           WHERE aufk~kdauf EQ lv_vbeln
+***             AND aufk~kdpos EQ lv_vbelp
+***             AND aufk~werks EQ t_eban-werks
+***             AND NOT EXISTS ( SELECT *
+***                                FROM jest
+***                               WHERE jest~objnr = aufk~objnr
+***                                 AND jest~inact = space
+***                                 AND jest~stat  IN ('I0076') ).    "Cierre técnico, petición de borrado
+***
+***        ENDIF.
+***
+***        Chequeo si he obtenido OF
+***        IF ( lv_aufnr IS NOT INITIAL ). "Posible imputación a OF
+***
+***          CLEAR: ls_pp_order_objects.
+***
+***          ls_pp_order_objects-components = abap_true.
+***          ls_pp_order_objects-operations = abap_true.
+***
+***          CALL FUNCTION 'BAPI_PRODORD_GET_DETAIL'
+***            EXPORTING
+***              number        = lv_aufnr
+***             COLLECTIVE_ORDER       =
+***              order_objects = ls_pp_order_objects
+***            IMPORTING
+***              return        = ls_bapiret2
+***            TABLES
+***             HEADER        =
+***             POSITION      =
+***             SEQUENCE      =
+***              operation     = lt_pp_order_operation
+***             TRIGGER_POINT =
+***              component     = lt_pp_order_component
+***             PROD_REL_TOOL =
+***            .
+***
+***          Comprobamos no hayan errores.
+***          READ TABLE lt_bapiret2 TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+***          CHECK sy-subrc NE 0.
+***          CHECK ls_bapiret2-type NE 'E'.
+***
+***          IF ( <ft_eban> IS ASSIGNED ).
+***
+***> Cálcula nueva cantidad
+***
+***            READ TABLE <ft_eban> ASSIGNING <fs_eban> WITH KEY banfn = t_eban-banfn bnfpo = t_eban-bnfpo.
+***            IF ( sy-subrc EQ 0 AND <fs_eban> IS ASSIGNED ).
+***
+***              LOOP AT lt_pp_order_operation INTO ls_pp_order_operation.
+***
+***                Si la operación contiene el material de la SolPed, añadimos merma a cantidad de SolPed
+***                READ TABLE lt_pp_order_component TRANSPORTING NO FIELDS WITH KEY material = <fs_eban>-matnr operation = ls_pp_order_operation-operation_number.
+***                IF ( sy-subrc EQ 0 ).
+***                  <fs_eban>-menge = <fs_eban>-menge + ls_pp_order_operation-scrap.
+***                ENDIF.
+***
+***              ENDLOOP.
+***
+***            ENDIF.
+***
+***< Cálcula nueva cantidad
+***
+***> EVITO CREAR PEDIDOS SI YA HAY ASIGNADOS AL PV O A LA OF
+***
+***            Chequeo si tengo pedido de ventas:
+***            IF ( lv_vbeln IS NOT INITIAL ). "Hay imputación a PV
+***
+***              CLEAR: lv_po_menge.
+***
+***              Obtengo suma de cantidad de pedidos de compra asociados a ese pedido de ventas
+***              SELECT SUM( menge ) UP TO 1 ROWS
+***                FROM ekkn
+***                INTO @lv_po_menge
+***               WHERE vbeln EQ @lv_vbeln
+***                 AND vbelp EQ @lv_vbelp
+***                 AND loekz EQ @abap_false.
+***
+***              Obtengo suma de cantidad de pedidos de venta asociados
+***              SELECT SUM( wmeng ) UP TO 1 ROWS
+***                FROM vbep
+***                INTO @lv_pv_menge
+***               WHERE vbeln EQ @lv_vbeln
+***                 AND posnr EQ @lv_vbelp.
+***
+***            ELSEIF ( lv_aufnr IS NOT INITIAL ).
+***
+***              Obtengo pedidos de compra asociados a ese pedido de ventas
+***              SELECT SUM( menge ) UP TO 1 ROWS
+***                FROM ekkn
+***                INTO @lv_po_menge
+***               WHERE aufnr EQ @lv_aufnr
+***                 AND loekz EQ @abap_false.
+***
+***            ENDIF.
+***
+***            En este punto veo si hay pedidos de compra por la cantidad de la OF
+***            IF ( lv_po_menge GT 0 AND <fs_eban>-menge GT 0 ).
+***
+***--> FCARDONA 05.05.2023 - Corregir creación de pedidos contra PV ya creados.
+***
+***              CLEAR: ls_r_menge.
+***              ls_r_menge-sign   = 'I'.
+***              ls_r_menge-option = 'BT'.
+***              ls_r_menge-low    = <fs_eban>-menge - <fs_eban>-menge * 5 / 100.
+***              ls_r_menge-high   = <fs_eban>-menge + <fs_eban>-menge * 5 / 100.
+***              APPEND ls_r_menge TO lt_r_menge.
+***
+***              "Si la cantidad del pedido está en el rango, no creo un nuevo pedido
+***              IF ( lv_po_menge IN lt_r_menge OR lv_po_menge GT <fs_eban>-menge ).
+***
+***                DELETE t_eban WHERE banfn = <fs_eban>-banfn AND bnfpo = <fs_eban>-bnfpo.
+***                DELETE t_ebanx WHERE banfn = <fs_eban>-banfn AND bnfpo = <fs_eban>-bnfpo.
+***
+***              ENDIF.
+***
+***
+***              IF ( lv_po_menge GT <fs_eban>-menge ).
+***
+***              ENDIF.
+***
+***            ENDIF.
+***
+***--> FCARDONA 05.05.2023 - Corregir creación de pedidos contra PV ya creados
+***
+***< EVITO CREAR PEDIDOS SI YA HAY ASIGNADOS AL PV O A LA OF
+***
+***            UNASSIGN <ft_eban>.
+***
+***          ENDIF.
+***
+***        ELSE. "No tenemos OF.
+***
+***          Aplicamos mermas pos escala
+***          IF ( <ft_eban> IS ASSIGNED ).
+***
+***            READ TABLE <ft_eban> ASSIGNING <fs_eban> WITH KEY banfn = t_eban-banfn bnfpo = t_eban-bnfpo.
+***            IF ( sy-subrc EQ 0 AND <fs_eban> IS ASSIGNED ).
+***
+***              CLEAR: lv_newmenge.
+***
+***              Obtengo valor con merma
+***              CALL FUNCTION 'ZFM_MM_ME59N_04'
+***                EXPORTING
+***                  i_werks = <fs_eban>-werks
+***                  i_menge = <fs_eban>-menge
+***                 I_ROUND = 'X'
+***                IMPORTING
+***                  e_kstbm = lv_newmenge.
+***
+***              IF ( lv_newmenge IS NOT INITIAL AND lv_newmenge GT 0 AND lv_newmenge GT <fs_eban>-menge ).
+***                MOVE lv_newmenge TO <fs_eban>-menge.
+***              ENDIF.
+***
+***              UNASSIGN <fs_eban>.
+***
+***            ENDIF.
+***
+***            UNASSIGN <ft_eban>.
+***
+***          ENDIF.
+***
+***        ENDIF.
+***
+***""""""""""""""""""""""""""""""""""" COMENTAMOS POR NUEVA lÖGICA
+
+        CLEAR: lo_utils_mto.
+
+        "Instanciamos clase utilidades MTO
+        lo_utils_mto = zcl_utils_mto=>s_get_instance_4_mereq( i_banfn = t_eban-banfn i_bnfpo = t_eban-bnfpo ).
+
+        "Compruebo si se ha instanciado => es MTO
+        IF ( lo_utils_mto IS BOUND ). "MTO
+
+** Obtengo cantidad SD
+
+          lv_pv_menge = lo_utils_mto->_s_vbap-kwmeng.
+
+** Obtengo cantidad PP
+
+          CLEAR: lv_of_menge_scrap, lv_of_menge.
+
+          "Obtengo cantidad PP
+          LOOP AT lo_utils_mto->_t_aufk INTO DATA(ls_aufk).
+
+            CLEAR: lo_utils_pp.
+
+            "Obtengo utilidades PP
+            TRY .
+              lo_utils_pp = NEW zcl_utils_pp( i_aufnr = ls_aufk-aufnr ).
+            CATCH zcx_exception.
+              CONTINUE.
+            ENDTRY.
+
+            "Chequeo OF del mismo centro
+            READ TABLE lo_utils_pp->_t_header INTO DATA(ls_pp_header) INDEX 1.
+            IF ( ls_pp_header-production_plant NE t_eban-werks ).
+              CONTINUE.
+            ENDIF.
+
+            "Obtengo cantidades
+            "Recorro operaciones
+            LOOP AT lo_utils_pp->_t_operations INTO DATA(ls_pp_operation).
+
+              "Si la operación contiene el material de la SolPed, obtenemos merma para añadirla a cantidad de SolPed
+              READ TABLE lo_utils_pp->_t_components TRANSPORTING NO FIELDS WITH KEY material = t_eban-matnr operation = ls_pp_operation-operation_number.
+              IF ( sy-subrc EQ 0 ).
+
+* Obtengo merma de OF
+
+                lv_of_menge_scrap = lv_of_menge_scrap + ls_pp_operation-scrap.
+
+* Obtengo cantidad de OF
+
+                lv_of_menge = lv_of_menge + ls_pp_operation-quantity.
+
+              ENDIF.
+
+            ENDLOOP.
+
+          ENDLOOP.
+
+** Obtengo cantidades MM
+
+          CLEAR: lv_po_menge.
+
+          "Obtengo cantidad MM
+          LOOP AT lo_utils_mto->_t_ekpo INTO DATA(ls_ekpo).
+
+            lv_po_menge = lv_po_menge + ls_ekpo-menge.
+
+          ENDLOOP.
+
+** TRATAMOS EBAN
+
+"Compruebo si cantidad de PCs es >= a cantidad de OFs + SCRAP
+
+          "Aplicamos un 5% a la cantidad del PC para comprobar que no son picos
+          IF ( ( lv_po_menge + ( lv_po_menge * 20 / 100 ) ) GE ( lv_of_menge + lv_of_menge_scrap ) ).
+
+            "En este caso no hay que crear pedido de compras.
+            "Actuamos sobre tabla de solpeds.
+            DELETE t_eban[]   WHERE banfn = t_eban-banfn AND bnfpo = t_eban-bnfpo.
+            DELETE t_ebanx[]  WHERE banfn = t_eban-banfn AND bnfpo = t_eban-bnfpo.
+
+          ELSE. "Cantidad PC < a cantidad OFs
+
+            "En este caso si que creo pedido aplicandole el scrap
+            "Asi evitamos crear pedidos con picos despues
+
+            "Compruebo si puedo sumar SCRAP
+            IF ( <ft_eban> IS ASSIGNED ).
+
+              READ TABLE <ft_eban> ASSIGNING <fs_eban> WITH KEY banfn = t_eban-banfn bnfpo = t_eban-bnfpo.
+              IF ( <fs_eban> IS ASSIGNED ).
+                <fs_eban>-menge = <fs_eban>-menge + lv_of_menge_scrap.
+              ENDIF.
+
+              UNASSIGN <fs_eban>.
+              UNASSIGN <ft_eban>.
+
+            ENDIF.
+
+          ENDIF.
+
+        ELSE. "MTS
+
+          "Aplicamos mermas pos escala
+          IF ( <ft_eban> IS ASSIGNED ).
+
+            READ TABLE <ft_eban> ASSIGNING <fs_eban> WITH KEY banfn = t_eban-banfn bnfpo = t_eban-bnfpo.
+            IF ( sy-subrc EQ 0 AND <fs_eban> IS ASSIGNED ).
+
+              CLEAR: lv_newmenge.
+
+              "Obtengo valor con merma
+              CALL FUNCTION 'ZFM_MM_ME59N_04'
+                EXPORTING
+                  i_werks = <fs_eban>-werks
+                  i_menge = <fs_eban>-menge
+*                 I_ROUND = 'X'
+                IMPORTING
+                  e_kstbm = lv_newmenge.
+
+              IF ( lv_newmenge IS NOT INITIAL AND lv_newmenge GT 0 AND lv_newmenge GT <fs_eban>-menge ).
+                MOVE lv_newmenge TO <fs_eban>-menge.
+              ENDIF.
+
+              UNASSIGN <fs_eban>.
+
+            ENDIF.
+
+            UNASSIGN <ft_eban>.
+
+          ENDIF.
+
+        ENDIF.
+
+*<-- FCARDONA 05.05.2023 - Corregir creación de pedidos contra PV ya creados.
+
+      ENDLOOP.
+
+    WHEN 'COME'.
+
+*** MERCADERIAS
+
+      "Se quiere sacar pedidos por dirección de cliente.
+
+      "Ordenamos por cliente y dirección
+      SORT t_eban BY kunnr adrn2 ASCENDING.
+
+      "Recorro EBAN ordenada
+      LOOP AT t_eban.
+
+        "Leo el correspondiente registro de T_EBANX[]
+        READ TABLE t_ebanx ASSIGNING <fs_ebanx> WITH KEY banfn = t_eban-banfn bnfpo = t_eban-bnfpo.
+
+        "Creo pedido nuevo si:
+        " - Cambia cliente
+        " - Cambia dirección de cliente
+        "No cambia si
+        " - No cambia cliente
+        IF ( t_eban_aux-kunnr NE t_eban-kunnr ).
+
+          <fs_ebanx>-new_po   = abap_true.
+          <fs_ebanx>-new_item = abap_false.
+
+        ELSE.
+
+          IF ( t_eban_aux-adrn2 NE t_eban-adrn2 ).
+
+            <fs_ebanx>-new_po   = abap_true.
+            <fs_ebanx>-new_item = abap_false.
+
+          ELSE.
+
+            <fs_ebanx>-new_po   = abap_false.
+            <fs_ebanx>-new_item = abap_true.
+
+          ENDIF.
+
+        ENDIF.
+
+        "Prepramos datos para siguiente LOOP.
+        CLEAR: t_eban_aux.
+        MOVE-CORRESPONDING t_eban TO t_eban_aux.
+        UNASSIGN <fs_ebanx>.
+
+      ENDLOOP.
+
+    WHEN 'SUBCO'.
+
+*** SUBCONTRATACIONES
+
+    WHEN OTHERS.
+
+  ENDCASE.
+
+
+
+ENDFUNCTION.

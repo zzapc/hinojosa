@@ -1,0 +1,436 @@
+FUNCTION zspp_idoc_grades.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_WERKS) TYPE  WERKS_D OPTIONAL
+*"----------------------------------------------------------------------
+
+  DATA: ls_idoc_header       TYPE edidc,
+        lt_idoc_comm_control TYPE TABLE OF edidc,
+        ls_idoc_comm_control TYPE edidc,
+        lt_return            TYPE bapiret2_t,
+        ls_return            TYPE bapiret2,
+        ls_return1           TYPE bapiret1,
+        t_edidd              TYPE edidd_tt,
+        t_edidd_aux          TYPE edidd_tt.
+
+
+  DATA: l_grade          TYPE zgrade,
+        l_gradedata      TYPE zgradedata,
+        l_gradelayer     TYPE zgradelayer,
+        l_gradelayerdata TYPE zgradelayerdata,
+        l_gradecor       TYPE zgradecor,
+        l_gradecordata   TYPE zgradecordata,
+        l_delta          TYPE p DECIMALS 10, "verpr,
+        l_thickness      TYPE zvcxi_p0ss_calip.
+
+  DATA wa_werks TYPE zccwerks.
+
+  SELECT board, a~gbogv, tboar, mboar, descr, flute INTO TABLE @DATA(t_grade)
+    FROM zvcxi_pcs_td100 AS a
+    LEFT OUTER JOIN zvcxi_pcs_td101 AS b ON a~gbogv = b~gbogv AND b~idest = 'PLDES' AND b~langu = @sy-langu
+    WHERE mboar = @c_p
+      AND valfr <= @sy-datum AND valto >= @sy-datum.
+
+  SELECT * INTO TABLE @DATA(t_grade2)
+    FROM yhp_idx_td110
+    WHERE mboar EQ @c_p.
+
+  SELECT * INTO TABLE @DATA(t_td231) FROM zvcxi_pcs_td231.
+  SELECT * INTO TABLE @DATA(t_tc213) FROM zvcxi_pcs_tc213.
+
+
+
+  IF t_grade IS NOT INITIAL.
+
+    SELECT * INTO TABLE @DATA(t_td1102)
+      FROM zvcxi_pcs_td110 AS a
+      LEFT OUTER JOIN zvcxi_pcs_td112 AS b ON a~gbopv = b~gbopv AND b~iclat = 'ETC'
+      FOR ALL ENTRIES IN @t_grade
+      WHERE a~gbogv = @t_grade-gbogv.
+
+  ENDIF.
+
+* //GRADES
+
+  "INI ADD JVM - 15/06/2023 - Añadimos segmento para centro y poder filtrar en PI la salida
+  wa_werks-werks = i_werks.
+  l_edidd-sdata = wa_werks.
+  l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_werks )->get_relative_name( ).
+  APPEND l_edidd TO t_edidd.
+  "FIN ADD JVM - 15/06/2023 - Añadimos segmento para centro y poder filtrar en PI la salida
+  LOOP AT t_grade INTO DATA(l_grade_r).
+
+    REFRESH: t_edidd_aux.
+
+    READ TABLE t_td231 INTO DATA(l_231) WITH KEY tboar = l_grade_r-tboar.
+    IF i_werks IS NOT INITIAL.
+      READ TABLE t_td231 INTO l_231 WITH KEY tboar = l_grade_r-tboar werks = i_werks.
+      CHECK sy-subrc = 0.
+    ENDIF.
+
+    TRY.
+        DATA(lo_board) = zcl_vcxi_pcss_cust_board=>get_instance(
+              if_board      = l_grade_r-board
+              if_mboar      = l_grade_r-mboar
+              if_werks      = l_231-werks
+*                      if_tlami      =
+              ).
+      CATCH /vcxi/cx_ckx INTO DATA(exc).
+        DATA(mensaje) = exc->get_text( ).
+        CONTINUE.
+    ENDTRY.
+    lo_board->get_bpap(
+      EXPORTING
+        if_arbpl     = l_231-arbpl
+*        is_boarw     =
+      RECEIVING
+        rt_bpap      = DATA(t_bpap)
+    ).
+*      CATCH /vcxi/cx_ckx.    "
+
+    DATA(bgwht) = lo_board->get_bgwht( if_arbpl = l_231-arbpl ).
+*      CATCH /vcxi/cx_ckx.    "
+
+    DATA(cowid) = lo_board->get_cowid( ).
+*      CATCH /vcxi/cx_ckx.    "
+
+
+    "Añadimos un segmento DUMMY para que cuelgue cada calidad de él, sino no funciona correctamente el IDOC
+    CLEAR: l_edidd.
+    l_edidd-sdata = 'X'.
+    l_edidd-segnam = 'ZDUMMY'.
+    APPEND l_edidd TO t_edidd.
+
+    CLEAR: l_edidd.
+    l_grade-operation = 'Replace'.
+    l_edidd-sdata = l_grade.
+
+    l_edidd-segnam = c_grade.
+    APPEND l_edidd TO t_edidd.
+
+    CLEAR: l_edidd.
+    l_gradedata-deltacost = 0.
+    l_gradedata-description = l_grade_r-descr.
+    l_gradedata-gradeid = l_grade_r-board.
+    l_gradedata-color = ''.
+    l_gradedata-activeflag = ''.
+    l_gradedata-deltaweight = ''.
+    l_gradedata-sequencenr = ''.
+    l_gradedata-standardboardgrade = ''.
+    l_gradedata-verticalcompression = ''.
+    l_gradedata-thickness = 0.
+
+
+* //  ZGRADELAYER
+
+    IF t_bpap IS NOT INITIAL.
+
+      SELECT matnr, maktx INTO TABLE @DATA(t_makt) FROM makt
+        FOR ALL ENTRIES IN @t_bpap
+        WHERE matnr = @t_bpap-bpmat
+          AND spras = @sy-langu.
+
+      SELECT matnr, vprsv, verpr, stprs, peinh INTO TABLE @DATA(t_mbew) FROM mbew
+        FOR ALL ENTRIES IN @t_bpap
+        WHERE matnr = @t_bpap-bpmat
+          AND bwkey = @l_231-werks.
+
+
+*      SELECT matnr,calip INTO TABLE @DATA(t_td100)
+*        FROM zvcxi_p1e_td100
+*        FOR ALL ENTRIES IN @t_bpap
+*        WHERE matnr = @t_bpap-bpmat
+*          AND werks = @l_231-werks.
+
+      SELECT matnr, hoehe AS calip INTO TABLE @DATA(t_td100)
+        FROM marm
+        FOR ALL ENTRIES IN @t_bpap
+        WHERE matnr EQ @t_bpap-bpmat
+        AND hoehe > 0.
+*        AND werks EQ @l_231-werks.
+
+      SELECT matnr, zzgramaje INTO TABLE @DATA(it_gramajes) FROM mara
+        FOR ALL ENTRIES IN @t_bpap
+        WHERE matnr EQ @t_bpap-bpmat.
+
+    ENDIF.
+
+    DESCRIBE TABLE t_bpap LINES DATA(lv_papeles).
+
+    CLEAR: l_delta,l_thickness.
+    LOOP AT t_bpap INTO DATA(l_gradelayer_r).
+
+      CLEAR: l_edidd, l_gradelayerdata.
+      l_gradelayer-operation = 'REPLACE'.
+
+      l_edidd-sdata = l_gradelayer.
+      l_edidd-segnam = c_gradelayer.
+      APPEND l_edidd TO t_edidd_aux.
+
+* //  ZGRADELAYERDATA
+
+      CLEAR: l_edidd.
+
+      READ TABLE t_tc213 INTO DATA(l_tc213) WITH KEY flute = l_grade_r-flute bpaid = l_gradelayer_r-bpaid.
+      IF sy-subrc = 0 AND l_tc213-oblig = 'X'.
+        "Si son 5 papeles, doble canal, el canal tendrá dos letras en vez de una, y deberá pasarse en los papeles 2 y 4
+        DATA(long_flute) = strlen( l_grade_r-flute ).
+        IF long_flute EQ 2 AND lv_papeles EQ 5 AND l_tc213-seqnr EQ '2'.
+          l_gradelayerdata-fluteid = l_grade_r-flute(1).
+        ELSEIF long_flute EQ 2 AND lv_papeles EQ 5 AND l_tc213-seqnr EQ '4'.
+          l_gradelayerdata-fluteid = l_grade_r-flute+1(1).
+        ELSE.
+          l_gradelayerdata-fluteid = l_grade_r-flute.
+        ENDIF.
+      ENDIF.
+
+      READ TABLE t_td100 INTO DATA(l_td100) WITH KEY matnr = l_gradelayer_r-bpmat.
+      IF sy-subrc = 0.
+        l_thickness = l_thickness + l_td100-calip.
+      ENDIF.
+      "Factores de ondulación
+*      B *1,35
+*      C*1,46
+*      E*1,29
+*      D*1.33
+      DATA lv_factor TYPE p DECIMALS 2.
+      CASE l_gradelayerdata-fluteid.
+        WHEN 'B'.
+          lv_factor = '1.35'.
+        WHEN 'C'.
+          lv_factor = '1.46'.
+        WHEN 'E'.
+          lv_factor = '1.29'.
+        WHEN 'D'.
+          lv_factor = '1.33'.
+        WHEN OTHERS.
+          lv_factor = 1.
+      ENDCASE.
+
+      READ TABLE it_gramajes WITH KEY matnr = l_gradelayer_r-bpmat INTO DATA(wa_gramaje).
+
+      READ TABLE t_mbew INTO DATA(l_mbew) WITH KEY matnr = l_gradelayer_r-bpmat.
+      IF sy-subrc = 0.
+        IF l_mbew-vprsv = 'V'.
+          l_delta = l_delta + ( ( l_mbew-verpr / l_mbew-peinh ) * ( wa_gramaje-zzgramaje / 1000 ) * lv_factor ).
+        ELSE.
+          l_delta = l_delta + ( ( l_mbew-stprs / l_mbew-peinh ) * ( wa_gramaje-zzgramaje / 1000 ) * lv_factor ).
+        ENDIF.
+
+      ENDIF.
+
+      READ TABLE t_makt INTO DATA(l_makt) WITH KEY matnr = l_gradelayer_r-bpmat.
+      IF sy-subrc = 0.
+        l_gradelayerdata-description = l_makt-maktx.
+      ENDIF.
+
+
+      l_gradelayerdata-gradeid = l_grade_r-board.
+      l_gradelayerdata-layernr = l_tc213-seqnr.
+
+      CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+        EXPORTING
+          input  = l_gradelayer_r-bpmat
+        IMPORTING
+          output = l_gradelayer_r-bpmat.
+
+      l_gradelayerdata-paperid = l_gradelayer_r-bpmat(9).
+
+      l_edidd-sdata = l_gradelayerdata.
+      l_edidd-segnam = c_gradelayerdata.
+      APPEND l_edidd TO t_edidd_aux.
+
+    ENDLOOP. "GRADELAYER
+    IF sy-subrc = 0.
+      l_thickness = l_thickness + bgwht-bgwht.
+    ENDIF.
+*    IF t_edidd_aux[] IS NOT INITIAL.
+*      APPEND LINES OF t_edidd_aux TO t_edidd.
+*      REFRESH t_edidd_aux[].
+*    ENDIF.
+* // ZGRADECOR
+    CLEAR: l_edidd.
+    l_gradecor-operation = 'REPLACE'.
+
+    l_edidd-sdata = l_gradecor.
+    l_edidd-segnam = c_gradecor.
+    APPEND l_edidd TO t_edidd_aux.
+
+* // ZGRADECORDATA
+
+    READ TABLE t_td1102 INTO DATA(l_td1102) WITH KEY a-gbogv = l_grade_r-gbogv a-werks = l_231-werks.
+
+    CLEAR: l_edidd.
+    l_gradecordata-activeflag = ''.
+    l_gradecordata-color = ''.
+    l_gradecordata-crushdepth = l_td1102-b-clava.
+    l_gradecordata-delay = l_td1102-a-minwt.
+    l_gradecordata-description = l_grade_r-descr.
+    l_gradecordata-dryingtime = ''.
+    l_gradecordata-gradeid = l_grade_r-board.
+
+    l_gradecordata-machineid = l_231-arbpl.
+
+    "INI JVM ADD REPLACE
+    SELECT SINGLE atributo1 AS speed, atributo2 AS targetspeed, atributo3 AS scoregap
+      FROM zparametros
+      WHERE campo = @i_werks
+      AND valor = @l_grade_r-flute
+      AND clave = 'ZOMPVELOCI'
+      INTO @DATA(wa_speed).
+
+    IF sy-subrc <> 0.
+      SELECT SINGLE atributo1 AS speed, atributo2 AS targetspeed, atributo3 AS scoregap
+        FROM zparametros
+        WHERE campo = @i_werks
+        AND valor = @space
+        AND clave = 'ZOMPVELOCI'
+        INTO @wa_speed.
+    ENDIF.
+
+    l_gradecordata-scoregap = wa_speed-scoregap.
+    REPLACE ALL OCCURRENCES OF ',' IN l_gradecordata-scoregap WITH '.'.
+*    l_gradecordata-scoregap = '0.002'.
+*    CASE l_grade_r-flute.
+*      WHEN 'B'.
+*        l_gradecordata-scoregap = '0.0025'.
+*      WHEN 'C'.
+*        l_gradecordata-scoregap = '0.0033'.
+*      WHEN 'E'.
+*        l_gradecordata-scoregap = '0.002'.
+*      WHEN 'BC'.
+*        l_gradecordata-scoregap = '0.0043'.
+*      WHEN 'EB'.
+*        l_gradecordata-scoregap = '0.0037'.
+*      WHEN 'BB'.
+*        l_gradecordata-scoregap = '0.002'.
+*    ENDCASE.
+
+    "JVM . FREPLACE
+
+    l_gradecordata-shortgradeid = ''.
+    l_gradecordata-solversetupmaxquantity = ''.
+    l_gradecordata-solversetupminquantity = ''.
+    l_gradecordata-solvercategory = ''.
+
+
+****TARGETSPEED
+****SPEED
+    "JVM - INI - 10/10/2024 - Utilizamos función SPEED de aicomp
+*    CASE l_grade_r-flute. "DEL
+*      WHEN 'B' OR 'C'."DEL
+*        l_gradecordata-speed = '160'."DEL
+*        l_gradecordata-targetspeed = '160'."DEL
+*      WHEN 'BC' OR 'EB'."DEL
+*        l_gradecordata-speed = '115'."DEL
+*        l_gradecordata-targetspeed = '115'."DEL
+*      WHEN 'D' OR 'E'."DEL
+*        l_gradecordata-speed = '125'."DEL
+*        l_gradecordata-targetspeed = '125'."DEL
+*    ENDCASE."DEL
+    "ADD
+*    DATA lt_msrs TYPE yhp_omp_tt_msrs.
+*    FREE lt_msrs.
+*    CALL FUNCTION 'YHP_OMP_MSRS'
+*      EXPORTING
+*        if_werks = i_werks
+**       IF_DATE  = SY-DATUM
+*      IMPORTING
+*        et_msrs  = lt_msrs.
+*    "ADD
+*    READ TABLE lt_msrs WITH KEY flute = l_grade_r-flute INTO DATA(wa_msrs).
+*    IF sy-subrc = 0.
+    l_gradecordata-speed = wa_speed-speed.
+    l_gradecordata-targetspeed = wa_speed-targetspeed.
+*    ENDIF.
+    "ADD
+    "ADD
+    "ADD
+
+
+
+    "JVM - FIN - 10/10/2024 - Utilizamos función SPEED de aicomp
+
+    l_gradecordata-speedfanfold = ''.
+
+    l_edidd-sdata = l_gradecordata.
+    l_edidd-segnam = c_gradecordata.
+    APPEND l_edidd TO t_edidd_aux.
+
+
+    CLEAR: l_edidd.
+    l_gradedata-thickness = l_thickness.
+    l_gradedata-deltacost = l_delta.
+
+    WRITE l_delta TO l_gradedata-deltacost DECIMALS 4 LEFT-JUSTIFIED.
+    REPLACE ALL OCCURRENCES OF '.' IN l_gradedata-deltacost WITH ''.
+    CONDENSE l_gradedata-deltacost.
+    REPLACE ALL OCCURRENCES OF ',' IN l_gradedata-deltacost WITH '.'.
+    CONDENSE l_gradedata-deltacost.
+
+    l_edidd-sdata = l_gradedata.
+    l_edidd-segnam = c_gradedata.
+    APPEND l_edidd TO t_edidd.
+
+    CLEAR: l_delta, l_thickness.
+
+    APPEND LINES OF t_edidd_aux TO t_edidd.
+
+  ENDLOOP. " GRADE
+
+
+  ls_idoc_header-mandt  = sy-mandt.
+  ls_idoc_header-direct = '1'.
+  ls_idoc_header-rcvpor = c_edi_extern.
+  ls_idoc_header-rcvprt = c_ls_d.
+  ls_idoc_header-rcvprn = c_rcvprn.
+  ls_idoc_header-sndprt = c_ls_r.
+  ls_idoc_header-sndprn = sy-uname.
+  ls_idoc_header-mestyp = c_zmsg_grades.
+  ls_idoc_header-idoctp = c_zstpm_grades.
+
+
+  CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE' "IN UPDATE TASK
+    EXPORTING
+      master_idoc_control            = ls_idoc_header
+    TABLES
+      communication_idoc_control     = lt_idoc_comm_control
+      master_idoc_data               = t_edidd
+    EXCEPTIONS
+      error_in_idoc_control          = 1
+      error_writing_idoc_status      = 2
+      error_in_idoc_data             = 3
+      sending_logical_system_unknown = 4
+      OTHERS                         = 5.
+  IF sy-subrc <> 0.
+    "KO
+    ls_return-type        = sy-msgty.
+    ls_return-number      = sy-msgno.
+    ls_return-id          = sy-msgid.
+    ls_return-message_v1  = sy-msgv1.
+    ls_return-message_v2  = sy-msgv2.
+    ls_return-message_v3  = sy-msgv3.
+    ls_return-message_v4  = sy-msgv4.
+    APPEND ls_return TO lt_return.
+  ELSE.
+    "OK
+    READ TABLE lt_idoc_comm_control INTO DATA(ls_control_record_out) INDEX 1.
+    CHECK sy-subrc = 0.
+    DATA(docnum) = ls_control_record_out-docnum.
+    ls_return-type        = 'S'.
+    ls_return-number      = '398'.
+    ls_return-id          = '00'.
+    ls_return-message_v1  = docnum.
+    APPEND ls_return TO lt_return.
+  ENDIF.
+
+* Hacemos un COMMIT para el Idoc
+*  CALL FUNCTION 'DEQUEUE_ALL'.
+**  COMMIT WORK AND WAIT.
+  CALL FUNCTION 'DB_COMMIT'.
+  CALL FUNCTION 'DEQUEUE_ALL'.
+  COMMIT WORK.
+
+
+ENDFUNCTION.

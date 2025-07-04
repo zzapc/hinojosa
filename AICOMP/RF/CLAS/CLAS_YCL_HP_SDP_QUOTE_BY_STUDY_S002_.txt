@@ -1,0 +1,247 @@
+
+class YCL_HP_SDP_QUOTE_BY_STUDY_S002 definition
+  public
+  inheriting from /VCXI/CL_CKMR_CLSTP
+  create public .
+
+public section.
+
+  types:
+    begin of Y_S_NEW_QUOT_H,
+              Q_NR  type I,
+              AUART type AUART,
+              VKORG type VKORG,
+              VTWEG type VTWEG,
+              SPART type SPART,
+              VKGRP type VKGRP,
+              KUNAG type KUNAG,
+              KUNWE type KUNWE,
+           end of Y_S_NEW_QUOT_H .
+
+  data R_DCO_INPUT type ref to YCL_RF_RQPTQ_DCO .
+  data R_DCO_OUTPUT type ref to YCL_RF_RQPTQ_DCO .
+
+  methods CONSTRUCTOR
+    importing
+      !IR_RPSEG type ref to /VCXI/CL_CKMR_RPSEG
+    raising
+      /VCXI/CX_CKX .
+
+  methods EXECUTE
+    redefinition .
+  methods GET_DESCR
+    redefinition .
+protected section.
+
+  methods CREATE_CONDREC
+    raising
+      /VCXI/CX_CKX .
+private section.
+endclass. "YCL_HP_SDP_QUOTE_BY_STUDY_S002 definition
+class YCL_HP_SDP_QUOTE_BY_STUDY_S002 implementation.
+method CONSTRUCTOR.
+
+*** Super Constructor
+  SUPER->CONSTRUCTOR( IR_RPSEG = IR_RPSEG ).
+
+*** Map DCO to Required Input/Output
+  ME->R_RPSEG->MAP_DCO( changing CR_DCO = ME->R_DCO_INPUT ).
+  ME->R_RPSEG->MAP_DCO( changing CR_DCO = ME->R_DCO_OUTPUT ).
+
+endmethod.
+method CREATE_CONDREC.
+
+  data: LF_POSNR type POSNR_VA, "JBL 23.01.2023
+        LF_INCPO type INCPO,    "JBL 23.01.2023
+        LF_PRSDT type PRSDT,
+        LF_VBELN type VBELN.
+  data: LS_KOMV  type KOMV.
+  data: LT_VBAK     type table of VBAK,
+        LT_VBAKKEY  type table of SALES_KEY,
+        LT_VBAPVB   type table of VBAPVB,
+        LT_VBKDVB   type table of VBKDVB,
+        LT_VBPAVB   type table of VBPAVB,
+        LT_KOMV     type table of KOMV,
+        LT_BAPIRET2 type table of BAPIRET2,
+        LT_BAPICOND type ZVCXI_XCI_TT_BAPICOND.
+  data: LR_COND_A05 type ref to YCL_HP_SD_IDOC_COND_A,
+        LR_BOB_ITEM type ref to YCL_RF_RQPTR_BOB_ITEM,
+        LR_BOB_SDOC type ref to ZCL_VCXI_XCI_BOB_SDOC.
+
+
+***--------------------------------------------------------------------------------------
+*** Process Marked Lines
+  loop at ME->R_DCO_OUTPUT->T_RQPTQ_POS reference into data(LR_RQPTQ_POS)
+                                                      where FLSEL eq ABAP_TRUE
+                                                        and MATNR ns '_MQ'.
+
+    clear: LT_BAPICOND, LT_VBAPVB, LT_VBPAVB, LT_VBKDVB.
+
+    if LF_POSNR is initial. "JBL 23.01.2023 add posnr to create condition record
+      LF_POSNR = LR_RQPTQ_POS->POSNR.
+      select single INCPO
+             into ( LF_INCPO )
+             from TVAK
+            where AUART = LR_RQPTQ_POS->AUART.
+    else.
+      LF_POSNR = LF_POSNR + LF_INCPO.
+    endif.
+
+*** Only continue for finished goods
+    select count( * ) from MARA where MATNR eq LR_RQPTQ_POS->MATNR
+                                  and MTART ne 'YREM'
+                                  and MTART ne 'YKMT'.
+    check SY-SUBRC is initial.
+
+*** Get Item Instance
+    LR_BOB_ITEM = YCL_RF_RQPTR_BOB_ITEM=>GET_INSTANCE( IF_VBELN = LR_RQPTQ_POS->VBELN
+                                                       IF_POSNR = LR_RQPTQ_POS->POSNR ).
+
+    data(LS_VBAK) = LR_BOB_ITEM->GET_BOB_HEAD( )->GET_VBAK( ).
+    data(LS_VBAP) = LR_BOB_ITEM->GET_VBAP( ).
+
+    LF_VBELN = LR_BOB_ITEM->GET_BOB_HEAD( )->F_VBELN.
+
+    LS_VBAP-POSNR = LF_POSNR."JBL 23.01.2023 Get correct posnr
+    append corresponding #( LS_VBAP ) to LT_VBAPVB.
+
+*** Get Condition for selected Item
+    append LR_BOB_ITEM->GET_POS_COND( 'ZPRC' ) to LT_BAPICOND.
+
+*** Only add Sub-Items for configured Materials (MQ Items => Scales)
+    if LR_BOB_ITEM->GET_VBAP( )-CUOBJ is not initial.
+
+***   Get all Sub-Items
+      loop at YCL_RF_RQPTR_BOB_ITEM=>GET_INSTANCES_BY_UEPOS( IR_BOB_ITEM = LR_BOB_ITEM ) into data(LR_BOB_ITEM_SUB).
+        append corresponding #( LR_BOB_ITEM_SUB->GET_VBAP( ) ) to LT_VBAPVB.
+
+***     Get Condition for Sub-Item
+        append LR_BOB_ITEM_SUB->GET_POS_COND( 'ZPRC' ) to LT_BAPICOND.
+      endloop.
+    endif.
+
+    append corresponding #( LR_BOB_ITEM->GET_VBPA( IF_PARVW = 'WE' ) ) to LT_VBPAVB.
+
+    clear LT_KOMV.
+
+    loop at LT_BAPICOND into data(LS_BAPICOND).
+
+      LS_BAPICOND-ITM_NUMBER = LF_POSNR. "JBL 23.01.2023 posnr to create condition record
+      call function 'YHP_MAP2I_BAPICOND_TO_KOMV'
+        exporting
+          BAPICOND                  = LS_BAPICOND
+        changing
+          KOMV                      = LS_KOMV
+        exceptions
+          ERROR_CONVERTING_ISO_CODE = 1
+          others                    = 2.
+      if SY-SUBRC eq 0.
+        append LS_KOMV to LT_KOMV.
+      endif.
+
+    endloop.
+
+    try.
+***     Check if cond.rec. creation necessary
+        data(LS_KOMV_CHECK) = value #( LT_KOMV[ KPOSN = LF_POSNR "LR_RQPTQ_POS->POSNR JBL 23.01.2023
+                                                KSCHL = 'ZPRC'
+                                                KINAK = SPACE ] ).
+      catch CX_SY_ITAB_LINE_NOT_FOUND.
+***     Cond.Rec. creation not needed for item &1 mat. &2. No price maintained...
+        ME->R_RPSEG->R_MSG->ADD_MESSAGE( IF_MSGTY = 'I'
+                                          IF_MSGID = 'YHP_SDP'
+                                          IF_MSGNO = '010'
+                                          IF_MSGV1 = LF_POSNR "LR_RQPTQ_POS->POSNR JBL 23.01.2023
+                                          IF_MSGV2 = LR_RQPTQ_POS->MATNR ).
+        continue.
+    endtry.
+
+    data(LS_VBKD) = LR_BOB_ITEM->GET_VBKD( ).
+    append corresponding #( LS_VBKD ) to LT_VBKDVB.
+
+
+    data(LS_KOMG) = YCL_HP_SD_IDOC_COND_A=>GET_KOMG_A927( IS_VBAK    = LS_VBAK   " Sales Document: Header Data
+                                                          IS_VBAP    = LS_VBAP  " Sales Document: Item Data
+                                                          IT_XVBPA   = LT_VBPAVB  " Reference table type for XVBPA/YVBPA
+                                                          IF_POSNR   = LR_RQPTQ_POS->POSNR   " Item number of the SD document
+                                                          IT_XVBKD   = LT_VBKDVB  " Table Type for XVBKD/YVBKD
+                                                          IF_KOTABNR = '929' ""JBL 30.01.2023 OPHJVC-190 Change table 927 to 929
+                                                          IF_KVEWE   = 'A' ).
+
+*** Fill Position Information
+    LF_PRSDT = LS_VBKD-PRSDT.
+
+    create object LR_COND_A05 type YCL_HP_SD_IDOC_COND_A
+      exporting
+        IF_DATAB = LF_PRSDT
+        IF_DATBI = '99991231'
+        IF_KAPPL = 'V'
+        IF_KSCHL = 'ZPRC'
+        IF_KVEWE = 'A'
+        IF_POSNR = LF_POSNR "LR_RQPTQ_POS->POSNR JBL 23.01.2023
+        IS_KOMG  = LS_KOMG
+        IT_KOMV  = LT_KOMV
+        IT_XVBAP = LT_VBAPVB.
+    check LR_COND_A05 is bound.
+
+    data(LT_BAPI_STATUS) = LR_COND_A05->CREATE( exporting IF_VBELN = LF_VBELN ).
+
+    loop at LT_BAPI_STATUS into data(LS_BAPI_STATUS) where MSGTY eq 'E'.
+      /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGTY = LS_BAPI_STATUS-MSGTY
+                                            IF_MSGID = LS_BAPI_STATUS-MSGID
+                                            IF_MSGNO = conv #( LS_BAPI_STATUS-MSGNO )
+                                            IF_MSGV1 = LS_BAPI_STATUS-MSGV1
+                                            IF_MSGV2 = LS_BAPI_STATUS-MSGV2
+                                            IF_MSGV3 = LS_BAPI_STATUS-MSGV3
+                                            IF_MSGV4 = LS_BAPI_STATUS-MSGV4 ).
+    endloop.
+
+    loop at LT_BAPI_STATUS into LS_BAPI_STATUS.
+      "Item &1 Material &2:
+      ME->R_RPSEG->R_MSG->ADD_MESSAGE( IF_MSGTY = 'S'
+                                        IF_MSGID = 'YHP_SDP'
+                                        IF_MSGNO = '011'
+                                        IF_MSGV1 = LR_RQPTQ_POS->POSNR
+                                        IF_MSGV2 = LR_RQPTQ_POS->MATNR ).
+
+      ME->R_RPSEG->R_MSG->ADD_MESSAGE( IF_MSGTY = LS_BAPI_STATUS-MSGTY
+                                       IF_MSGID = LS_BAPI_STATUS-MSGID
+                                       IF_MSGNO = conv #( LS_BAPI_STATUS-MSGNO )
+                                       IF_MSGV1 = LS_BAPI_STATUS-MSGV1
+                                       IF_MSGV2 = LS_BAPI_STATUS-MSGV2
+                                       IF_MSGV3 = LS_BAPI_STATUS-MSGV3
+                                       IF_MSGV4 = LS_BAPI_STATUS-MSGV4 ).
+    endloop.
+
+  endloop.
+
+endmethod.
+method EXECUTE.
+  try.
+
+*** Create New Condition Record
+      ME->CREATE_CONDREC( ).
+
+*** Set Status to Completed
+      ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_COMPLETED ).
+
+    catch /VCXI/CX_CKX into data(LR_CX_CKX).
+
+*** Set Status to Error
+      ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_ERROR ).
+
+***     Add Message to Message Log
+      ME->R_RPSEG->R_MSG->ADD_MESSAGE_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+
+*** Set Status of Items to Error
+      ME->R_DCO_OUTPUT->SET_ITEMS_STATUS( IF_ERROR = ABAP_TRUE ).
+
+  endtry.
+
+endmethod.
+method GET_DESCR.
+
+*** Change Step Description
+  move 'Create Condition Record'(D01) to RF_DESCR.
+
+endmethod.

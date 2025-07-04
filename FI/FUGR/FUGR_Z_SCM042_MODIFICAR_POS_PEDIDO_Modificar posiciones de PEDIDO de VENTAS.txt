@@ -1,0 +1,140 @@
+FUNCTION z_scm042_modificar_pos_pedido.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IT_PED_POS_MOD) TYPE  /SPE/DELIVERY_QUANT_RED_T
+*"  EXPORTING
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_TT
+*"----------------------------------------------------------------------
+* JGM 02.2024 GAPCM042 Aplicativo Gestión de Desvíos:
+* Modificar posiciones (reducir cantidad) de PEDIDOS de VENTAS
+*--------------------------------------------------------------------*
+  DATA: lt_ped_pos     TYPE /spe/delivery_quant_red_t,
+        lt_ped_pos_aux TYPE /spe/delivery_quant_red_t,
+        lt_return      TYPE bapiret2_tt.
+
+  DATA: lt_order_items_in  TYPE TABLE OF bapisditm,
+        lt_order_items_inx TYPE TABLE OF  bapisditmx,
+        lt_schedule_lines  TYPE TABLE OF bapischdl,
+        lt_schedule_linesx TYPE TABLE OF bapischdlx.
+
+  DATA: ls_order_header_in  TYPE bapisdh1,
+        ls_order_header_inx TYPE bapisdh1x,
+        ls_order_items_in   TYPE bapisditm,
+        ls_order_items_inx  TYPE bapisditmx,
+        ls_schedule_lines   TYPE bapischdl,
+        ls_schedule_linesx  TYPE bapischdlx.
+
+  DATA: lv_salesdocument TYPE bapivbeln-vbeln,
+        lv_kwmeng_new    TYPE vbap-kwmeng,
+        lv_posnr         TYPE vbap-posnr.
+  DATA: lr_type_error TYPE RANGE OF bapi_mtype.
+
+
+  lr_type_error = VALUE #( sign = 'I' option = 'EQ' ( low = 'E' ) ( low = 'A' ) ).
+
+*  lt_ped_pos = it_ped_pos_mod.
+*  SORT lt_ped_pos BY document_number document_item.
+
+  ">Puede haber partición de lotes, agrupar por pedido-pos de procedencia.
+  lt_ped_pos_aux = VALUE #( FOR wa_mod IN it_ped_pos_mod ( CORRESPONDING #( wa_mod EXCEPT delivery_number delivery_item ) ) ).
+  SORT lt_ped_pos_aux BY document_number document_item.
+
+  LOOP AT lt_ped_pos_aux INTO DATA(wa_aux).
+    COLLECT wa_aux INTO lt_ped_pos.
+  ENDLOOP.
+  "<
+
+  LOOP AT lt_ped_pos ASSIGNING FIELD-SYMBOL(<fs_ped_pos>).
+
+    AT NEW document_number.
+      lv_salesdocument = <fs_ped_pos>-document_number.
+
+      SELECT vbeln, posnr, matnr, kwmeng
+        INTO TABLE @DATA(lt_vbap)
+        FROM vbap
+        WHERE vbeln EQ @lv_salesdocument.
+
+      "Cabecera:
+      CLEAR ls_order_header_in.
+      ls_order_header_inx-updateflag = 'U'.
+    ENDAT.
+
+    "Posiciones:
+    lv_posnr = <fs_ped_pos>-document_item.
+
+    TRY .
+        DATA(ls_vbap) = lt_vbap[ posnr = lv_posnr ].
+      CATCH cx_root.
+    ENDTRY.
+
+    IF ls_vbap IS NOT INITIAL.
+      lv_kwmeng_new = ls_vbap-kwmeng - <fs_ped_pos>-quantity_chg. "Reducir cantidad.
+    ENDIF.
+
+    ls_order_items_in-itm_number = lv_posnr.
+    ls_order_items_in-target_qty = lv_kwmeng_new.
+    APPEND ls_order_items_in TO lt_order_items_in.
+    CLEAR ls_order_items_in.
+
+    ls_order_items_inx-itm_number = lv_posnr.
+    ls_order_items_inx-updateflag = 'U'.
+    ls_order_items_inx-target_qty = 'X'.
+    APPEND ls_order_items_inx TO lt_order_items_inx.
+    CLEAR ls_order_items_inx.
+
+    ls_schedule_lines-itm_number = lv_posnr.
+    ls_schedule_lines-sched_line = '0001'.
+    ls_schedule_lines-req_qty    = lv_kwmeng_new.
+    APPEND ls_schedule_lines TO lt_schedule_lines.
+    CLEAR ls_schedule_lines.
+
+    ls_schedule_linesx-itm_number = lv_posnr.
+    ls_schedule_linesx-sched_line = '0001'.
+    ls_schedule_linesx-updateflag = 'U'.
+    ls_schedule_linesx-req_qty    = 'X'.
+    APPEND ls_schedule_linesx TO lt_schedule_linesx.
+    CLEAR ls_schedule_linesx.
+
+    CLEAR ls_vbap.
+
+    AT END OF document_number.
+      CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+        EXPORTING
+          salesdocument    = lv_salesdocument
+          order_header_inx = ls_order_header_inx
+        TABLES
+          return           = lt_return
+          order_item_in    = lt_order_items_in
+          order_item_inx   = lt_order_items_inx
+          schedule_lines   = lt_schedule_lines
+          schedule_linesx  = lt_schedule_linesx.
+
+      LOOP AT lt_return TRANSPORTING NO FIELDS WHERE type IN lr_type_error.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc EQ 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+
+        "Modificadas cantidades pedido cliente".
+        PERFORM fill_return USING 'S' 'ZSCM042' '046' lv_salesdocument space space space CHANGING et_return.
+      ENDIF.
+
+      "Mensajes de error de la bapi.
+      DELETE lt_return WHERE type NOT IN lr_type_error.
+
+      APPEND LINES OF lt_return TO et_return.
+
+      FREE: lt_return,
+            lt_order_items_in,
+            lt_order_items_inx,
+            lt_schedule_lines,
+            lt_schedule_linesx.
+    ENDAT.
+  ENDLOOP.
+
+ENDFUNCTION.

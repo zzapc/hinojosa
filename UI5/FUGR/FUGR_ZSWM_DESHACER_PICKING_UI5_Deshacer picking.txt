@@ -1,0 +1,221 @@
+FUNCTION zswm_deshacer_picking_ui5.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(TCODE) TYPE  TCODE OPTIONAL
+*"     VALUE(UNAME) TYPE  SY-UNAME DEFAULT SY-UNAME
+*"     VALUE(OPERARIO) TYPE  ZLNUM_OPER OPTIONAL
+*"     VALUE(TKNUM) TYPE  TKNUM OPTIONAL
+*"     VALUE(VBELN) TYPE  VBELN OPTIONAL
+*"     VALUE(POSNR) TYPE  POSNR OPTIONAL
+*"     VALUE(LGPLA) TYPE  LGPLA OPTIONAL
+*"     VALUE(BARCODE) TYPE  BARCODE OPTIONAL
+*"     VALUE(TT_BARCODE) TYPE  BARCODE_T2 OPTIONAL
+*"  EXPORTING
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_TT
+*"----------------------------------------------------------------------
+  PERFORM break USING 'ZSWM_DESHACER_PICKING_UI5'.
+  CHECK barcode IS NOT INITIAL
+     OR tt_barcode[] IS NOT INITIAL.
+  IF barcode IS NOT INITIAL.
+    APPEND barcode TO tt_barcode.
+  ENDIF.
+  LOOP AT tt_barcode INTO barcode .
+    DATA(sw_tabix) = sy-tabix.
+    IF barcode IS NOT INITIAL.
+      WHILE barcode+0(1) EQ space.
+        barcode = barcode+1.
+      ENDWHILE.
+
+      MODIFY tt_barcode FROM barcode INDEX sw_tabix.
+    ELSE.
+      DELETE tt_barcode INDEX sw_tabix.
+    ENDIF.
+  ENDLOOP.
+  DATA: data_u            TYPE zswm_data_ui5_eeeoo_str,
+        r_param           TYPE zswm_data_ui5_param_str,
+        r_funcionalidades TYPE zswm_data_ui5_func_str.
+
+  CALL FUNCTION 'ZSWM_GET_DATA_USER_UI5'
+    EXPORTING
+      uname      = uname
+      statu      = 'X'
+      no_gen_log = abap_true
+    IMPORTING
+      data_user  = data_u
+*     ERROR      =
+*     TT_LOG     =
+    .
+  data_u-operario = operario.
+
+  DATA nltyp TYPE ltap-nltyp.
+  PERFORM validar_ubicacion USING data_u-lgnum lgpla CHANGING error tt_log nltyp.
+  IF error NE abap_true.
+    LOOP AT tt_barcode INTO barcode.
+      DATA lenum TYPE lenum.
+      CALL FUNCTION 'CONVERSION_EXIT_LENUM_INPUT'
+        EXPORTING
+          input           = barcode+0(20)
+        IMPORTING
+          output          = lenum
+        EXCEPTIONS
+          check_failed    = 1
+          not_numeric     = 2
+          t344_get_failed = 3
+          wrong_length    = 4
+          OTHERS          = 5.
+      IF sy-subrc NE 0.
+        MOVE abap_true TO error.
+        PERFORM mensaje USING 'E' sy-msgid sy-msgno sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 CHANGING tt_log[].
+        EXIT.
+      ENDIF.
+      SELECT SINGLE * INTO @DATA(lein) FROM lein WHERE lenum EQ @lenum.
+      IF sy-subrc NE 0.
+        MOVE abap_true TO error.
+*     El Bulto & no existe en SAP
+        PERFORM mensaje USING 'E' 'ZSWM_UI5' '071' lenum space space space CHANGING tt_log[].
+        EXIT.
+      ENDIF..
+      IF lein-lgnum NE data_u-lgnum.
+        MOVE abap_true TO error.
+*       El bulto & no pertenece al número de almacén &
+        PERFORM mensaje USING 'E' 'ZSWM_UI5' '072' lenum data_u-lgnum space space CHANGING tt_log[].
+        EXIT.
+      ENDIF.
+      IF lein-skzua EQ abap_true
+         OR lein-skzue EQ abap_true.
+        MOVE abap_true TO error.
+*        El bulto & está bloqueado
+        PERFORM mensaje USING 'E' 'ZSWM_UI5' '073' lenum data_u-lgnum space space CHANGING tt_log[].
+        EXIT.
+      ENDIF.
+      SELECT * INTO TABLE @DATA(tt_lqua) FROM lqua WHERE lgnum EQ @lein-lgnum
+                                                     AND lenum EQ @lein-lenum.
+      IF sy-dbcnt > 1.
+        MOVE abap_true TO error.
+*         Bulto & es palet mix o tiene una tarea sin confirmar
+        PERFORM mensaje USING 'E' 'ZSWM_UI5' '074' lenum data_u-lgnum space space CHANGING tt_log[].
+        EXIT.
+      ENDIF.
+      READ TABLE tt_lqua INTO DATA(rt_lqua) INDEX 1.
+      IF rt_lqua-einme <> 0
+      OR rt_lqua-ausme <> 0.
+        MOVE abap_true TO error.
+*         Bulto & es palet mix o tiene una tarea sin confirmar
+        PERFORM mensaje USING 'E' 'ZSWM_UI5' '074' lenum data_u-lgnum space space CHANGING tt_log[].
+        EXIT.
+      ENDIF.
+      SELECT SINGLE * INTO @DATA(rt_pick) FROM zswm_ui5_pick WHERE exidv EQ @lein-lenum
+                                                               AND lvorm NE @abap_true
+                                                               AND lgnum EQ @data_u-lgnum.
+      IF sy-subrc NE 0.
+        MOVE abap_true TO error.
+*             El bulto & no pertenece a ningún picking
+        PERFORM mensaje USING 'E' 'ZSWM_UI5' '079' lein-lenum space space space CHANGING tt_log[].
+        EXIT.
+      ENDIF.
+      IF rt_pick-vbeln NE vbeln
+          OR rt_pick-posnr NE posnr.
+        MOVE abap_true TO error.
+*             El bulto & no pertenece a ningún picking
+        PERFORM mensaje USING 'E' 'ZSWM_UI5' '080' lein-lenum vbeln posnr space CHANGING tt_log[].
+        EXIT.
+      ENDIF.
+      IF lgpla IS INITIAL.
+        CALL FUNCTION 'ZSWM_CREATE_BIN'
+          EXPORTING
+            lgnum = data_u-lgnum
+*           LGTYP = 'MUE'
+            lgpla = 'MUELLE'
+*           LGBER = 'GEN'
+*           LPTYP = 'GN'
+          .
+        nltyp = 'MUE'.
+        lgpla = 'MUELLE'.
+      ENDIF.
+      DATA tanum TYPE ltak-tanum.
+      CALL FUNCTION 'L_TO_CREATE_MOVE_SU' DESTINATION 'NONE'
+        EXPORTING
+          i_lenum               = lein-lenum
+          i_bwlvs               = '997'
+*         I_LZNUM               = ' '
+          i_nltyp               = nltyp
+*         I_NLBER               = ' '
+          i_nlpla               = lgpla
+*         I_NPPOS               = ' '
+          i_squit               = abap_true
+          i_letyp               = lein-letyp
+*         I_NIDRU               = ' '
+*         I_DRUKZ               = ' '
+*         I_LDEST               = ' '
+*         I_UPDATE_TASK         = ' '
+*         I_COMMIT_WORK         = 'X'
+*         I_BNAME               = SY-UNAME
+*         I_SOLEX               = 0
+*         I_PERNR               = 0
+*         I_BETYP               = ' '
+*         I_BENUM               = ' '
+        IMPORTING
+          e_tanum               = tanum
+*         E_NLTYP               =
+*         E_NLBER               =
+*         E_NLPLA               =
+*         E_NPPOS               =
+*                 TABLES
+*         T_LTAP_MOVE_SU        =
+*         T_LTAK                =
+*         T_LTAP_VB             =
+        EXCEPTIONS
+          not_confirmed_to      = 1
+          foreign_lock          = 2
+          bwlvs_wrong           = 3
+          betyp_wrong           = 4
+          nltyp_wrong           = 5
+          nlpla_wrong           = 6
+          nltyp_missing         = 7
+          nlpla_missing         = 8
+          squit_forbidden       = 9
+          lgber_wrong           = 10
+          xfeld_wrong           = 11
+          drukz_wrong           = 12
+          ldest_wrong           = 13
+          no_stock_on_su        = 14
+          su_not_found          = 15
+          update_without_commit = 16
+          no_authority          = 17
+          benum_required        = 18
+          ltap_move_su_wrong    = 19
+          lenum_wrong           = 20
+*         OTHERS                = 21
+          error_message         = 98
+          OTHERS                = 99.
+
+      .
+      IF sy-subrc <> 0.
+        MOVE abap_true TO error.
+        PERFORM mensaje USING 'E' sy-msgid sy-msgno sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 CHANGING tt_log[].
+        EXIT.
+      ENDIF.
+      DATA: zswm_ui5_pick_origen_anul TYPE zswm_ui5_pick_origen_anul.
+      zswm_ui5_pick_origen_anul-vltyp_2     = lein-lgtyp.
+      zswm_ui5_pick_origen_anul-vlpla_2     = lein-lgpla.
+      zswm_ui5_pick_origen_anul-vlenr_2     = lein-lenum.
+      zswm_ui5_pick_origen_anul-nltyp_2     = nltyp.
+      zswm_ui5_pick_origen_anul-nlpla_2     = lgpla.
+      zswm_ui5_pick_origen_anul-nlenr_2     = lein-lenum.
+      zswm_ui5_pick_origen_anul-tanum_canc  = tanum.
+      MOVE-CORRESPONDING                   zswm_ui5_pick_origen_anul TO rt_pick.
+      rt_pick-lvorm = abap_true.
+      MODIFY zswm_ui5_pick FROM rt_pick.
+      COMMIT WORK AND WAIT.
+    ENDLOOP.
+  ENDIF.
+
+
+
+
+
+
+
+ENDFUNCTION.

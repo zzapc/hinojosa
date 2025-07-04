@@ -1,0 +1,791 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZSSDD069_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  INIT_ICON_VALUES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM init_icon_values CHANGING pt_values TYPE ty_tab_values.
+
+  CONSTANTS: lc_domname TYPE dd07l-domname VALUE 'ZSSD_DO_ICONPROV'.
+
+  DATA: lt_dd07v TYPE TABLE OF dd07v.
+  DATA: ls_values TYPE ty_values.
+
+  CALL FUNCTION 'DD_DOMVALUES_GET'
+    EXPORTING
+      domname        = lc_domname
+      text           = 'X'
+      langu          = sy-langu
+    TABLES
+      dd07v_tab      = lt_dd07v
+    EXCEPTIONS
+      wrong_textflag = 1
+      OTHERS         = 2.
+
+  "Valores posibles restringidos para seleccionar indicador en matchcode.
+  LOOP AT lt_dd07v INTO DATA(ls_dd07v).
+    ls_values-icon = ls_dd07v-domvalue_l.
+    ls_values-text = ls_dd07v-ddtext.
+
+    APPEND ls_values TO pt_values.
+    CLEAR ls_values.
+  ENDLOOP.
+
+  "Valor por defecto icono/indicador (semáforo).
+  pb_icon = icon_led_red.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  GET_DATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_GT_OUTTAB  text
+*----------------------------------------------------------------------*
+FORM get_data  CHANGING pt_outtab TYPE ty_tab_outtab.
+  ">
+  CONSTANTS: lc_kappl_v TYPE t6b2f-kappl VALUE 'V',
+             lc_z005    TYPE t6b2f-kobog VALUE 'Z005'. "Rappel clientes PACS.
+  "<
+  DATA: ls_outtab     TYPE ty_outtab.
+  DATA: lv_name1     TYPE kna1-name1,
+        lv_kstbs_sum TYPE s060-kstbs,
+        lv_kwaeh     TYPE s060-kwaeh.
+  DATA: lv_tabname  TYPE c LENGTH 10,   "*
+        lv_textline TYPE zssdst069_prov_rappel_alv-textline. "*
+
+  FIELD-SYMBOLS <fs_tabline> TYPE any.  "*
+  DATA: lref_dataline TYPE REF TO data. "*
+
+
+  SELECT a~knuma, a~vkorg, a~vtweg, a~spart, a~bonem, a~waers, a~bosta, a~datab, a~datbi, a~botext,
+         b~knumh, b~kopos, b~kschl, b~kbetr, b~konwa, b~kbrue
+    INTO TABLE @DATA(lt_data)
+    FROM kona AS a
+    INNER JOIN konp AS b
+      ON a~knuma EQ b~knuma_bo
+    WHERE a~knuma IN @so_knuma
+      AND a~vkorg IN @so_vkorg
+      AND a~bonem IN @so_kunnr
+      AND a~bosta IN @so_bosta
+      AND a~datab GE @p_datab
+      AND a~datbi LE @p_datbi.
+
+  IF sy-subrc EQ 0.
+    SORT lt_data BY knuma.
+
+    ">Tablas de condiciones permitidas para Rappels.
+    SELECT *
+      INTO TABLE @DATA(lt_t6b2f)
+      FROM t6b2f
+      FOR ALL ENTRIES IN @lt_data
+      WHERE kappl EQ @lc_kappl_v
+        AND kobog EQ @lc_z005
+        AND kschl EQ @lt_data-kschl.
+    IF sy-subrc EQ 0.
+      SORT lt_t6b2f BY zaehk ASCENDING.
+    ENDIF.
+    "<
+
+    "Completar datos.
+    LOOP AT lt_data INTO DATA(wa_data).
+      DATA(lv_index) = sy-tabix.
+      DATA(ls_data) = wa_data. "*
+
+      ls_outtab = CORRESPONDING #( ls_data ).
+
+      ">Calcular antes el Volumen de negocio pero de todos los konp de un mismo acuerdo:
+      AT NEW knuma.
+        CLEAR lv_kstbs_sum.
+        LOOP AT lt_data INTO DATA(wa_data_aux) WHERE knuma EQ ls_data-knuma.
+
+          PERFORM leer_volumen_negocio_sum USING wa_data_aux-knumh
+                                                 wa_data_aux-kopos
+                                           CHANGING lv_kstbs_sum lv_kwaeh.
+        ENDLOOP.
+      ENDAT.
+      "<
+
+      "Proponer provisión según icono/semáforo:
+      PERFORM buscar_provision USING ls_data-knumh
+                                     ls_data-kopos
+                                     lv_kstbs_sum lv_kwaeh "*
+                               CHANGING ls_outtab.
+
+      "Filtrar selección según icono/semáforo.
+      IF pb_icon NE space AND ls_outtab-icon EQ space. "Todos o Solo Propuestas.
+        DELETE lt_data INDEX lv_index.
+        CLEAR ls_outtab.
+        CONTINUE.
+      ENDIF.
+
+      "Nombre beneficiario:
+      PERFORM read_name1_kunnr USING ls_data-bonem
+                               CHANGING lv_name1.
+      IF lv_name1 IS NOT INITIAL.
+        ls_outtab-nameb = lv_name1.
+        CLEAR lv_name1.
+      ENDIF.
+
+      IF ls_outtab-konwa EQ '%'.
+        "Formato.
+        ls_outtab-kbetr = ls_outtab-kbetr / 10. "Revisar%
+        ls_outtab-kbrue = ls_outtab-kbrue / 10. "Revisar%
+      ENDIF.
+
+      ">Buscar el código Cliente de la condición, en las tablas KOTE* existentes:
+      LOOP AT lt_t6b2f INTO DATA(ls_t6b2f) WHERE kschl EQ ls_data-kschl.
+        CONCATENATE 'KOTE' ls_t6b2f-kotabnr INTO lv_tabname.
+        CONDENSE lv_tabname.
+
+        "Consultar dinámicamente cada tabla hasta encontrar el registro.
+        CREATE DATA lref_dataline TYPE (lv_tabname).
+        ASSIGN lref_dataline->* TO <fs_tabline>.
+
+        SELECT SINGLE *
+          INTO <fs_tabline>
+          FROM (lv_tabname)
+          WHERE knuma EQ ls_data-knuma
+            AND knumh EQ ls_data-knumh
+            AND datab LE sy-datum.
+
+        IF sy-subrc EQ 0.
+          TRY .
+              ASSIGN COMPONENT 'KUNNR' OF STRUCTURE <fs_tabline> TO FIELD-SYMBOL(<fs_kunnr>).
+              IF <fs_kunnr> IS ASSIGNED AND <fs_kunnr> IS NOT INITIAL.
+
+                "Código Cliente:
+                ls_outtab-kunnr = <fs_kunnr>.
+
+                "Nombre cliente:
+                PERFORM read_name1_kunnr USING <fs_kunnr>
+                                         CHANGING lv_name1.
+                IF lv_name1 IS NOT INITIAL.
+                  ls_outtab-name1 = lv_name1.
+                  CLEAR lv_name1.
+                ENDIF.
+
+                UNASSIGN: <fs_tabline>, <fs_kunnr>.
+                FREE lref_dataline.
+                CLEAR lv_tabname.
+
+                EXIT. "Cliente encontrado.
+              ENDIF.
+
+            CATCH cx_root.
+          ENDTRY.
+        ENDIF.
+
+        UNASSIGN: <fs_tabline>, <fs_kunnr>.
+        FREE lref_dataline.
+        CLEAR lv_tabname.
+      ENDLOOP.
+      "<
+
+      ">Leer texto corto "Pagos de rappel":
+      CLEAR lv_textline.
+      PERFORM read_text_pagos_rappel USING ls_data-knuma
+                                     CHANGING lv_textline.
+      IF lv_textline IS NOT INITIAL.
+        ls_outtab-textline = lv_textline.
+      ENDIF.
+      "<
+
+      APPEND ls_outtab TO pt_outtab.
+      CLEAR ls_outtab.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM process_selection .
+
+  DATA: BEGIN OF ls_stable,
+          row TYPE c VALUE 'X',
+          col TYPE c VALUE 'X',
+        END OF ls_stable.
+
+  DATA: lt_row         TYPE lvc_t_roid,
+        lt_return      TYPE bapiret2_tt,
+        lt_return_prov TYPE bapiret2_tt.
+
+
+  CALL METHOD gref_alv->get_selected_rows
+    IMPORTING
+      et_row_no = lt_row.
+
+  IF lt_row IS NOT INITIAL.
+
+    "Procesar selección.
+    LOOP AT lt_row INTO DATA(wa_row).
+      READ TABLE gt_outtab ASSIGNING FIELD-SYMBOL(<fs_outtab>) INDEX wa_row-row_id.
+      IF sy-subrc EQ 0.
+
+        PERFORM aplicar_provision CHANGING <fs_outtab> lt_return_prov.
+
+        APPEND LINES OF lt_return_prov TO lt_return.
+        FREE lt_return_prov.
+      ENDIF.
+    ENDLOOP.
+  ELSE.
+    "No se han seleccionado registros.
+    MESSAGE i002 DISPLAY LIKE 'E'.
+  ENDIF.
+
+
+  IF lt_return IS NOT INITIAL.
+    PERFORM display_log USING lt_return.
+  ENDIF.
+
+  CALL METHOD gref_alv->refresh_table_display
+    EXPORTING
+      is_stable = ls_stable.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  APLICAR_PROVISION
+*&---------------------------------------------------------------------*
+*       Modificar valor campo Provisión en la condición KONP.
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM aplicar_provision CHANGING ps_outtab TYPE ty_outtab
+                                pt_return TYPE bapiret2_tt.
+
+  DATA: ls_return TYPE bapiret2.
+
+  DATA: lv_par1   TYPE sy-msgv1.
+*        lv_par2   TYPE sy-msgv2,
+*        lv_par3   TYPE sy-msgv3,
+*        lv_par4   TYPE sy-msgv4.
+
+  DATA: lt_konhdb    TYPE STANDARD TABLE OF konhdb,
+        lt_konpdb    TYPE STANDARD TABLE OF konpdb,
+        lt_konm_staf TYPE STANDARD TABLE OF condscale.
+  DATA: ls_konpdb    TYPE konpdb.
+
+
+  "Buscar datos completos de KONP.
+  SELECT SINGLE *
+    INTO @DATA(ls_konp)
+    FROM konp
+    WHERE knumh EQ @ps_outtab-knumh
+      AND kopos EQ @ps_outtab-kopos.
+
+  IF sy-subrc EQ 0.
+    MOVE-CORRESPONDING ls_konp TO ls_konpdb.
+
+    IF ps_outtab-konwa EQ '%'.
+      ls_konpdb-kbrue = ps_outtab-kbrue * 10. "Revisar%.
+    ELSE.
+      ls_konpdb-kbrue = ps_outtab-kbrue.
+    ENDIF.
+
+    ls_konpdb-updkz = 'U'.
+
+    APPEND ls_konpdb TO lt_konpdb.
+    CLEAR ls_konpdb.
+  ENDIF.
+
+  PERFORM lock_obj USING ps_outtab-knuma
+                   CHANGING ls_return.
+
+  IF ls_return-type EQ 'E'.
+    APPEND ls_return TO pt_return.
+    RETURN.
+  ENDIF.
+
+  "Actualizar Provisión (KBRUE) en KONP:
+  "NOTA: Para crear o modif cond, Nota SAP 1135984 - Conditions cannot be created with BAPI_PRICES_CONDITIONS
+  "Entonces con:
+  CALL FUNCTION 'CND_PRICES_DETAILS_SAVE'
+    TABLES
+      db_xkonh           = lt_konhdb
+      db_xkonp           = lt_konpdb
+      db_xstaf           = lt_konm_staf
+    EXCEPTIONS
+      konh_insert_failed = 1
+      konh_update_failed = 2
+      konh_delete_failed = 3
+      konh_modify_failed = 4
+      konp_insert_failed = 5
+      konp_update_failed = 6
+      konp_delete_failed = 7
+      konp_modify_failed = 8
+      konm_insert_failed = 9
+      konm_update_failed = 10
+      konm_delete_failed = 11
+      konm_modify_failed = 12
+      konw_insert_failed = 13
+      konw_update_failed = 14
+      konw_delete_failed = 15
+      konw_modify_failed = 16
+      OTHERS             = 17.
+
+  IF sy-subrc = 0.
+    COMMIT WORK AND WAIT.
+
+    lv_par1 = |{ ps_outtab-knuma ALPHA = OUT }|.
+
+    "Acuerdo, provisión actualizada".
+    CLEAR ls_return.
+    CALL FUNCTION 'BALW_BAPIRETURN_GET2'
+      EXPORTING
+        type   = 'S'
+        cl     = 'ZSSD069'
+        number = '003'
+        par1   = lv_par1
+      IMPORTING
+        return = ls_return.
+
+    APPEND ls_return TO pt_return.
+
+*    CLEAR ps_outtab-icon.  "Cambiar estado.
+  ELSE.
+    CLEAR ls_return.
+    CALL FUNCTION 'BALW_BAPIRETURN_GET2'
+      EXPORTING
+        type   = sy-msgty
+        cl     = sy-msgid
+        number = sy-msgno
+        par1   = sy-msgv1
+        par2   = sy-msgv2
+        par3   = sy-msgv3
+        par4   = sy-msgv4
+      IMPORTING
+        return = ls_return.
+
+    APPEND ls_return TO pt_return.
+  ENDIF.
+
+  PERFORM unlock_obj USING ps_outtab-knuma.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_LOG
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LT_RETURN  text
+*----------------------------------------------------------------------*
+FORM display_log  USING pt_return TYPE bapiret2_tt.
+
+  DATA:
+    l_log_handle        TYPE balloghndl,
+    l_s_log             TYPE bal_s_log,
+    l_s_msg             TYPE bal_s_msg,
+    l_s_display_profile TYPE bal_s_prof,
+*    ls_messages         TYPE bal_s_msg.
+    ls_return           TYPE bapiret2.
+
+* create an initial log file
+  l_s_log-extnumber  = text-000.  "Application Log.
+
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log      = l_s_log
+    IMPORTING
+      e_log_handle = l_log_handle
+    EXCEPTIONS
+      OTHERS       = 1.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+* Añadir mensajes al log.
+  LOOP AT pt_return INTO ls_return.
+
+    CLEAR l_s_msg.
+    l_s_msg-msgid     = ls_return-id.
+    l_s_msg-msgno     = ls_return-number.
+    l_s_msg-msgty     = ls_return-type.
+    l_s_msg-msgv1     = ls_return-message_v1.
+    l_s_msg-msgv2     = ls_return-message_v2.
+    l_s_msg-msgv3     = ls_return-message_v3.
+    l_s_msg-msgv4     = ls_return-message_v4.
+    l_s_msg-probclass = '3'.  "Default medium.
+
+    CALL FUNCTION 'BAL_LOG_MSG_ADD'
+      EXPORTING
+        i_log_handle = l_log_handle
+        i_s_msg      = l_s_msg
+      EXCEPTIONS
+        OTHERS       = 1.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+               WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ENDLOOP.
+
+
+* get a prepared profile
+  CALL FUNCTION 'BAL_DSP_PROFILE_POPUP_GET'
+    IMPORTING
+      e_s_display_profile = l_s_display_profile
+    EXCEPTIONS
+      OTHERS              = 1.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  l_s_display_profile-use_grid = 'X'.
+* set report to allow saving of variants
+  l_s_display_profile-disvariant-report = sy-repid.
+  l_s_display_profile-disvariant-handle = 'LOG'.
+
+
+* call display function module
+  CALL FUNCTION 'BAL_DSP_LOG_DISPLAY'
+    EXPORTING
+      i_s_display_profile = l_s_display_profile
+    EXCEPTIONS
+      OTHERS              = 1.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  CALL FUNCTION 'BAL_LOG_REFRESH'
+    EXPORTING
+      i_log_handle  = l_log_handle
+    EXCEPTIONS
+      log_not_found = 1
+      OTHERS        = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  READ_NAME1_KUNNR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_OUTTAB_KUNAG  text
+*      <--P_LS_OUTTAB_NAME1_AG  text
+*----------------------------------------------------------------------*
+FORM read_name1_kunnr  USING    p_kunnr TYPE kna1-kunnr
+                       CHANGING p_name1 TYPE kna1-name1.
+
+  IF p_kunnr IS NOT INITIAL.
+    SELECT SINGLE name1
+      INTO p_name1
+      FROM kna1
+      WHERE kunnr EQ p_kunnr.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  SET_ICON
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_OUTTAB  text
+*----------------------------------------------------------------------*
+FORM set_icon  CHANGING ps_outtab TYPE ty_outtab.
+
+*  IF ps_outtab-kbrue NE ps_outtab-kbetr.
+  ps_outtab-icon = icon_led_red.
+*  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  SEARCH_ACCRUALS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_OUTTAB  text
+*----------------------------------------------------------------------*
+FORM buscar_provision  USING p_knumh  TYPE knumh
+                             p_kopos  TYPE kopos
+                             p_kstbs TYPE s060-kstbs "*
+                             p_kwaeh TYPE s060-kwaeh "*
+                    CHANGING ps_outtab  TYPE ty_outtab.
+
+  DATA: lv_kbetr     TYPE kbetr,
+        lv_kstbs_sum TYPE s060-kstbs.
+
+  "Buscar volumen de negocio actual:
+  SELECT *
+    INTO TABLE @DATA(lt_s060)
+    FROM s060
+    WHERE knumh EQ @p_knumh
+      AND kopos EQ @p_kopos.
+
+  IF sy-subrc EQ 0.
+    SORT lt_s060 BY spmon ASCENDING.
+
+    LOOP AT lt_s060 INTO DATA(ls_s060).
+      lv_kstbs_sum = lv_kstbs_sum + ls_s060-kstbs.
+    ENDLOOP.
+
+    "Volumen negocio:
+    ps_outtab-kstbs = lv_kstbs_sum.
+    ps_outtab-kwaeh = ls_s060-kwaeh.  "Revisar: Siempre misma moneda?
+  ENDIF.
+
+  ">Reemplazar con Volumen de negocio total de todo el acuerdo, si existe.
+  IF p_kstbs IS NOT INITIAL AND ps_outtab-kwaeh EQ p_kwaeh.
+    lv_kstbs_sum = p_kstbs.
+  ENDIF.
+  "<
+
+  "Buscar valores de escala para este registro condición KNUMH, tope hasta el importe de volumen de negocio:
+  "En KONW (escala valores):
+  SELECT *
+    INTO TABLE @DATA(lt_konw)
+    FROM konw
+    WHERE knumh EQ @p_knumh
+      AND kopos EQ @p_kopos
+      AND kstbw LE @lv_kstbs_sum.
+
+  IF sy-subrc EQ 0.
+    SORT lt_konw BY kstbw DESCENDING.
+    lv_kbetr = lt_konw[ 1 ]-kbetr.
+  ELSE.
+    "En KONM (escala cantidades):  "Revisar -tiene sentido con cantidades?
+    SELECT *
+      INTO TABLE @DATA(lt_konm)
+      FROM konm
+      WHERE knumh EQ @p_knumh
+        AND kopos EQ @p_kopos
+        AND kstbm LE @ls_s060-kstbs.
+
+    IF sy-subrc EQ 0.
+      SORT lt_konm BY kstbm DESCENDING.
+      lv_kbetr = lt_konw[ 1 ]-kbetr.
+    ENDIF.
+  ENDIF.
+
+  IF lv_kbetr IS NOT INITIAL AND lv_kbetr NE ps_outtab-kbrue.
+    "Nuevo valor propuesto de provisión según volumen de negocio y el intervalo correspondiente en las escalas.
+    ps_outtab-kbrue = lv_kbetr.
+
+    "Icono/semáforo:
+    PERFORM set_icon CHANGING ps_outtab.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  INIT_PARAM_DATES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM init_param_dates .
+
+  IF p_datab IS INITIAL.
+    p_datab(4) = sy-datum(4).
+    p_datab+4(4) = '0101'.
+  ENDIF.
+
+  IF p_datbi IS INITIAL.
+    p_datbi(4) = sy-datum(4).
+    p_datbi+4(4) = '1231'.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  LOCK_OBJ
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_TABLE  text
+*----------------------------------------------------------------------*
+FORM lock_obj  USING p_knuma      TYPE kona-knuma
+               CHANGING ps_return TYPE bapiret2.
+
+  DATA: lv_msgv1 TYPE sy-msgv1.
+
+  CALL FUNCTION 'ENQUEUE_EVKONAE'
+    EXPORTING
+*     MODE_KONA      = 'E'
+*     MANDT          = SY-MANDT
+      knuma          = p_knuma
+*     X_KNUMA        = ' '
+*     _SCOPE         = '2'
+*     _WAIT          = ' '
+*     _COLLECT       = ' '
+    EXCEPTIONS
+      foreign_lock   = 1
+      system_failure = 2
+      OTHERS         = 3.
+
+  IF sy-subrc NE 0.
+*    "Normalmente devuelve el mensaje: SY-MSGID='MC', SY-MSGNO='601', SY-MSGV1=nombre_usuario:
+*    "-> El objeto solicitado está siendo bloqueado por el usuario &"
+
+    lv_msgv1 = |{ p_knuma ALPHA = OUT }|.
+
+    "El acuerdo ya está en tratamiento".
+    CLEAR ps_return.
+    CALL FUNCTION 'BALW_BAPIRETURN_GET2'
+      EXPORTING
+        type   = 'E'
+        cl     = 'MN'
+        number = '301'
+        par1   = lv_msgv1
+      IMPORTING
+        return = ps_return.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  UNLOCK_OBJ
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_KNUMA  text
+*----------------------------------------------------------------------*
+FORM unlock_obj  USING p_knuma TYPE kona-knuma.
+
+  CALL FUNCTION 'DEQUEUE_EVKONAE'
+    EXPORTING
+      knuma = p_knuma.
+
+ENDFORM.
+*>
+*&---------------------------------------------------------------------*
+*&      Form  LEER_VOLUMEN_NEGOCIO_SUM
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_DATA_KNUMH  text
+*      -->P_LS_DATA_KOPOS  text
+*      <--P_LV_KSTBS  text
+*----------------------------------------------------------------------*
+FORM leer_volumen_negocio_sum  USING p_knumh  TYPE knumh
+                                     p_kopos  TYPE kopos
+                              CHANGING p_kstbs TYPE s060-kstbs
+                                       p_kwaeh TYPE s060-kwaeh.
+
+  DATA: lv_kstbs_sum TYPE s060-kstbs.
+
+  "Buscar volumen de negocio de este knuma + kopos:
+  SELECT *
+    INTO TABLE @DATA(lt_s060)
+    FROM s060
+    WHERE knumh EQ @p_knumh
+      AND kopos EQ @p_kopos.
+
+  IF sy-subrc EQ 0.
+    SORT lt_s060 BY spmon ASCENDING.
+
+    "Acumular incluyendo valor anterior inicial:
+    IF p_kstbs IS NOT INITIAL.
+      lv_kstbs_sum = p_kstbs.
+    ENDIF.
+    LOOP AT lt_s060 INTO DATA(ls_s060).
+      lv_kstbs_sum = lv_kstbs_sum + ls_s060-kstbs.
+    ENDLOOP.
+
+    "Volumen negocio:
+    p_kstbs = lv_kstbs_sum.
+    p_kwaeh = ls_s060-kwaeh.  "Revisar: Siempre misma moneda?
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  READ_TEXT_PAGOS_RAPPEL
+*&---------------------------------------------------------------------*
+*       Leer texto del Acuerdo, correspondiente al objeto "Pagos de rappel",
+*       ("Bonus payment"): OBJECT='KONA', ID='1000', NAME=knuma.
+*----------------------------------------------------------------------*
+*      -->P_LS_DATA_KNUMA  text
+*      <--P_LV_TEXT_LINE  text
+*----------------------------------------------------------------------*
+FORM read_text_pagos_rappel  USING    p_knuma TYPE kona-knuma
+                             CHANGING p_textline TYPE zssdst069_prov_rappel_alv-textline.
+  CONSTANTS:
+    lc_tdobject_kona TYPE thead-tdobject  VALUE 'KONA',
+    lc_tdid_1000     TYPE thead-tdid      VALUE '1000',
+    lc_tabname       TYPE ddobjname       VALUE 'ZSSDST069_PROV_RAPPEL_ALV',
+    lc_fieldname     TYPE dfies-fieldname VALUE 'TEXTLINE'.
+
+  DATA: ls_thead TYPE thead.
+  DATA: lt_lines     TYPE TABLE OF tline,
+        lt_dfies_tab TYPE TABLE OF dfies.
+  DATA: lv_dd_leng TYPE i.
+
+  IF p_knuma IS NOT INITIAL.
+    CLEAR p_textline.
+
+    CLEAR ls_thead.
+    ls_thead-tdobject = lc_tdobject_kona.
+    ls_thead-tdname   = p_knuma.
+    ls_thead-tdid     = lc_tdid_1000.
+    ls_thead-tdspras  = sy-langu.
+
+    CALL FUNCTION 'READ_TEXT'
+      EXPORTING
+*       CLIENT                  = SY-MANDT
+        id                      = ls_thead-tdid
+        language                = ls_thead-tdspras
+        name                    = ls_thead-tdname
+        object                  = ls_thead-tdobject
+      TABLES
+        lines                   = lt_lines
+      EXCEPTIONS
+        id                      = 1
+        language                = 2
+        name                    = 3
+        not_found               = 4
+        object                  = 5
+        reference_check         = 6
+        wrong_access_to_archive = 7
+        OTHERS                  = 8.
+
+    IF lt_lines IS NOT INITIAL.
+
+      CALL FUNCTION 'DDIF_FIELDINFO_GET'
+        EXPORTING
+          tabname        = lc_tabname
+          fieldname      = lc_fieldname
+*         LANGU          = SY-LANGU
+        TABLES
+          dfies_tab      = lt_dfies_tab
+*         FIXED_VALUES   =
+        EXCEPTIONS
+          not_found      = 1
+          internal_error = 2
+          OTHERS         = 3.
+      IF sy-subrc EQ 0 AND lt_dfies_tab IS NOT INITIAL.
+        DATA(ls_defies_tab) = lt_dfies_tab[ 1 ].
+        lv_dd_leng = ls_defies_tab-leng.
+      ENDIF.
+
+      LOOP AT lt_lines INTO DATA(ls_lines) WHERE tdline IS NOT INITIAL.
+        "El campo de salida p_textline está limitado a la longitud de su tipo, para mostrar solo esa longitud en el ALV.
+        p_textline = p_textline && ls_lines-tdline.
+
+        "Parar si ya se ha llegado a la longitud (o toda menos un espacio, para no insertar algun texto de la siguiente línea).
+        DATA(lv_line_leng) = strlen( p_textline ).
+        IF lv_dd_leng IS NOT INITIAL AND
+          lv_line_leng EQ lv_dd_leng OR lv_line_leng EQ ( lv_dd_leng - 1 ).
+          EXIT.
+        ENDIF.
+      ENDLOOP.
+
+    ENDIF.
+
+  ENDIF.
+ENDFORM.
+"<

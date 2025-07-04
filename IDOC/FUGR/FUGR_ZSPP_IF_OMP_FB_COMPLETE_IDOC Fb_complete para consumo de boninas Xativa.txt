@@ -1,0 +1,268 @@
+FUNCTION zspp_if_omp_fb_complete.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(INPUT_METHOD) LIKE  BDWFAP_PAR-INPUTMETHD
+*"     VALUE(MASS_PROCESSING) LIKE  BDWFAP_PAR-MASS_PROC
+*"  EXPORTING
+*"     VALUE(WORKFLOW_RESULT) LIKE  BDWF_PARAM-RESULT
+*"     VALUE(APPLICATION_VARIABLE) LIKE  BDWF_PARAM-APPL_VAR
+*"     VALUE(IN_UPDATE_TASK) LIKE  BDWFAP_PAR-UPDATETASK
+*"     VALUE(CALL_TRANSACTION_DONE) LIKE  BDWFAP_PAR-CALLTRANS
+*"  TABLES
+*"      IDOC_CONTRL STRUCTURE  EDIDC
+*"      IDOC_DATA STRUCTURE  EDIDD
+*"      IDOC_STATUS STRUCTURE  BDIDOCSTAT
+*"      RETURN_VARIABLES STRUCTURE  BDWFRETVAR
+*"      SERIALIZATION_INFO STRUCTURE  BDI_SER
+*"  EXCEPTIONS
+*"      WRONG_FUNCTION_CALLED
+*"----------------------------------------------------------------------
+
+*Comentado Según MAIL DE CARLOS ASENJO
+*De: Carlos Asenjo Velasco <casenjo@hinojosa.es>
+*Enviado el: viernes, 19 de abril de 2024 10:16
+*Hola Jose,
+*Asteriscalo por favor por si acaso a futuro fuese necesario.
+
+**** FB_COMPLETE: quitar 2001 y dejar 2000 (Este mensaje se genera cada vez que se notifica una operación y
+**** solo tenemos que procesar los que contienen en el mensaje 2000_104 y 2000_105) con IDOC ZIF_OMP_FB_COMPLETE
+***  DATA(lo_log) =  NEW zcl_seidor_guardar_log( ).
+***
+***  CONSTANTS: c_processed_idocs(15) VALUE 'Processed_IDOCs',
+***             c_appl_objects(12)    VALUE 'Appl_Objects'.
+***  SELECT SINGLE waitsec INTO @DATA(lv_waitsec) FROM zsppt_wait WHERE funcion EQ 'zspp_if_omp_fb_complete'.
+***  DATA it_consumo TYPE TABLE OF zsppfbcomplete.
+***
+***  LOOP AT idoc_data INTO DATA(wa_data_head) WHERE segnam EQ c_fbcomplete."'ZSPPFBCOMPLETE'.
+***    APPEND INITIAL LINE TO it_consumo ASSIGNING FIELD-SYMBOL(<valors>).
+***    <valors> = wa_data_head-sdata.
+***  ENDLOOP.
+***
+***  DATA: wa_return TYPE bapiret1,
+***        it_tt     TYPE TABLE OF bapi_pp_timeticket,
+***        it_return TYPE TABLE OF bapi_coru_return,
+***        it_goods  TYPE TABLE OF bapi2017_gm_item_create,
+***        it_link   TYPE TABLE OF bapi_link_conf_goodsmov.
+***
+***  LOOP AT it_consumo ASSIGNING FIELD-SYMBOL(<consumo>).
+***
+***    APPEND INITIAL LINE TO it_goods ASSIGNING FIELD-SYMBOL(<goods>).
+***    <goods>-material = <consumo>-productid.
+***    CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+***      EXPORTING
+***        input        = <consumo>-productid
+***      IMPORTING
+***        output       = <goods>-material
+***      EXCEPTIONS
+***        length_error = 1
+***        OTHERS       = 2.
+***    IF sy-subrc <> 0.
+****     MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+****                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+***    ENDIF.
+***    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+***      EXPORTING
+***        input  = <consumo>-orderid
+***      IMPORTING
+***        output = <goods>-orderid.
+***
+***    SELECT SINGLE werks, lgort FROM resb WHERE aufnr = @<goods>-orderid AND matnr = @<goods>-material INTO @DATA(wa_resb).
+***    IF sy-subrc = 0.
+***      <goods>-plant = wa_resb-werks.
+***      <goods>-stge_loc = wa_resb-lgort.
+***    ENDIF.
+***    IF <goods>-plant <> '2000'.
+***      APPEND INITIAL LINE TO idoc_status ASSIGNING FIELD-SYMBOL(<stat>).
+***      <stat>-msgty = 'E'.
+***      <stat>-msgid = 'ZEDI_OMP'.
+***      <stat>-msgno = '007'.
+***      <stat>-msgv1 = <consumo>-orderid.
+***      <stat>-msgv2 =
+***      <stat>-msgv3 =
+***      <stat>-msgv4 = ''.
+***      CONTINUE.
+***    ENDIF.
+***    <goods>-batch = <consumo>-lotid.
+***    <goods>-entry_qnt = <consumo>-netweightused.
+***    <goods>-entry_uom = 'KG'.
+***    <goods>-move_type = 261.
+***
+***    "Ajuste de tolerancia de consumo
+****    #  Bobina de 2500 KG // Tolerancia fija de 100 KG
+****o  Escenario 1
+****#  A: Viene consumo de 2500 KG # Consumo real 2500 KG
+****#  B: Viene consumo de 2550 KG # Consumo real 2500 KG. Es decir, tenemos que consumir la totalidad del stock que tenga ese lote de la MCHB, no el que nos llega de OMP.
+****o  Escenario 2:
+****#  A: Viene consumo 2450 KG # 2500 – 2450 = 50 KG # 50 < 100 # Consumo real 2500 KG
+****#  B: Viene consumo de 2350 KG # 2500 – 2350 = 150 KG # 150 > 100 # Consumo 2350 KG.
+***    "Obtenemos la cantidad del lote en MCHB
+***    SELECT SINGLE clabs
+***      INTO @DATA(lv_cant)
+***      FROM mchb
+***      WHERE matnr = @<goods>-material
+***      AND charg = @<goods>-batch
+***      AND werks = @<goods>-plant
+***      AND lgort = @<goods>-stge_loc.
+***
+***    SELECT SINGLE tolerancia FROM zspp_tolerancia INTO @DATA(lv_tolerancia).
+***    IF sy-subrc <> 0.
+***      lv_tolerancia = 100.
+***    ENDIF.
+***
+***    DATA lv_diferencia TYPE menge_d.
+***
+***    lv_diferencia = lv_cant - <goods>-entry_qnt.
+***
+***    "Si llega más cantidad o la diferencia entre lo que llega y lo que se consume es < 100, se consume el lote completo.
+***    IF lv_cant < <goods>-entry_qnt OR lv_diferencia <= lv_tolerancia."100.
+***      <goods>-entry_qnt = lv_cant.
+***    ENDIF.
+***
+***    APPEND INITIAL LINE TO it_tt ASSIGNING FIELD-SYMBOL(<tt>).
+***    <tt>-orderid = <goods>-orderid.
+***    <tt>-operation = '0010'.
+***    SELECT SINGLE rueck
+***      FROM caufv
+***      INTO @<tt>-conf_no
+***      WHERE aufnr EQ @<goods>-orderid.
+***
+***    APPEND INITIAL LINE TO it_link ASSIGNING FIELD-SYMBOL(<link>).
+***    <link>-index_confirm = '1'.
+***    <link>-index_goodsmov = '1'.
+***
+***    CALL FUNCTION 'BAPI_PRODORDCONF_CREATE_TT'
+****      EXPORTING
+****        post_wrong_entries       = '0'
+****        testrun                  =
+****        call_on_inbound_queue    = SPACE
+***      IMPORTING
+***        return             = wa_return
+***      TABLES
+***        timetickets        = it_tt
+***        goodsmovements     = it_goods
+***        link_conf_goodsmov = it_link
+****       characteristics_wipbatch =
+****       link_conf_char_wipbatch  =
+***        detail_return      = it_return
+****       characteristics_batch    =
+****       link_gm_char_batch =
+***      .
+***    LOOP AT it_return ASSIGNING FIELD-SYMBOL(<ret>) WHERE id IS NOT INITIAL.
+***      APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+***      <stat>-msgty = <ret>-type.
+***      <stat>-msgid = <ret>-id.
+***      <stat>-msgno = <ret>-number.
+***      <stat>-msgv1 = <ret>-message_v1.
+***      <stat>-msgv2 = <ret>-message_v2.
+***      <stat>-msgv3 = <ret>-message_v3.
+***      <stat>-msgv4 = <ret>-message_v4.
+***    ENDLOOP.
+***    IF sy-subrc <> 0 AND wa_return-id IS NOT INITIAL.
+***
+***      APPEND INITIAL LINE TO idoc_status ASSIGNING <stat>.
+***      <stat>-msgty = wa_return-type.
+***      <stat>-msgid = wa_return-id.
+***      <stat>-msgno = wa_return-number.
+***      <stat>-msgv1 = wa_return-message_v1.
+***      <stat>-msgv2 = wa_return-message_v2.
+***      <stat>-msgv3 = wa_return-message_v3.
+***      <stat>-msgv4 = wa_return-message_v4.
+***
+***    ENDIF.
+***
+***    COMMIT WORK AND WAIT.
+***    WAIT UP TO lv_waitsec SECONDS.
+***
+***  ENDLOOP.
+***
+***
+***
+***  DATA: i_type       TYPE bapi_mtype,
+***        i_id         TYPE symsgid,
+***        i_number     TYPE symsgno,
+***        i_message_v1 TYPE symsgv,
+***        i_message_v2 TYPE symsgv,
+***        i_message_v3 TYPE symsgv,
+***        i_message_v4 TYPE symsgv.
+***
+***  LOOP AT idoc_status INTO DATA(wa_status).
+***    i_type = wa_status-msgty.
+***    i_id = wa_status-msgid.
+***    i_number = wa_status-msgno.
+***    i_message_v1 = wa_status-msgv1.
+***    i_message_v2 = wa_status-msgv2.
+***    i_message_v3 = wa_status-msgv3.
+***    i_message_v4 = wa_status-msgv4.
+***    lo_log->guardar_mensaje(
+***    EXPORTING
+***      i_type       = i_type
+***      i_id         = i_id
+***      i_number     = i_number
+***      i_message_v1 = i_message_v1
+***      i_message_v2 = i_message_v2
+***      i_message_v3 = i_message_v3
+***      i_message_v4 = i_message_v4
+***      ).
+***  ENDLOOP.
+***  IF sy-subrc = 0.
+***    lo_log->guardar_log(
+***    EXPORTING
+***      objeto    = 'ZEDI_OMP'
+***      subobjeto = 'ZFBCOMPLET'
+***    IMPORTING
+***    lognumber = DATA(lv_lognum)    " Número de LOG
+***          ).
+***  ENDIF.
+***  DATA it_logtab TYPE bapiret2_tab.
+***  lo_log->get_bapiret_tab(
+***  IMPORTING
+***  gt_bapiret = it_logtab
+***  ).
+***  LOOP AT it_logtab TRANSPORTING NO FIELDS WHERE type EQ 'E' OR type EQ 'A' OR type EQ 'X'.
+***    DATA(lv_err_idoc) = 'X'.
+***    EXIT.
+***  ENDLOOP.
+***  LOOP AT idoc_status TRANSPORTING NO FIELDS WHERE msgty EQ 'E' OR msgty EQ 'A' OR msgty EQ 'X'.
+***    lv_err_idoc = 'X'.
+***    EXIT.
+***  ENDLOOP.
+***  REFRESH idoc_status.
+***  CLEAR idoc_status.
+***
+***  workflow_result = '99999'.
+***  CLEAR idoc_status.
+***
+***  IF lv_err_idoc = 'X'.
+***    idoc_status-msgty    = 'E'.
+***    idoc_status-status   = '63'.
+***  ELSE.
+***    idoc_status-msgty    = 'S'.
+***    idoc_status-status   = '53'.
+***  ENDIF.
+***  idoc_status-msgid    = '00'.
+***  idoc_status-msgno    = '398'.
+***  idoc_status-msgv1    = 'Revisar LOG de Aplicación'.
+***  idoc_status-msgv2    = ''.
+***  idoc_status-msgv3    = ''.
+***  idoc_status-msgv4    = ''.
+***
+***  idoc_status-repid    = sy-repid.
+***  idoc_status-appl_log = lv_lognum.
+***  CLEAR return_variables.
+***  return_variables-wf_param = 'PROCESS_IDOCs'.
+***  LOOP AT idoc_contrl.
+***    idoc_status-docnum = idoc_contrl-docnum.
+***    APPEND idoc_status.
+***    return_variables-doc_number = idoc_contrl-docnum.
+***    APPEND return_variables.
+***  ENDLOOP.
+***
+***  SORT return_variables.
+***  DELETE ADJACENT DUPLICATES FROM return_variables.
+***
+***  CALL FUNCTION 'DB_COMMIT'.
+***  CALL FUNCTION 'DEQUEUE_ALL'.
+***  COMMIT WORK.
+
+ENDFUNCTION.

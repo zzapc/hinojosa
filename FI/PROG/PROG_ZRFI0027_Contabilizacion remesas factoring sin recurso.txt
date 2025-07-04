@@ -1,0 +1,361 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRFI0027
+*&
+*&---------------------------------------------------------------------*
+*& Contabilización remesas factoring sin recurso
+*& Javier Calás. 06.10.22
+*&---------------------------------------------------------------------*
+
+REPORT zrfi0027.
+
+
+TABLES: bkpf, bseg.
+
+""""""""""""""""""""""""
+" Pantalla de selección
+""""""""""""""""""""""""
+PARAMETERS:       p_bukrs TYPE  bkpf-bukrs OBLIGATORY.
+SELECT-OPTIONS    s_belnr FOR   bkpf-belnr OBLIGATORY.
+PARAMETER:        p_gjahr TYPE  bkpf-gjahr OBLIGATORY.
+SELECT-OPTIONS:   s_kunnr FOR   bseg-kunnr.
+
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-t01.
+PARAMETERS:       p_budat TYPE  budat OBLIGATORY DEFAULT sy-datum.
+SELECTION-SCREEN END OF BLOCK b01.
+
+SELECTION-SCREEN BEGIN OF BLOCK b02 WITH FRAME TITLE text-t02.
+PARAMETERS:       p_mode TYPE zbdc_mode OBLIGATORY DEFAULT 'N'.
+SELECTION-SCREEN END OF BLOCK b02.
+
+
+
+START-OF-SELECTION.
+  PERFORM f_start_of_selection.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_START_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_start_of_selection.
+
+  DATA: tl_alv TYPE zrfi0027_t_alv.
+
+  SELECT belnr, gjahr, blart, bukrs, bstat, stblg, xblnr, waers, bldat
+    INTO TABLE @DATA(tl_bkpf)
+    FROM bkpf
+    WHERE bukrs =   @p_bukrs AND
+          belnr IN  @s_belnr AND
+          gjahr =   @p_gjahr.
+
+  LOOP AT s_belnr ASSIGNING FIELD-SYMBOL(<fs_belnr>) WHERE option = 'EQ'.
+    READ TABLE tl_bkpf TRANSPORTING NO FIELDS WITH KEY belnr = <fs_belnr>-low.
+    IF sy-subrc <> 0.
+      APPEND INITIAL LINE TO tl_alv ASSIGNING FIELD-SYMBOL(<fs_alv>).
+      <fs_alv>-bukrs = p_bukrs.
+      <fs_alv>-belnr = <fs_belnr>-low.
+      <fs_alv>-gjahr = p_gjahr.
+      <fs_alv>-message = 'El documento no existe'.
+    ENDIF.
+  ENDLOOP.
+
+  SELECT SINGLE xkkbi
+    INTO @DATA(vl_xkkbi)
+    FROM t001
+    WHERE bukrs = @p_bukrs.
+
+
+  IF tl_bkpf IS NOT INITIAL.
+    DATA vl_answer.
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        text_question  = 'Se van a contabilizar los documentos seleccionados. ¿Desea continuar?'
+      IMPORTING
+        answer         = vl_answer
+      EXCEPTIONS
+        text_not_found = 1
+        OTHERS         = 2.
+    IF vl_answer <> '1'.
+      RETURN.
+    ENDIF.
+
+    SELECT bukrs, belnr, gjahr, hkont, kunnr, bschl, cession_kz, wrbtr, umskz, wverw, zfbdt, koart, zterm,
+           gsber, kkber, zbd1t
+      INTO TABLE @DATA(tl_bseg_tot)
+      FROM bseg
+      FOR ALL ENTRIES IN @tl_bkpf
+      WHERE bukrs = @tl_bkpf-bukrs  AND
+            belnr = @tl_bkpf-belnr AND
+            gjahr = @tl_bkpf-gjahr AND
+            kunnr IN @s_kunnr.
+
+    SELECT *
+      INTO TABLE @DATA(tl_zfi_ind_cc_bp)
+      FROM zfi_ind_cc_bp
+      WHERE company = @p_bukrs.
+  ENDIF.
+
+
+  DATA tl_bseg LIKE tl_bseg_tot.
+  DATA wl_t052 TYPE t052.
+
+  LOOP AT tl_bkpf ASSIGNING FIELD-SYMBOL(<fs_bkpf>).
+    CLEAR tl_bseg.
+
+    APPEND INITIAL LINE TO tl_alv ASSIGNING <fs_alv>.
+    <fs_alv>-bukrs = <fs_bkpf>-bukrs.
+    <fs_alv>-belnr = <fs_bkpf>-belnr.
+    <fs_alv>-gjahr = <fs_bkpf>-gjahr.
+
+    "2.2  Chequeo del documento a procesar.
+    IF <fs_bkpf>-bstat IS NOT INITIAL.
+      <fs_alv>-message = 'No aplica por estatus incorrecto'. CONTINUE.
+    ENDIF.
+
+    IF <fs_bkpf>-stblg IS NOT INITIAL.
+      <fs_alv>-message = 'No aplica por documento anulado'. CONTINUE.
+    ENDIF.
+
+    IF <fs_bkpf>-blart <> 'DR' AND <fs_bkpf>-blart <> 'DE' AND <fs_bkpf>-blart <> 'DW'.
+      <fs_alv>-message = 'No aplica por clase de documento incorrecta'. CONTINUE.
+    ENDIF.
+
+    DATA(vl_bschl) = SWITCH #( <fs_bkpf>-blart WHEN 'DR' OR 'DW' THEN '01' ELSE '09' ).
+
+    LOOP AT tl_bseg_tot ASSIGNING FIELD-SYMBOL(<fs_bseg>) WHERE belnr = <fs_bkpf>-belnr AND
+                                                                gjahr = <fs_bkpf>-gjahr AND
+                                                                bschl = vl_bschl.
+      IF <fs_bseg>-cession_kz IS INITIAL.
+        <fs_alv>-message = 'No aplica por cesión de crédito'. EXIT.
+      ENDIF.
+
+      "Chequeo de mapeo de Indicador de Cesión de crédito
+      READ TABLE tl_zfi_ind_cc_bp ASSIGNING FIELD-SYMBOL(<fs_zfi_ind_cc_bp>) WITH KEY company     = <fs_bkpf>-bukrs
+                                                                                      cession_kz  = <fs_bseg>-cession_kz.
+      IF sy-subrc <> 0.
+        <fs_alv>-message = 'Falta mapeo de indicador de cesión de crédito'. EXIT.
+      ENDIF.
+
+
+      CASE <fs_bkpf>-blart.
+        WHEN 'DR' OR 'DW'.
+          ADD <fs_bseg>-zbd1t TO <fs_bseg>-zfbdt.
+
+          IF <fs_bseg>-zfbdt < sy-datum.
+            <fs_alv>-message = 'No aplica por vencimiento en el pasado'. EXIT.
+          ENDIF.
+
+        WHEN 'DE'.
+          "Chequeos adicionales si el documento tiene clase de documento DE
+          IF <fs_bseg>-umskz NA 'HR'.
+            <fs_alv>-message = 'No aplica por CME incorrecto'. EXIT.
+          ENDIF.
+
+          IF <fs_bseg>-wverw IS NOT INITIAL.
+            <fs_alv>-message = 'No aplica por utilización del CME'. EXIT.
+          ENDIF.
+
+          IF <fs_bseg>-zfbdt < sy-datum.
+            <fs_alv>-message = 'No aplica por vencimiento en el pasado'. EXIT.
+          ENDIF.
+      ENDCASE.
+
+      APPEND <fs_bseg> TO tl_bseg.
+    ENDLOOP.
+
+    CHECK <fs_alv>-message IS INITIAL.
+
+    IF tl_bseg IS INITIAL.
+      <fs_alv>-message = 'No se ha encontrado posiciones deudor'. CONTINUE.
+    ENDIF.
+
+
+    READ TABLE tl_bseg ASSIGNING <fs_bseg> INDEX 1. "Lo utilizo para el primer valor KUNNR de la cabecera
+
+    DATA: vl_doc_date_external TYPE c LENGTH 10,
+          vl_budat_external    TYPE c LENGTH 10,
+          vl_zfbdt_external    TYPE c LENGTH 10,
+          vl_importe_external  TYPE c LENGTH 20.
+    CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+      EXPORTING
+        date_internal            = <fs_bkpf>-bldat
+      IMPORTING
+        date_external            = vl_doc_date_external
+      EXCEPTIONS
+        date_internal_is_invalid = 1
+        OTHERS                   = 2.
+
+    CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+      EXPORTING
+        date_internal            = p_budat
+      IMPORTING
+        date_external            = vl_budat_external
+      EXCEPTIONS
+        date_internal_is_invalid = 1
+        OTHERS                   = 2.
+
+
+    DATA(rl_batch_input) = NEW zcl_seis_batch_input( 'F-02' ).
+    rl_batch_input->add_dynpro( vp_programa = 'SAPMF05A' vp_dynpro   = '0100' ).
+    rl_batch_input->add_field( vp_campo = 'BDC_CURSOR'    vp_valor = 'RF05A-NEWUM' ).
+    rl_batch_input->add_field( vp_campo = 'BDC_OKCODE'    vp_valor = '/00' ).
+    rl_batch_input->add_field( vp_campo = 'BKPF-BLDAT'    vp_valor = vl_doc_date_external ).
+    rl_batch_input->add_field( vp_campo = 'BKPF-BLART'    vp_valor = 'DJ' ).
+    rl_batch_input->add_field( vp_campo = 'BKPF-BUKRS'    vp_valor = <fs_bkpf>-bukrs ).
+    rl_batch_input->add_field( vp_campo = 'BKPF-BUDAT'    vp_valor = vl_budat_external ).
+    rl_batch_input->add_field( vp_campo = 'BKPF-MONAT'    vp_valor = p_budat+4(2) ).
+    rl_batch_input->add_field( vp_campo = 'BKPF-WAERS'    vp_valor = <fs_bkpf>-waers ).
+    rl_batch_input->add_field( vp_campo = 'BKPF-XBLNR'    vp_valor = <fs_bkpf>-xblnr ).
+    rl_batch_input->add_field( vp_campo = 'BKPF-BKTXT'    vp_valor = 'Factoring sin recurso' ).
+    rl_batch_input->add_field( vp_campo = 'FS006-DOCID'   vp_valor = '*' ).
+    rl_batch_input->add_field( vp_campo = 'RF05A-NEWBS'   vp_valor = '09' ).
+    rl_batch_input->add_field( vp_campo = 'RF05A-NEWKO'   vp_valor = <fs_bseg>-kunnr ).
+    rl_batch_input->add_field( vp_campo = 'RF05A-NEWUM'   vp_valor = 'K' ).
+    rl_batch_input->add_field( vp_campo = 'BDC_SUBSCR'    vp_valor = 'SAPMF05A                                1300APPL_SUB_T' ).
+    rl_batch_input->add_field( vp_campo = 'BDC_SUBSCR'    vp_valor = 'SAPLSEXM                                0200APPL_SUB' ).
+
+
+
+    LOOP AT tl_bseg ASSIGNING <fs_bseg>.
+      DATA(vl_tabix) = sy-tabix.
+      READ TABLE tl_zfi_ind_cc_bp ASSIGNING <fs_zfi_ind_cc_bp> WITH KEY company     = <fs_bkpf>-bukrs
+                                                                        cession_kz  = <fs_bseg>-cession_kz.
+      CHECK sy-subrc = 0.
+
+      IF <fs_zfi_ind_cc_bp>-porc_financiacion <> 0.
+        <fs_bseg>-wrbtr =  <fs_bseg>-wrbtr * ( <fs_zfi_ind_cc_bp>-porc_financiacion / 100 ).
+      ENDIF.
+
+      CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+        EXPORTING
+          date_internal            = <fs_bseg>-zfbdt
+        IMPORTING
+          date_external            = vl_zfbdt_external
+        EXCEPTIONS
+          date_internal_is_invalid = 1
+          OTHERS                   = 2.
+      WRITE <fs_bseg>-wrbtr TO vl_importe_external.
+      CONDENSE vl_importe_external NO-GAPS.
+
+
+      rl_batch_input->add_dynpro( vp_programa = 'SAPMF05A' vp_dynpro = '2320' ).
+      rl_batch_input->add_field( vp_campo = 'BDC_CURSOR'    vp_valor = 'BSEG-GSBER' ).
+      rl_batch_input->add_field( vp_campo = 'BDC_OKCODE'    vp_valor = '=ZK' ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-WRBTR'    vp_valor = vl_importe_external ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-GSBER'    vp_valor = <fs_bseg>-gsber ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-SGTXT'    vp_valor = |FACTORING SIN RECURSO { <fs_bkpf>-xblnr }| ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-ZUONR'    vp_valor = <fs_zfi_ind_cc_bp>-hbkid ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-ZFBDT'    vp_valor = vl_zfbdt_external ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-ZLSCH'    vp_valor =  'F').
+
+      SELECT COUNT( * )
+        INTO @DATA(vl_cuenta)
+        FROM knbk
+        WHERE kunnr = @<fs_bseg>-kunnr.
+      IF vl_cuenta > 1.
+        rl_batch_input->add_field( vp_campo = 'BSEC-BANKL'    vp_valor =  space ).
+      ENDIF.
+
+
+      rl_batch_input->add_dynpro( vp_programa = 'SAPMF05A' vp_dynpro = '0331' ).
+      rl_batch_input->add_field( vp_campo = 'BDC_CURSOR'    vp_valor = 'RF05A-NEWKO' ).
+      rl_batch_input->add_field( vp_campo = 'BDC_OKCODE'    vp_valor = '/00' ).
+      IF vl_xkkbi = 'X'.
+        rl_batch_input->add_field( vp_campo = 'BSEG-KKBER'    vp_valor = <fs_bseg>-kkber ).
+      ENDIF.
+      rl_batch_input->add_field( vp_campo = 'BSEG-HBKID'    vp_valor = <fs_zfi_ind_cc_bp>-hbkid ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-FDLEV'    vp_valor = 'DF' ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-HZUON'    vp_valor = <fs_zfi_ind_cc_bp>-hbkid ).
+      rl_batch_input->add_field( vp_campo = 'RF05A-NEWBS'   vp_valor = '17' ).
+      rl_batch_input->add_field( vp_campo = 'RF05A-NEWKO'   vp_valor = <fs_bseg>-kunnr ).
+
+      rl_batch_input->add_dynpro( vp_programa = 'SAPMF05A' vp_dynpro = '0301' ).
+      rl_batch_input->add_field( vp_campo = 'BDC_CURSOR'    vp_valor = 'BSEG-ZLSCH' ).
+      rl_batch_input->add_field( vp_campo = 'BDC_OKCODE'    vp_valor = '=ZK' ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-WRBTR'    vp_valor = vl_importe_external ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-MWSKZ'    vp_valor = '**' ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-GSBER'    vp_valor = <fs_bseg>-gsber ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-SGTXT'    vp_valor = |FACTORING SIN RECURSO { <fs_bkpf>-xblnr }| ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-ZUONR'    vp_valor = <fs_zfi_ind_cc_bp>-hbkid ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-ZFBDT'    vp_valor = vl_zfbdt_external ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-ZLSCH'    vp_valor =  'J').
+
+      rl_batch_input->add_dynpro( vp_programa = 'SAPMF05A' vp_dynpro = '0331' ).
+      rl_batch_input->add_field( vp_campo = 'BDC_CURSOR'    vp_valor = 'BSEG-HBKID' ).
+      IF vl_xkkbi = 'X'.
+        rl_batch_input->add_field( vp_campo = 'BSEG-KKBER'    vp_valor = <fs_bseg>-kkber ).
+      ENDIF.
+      rl_batch_input->add_field( vp_campo = 'BSEG-HBKID'    vp_valor = <fs_zfi_ind_cc_bp>-hbkid ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-FDLEV'    vp_valor = 'F1' ).
+      rl_batch_input->add_field( vp_campo = 'BSEG-HZUON'    vp_valor = <fs_zfi_ind_cc_bp>-hbkid ).
+
+      IF vl_tabix < lines( tl_bseg ).
+        rl_batch_input->add_field( vp_campo = 'BDC_OKCODE'    vp_valor = '/00'  ).
+        rl_batch_input->add_field( vp_campo = 'RF05A-NEWBS'   vp_valor = '09' ).
+        rl_batch_input->add_field( vp_campo = 'RF05A-NEWKO'   vp_valor = <fs_bseg>-kunnr ).
+        rl_batch_input->add_field( vp_campo = 'RF05A-NEWUM'   vp_valor = 'K' ).
+      ELSE.
+        rl_batch_input->add_field( vp_campo = 'BDC_OKCODE'    vp_valor =  '=BU' ).
+      ENDIF.
+    ENDLOOP.
+
+
+    rl_batch_input->set_modo( p_mode ).
+    DATA(tl_mensajes) = rl_batch_input->call_transaction( ).
+
+    DATA vl_msg TYPE bapiret2-message.
+    READ TABLE tl_mensajes INTO DATA(wl_mensaje) WITH KEY msgtyp = 'E'.
+    IF sy-subrc <> 0.
+      READ TABLE tl_mensajes INTO wl_mensaje WITH KEY msgtyp = 'A'.
+    ENDIF.
+
+    IF sy-subrc = 0.
+      DELETE tl_mensajes WHERE msgtyp NA 'EA'.
+      LOOP AT tl_mensajes ASSIGNING FIELD-SYMBOL(<fs_mensaje>).
+        MESSAGE ID <fs_mensaje>-msgid TYPE <fs_mensaje>-msgtyp NUMBER <fs_mensaje>-msgnr
+            WITH <fs_mensaje>-msgv1 <fs_mensaje>-msgv2 <fs_mensaje>-msgv3 <fs_mensaje>-msgv4
+            INTO vl_msg.
+
+        AT FIRST.
+          <fs_alv>-message = vl_msg.
+          <fs_alv>-msgid   = <fs_mensaje>-msgid.
+          <fs_alv>-msgno   = <fs_mensaje>-msgnr.
+          CONTINUE.
+        ENDAT.
+        APPEND <fs_alv> TO tl_alv ASSIGNING <fs_alv>.
+        <fs_alv>-message = vl_msg.
+        <fs_alv>-msgid   = <fs_mensaje>-msgid.
+        <fs_alv>-msgno   = <fs_mensaje>-msgnr.
+      ENDLOOP.
+
+    ELSE.
+      READ TABLE tl_mensajes ASSIGNING <fs_mensaje> WITH KEY  msgid = 'F5'
+                                                              msgnr = '312'.
+      IF sy-subrc = 0.
+        MESSAGE ID <fs_mensaje>-msgid TYPE <fs_mensaje>-msgtyp NUMBER <fs_mensaje>-msgnr
+            WITH <fs_mensaje>-msgv1 <fs_mensaje>-msgv2 <fs_mensaje>-msgv3 <fs_mensaje>-msgv4
+            INTO <fs_alv>-message.
+
+      ELSE.
+        <fs_alv>-message = 'No se ha encontrado el documento contabilizado. Revise'.
+      ENDIF.
+
+    ENDIF.
+  ENDLOOP.
+
+  "Mostrar ALV
+  SORT tl_alv BY belnr.
+  TRY.
+      cl_salv_table=>factory( IMPORTING r_salv_table = DATA(rl_alv)
+                              CHANGING  t_table      = tl_alv ).
+      rl_alv->get_functions( )->set_all( abap_true ).
+      rl_alv->get_columns( )->set_optimize( abap_false ).
+      rl_alv->display( ).
+    CATCH cx_salv_msg.
+  ENDTRY.
+ENDFORM.

@@ -1,0 +1,370 @@
+*&---------------------------------------------------------------------*
+*& Report  ZSPP_CREAR_OF_PEDIDO
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+REPORT zspp_crear_of_pedido.
+
+
+CONSTANTS c_2003 TYPE werks_d VALUE '2003'.
+CONSTANTS c_2001 TYPE werks_d VALUE '2001'.
+CONSTANTS c_2000 TYPE werks_d VALUE '2000'.
+
+*CONSTANTS c_pstyv TYPE vbap-pstyv VALUE 'ZZZ'.
+*CONSTANTS c_bedae TYPE vbap-bedae VALUE 'ZZZ'.
+DATA: rg_semis TYPE RANGE OF mtart,
+      rg_pto   TYPE RANGE OF mtart.
+FREE: rg_semis, rg_pto.
+CONSTANTS: c_pto  TYPE rvari_vnam VALUE 'ZSPP_UPD_MTART_PTE',
+           c_semi TYPE rvari_vnam VALUE 'ZSPP_UPD_MTART_SEM'.
+
+PARAMETERS p_vbeln TYPE vbeln_va OBLIGATORY.
+PARAMETERS p_posnr TYPE posnr OBLIGATORY.
+
+START-OF-SELECTION.
+
+  FREE: rg_pto, rg_semis.
+  SELECT sign, opti, low, high INTO TABLE @rg_pto FROM tvarvc WHERE name EQ @c_pto.
+  SELECT sign, opti, low, high INTO TABLE @rg_semis FROM tvarvc WHERE name EQ @c_semi.
+
+  "Espera bloqueo reserva
+  DATA: lt_seqg3 TYPE TABLE OF seqg3 WITH HEADER LINE,
+        l_object TYPE char100.
+
+  "l_object = sy-mandt && lw_timetickets-orderid. "Bloqueo orden AUFK
+  l_object = sy-mandt && p_vbeln.
+
+  DO 5 TIMES.
+    CALL FUNCTION 'ENQUEUE_READ'
+      EXPORTING
+        gclient               = sy-mandt
+        guname                = ''
+      TABLES
+        enq                   = lt_seqg3
+      EXCEPTIONS
+        communication_failure = 1
+        system_failure        = 2
+        OTHERS                = 3.
+
+    READ TABLE lt_seqg3 WITH KEY gname = 'VBAK'
+                                         garg = l_object.
+    IF sy-subrc = 0.
+      WAIT UP TO 1 SECONDS.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDDO.
+
+  CALL FUNCTION 'ENQUEUE_EVVBAKE'
+    EXPORTING
+*     mode_vbak      = 'E'    " Modo de bloqueo p. tabla VBAK
+      mandt          = sy-mandt    " 01. Argumento enqueue
+      vbeln          = p_vbeln   " 02. Argumento enqueue
+*     x_vbeln        = SPACE    " ¿Cumplimentar argumento 02 con valor inicial?
+*     _scope         = '2'
+*     _wait          = SPACE
+*     _collect       = ' '    " Por lo pronto, juntar bloqueo
+    EXCEPTIONS
+      foreign_lock   = 1
+      system_failure = 2
+      OTHERS         = 3.
+  IF sy-subrc <> 0.
+*   MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  WRITE |Inicio proceso.|.
+  SKIP.
+  DO 5 TIMES.
+    WRITE |Buscando OF y pedido: { p_vbeln ALPHA = OUT } posicion { p_posnr ALPHA = OUT }.|.
+    SKIP.
+    "Esperamos hasta que el pedido y la OF de terminado esté creada
+    SELECT SINGLE t1~matnr, werks, kwmeng, mbdat
+      INTO @DATA(wa_of)
+      FROM vbap AS t1 INNER JOIN mara AS t2 ON t1~matnr EQ t2~matnr
+      INNER JOIN vbep AS t3 ON t1~vbeln EQ t3~vbeln AND t1~posnr EQ t3~posnr AND etenr EQ 1
+      WHERE t1~vbeln EQ @p_vbeln
+      AND t1~posnr EQ @p_posnr
+*      AND pstyv EQ @c_pstyv
+*      AND t1~bedae EQ @c_bedae
+      AND ( t1~bedae EQ 'ZZZ' OR t1~bedae EQ 'ZRP' OR t1~bedae EQ 'ZRS' )
+      AND ( t1~werks EQ @c_2003 OR t1~werks EQ @c_2001 )
+      AND mtart IN @rg_pto.
+    IF sy-subrc = 0.
+      DATA(lv_found) = abap_true.
+      EXIT.
+    ELSE.
+      IF sy-tcode = 'Z360'.
+        MESSAGE |Pedido { p_vbeln alpha = out } no es susceptible de poder crear OF plancha| TYPE 'I'.
+        LEAVE PROGRAM.
+      ENDIF.
+      CLEAR lv_found.
+      WAIT UP TO 3 SECONDS.
+    ENDIF.
+
+  ENDDO.
+
+  IF lv_found EQ abap_true.
+    "Buscamos si se produce la plancha en el otro centro
+*    BESKZ = 'F'.
+*    SOBSL = '40'.
+
+    "Chequeamos que haya una OF de PT en curso ya por la cantidad de pedido
+    DO 5 TIMES.
+      SELECT SINGLE t1~aufnr, t2~gstrp
+        INTO @DATA(check_aufnr)
+        FROM afpo AS t1 INNER JOIN afko AS t2 ON t1~aufnr EQ t2~aufnr
+        INNER JOIN caufv AS t3 ON t3~aufnr = t2~aufnr "JVM - 07/08/2024 añadir indicador de borrado
+        WHERE t1~kdauf EQ @p_vbeln
+        AND t1~kdpos EQ @p_posnr
+        AND matnr EQ @wa_of-matnr
+        AND psmng EQ @wa_of-kwmeng
+        AND t2~gstrp EQ @wa_of-mbdat
+        AND t3~loekz EQ @space. "JVM - 07/08/2024 añadir indicador de borrado
+
+      IF sy-subrc NE 0.
+        SELECT SINGLE t1~aufnr, t2~gstrp
+         INTO @DATA(check_aufnr2)
+         FROM afpo AS t1 INNER JOIN afko AS t2 ON t1~aufnr EQ t2~aufnr
+          INNER JOIN caufv AS t3 ON t3~aufnr = t2~aufnr "JVM - 07/08/2024 añadir indicador de borrado
+         WHERE t1~kdauf EQ @p_vbeln
+         AND t1~kdpos EQ @p_posnr
+         AND matnr EQ @wa_of-matnr
+         AND psmng EQ @wa_of-kwmeng
+          AND  t3~loekz EQ @space. "JVM - 07/08/2024 añadir indicador de borrado
+*        AND gstrp EQ @wa_of-mbdat.
+        IF sy-subrc EQ 0.
+          check_aufnr = check_aufnr2.
+        ENDIF.
+      ENDIF.
+
+
+      IF sy-subrc = 0.
+        DATA(lv_found_modif) = abap_true.
+        EXIT.
+      ELSE.
+        CLEAR lv_found_modif.
+        WAIT UP TO 10 SECONDS.
+        WRITE |Esperando OF.|.
+      ENDIF.
+    ENDDO.
+
+    IF lv_found_modif = abap_true.
+      WRITE |OF para producto terminado encontrada|.
+      SKIP.
+
+      DATA wa_order TYPE  bapi_pp_order_create.
+      CLEAR wa_order.
+      DATA: wa_ret   TYPE bapiret2,
+            lv_aufnr TYPE aufnr.
+      CLEAR: wa_ret, lv_aufnr.
+
+      lv_aufnr = check_aufnr.
+
+      IF lv_aufnr IS NOT INITIAL.
+
+        WRITE |Orden creada: { lv_aufnr ALPHA = OUT }.|.
+        SKIP.
+
+        WAIT UP TO 2 SECONDS.
+
+        "Recuperamos aquellos que sean semis
+        SELECT t1~matnr, werks, bdmng INTO TABLE @DATA(it_semis)
+          FROM resb AS t1 INNER JOIN mara AS t2 ON t1~matnr EQ t2~matnr
+          WHERE aufnr EQ @lv_aufnr
+          AND t2~mtart IN @rg_semis
+          AND t1~xloek = @space. "JVM - 07/08/2024 añadir indicador de borrado
+
+        "Comprobamos la clase de aprovisionamiento del semi en el centro.
+        LOOP AT it_semis ASSIGNING FIELD-SYMBOL(<semi>).
+          SELECT SINGLE beskz, sobsl INTO @DATA(wa_sobsl)
+            FROM marc
+            WHERE werks EQ @<semi>-werks
+            AND matnr EQ @<semi>-matnr.
+*          AND beskz EQ 'F'
+*          AND sobsl EQ '40'.
+          IF sy-subrc = 0.
+
+*          DATA wa_order TYPE  bapi_pp_order_create.
+            CLEAR wa_order.
+*          DATA: wa_ret   TYPE bapiret2,
+*                lv_aufnr TYPE aufnr.
+            CLEAR: wa_ret, lv_aufnr.
+
+            "recuperamos la planta donde se debe producir en base a la clase de aprov externo
+            SELECT SINGLE wrk02 INTO @DATA(lv_wrk02) FROM t460a WHERE beskz EQ @wa_sobsl-beskz AND werks EQ @<semi>-werks AND sobsl EQ @wa_sobsl-sobsl.
+            IF lv_wrk02 IS NOT INITIAL.
+              "Comprobamos si ya hay orden de semi
+*              SELECT SINGLE aufnr INTO @DATA(check_aufnr_semi)
+*                              FROM afpo
+*                              WHERE kdauf EQ @p_vbeln
+*                              AND kdpos EQ @p_posnr
+*                              AND matnr EQ @<semi>-matnr.
+*             IF sy-subrc <> 0.
+
+              " 02.01.2023 LRE Comprobamos si ya hay orden de semi que no tenga PTBO
+              SELECT  SINGLE t1~aufnr INTO @DATA(check_aufnr_semi)
+                              FROM aufk AS t1
+                INNER JOIN afpo AS t2 ON t1~aufnr EQ t2~aufnr AND t2~matnr EQ @<semi>-matnr AND t2~kdauf EQ @p_vbeln AND t2~kdpos EQ @p_posnr
+                WHERE loekz <> 'X'.
+
+              IF sy-subrc <> 0.
+                " FIN 02.01.2023 LRE
+
+                "Tenemos que fabricar en otro centro
+                wa_order-material = <semi>-matnr.
+                wa_order-plant = lv_wrk02.
+
+                " LRE Recuperamos el CUOBJ de la MARC del semi para explosionar la BOM y la HDR
+
+                SELECT SINGLE cuobj INTO @DATA(wa_cuobj)
+                  FROM marc
+                  WHERE werks EQ  @lv_wrk02
+                  AND matnr EQ @<semi>-matnr.
+
+                "Le pasamos el CUOBJ a la Bapi
+
+                wa_order-configuration = wa_cuobj.
+
+
+                wa_order-planning_plant  =    lv_wrk02.
+                wa_order-quantity = <semi>-bdmng.
+                wa_order-sales_order = p_vbeln.
+                wa_order-sales_order_item = p_posnr.
+                SELECT SINGLE auart INTO wa_order-order_type FROM t399x WHERE werks EQ wa_order-plant AND auart LIKE 'Z___'.
+                wa_order-basic_start_date = wa_order-basic_end_date = check_aufnr-gstrp.
+
+
+                WRITE |Tratando pedido: { p_vbeln ALPHA = OUT }, posición { p_posnr ALPHA = OUT }.|.
+                SKIP.
+                WRITE |Creando orden para material semi: { <semi>-matnr ALPHA = OUT }|.
+                WRITE |cantidad { <semi>-bdmng }, centro { wa_order-plant }.|.
+                SKIP.
+
+                CALL FUNCTION 'BAPI_PRODORD_CREATE'
+                  EXPORTING
+                    orderdata    = wa_order
+                  IMPORTING
+                    return       = wa_ret
+                    order_number = lv_aufnr
+*                   ORDER_TYPE   =
+                  .
+
+                IF lv_aufnr IS NOT INITIAL.
+                  COMMIT WORK AND WAIT.
+                  WRITE |Orden de semi creada: { lv_aufnr ALPHA = OUT }.|.
+                  SKIP.
+
+                  DATA it_orders TYPE  zspp_tt_update_ordenes.
+                  FREE it_orders.
+                  APPEND INITIAL LINE TO it_orders ASSIGNING FIELD-SYMBOL(<auf>).
+                  <auf>-aufnr = lv_aufnr.
+                  WRITE |Enviando ORDERS para { lv_aufnr ALPHA = OUT }|.
+                  CALL FUNCTION 'ZSPP_ENVIO_ORDERS_BACKGROUND' IN BACKGROUND TASK AS SEPARATE UNIT
+                    EXPORTING
+                      it_aufnr = it_orders.
+
+                ELSE.
+                  ROLLBACK WORK.
+                  WRITE |ERROR AL CREAR ORDEN DE SEMI.|.
+                  SKIP.
+                ENDIF.
+              ELSE.
+                SELECT SINGLE gstrp
+                  FROM afko
+                  WHERE aufnr EQ @check_aufnr_semi
+                  INTO @DATA(lv_fecha_semi_new).
+
+                DATA: wa_orderdata  TYPE bapi_pp_order_change,
+                      wa_orderdatax TYPE bapi_pp_order_changex,
+                      wa_return     TYPE bapiret2.
+
+                CLEAR: wa_orderdata, wa_orderdatax, wa_return.
+
+                wa_orderdata-basic_end_date = check_aufnr-gstrp.
+                wa_orderdatax-basic_end_date = abap_true.
+                wa_orderdata-basic_start_date = wa_orderdata-basic_end_date.
+                wa_orderdatax-basic_start_date = abap_true.
+
+                WRITE |Nueva fecha { wa_orderdata-basic_end_date DATE = ISO }|.
+                SKIP.
+
+                wa_orderdata-quantity = <semi>-bdmng.
+                wa_orderdatax-quantity = abap_true.
+                WRITE |Nueva cantidad { wa_orderdata-quantity }|.
+                SKIP.
+                CALL FUNCTION 'BAPI_PRODORD_CHANGE'
+                  EXPORTING
+                    number     = check_aufnr_semi
+                    orderdata  = wa_orderdata
+                    orderdatax = wa_orderdatax
+                  IMPORTING
+                    return     = wa_return
+*                   ORDER_TYPE =
+*                   ORDER_STATUS           =
+*                   MASTER_DATA_READ       =
+                  .
+
+                IF wa_return-type EQ 'A' OR wa_return-type EQ 'X' OR wa_return-type EQ 'E'.
+                  ROLLBACK WORK.
+                  WRITE |ERROR AL MODIFICAR LA ORDEN DE SEMI { check_aufnr_semi ALPHA = OUT }.|.
+                  SKIP.
+                ELSE.
+                  COMMIT WORK AND WAIT.
+                  WRITE |Orden de semi modificada: { check_aufnr_semi ALPHA = OUT }.|.
+                  SKIP.
+*                  DATA it_aufnr TYPE  zspp_tt_update_ordenes.
+                  FREE it_orders.
+                  APPEND INITIAL LINE TO it_orders ASSIGNING <auf>.
+                  <auf>-aufnr = check_aufnr_semi.
+                  WRITE |Enviando ORDERS para { check_aufnr_semi ALPHA = OUT }|.
+                  CALL FUNCTION 'ZSPP_ENVIO_ORDERS_BACKGROUND' IN BACKGROUND TASK AS SEPARATE UNIT
+                    EXPORTING
+                      it_aufnr = it_orders.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+          CLEAR check_aufnr_semi.
+        ENDLOOP.
+
+      ELSE.
+
+        ROLLBACK WORK.
+        WRITE |ERROR AL CREAR ORDEN.|.
+        SKIP.
+
+      ENDIF.
+    ELSE.
+      WRITE |No encontrada OF|.
+      SKIP.
+    ENDIF.
+  ENDIF.
+
+  CALL FUNCTION 'DEQUEUE_EVVBAKE'
+    EXPORTING
+*     mode_vbak = 'E'    " Modo de bloqueo p. tabla VBAK
+      mandt = sy-mandt    " 01. Argumento enqueue
+      vbeln = p_vbeln
+*     x_vbeln   = SPACE    " ¿Cumplimentar argumento 02 con valor inicial?
+*     _scope    = '3'
+*     _synchron = SPACE    " Desbloq.sincrónicam.
+*     _collect  = ' '    " Por lo pronto, juntar bloqueo
+    .
+
+*  IF lv_aufnr IS NOT INITIAL.
+*    FREE it_orders.
+*    APPEND INITIAL LINE TO it_orders ASSIGNING <auf>.
+*    <auf>-aufnr = check_aufnr-aufnr.
+*
+**    WAIT UP TO 10 SECONDS.
+**    SKIP.
+*    WRITE |Enviando ORDERS para { check_aufnr-aufnr ALPHA = OUT }|.
+*
+*    CALL FUNCTION 'ZSPP_ENVIO_ORDERS_BACKGROUND' IN BACKGROUND TASK AS SEPARATE UNIT
+*      EXPORTING
+*        it_aufnr = it_orders.
+*
+*  ENDIF.

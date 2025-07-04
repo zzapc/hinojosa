@@ -1,0 +1,168 @@
+
+class ZHCL_SD_HU_CORE definition
+  public
+  create public .
+
+public section.
+
+  class-methods GET_VHILM
+    importing
+      !LP_MATNR type MATNR
+      !LP_WERKS type WERKS_D
+      !LP_CHARG type CHARG_D
+    exporting
+      !LP_VHILM type VHILM
+      !LP_VHILM_MAKTX type ZSWM_VHILM_MAKTX
+      !LP_RETURN type BAPIRET2_T .
+protected section.
+private section.
+endclass. "ZHCL_SD_HU_CORE definition
+class ZHCL_SD_HU_CORE implementation.
+  METHOD get_vhilm.
+
+    DATA: r_werks TYPE RANGE OF mseg-werks,
+          r_charg TYPE RANGE OF mseg-charg,
+          r_aufnr TYPE RANGE OF mseg-aufnr.
+    DATA zswmvhilm TYPE zswmvhilm. " add jtm 31.10.2022
+
+    CLEAR: lp_vhilm, lp_vhilm_maktx, lp_return.
+
+    CLEAR: r_werks, r_charg, r_aufnr.
+
+    IF lp_werks IS NOT INITIAL.
+      APPEND INITIAL LINE TO r_werks ASSIGNING FIELD-SYMBOL(<fs_r_werks>).
+      <fs_r_werks>-sign = 'I'.
+      <fs_r_werks>-option = 'EQ'.
+      <fs_r_werks>-low  = lp_werks.
+    ENDIF.
+    IF lp_charg IS NOT INITIAL.
+      APPEND INITIAL LINE TO r_charg ASSIGNING FIELD-SYMBOL(<fs_r_charg>).
+      <fs_r_charg>-sign = 'I'.
+      <fs_r_charg>-option = 'EQ'.
+      <fs_r_charg>-low  = lp_charg.
+    ENDIF.
+*     add jtm 31.10.2022 en algunos casos se cambia el material de embalaje en la expedición
+    SELECT SINGLE vhilm INTO lp_vhilm FROM zswmvhilm  WHERE matnr EQ lp_matnr
+                                                      AND werks IN r_werks
+                                                      AND charg IN r_charg
+                                                      AND lvorm NE abap_true.
+
+    IF lp_vhilm IS INITIAL.
+      APPEND INITIAL LINE TO r_aufnr ASSIGNING FIELD-SYMBOL(<fs_r_aufnr>).
+      "r_aufnr+0(3) = 'INE'. APPEND r_aufnr.
+      <fs_r_aufnr>-sign = 'I'.
+      <fs_r_aufnr>-option = 'NE'.
+      CLEAR <fs_r_aufnr>-low.
+
+* busco la OF que les dio de alta
+      SELECT * INTO TABLE @DATA(tt_mseg) FROM mseg WHERE matnr EQ @lp_matnr
+                                                     AND werks IN @r_werks
+                                                     AND charg IN @r_charg
+                                                     AND aufnr IN @r_aufnr
+                                                     AND bwart EQ '101'.
+      IF sy-subrc NE 0.
+        SELECT * INTO TABLE tt_mseg FROM mseg WHERE matnr EQ lp_matnr
+*                                           and werks in r_werks
+                                                AND charg IN r_charg
+                                                AND aufnr IN r_aufnr
+                                                AND bwart EQ '101'.
+      ENDIF.
+      SORT tt_mseg BY aufnr.
+      DELETE ADJACENT DUPLICATES FROM tt_mseg COMPARING aufnr.
+      LOOP AT tt_mseg INTO DATA(rt_mseg).
+        SELECT SINGLE rsnum INTO @DATA(rsnum) FROM afko WHERE aufnr EQ  @rt_mseg-aufnr.
+        CHECK sy-subrc EQ 0
+          AND rsnum    IS NOT INITIAL.
+        SELECT  mara~matnr INTO lp_vhilm UP TO 1 ROWS FROM resb INNER JOIN mara ON resb~matnr EQ mara~matnr WHERE rsnum EQ rsnum
+                                                                                                           AND mtart EQ 'ZPAL'.
+        ENDSELECT.
+        CHECK sy-subrc EQ 0
+          AND lp_vhilm    IS NOT INITIAL.
+        EXIT.
+      ENDLOOP.
+    ENDIF.
+
+    "
+    " Si no se ha encontrado material de embalaje, buscamos la definición.
+    "
+    IF lp_vhilm IS INITIAL.
+      SELECT SINGLE cuobj
+        INTO @DATA(lv_cuobj)
+        FROM marc
+        WHERE matnr EQ @lp_matnr AND
+              werks EQ @lp_werks.
+
+      IF sy-subrc <> 0.
+        CLEAR lv_cuobj.
+      ENDIF.
+
+      SELECT SINGLE *
+        INTO @DATA(ls_yhp_idx_td160)
+        FROM yhp_idx_td160
+        WHERE cuobj = @lv_cuobj.
+      IF sy-subrc <> 0.
+        CLEAR ls_yhp_idx_td160.
+      ENDIF.
+
+      lp_vhilm = ls_yhp_idx_td160-pmatn.
+      lp_vhilm_maktx = ls_yhp_idx_td160-descr.
+
+    ENDIF.
+
+
+    "
+    " Última oportunidad.
+    "
+    IF lp_vhilm IS INITIAL.
+      DATA: rr_werks TYPE  range_t_werks,
+            rr_vhilm TYPE  zswm_vhilm_ranges_tt,
+            error    TYPE flag,
+            tt_log   TYPE bapiret2_tt.
+* Si no hemos sacado nada de la lista ==> Lo sacamos del SET de datos
+      CALL FUNCTION 'ZSWM_SET_GET_VALUES'
+*   EXPORTING
+*     SHORTNAME                = 'ZSWM_PLANCHA'
+*     TT_SHORTNAME             =
+*     NO_AUTHORITY_CHECK       = 'X'
+*     LANGU                    = SYST-LANGU
+*     TT_FIELDNAME             =
+        IMPORTING
+          error    = error
+          tt_log   = tt_log
+*         TT_SET   =
+          rr_werks = rr_werks
+*         RR_PSTYV =
+*         RR_LGNUM =
+*         RR_BWLVS =
+          rr_vhilm = rr_vhilm.
+      CHECK error NE abap_true
+        AND lp_werks IN rr_werks.
+
+      READ TABLE rr_vhilm INDEX 1 INTO DATA(rt_vhilm).
+      IF sy-subrc EQ 0.
+        MOVE rt_vhilm-low  TO lp_vhilm.
+      ENDIF.
+
+      APPEND LINES OF tt_log TO lp_return.
+    ENDIF.
+
+    "
+    " Si no se puede determinar, devolvemos error.
+    "
+    IF lp_vhilm IS INITIAL.
+      APPEND INITIAL LINE TO lp_return ASSIGNING FIELD-SYMBOL(<fs_return>).
+      <fs_return>-type = 'E'.
+      <fs_return>-id = 'ZSD'.
+      <fs_return>-number = '215'.
+    ELSE.
+      IF lp_vhilm_maktx IS INITIAL.
+        SELECT SINGLE maktx INTO lp_vhilm_maktx FROM makt WHERE matnr EQ lp_vhilm
+                                                 AND spras EQ sy-langu.
+        IF sy-subrc <> 0.
+          SELECT SINGLE maktx INTO lp_vhilm_maktx FROM makt WHERE matnr EQ lp_vhilm
+                                                           AND spras EQ 'S'.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+endclass. "ZHCL_SD_HU_CORE implementation

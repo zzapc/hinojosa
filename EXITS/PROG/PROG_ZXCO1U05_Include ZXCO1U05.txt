@@ -1,0 +1,215 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZXCO1U05
+*&---------------------------------------------------------------------*
+*"----------------------------------------------------------------------
+*"*"Lokale Schnittstelle:
+*"       IMPORTING
+*"             VALUE(RESV_I) LIKE  RESBDGET STRUCTURE  RESBDGET
+*"             VALUE(SUPAR_I) LIKE  PVBE STRUCTURE  PVBE
+*"             VALUE(CAUFVD_I) LIKE  CAUFVD STRUCTURE  CAUFVD
+*"                             OPTIONAL
+*"             VALUE(STRLC_I) LIKE  RESBD-LGORT
+*"             VALUE(PLORD_CONV_I) LIKE  RC27X-FLG_SEL
+*"             VALUE(STRLC_HEADER_I) LIKE  AFPOD-LGORT
+*"             VALUE(PRODVER_I) LIKE  AFPOD-VERID
+*"             VALUE(MATNR_HEADER_I) LIKE  AFPOD-MATNR
+*"             VALUE(PRODPLANT_I) LIKE  AFPOD-DWERK
+*"             VALUE(PROD_STLOC_SEL_I) LIKE  T438M-PLSEL
+*"             VALUE(MRP_GROUP_I) LIKE  T438M-MTART
+*"       EXPORTING
+*"             VALUE(BCKFL_E) LIKE  RESB-RGEKZ
+*"             VALUE(STRLC_E) LIKE  RESB-LGORT
+*"             VALUE(PRVBE_E) LIKE  RESB-PRVBE
+*"             VALUE(CUST_E) LIKE  COMP_CUST STRUCTURE  COMP_CUST
+*"----------------------------------------------------------------------
+DATA: is_caufvdb TYPE caufvdb.
+
+* Pasamos datos de la estructura de entrada
+MOVE-CORRESPONDING caufvd_i TO is_caufvdb.
+
+* Comprobamos que estamos en las COR* y en la sociedad 4000
+IF ( sy-tcode EQ 'COR1' OR sy-tcode EQ 'COR2' ) AND caufvd_i-werks = '4000'.
+* Comprobamos si se ha cambiado de versión.
+  IF ( is_caufvdb-plnty NE zcl_im_zworkorder_update=>gv_plnty OR is_caufvdb-plnnr NE zcl_im_zworkorder_update=>gv_plnnr ) OR
+     ( is_caufvdb-plnty EQ zcl_im_zworkorder_update=>gv_plnty AND is_caufvdb-plnnr EQ zcl_im_zworkorder_update=>gv_plnnr AND
+          is_caufvdb-stlal NE zcl_im_zworkorder_update=>gv_stlal  ).
+*   Llamamos método estático de inicialización de datos. Se utiliza también en exit
+    zcl_im_zworkorder_update=>init_vers_alv( is_caufvdb = is_caufvdb
+                                             iv_ddmm    = 'X').
+  ENDIF.
+* ----------------------------------------------------------------------------------*
+* add jtm 01.02.2022 fabricación 2001 y 2003 determinación de ASPS alternativas     *
+ELSEIF caufvd_i-werks EQ '2001'
+    OR caufvd_i-werks EQ '2003'
+"ARA 01.10.24 Incluir Xátiva en la logica existente.
+    OR caufvd_i-werks EQ '2000'.
+  DATA: ex_object_cx_root TYPE REF TO cx_root,
+        ex_text           TYPE string,
+        ex_text_long      TYPE string.
+  TRY.
+      CALL FUNCTION 'ZSWM_MODIFICA_RESERVAS_PP'
+        EXPORTING
+          resv_i   = resv_i
+          caufvd_i = caufvd_i
+        IMPORTING
+          prvbe_e  = prvbe_e.
+
+    CATCH cx_root INTO ex_object_cx_root.
+      ex_text = ex_object_cx_root->get_text( ).
+      ex_text_long = ex_object_cx_root->get_longtext( ).
+  ENDTRY.
+
+* fin de add jtm 01.02.2022                                                         *
+* ----------------------------------------------------------------------------------*
+
+  DATA wa_lgort TYPE cslgo.
+  DATA wa_lgpro TYPE lgpro.
+
+  CLEAR: wa_lgort, wa_lgpro.
+
+
+*SELECT SINGLE lgort
+*  FROM mast
+*  INNER JOIN stpo ON stpo~stlnr = mast~stlnr AND stpo~idnrk EQ resv_i-matnr
+*  INTO wa_lgort
+*  WHERE matnr = resv_i-baugr.
+
+  SELECT mkal~stlal, mkal~stlan, stlnr, mkal~matnr
+    FROM mkal
+    INNER JOIN mast ON mast~matnr EQ mkal~matnr
+      AND mast~werks EQ mkal~werks
+      AND mast~stlal EQ mkal~stlal
+      AND mast~stlan EQ mkal~stlan
+    INTO TABLE @DATA(it_ldm)
+    WHERE mkal~werks EQ @prodplant_i
+      AND mkal~matnr EQ @matnr_header_i
+      AND verid EQ @prodver_i.
+
+  IF it_ldm IS NOT INITIAL.
+
+    SELECT stlnr, stlal, stlkn
+      FROM stas
+      INTO TABLE @DATA(it_stas)
+      FOR ALL ENTRIES IN @it_ldm
+      WHERE stlnr EQ @it_ldm-stlnr
+        AND stlal EQ @it_ldm-stlal.
+
+    IF it_stas IS NOT INITIAL.
+
+      SELECT stlnr, stlkn, idnrk, lgort, andat
+        FROM stpo
+        INTO TABLE @DATA(it_lgort)
+        FOR ALL ENTRIES IN @it_stas
+        WHERE stlty = 'M'
+          AND stlnr EQ @it_stas-stlnr
+          AND stlkn EQ @it_stas-stlkn
+          AND idnrk EQ @resv_i-matnr.
+
+      SORT it_lgort BY andat DESCENDING.
+    ENDIF.
+  ENDIF.
+
+  READ TABLE it_lgort INTO DATA(wa_lgort_aux) INDEX 1.
+  MOVE wa_lgort_aux-lgort TO wa_lgort.
+
+  IF wa_lgort IS INITIAL.
+    SELECT SINGLE lgpro FROM marc
+      INTO wa_lgpro
+      WHERE matnr = resv_i-matnr
+        AND werks = resv_i-werks.
+
+    IF wa_lgpro IS NOT INITIAL.
+      strlc_e = wa_lgpro.
+    ENDIF.
+
+**********************************NUEVO
+    DATA(o_exit_almacen_prod) = NEW zcl_ap_exits( 'CO01_FORZAR_ALMACEN_PRODUCCION' ).
+    IF o_exit_almacen_prod->activa( ).
+      IF resv_i-werks = '2000'. "Sólo para el centro 2000
+*APC20241205 Forzar almacén producción LGORT en CO01
+*Caso 1: Si el componente (resv_i-matnr) está en la tabla: ZVCXI_XCS_TD100
+        SELECT SINGLE pmatn FROM zvcxi_xcs_td100
+          INTO @DATA(l_pmatn)
+         WHERE pmatn = @resv_i-matnr.
+        IF sy-subrc = 0.
+          CASE resv_i-matnr(2).
+* Si el componente empieza por CO* almacén 1010
+            WHEN 'CO'.
+              strlc_e = '1010'.
+              o_exit_almacen_prod->log( p1 = 'Material' p2 = resv_i-matnr p3 = 'está en tabla ZVCXI_XCS_TD100 y comienza por CO. Fijamos almacen 1010' msgty = 'S' ).
+            WHEN 'KI'.
+* Si el componente empieza por KI* # buscar su nº lista de materiales desde la MAST (MAST-STLNR) y desde la STPO buscar sus componentes, esos componentes también cumplen esta condición # strlc_e = ‘1010’.
+              strlc_e = '1010'.
+              o_exit_almacen_prod->log( p1 = 'Material' p2 = resv_i-matnr p3 = 'está en tabla ZVCXI_XCS_TD100 y comienza por KI. Fijamos almacen 1010' msgty = 'S' ).
+          ENDCASE.
+        ELSE.
+*CASO2: Si el componente es de tipo material ZPSE (o poner SE*)
+          SELECT SINGLE mtart FROM mara
+            INTO @DATA(l_mtart)
+           WHERE matnr = @resv_i-matnr.
+          IF l_mtart = 'ZPSE' AND resv_i-dbskz <> 'E'.
+            strlc_e = '1010'.
+            o_exit_almacen_prod->log( p1 = 'Material' p2 = resv_i-matnr p3 = 'es ZPSE y DBSKZ' p4 = resv_i-dbskz p5 = '. Fijamos almacen 1010' msgty = 'S' ).
+          ENDIF.
+        ENDIF.
+
+* Casi 1B El componente es un CO que no está en tabla ZVCI_XCS_TD100 y está dentro de un KI que está en la receta
+        IF resv_i-matnr(2) = 'CO'.
+* Busco si ese CO tiene alguna receta cuyo padre sea un KI
+          SELECT DISTINCT mast~matnr
+            FROM mast JOIN stpo ON mast~stlnr = stpo~stlnr
+            INTO TABLE @DATA(i_ki)
+           WHERE mast~matnr LIKE 'KI%'
+             AND mast~werks = @resv_i-werks
+             AND stpo~stlty = 'M'
+             AND stpo~idnrk = @resv_i-matnr.
+          IF sy-subrc = 0.
+            DATA i_resbd_g TYPE TABLE OF resbdget.
+            CLEAR i_resbd_g.
+* BUsco si eetá dentro de los componentes.
+            CALL FUNCTION 'CO_BC_RESBD_OF_ORDER_GET'
+              EXPORTING
+                aufnr_act = resv_i-aufnr
+                get_old   = ' '
+              TABLES
+                resbd_get = i_resbd_g.
+            LOOP AT i_resbd_g ASSIGNING FIELD-SYMBOL(<res>) WHERE matnr(2) = 'KI'.
+              IF line_exists( i_ki[ matnr = <res>-matnr ] ).
+                strlc_e = '1010'.
+              ENDIF.
+            ENDLOOP.
+          ENDIF.
+        ENDIF.
+
+
+        IF strlc_e IS INITIAL.
+          o_exit_almacen_prod->log( p1 = 'Material' p2 = resv_i-matnr p3 = 'No se fija almacén 1010' msgty = 'W' ).
+        ENDIF.
+      ELSEIF  resv_i-werks = '2003'.
+********** TO DO ADAPTAR LOS HARDCORES A PARAMETRIZACION CORE
+
+*APC20250206 CENTRO 2003
+* Busco si tiene un componente ZPSE (o el componente empieza por SE*=
+*        SELECT DISTINCT mast~matnr
+*          FROM mast JOIN stpo ON mast~stlnr = stpo~stlnr
+*                    JOIN mara ON mara~matnr = stpo~idnrk
+*          INTO TABLE @DATA(i_comp_zpse)
+*         WHERE mast~werks = @resv_i-werks
+*           AND stpo~stlty = 'M'
+*           AND stpo~idnrk = @resv_i-matnr
+*           AND ( mara~mtart = 'ZPSE'
+*              OR stpo~idnrk LIKE 'SE%' ).
+        SELECT SINGLE mtart FROM mara
+          INTO @l_mtart
+         WHERE matnr = @resv_i-matnr.
+        IF l_mtart = 'ZPSE' AND resv_i-dbskz <> 'E'.
+          strlc_e = '1020'.
+          o_exit_almacen_prod->log( p1 = 'Material' p2 = resv_i-matnr p3 = 'es ZPSE y DBSKZ' p4 = resv_i-dbskz p5 = '. Fijamos almacen 1020' msgty = 'S' ).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+**********************************FIN NUEVO
+  ELSE.
+    strlc_e = wa_lgort.
+  ENDIF.
+ENDIF.

@@ -1,0 +1,171 @@
+FUNCTION zui5_cm_liberar_stock_montaje.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_MONTAJE) TYPE  ZUI5S_CM_MONTAJE
+*"  EXPORTING
+*"     VALUE(O_STOCK) TYPE  ZUI5S_CM_STOCK
+*"     VALUE(O_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+  CONSTANTS: v_veces TYPE i VALUE 10.
+
+  DATA: lt_return        TYPE bapiret2_t,
+        lt_return_temp   TYPE bapiret2_t,
+        goodsmvt_header  TYPE  bapi2017_gm_head_01,
+        lv_charg_3d      TYPE charg_d,
+        goodsmvt_code    TYPE  bapi2017_gm_code,
+        goodsmvt_item    TYPE TABLE OF  bapi2017_gm_item_create,
+        objectkeynew     TYPE  bapi1003_key-object,
+        objecttablenew   TYPE  bapi1003_key-objecttable,
+        classnumnew      TYPE  bapi1003_key-classnum,
+        classtypenew     TYPE  bapi1003_key-classtype,
+        classif_status   TYPE  bapi1003_key-status,
+        materialdocument TYPE  bapi2017_gm_head_ret-mat_doc,
+        matdocumentyear  TYPE  bapi2017_gm_head_ret-doc_year,
+        batch            TYPE  bapibatchkey-batch,
+        batchattributes  TYPE  bapibatchatt,
+        lv_cantidad      LIKE i_montaje-cantidad,
+        lv_meins         TYPE meins,
+        lv_valida,
+        v_status         TYPE zui5_cm_sm_status,
+        wa_stock         TYPE zui5s_cm_stock.
+
+  DATA: r_charg TYPE RANGE OF charg_d.
+
+  PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '087' i_montaje-matnr i_montaje-charg i_montaje-werks i_montaje-lgort CHANGING o_return.
+
+  CLEAR: lt_return.
+  CALL FUNCTION 'CONVERSION_EXIT_CUNIT_INPUT'
+    EXPORTING
+      input          = i_montaje-cantidad_uom
+    IMPORTING
+      output         = lv_meins
+    EXCEPTIONS
+      unit_not_found = 1
+      OTHERS         = 2.
+
+  "comprobamos que la cantidad no sea mayor a la <fs_mchb>-cspem - ( <fs_mchb>-zzcm_montaje + <fs_mchb>-zzcm_defectuos )
+  SELECT SINGLE a~cspem, a~zzcm_montaje, a~zzcm_defectuosa, b~meins
+    FROM mchb AS a
+    INNER JOIN mara AS b ON b~matnr = a~matnr
+    INTO @DATA(ls_mchb)
+    WHERE a~matnr = @i_montaje-matnr
+    AND a~werks = @i_montaje-werks
+    AND a~lgort = @i_montaje-lgort
+    AND a~charg = @i_montaje-charg.
+  IF sy-subrc = 0.
+    IF ls_mchb-meins NE lv_meins.
+      CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+        EXPORTING
+          i_matnr              = i_montaje-matnr
+          i_in_me              = lv_meins
+          i_out_me             = ls_mchb-meins
+          i_menge              = i_montaje-cantidad
+        IMPORTING
+          e_menge              = lv_cantidad
+        EXCEPTIONS
+          error_in_application = 1
+          error                = 2
+          OTHERS               = 3.
+      IF sy-subrc <> 0.
+        APPEND INITIAL LINE TO lt_return ASSIGNING FIELD-SYMBOL(<ls_return>).
+        <ls_return>-id = sy-msgid.
+        <ls_return>-type = sy-msgty.
+        <ls_return>-number = sy-msgno.
+        <ls_return>-message_v1 = sy-msgv1.
+        <ls_return>-message_v2 = sy-msgv2.
+        <ls_return>-message_v3 = sy-msgv3.
+        <ls_return>-message_v3 = sy-msgv4.
+
+        EXIT.
+      ENDIF.
+    ELSE.
+      lv_cantidad = i_montaje-cantidad.
+    ENDIF.
+    DATA(lv_result) = ls_mchb-cspem - ( ls_mchb-zzcm_montaje + ls_mchb-zzcm_defectuosa ).
+    IF lv_result < lv_cantidad.
+      lv_valida = 'X'.
+    ENDIF.
+  ENDIF.
+
+  IF lv_valida IS INITIAL.
+    "Datos de Cabecera
+    goodsmvt_header-doc_date = sy-datum.
+    goodsmvt_header-pstng_date = sy-datum.
+    goodsmvt_code-gm_code = '04'.
+
+    "Datos de Posición
+    APPEND INITIAL LINE TO goodsmvt_item ASSIGNING FIELD-SYMBOL(<ls_item>).
+    <ls_item>-material = i_montaje-matnr.
+    <ls_item>-plant = i_montaje-werks.
+    <ls_item>-batch = i_montaje-charg.
+    <ls_item>-stge_loc = i_montaje-lgort.
+    <ls_item>-entry_uom = i_montaje-cantidad_uom.
+    <ls_item>-entry_qnt = i_montaje-cantidad.
+    <ls_item>-move_type = '343'.
+
+
+    <ls_item>-entry_uom = lv_meins.
+    <ls_item>-move_mat = i_montaje-matnr.
+    <ls_item>-move_plant = i_montaje-werks.
+    <ls_item>-move_stloc = i_montaje-lgort.
+    <ls_item>-move_batch = i_montaje-charg.
+
+    CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+      EXPORTING
+        goodsmvt_header  = goodsmvt_header
+        goodsmvt_code    = goodsmvt_code
+      IMPORTING
+        materialdocument = materialdocument
+        matdocumentyear  = matdocumentyear
+      TABLES
+        goodsmvt_item    = goodsmvt_item
+        return           = lt_return.
+    APPEND LINES OF lt_return TO o_return.
+
+    READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+      APPEND INITIAL LINE TO o_return ASSIGNING <ls_return>.
+      <ls_return>-id = 'ZUI5_CM'.
+      <ls_return>-type = 'S'.
+      <ls_return>-number = '001'.
+      <ls_return>-message_v1 = materialdocument.
+      <ls_return>-message_v2 = matdocumentyear.
+
+*    "En caso de pasar cantidad bloqueo, lanzamos el MF ZUI5_CM_STOCK_BLOQUEO Bloqueo Crear
+*    IF i_montaje-cant_bloqueo IS NOT INITIAL.
+*      CALL FUNCTION 'ZUI5_CM_STOCK_BLOQUEO'
+*        EXPORTING
+*          i_montaje = i_montaje
+*        IMPORTING
+**         O_STOCK   =
+*          o_return  = lt_return_temp.
+*      APPEND LINES OF lt_return_temp TO lt_return.
+*    ENDIF.
+
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+    ENDIF.
+  ELSE.
+    APPEND INITIAL LINE TO lt_return ASSIGNING <ls_return>.
+    <ls_return>-id = 'ZUI5_CM'.
+    <ls_return>-type = 'E'.
+    <ls_return>-number = '101'.
+    <ls_return>-message_v1 = ceil( i_montaje-cantidad ).
+    <ls_return>-message_v2 = i_montaje-cantidad_uom.
+    <ls_return>-message_v3 = ceil( lv_result ).
+  ENDIF.
+
+  APPEND LINES OF lt_return TO o_return.
+
+  PERFORM guardar_log USING i_montaje-matnr o_return.
+
+  MOVE-CORRESPONDING i_montaje TO o_stock.
+  IF o_stock-budat IS INITIAL.
+    o_stock-budat = sy-datum.
+  ENDIF.
+
+ENDFUNCTION.

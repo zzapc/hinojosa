@@ -1,0 +1,512 @@
+FUNCTION zswm_ui5_em_sub_pedido.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(TCODE) TYPE  TCODE OPTIONAL
+*"     VALUE(UNAME) TYPE  XUBNAME DEFAULT SY-UNAME
+*"     VALUE(OPERARIO) TYPE  ZLNUM_OPER OPTIONAL
+*"     VALUE(EBELN) TYPE  EBELN OPTIONAL
+*"     VALUE(EBELP) TYPE  EBELP OPTIONAL
+*"     VALUE(ALBARAN) TYPE  VERUR_VL OPTIONAL
+*"     VALUE(TT_BULTOS_OF) TYPE  ZSWM_CHECK_PO_UI5_BULTOS_TT OPTIONAL
+*"     VALUE(FORZAR_STOCK) TYPE  FLAG OPTIONAL
+*"     VALUE(TKNUM) TYPE  TKNUM OPTIONAL
+*"  EXPORTING
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_TT
+*"     VALUE(OK) TYPE  FLAG
+*"----------------------------------------------------------------------
+  DATA: data_user         TYPE  zswm_data_ui5_eeeoo_str,
+        r_funcionalidades TYPE  zswm_data_ui5_func_str.
+  DATA t_bultos_cu LIKE zswm_ui5_nlpla OCCURS 0 WITH HEADER LINE. " add jtm 21.03.2023 JTM AMPLWM002 Ubicar entradas RF
+
+  DATA data_of TYPE zswm_check_ofs_ui5_str.
+
+  DATA tl_ltap_crea TYPE STANDARD TABLE OF ltap_creat.
+  DATA tl_ltap_vb TYPE STANDARD TABLE OF ltap_vb.
+  DATA tl_ltap TYPE STANDARD TABLE OF ltap_vb.
+  DATA: posi              TYPE lips-posnr,
+        vv_cantidad_total TYPE menge_d,
+        vv_cantidad_pend  TYPE menge_d,
+        r_ebelp           TYPE RANGE OF ebelp.
+
+  DATA: header_data    TYPE  bapiibdlvhdrcon,
+        header_control TYPE  bapiibdlvhdrctrlcon,
+        delivery       TYPE  bapiibdlvhdrcon-deliv_numb,
+        lt_return_temp TYPE bapiret2_t.
+
+  CLEAR: error, tt_log[], data_of,
+         t_bultos_cu[]. " add jtm 21.03.2023 JTM AMPLWM002 Ubicar entradas RF
+  PERFORM break USING 'ZSWM_UI5_EM_SUBCONTRATACION'.
+  CALL FUNCTION 'ZSWM_GET_DATA_USER_UI5'
+    EXPORTING
+      uname      = uname
+      statu      = 'X'
+      no_gen_log = abap_true
+    IMPORTING
+      data_user  = data_user
+*     ERROR      =
+*     TT_LOG     =
+    .
+
+  ebeln = |{ ebeln ALPHA = IN }|.
+  ebelp = |{ ebelp ALPHA = IN }|.
+  r_ebelp = VALUE #( FOR pos IN tt_bultos_of ( sign = 'I' option = 'EQ' low = pos-vgpos ) ).
+
+  PERFORM es_pedido_sub_delivery USING ebeln data_user  CHANGING data_of error tt_log.
+
+  IF error NE abap_true.
+    DATA: ctd_alta    TYPE menge_d, ctd_demanda TYPE menge_d.
+    ctd_alta = 0.
+    LOOP AT tt_bultos_of INTO DATA(rt_bultos_of).
+      DATA(sw_tabix) = sy-tabix.
+      ADD rt_bultos_of-lfimg TO ctd_alta.
+      rt_bultos_of-exidv = |{ rt_bultos_of-exidv ALPHA = IN }|.
+      MODIFY tt_bultos_of FROM rt_bultos_of INDEX sw_tabix.
+    ENDLOOP.
+    DATA: mblnr TYPE mkpf-mblnr, mjahr LIKE mkpf-mjahr.
+
+    DATA: is_inb_delivery_header LIKE bbp_inbd_l,
+          v_vbeln                TYPE vbeln_vl,
+          t_return               TYPE STANDARD TABLE OF bapireturn,
+          ls_return_2            TYPE bapiret2,
+          lt_return_2            TYPE bapiret2_t,
+          t_detail               TYPE STANDARD TABLE OF bbp_inbd_d.
+
+    DATA wl_xvbsk TYPE vbsk.
+    DATA: tl_xvbfs  TYPE TABLE OF vbfs,
+          tl_xvbls  TYPE TABLE OF vbls,
+          lt_return TYPE bapiret2_t,
+          tl_xxlips TYPE TABLE OF lips.
+    DATA: tl_xkomdlgn TYPE TABLE OF komdlgn,
+          wl_xkomdlgn LIKE LINE OF tl_xkomdlgn,
+          it_lecomp   TYPE  lecomp_consumption_t,
+          n_bultos    TYPE i,
+          xverko      TYPE TABLE OF verko,
+          xverpo      TYPE TABLE OF verpo,
+          r_lote      TYPE RANGE OF charg_d,
+          lote_vacio.
+
+    CLEAR wl_xvbsk.
+    wl_xvbsk-mandt = sy-mandt.
+    wl_xvbsk-ernam = sy-uname.
+    wl_xvbsk-erdat = sy-datum.
+    wl_xvbsk-uzeit = sy-uzeit.
+    wl_xvbsk-smart = 'L'.
+
+    SELECT SINGLE *
+         FROM ekko
+         INTO @DATA(ls_ekko)
+         WHERE ebeln = @ebeln.
+
+    SELECT *
+      FROM ekpo AS a
+      INTO TABLE @DATA(lt_ekpo)
+      WHERE a~ebeln = @ebeln
+      AND a~ebelp IN @r_ebelp
+      AND a~loekz = @space.
+
+    SELECT *
+       FROM eket AS a
+       INTO TABLE @DATA(lt_eket)
+       WHERE a~ebeln = @ebeln
+      AND a~ebelp IN @r_ebelp.
+
+    SELECT *
+       FROM ekes AS a
+       INTO TABLE @DATA(lt_ekes)
+       WHERE a~ebeln = @ebeln
+      AND a~ebelp IN @r_ebelp.
+
+    SELECT DISTINCT a~matnr,
+      CASE WHEN c~hsdat NE '00000000' THEN c~hsdat
+      ELSE c~ersda
+      END AS fecha, a~baugr,
+      b~charg, b~lblab, b~lbins, a~bdmng, a~enmng, a~meins, a~charg AS lote_resb, ebeln, ebelp INTO TABLE @DATA(tt_mslb) FROM resb AS a
+      LEFT JOIN mslb AS b ON b~matnr = a~matnr AND b~werks EQ @data_of-pwerk AND b~sobkz EQ 'O'  AND b~lifnr EQ @data_of-lifnr
+      LEFT JOIN mch1 AS c ON b~matnr = c~matnr AND c~charg = b~charg
+      WHERE a~ebeln = @ebeln
+      AND a~ebelp IN @r_ebelp
+      ORDER BY a~matnr,  fecha.
+
+    DATA(tv_mslb) = tt_mslb.
+
+    "Nos quedamos con los componentes
+    DATA(tv_resb) = tt_mslb.
+    SORT tv_resb BY matnr baugr ebelp.
+    DELETE ADJACENT DUPLICATES FROM tv_resb COMPARING matnr baugr ebelp.
+
+    "Si tenemos asignado el lote en la RESB borramos el resto
+    IF tv_mslb IS NOT INITIAL.
+      r_lote =  VALUE #( FOR reg IN tt_mslb WHERE ( lote_resb IS NOT INITIAL ) ( sign = 'I' option = 'EQ' low = reg-lote_resb ) ).
+
+      IF r_lote IS NOT INITIAL.
+        DELETE tv_mslb WHERE charg NOT IN r_lote .
+      ENDIF.
+    ENDIF.
+
+    DATA: cantidad TYPE komdlgn-lfimg.
+    DATA: r_exidv TYPE RANGE OF exidv.
+
+    "En caso de existir la UA marcamos estatus
+    IF tt_bultos_of IS NOT INITIAL.
+      r_exidv = VALUE #( FOR res IN tt_bultos_of WHERE ( exidv NE space ) ( sign = 'I' option = 'EQ' low = res-exidv ) ).
+      IF r_exidv IS NOT INITIAL.
+        UPDATE vekp SET status = '0060' WHERE exidv IN r_exidv.
+      ENDIF.
+    ENDIF.
+
+    LOOP AT lt_ekpo INTO DATA(ls_ekpo).
+      READ TABLE lt_eket INTO DATA(ls_eket) WITH KEY ebeln = ls_ekpo-ebeln ebelp = ls_ekpo-ebelp.
+      "Sumanos la cantidad para totalizar en una posición de la entrega.
+      ADD 1 TO posi.
+      v_vbeln = '$       1'.
+
+      CLEAR: lote_vacio.
+      IF ls_eket-charg IS INITIAL.
+        lote_vacio = 'X'.
+        CALL FUNCTION 'BAPI_BATCH_CREATE'
+          EXPORTING
+            material = ls_ekpo-matnr
+            plant    = ls_ekpo-werks
+          IMPORTING
+            batch    = ls_eket-charg.
+
+      ENDIF.
+
+      CLEAR: cantidad.
+
+      LOOP AT tt_bultos_of ASSIGNING FIELD-SYMBOL(<ls_bulto>) WHERE matnr = ls_ekpo-matnr AND vgpos = ls_ekpo-ebelp ."and charg IS NOT INITIAL. "debe tener lote la posición
+        ADD <ls_bulto>-lfimg TO cantidad.
+        ADD 1 TO n_bultos.
+
+        IF <ls_bulto>-charg IS INITIAL.
+          <ls_bulto>-charg = ls_eket-charg.
+        ENDIF.
+
+        "Embalamos HU del bulto con cantidad de la posición
+        APPEND INITIAL LINE TO xverko ASSIGNING FIELD-SYMBOL(<ls_verko>).
+        <ls_verko>-exidv  = <ls_bulto>-exidv.
+        <ls_verko>-exidv2 = <ls_bulto>-nlpla.
+        CALL FUNCTION 'ZSWM_UI5_GET_VHILM'
+          EXPORTING
+            matnr = ls_ekpo-matnr
+            werks = ls_ekpo-werks
+            charg = ls_eket-charg
+            vbtyp = '7'
+          IMPORTING
+*           ERROR =
+*           TT_LOG        =
+            vhilm = <ls_verko>-vhilm.
+        <ls_verko>-exida     = 'A'.
+
+        APPEND INITIAL LINE TO xverpo ASSIGNING FIELD-SYMBOL(<ls_verpo>).
+
+        <ls_verpo>-exidv_ob =
+        <ls_verpo>-exidv    = <ls_bulto>-exidv.
+        <ls_verpo>-velin    = '1'.
+        <ls_verpo>-vbeln = v_vbeln.
+*        <ls_verpo>-rfbel = v_vbeln.
+*        <ls_verpo>-rfpos =  posi.
+        <ls_verpo>-posnr =  posi * 10.
+        <ls_verpo>-tmeng = <ls_bulto>-lfimg.
+        <ls_verpo>-vrkme = <ls_bulto>-vrkme.
+        <ls_verpo>-matnr = <ls_bulto>-matnr.
+*        <ls_verpo>-bestq = ls_ekpo-bestq.
+*        <ls_verpo>-sobkz = ls_ekpo-sobkz.
+*        <ls_verpo>-sonum = ls_ekpo-sonum.
+
+        <ls_verpo>-charg = ls_eket-charg.
+
+        <ls_verpo>-werks = ls_ekpo-werks.
+        <ls_verpo>-lgort = ls_ekpo-lgort.
+
+
+      ENDLOOP.
+
+      APPEND INITIAL LINE TO tl_xkomdlgn ASSIGNING FIELD-SYMBOL(<ls_detail>).
+
+      <ls_detail>-lfdat = sy-datum.
+      <ls_detail>-lifnr = ls_ekko-lifnr.
+
+** EKPO
+      <ls_detail>-posnr = posi * 10.
+      <ls_detail>-arktx = ls_ekpo-txz01.
+      <ls_detail>-matnr = ls_ekpo-matnr.
+      <ls_detail>-uebtk = ls_ekpo-uebtk.
+      <ls_detail>-uebto = ls_ekpo-uebto.
+      <ls_detail>-untto = ls_ekpo-untto.
+      <ls_detail>-werks = ls_ekpo-werks.
+      <ls_detail>-lgort = ls_ekpo-lgort.
+      <ls_detail>-vrkme = ls_ekpo-meins.
+      <ls_detail>-meins = <ls_bulto>-vrkme.
+      <ls_detail>-umvkz = ls_ekpo-umrez.
+      <ls_detail>-umvkn = ls_ekpo-umren.
+      <ls_detail>-vgbel = ls_ekpo-ebeln.
+      <ls_detail>-vgpos = ls_ekpo-ebelp.
+      <ls_detail>-meins = ls_ekpo-meins.
+      <ls_detail>-lifex = albaran. " PMP 03.09.2024 Añadimos albaran a proveedor externo
+      IF ls_eket-charg IS NOT INITIAL.
+        <ls_detail>-charg = ls_eket-charg.
+      ENDIF.
+
+** OTHERS
+
+      <ls_detail>-lfart = 'EL'.
+      <ls_detail>-lfimg = cantidad.
+      <ls_detail>-vgtyp = 'V'.
+      <ls_detail>-kzazu = 'X'.
+
+
+      LOOP AT tv_resb INTO DATA(ls_resb) WHERE baugr = ls_ekpo-matnr AND ebelp = ls_ekpo-ebelp.
+
+        vv_cantidad_pend = ls_ekpo-menge.
+        LOOP AT lt_ekes INTO DATA(wa_ekes)
+          WHERE ebeln EQ ls_ekpo-ebeln
+            AND ebelp EQ ls_ekpo-ebelp.
+          vv_cantidad_pend = vv_cantidad_pend - wa_ekes-dabmg.
+        ENDLOOP.
+
+        IF vv_cantidad_pend IS NOT INITIAL.
+*        IF data_of-gamng IS NOT INITIAL.
+*          vv_cantidad_total =  ( ls_resb-bdmng * cantidad ) / data_of-gamng.
+          " INI: PMP 03.09.2024 Ajustamos cálculo y redondeamos
+          vv_cantidad_total =	ceil( (  ( ls_resb-bdmng - ls_resb-enmng ) * cantidad ) / vv_cantidad_pend ). " data_of-gamng.
+          " FIN: PMP 03.09.2024 Ajustamos cálculo y redondeamos
+        ELSE.
+          CONTINUE.
+        ENDIF.
+
+        LOOP AT tv_mslb INTO DATA(wv_mslb) WHERE matnr = ls_resb-matnr AND lblab > 0 AND ebelp = ls_ekpo-ebelp.
+          DATA(vv_tabix) = sy-tabix.
+          wv_mslb-lbins = 0. " en este campo guardaré la cantidad a consumir
+          IF vv_cantidad_total <= 0.
+            EXIT.
+          ELSEIF wv_mslb-lblab >= vv_cantidad_total.
+            wv_mslb-lbins = vv_cantidad_total.
+            wv_mslb-lblab =  wv_mslb-lblab - vv_cantidad_total.
+            vv_cantidad_total = 0.
+          ELSEIF wv_mslb-lblab <  vv_cantidad_total.
+            wv_mslb-lbins = wv_mslb-lblab.
+            vv_cantidad_total = vv_cantidad_total - wv_mslb-lblab.
+            CLEAR wv_mslb-lblab.
+          ENDIF.
+          MODIFY tv_mslb FROM wv_mslb INDEX vv_tabix.
+
+        ENDLOOP.
+        IF vv_cantidad_total > 0.
+          IF forzar_stock IS INITIAL.
+            MOVE abap_true TO error.
+
+            IF ls_resb-lote_resb IS INITIAL.
+              PERFORM mensaje USING 'E' 'ZSWM_UI5' '214' data_of-ebeln ls_ekpo-ebelp ls_resb-matnr space  CHANGING tt_log[].
+            ELSE.
+              PERFORM mensaje USING 'E' 'ZSWM_UI5' '214' data_of-ebeln ls_ekpo-ebelp ls_resb-matnr ls_resb-lote_resb  CHANGING tt_log[].
+            ENDIF.
+
+            "Borramos el lote en caso de haberlo creado
+            IF lote_vacio IS NOT INITIAL.
+              DATA: batchattributes  LIKE  bapibatchatt,
+                    batchattributesx LIKE  bapibatchattx,
+                    lt_return_batch        TYPE bapiret2_t.
+              batchattributes-del_flag = 'X'.
+              batchattributesx-del_flag = 'X'.
+
+              CALL FUNCTION 'BAPI_BATCH_CHANGE'
+                EXPORTING
+                  material         = ls_ekpo-matnr
+                  batch            = ls_eket-charg
+*                 PLANT            =
+                  batchattributes  = batchattributes
+                  batchattributesx = batchattributesx
+*                 BATCHCONTROLFIELDS       =
+*                 INTERNALNUMBERCOM        =
+*                 EXTENSION1       =
+*                 MATERIAL_EVG     =
+* IMPORTING
+*                 BATCHATTRIBUTES  =
+                TABLES
+                  return           = lt_return_batch.
+            ENDIF.
+            CONTINUE.
+          ELSE.
+            LOOP AT tv_mslb ASSIGNING FIELD-SYMBOL(<fs_mslb1>) WHERE matnr = ls_resb-matnr AND lblab > 0 AND ebelp = ls_ekpo-ebelp.
+              <fs_mslb1>-lbins = <fs_mslb1>-lblab.
+            ENDLOOP.
+          ENDIF.
+        ENDIF.
+
+        LOOP AT tv_mslb ASSIGNING FIELD-SYMBOL(<fs_mslb>) WHERE matnr = ls_resb-matnr AND lbins > 0 AND ebelp = ls_ekpo-ebelp.
+
+          APPEND INITIAL LINE TO it_lecomp ASSIGNING FIELD-SYMBOL(<ls_lecomp>).
+*      <ls_lecomp>-VBELN      = v_vbeln.
+          <ls_lecomp>-posnr      = posi * 10.
+          <ls_lecomp>-erfmg          = <fs_mslb>-lbins.
+          <ls_lecomp>-erfme = ls_ekpo-meins.
+          <ls_lecomp>-linct  = 1.
+          <ls_lecomp>-matnr = <fs_mslb>-matnr.
+          <ls_lecomp>-charg = <fs_mslb>-charg.
+          <ls_lecomp>-ebeln = ls_ekpo-ebeln.
+          <ls_lecomp>-ebelp = ls_ekpo-ebelp.
+
+          <fs_mslb>-lbins = 0. " reiniciamos la cantidad tomada
+        ENDLOOP.
+
+        "Si no existe stock tenemos que eliminar el componente
+        IF sy-subrc NE 0.
+          APPEND INITIAL LINE TO it_lecomp ASSIGNING <ls_lecomp>.
+*      <ls_lecomp>-VBELN      = v_vbeln.
+          <ls_lecomp>-posnr      = posi * 10.
+          <ls_lecomp>-erfmg          = 0.
+          <ls_lecomp>-erfme = ls_resb-meins.
+          <ls_lecomp>-linct  = 1.
+          <ls_lecomp>-matnr = ls_resb-matnr.
+*          <ls_lecomp>-charg = <fs_mslb>-charg.
+          <ls_lecomp>-ebeln = ls_ekpo-ebeln.
+          <ls_lecomp>-ebelp = ls_ekpo-ebelp.
+
+*        <fs_mslb>-lbins = 0. " reiniciamos la cantidad tomada
+
+        ENDIF.
+      ENDLOOP.
+
+      CLEAR: ls_eket.
+    ENDLOOP.
+
+    READ TABLE tt_log TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+      CALL FUNCTION 'GN_DELIVERY_CREATE'
+        EXPORTING
+          vbsk_i        = wl_xvbsk
+          it_lecomp     = it_lecomp
+*     IMPORTING
+*         VBSK_E        =
+*         ET_SPLITPROT  =
+*         ET_VBADR      =
+*         ET_VBPA       =
+        TABLES
+          xkomdlgn      = tl_xkomdlgn
+          xvbfs         = tl_xvbfs
+          xvbls         = tl_xvbls
+          xverko        = xverko
+          xverpo        = xverpo
+        EXCEPTIONS
+          error_message = 1
+          OTHERS        = 2.
+
+      LOOP AT tl_xvbfs ASSIGNING FIELD-SYMBOL(<fs_xvbfs>).
+        APPEND INITIAL LINE TO tt_log ASSIGNING FIELD-SYMBOL(<fs_return>).
+        MOVE-CORRESPONDING <fs_xvbfs> TO <fs_return>.
+        <fs_return>-type = <fs_xvbfs>-msgty.
+        <fs_return>-id = <fs_xvbfs>-msgid.
+        <fs_return>-number = <fs_xvbfs>-msgno.
+*<fs_return>-MESSAGE = <fs_xvbfs>-
+        <fs_return>-message_v1 = <fs_xvbfs>-msgv1.
+        <fs_return>-message_v2 = <fs_xvbfs>-msgv2.
+        <fs_return>-message_v3 = <fs_xvbfs>-msgv3.
+        <fs_return>-message_v4 = <fs_xvbfs>-msgv4.
+
+        IF <fs_return>-type = 'E' OR <fs_return>-type = 'A'.
+          error = abap_true.
+        ENDIF.
+      ENDLOOP.
+      IF error IS INITIAL.
+        LOOP AT tl_xvbls INTO DATA(ls_vbeln) WHERE vbeln_lif IS NOT INITIAL.
+          v_vbeln = ls_vbeln-vbeln_lif.
+
+*          "Rellenamos la tabla zswm_ui5_nlpla para poder ubicar el bulto
+*          LOOP AT t_bultos_cu ASSIGNING <ls_bultos_cu>.
+*            <ls_bultos_cu>-lgnum = data_user-lgnum.
+*            <ls_bultos_cu>-vbeln = v_vbeln.
+*            <ls_bultos_cu>-ernam = sy-uname.
+*            <ls_bultos_cu>-erdat = sy-datum.
+*            <ls_bultos_cu>-erzeit = sy-uzeit.
+*          ENDLOOP.
+*          IF sy-subrc = 0.
+*            MODIFY zswm_ui5_nlpla FROM TABLE t_bultos_cu.
+*          ENDIF.
+
+          "Contabilizamos la entrega
+          "Cabecera
+*          header_control-deliv_numb  = v_vbeln.
+*          header_control-post_gi_flg = 'X'.
+*          header_data-deliv_numb  = v_vbeln.
+*          delivery = v_vbeln.
+*          DO 10 TIMES.
+*            CLEAR: lt_return_temp.
+*            CALL FUNCTION 'BAPI_INB_DELIVERY_CONFIRM_DEC'
+*              EXPORTING
+*                header_data    = header_data
+*                header_control = header_control
+*                delivery       = delivery
+**               TECHN_CONTROL  =
+**               HEADER_CONTROL_SPL         =
+*              TABLES
+**               item_data      = item_data
+**               item_control   = item_control
+*                return         = lt_return_temp.
+*
+*            READ TABLE lt_return_temp TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+*            IF sy-subrc = 0 .
+*              CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+*              WAIT UP TO 1 SECONDS.
+*            ELSE.
+*              EXIT.
+*            ENDIF.
+*
+*          ENDDO.
+*          APPEND LINES OF lt_return_temp TO tt_log[].
+          "Si tiene transporte asociado asignamos la entrega al transporte
+          IF tknum IS NOT INITIAL AND v_vbeln IS NOT INITIAL AND error IS INITIAL.
+            CALL FUNCTION 'ZSWM_ADD_DELV_TO_SHIPMENT_UI5'
+              EXPORTING
+                tcode    = tcode
+                uname    = uname
+                operario = operario
+                tknum    = tknum
+                vbeln    = v_vbeln
+              IMPORTING
+                error    = error
+                tt_log   = tt_log.
+
+          ENDIF.
+          IF error IS INITIAL.
+            CALL FUNCTION 'ZSWM_POST_ID_DELIVERY'
+              EXPORTING
+                tcode                = tcode
+                uname                = uname
+                vbeln                = v_vbeln
+                operario             = operario
+                tknum                = tknum
+                num_bultos           = n_bultos
+                no_cerrar_transporte = abap_true
+                no_gen_log           = abap_true
+              IMPORTING
+                error                = error
+                tt_log               = tt_log_global.
+
+            APPEND LINES OF tt_log_global TO tt_log.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+      IF v_vbeln IS NOT INITIAL.
+        READ TABLE tt_log TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+        IF sy-subrc = 0 OR error = abap_true.
+          IF tknum IS NOT INITIAL.
+            "Desasignamos la entrega del transporte
+            PERFORM borrar_asig_ent_trans  USING    v_vbeln tknum
+                                CHANGING tt_log.
+          ENDIF.
+
+          "Borramos la entrega entrante generada en caso de error al hacer el 101
+          PERFORM borrar_entrega_entrante USING v_vbeln CHANGING tt_log.
+
+
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+ENDFUNCTION.

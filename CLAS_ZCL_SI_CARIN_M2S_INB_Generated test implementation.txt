@@ -1,0 +1,496 @@
+
+class ZCL_SI_CARIN_M2S_INB definition
+  public
+  create public .
+
+public section.
+
+  interfaces ZII_SI_CARIN_M2S_INB .
+protected section.
+private section.
+endclass. "ZCL_SI_CARIN_M2S_INB definition
+class ZCL_SI_CARIN_M2S_INB implementation.
+  METHOD zii_si_carin_m2s_inb~si_carin_m2s_inb.
+*------------------------------------------------------------------------------------------
+* Declaración de variables
+    DATA: wa_row           TYPE zdt_carin_l,
+          lv_inspoper      TYPE bapi2045l2-inspoper, "Nº operación lote inspección
+          lv_insppointdata TYPE bapi2045l4,
+          t_return         TYPE TABLE OF bapiret2,
+          wa_return        TYPE bapiret2,
+          t_char_results   TYPE TABLE OF bapi2045d2,
+          wa_char_results  TYPE bapi2045d2.
+
+    DATA: lv_extnumber TYPE balnrext.
+
+    DATA: e_prueflos   TYPE  qplos,
+          e_qals       TYPE  qals,
+          lv_qals_imp  TYPE qals,
+          lv_rmqed_imp TYPE rmqed,
+          lv_subrc     TYPE sy-subrc.
+
+    DATA: lv_objnr TYPE jest-objnr.
+
+    DATA: lv_prueflos TYPE bapi2045l2-insplot.
+
+    DATA: num_reg TYPE sy-tabix.
+
+    FIELD-SYMBOLS: <wa_qamv> TYPE qamv.
+
+    DATA: lv_verwmerkm TYPE qmerknr.
+
+    DATA: t_output  TYPE zdt_carin_l_response_tab,
+          wa_output TYPE zdt_carin_l_response.
+
+
+*   variables envio mail.
+    DATA: lv_mail TYPE xfeld.
+
+    DATA: lt_addr        TYPE bcsy_smtpa,
+          lo_send_email  TYPE REF TO cl_bcs,
+          lo_document    TYPE REF TO cl_document_bcs,
+          lo_recipient   TYPE REF TO if_recipient_bcs,
+          lv_sent_to_all TYPE os_boolean,
+          lo_sender      TYPE REF TO cl_cam_address_bcs,
+          lv_sender      TYPE adr6-smtp_addr,
+          lv_subject     TYPE so_obj_des,
+          lt_message     TYPE soli_tab,
+          ls_message     TYPE soli.
+
+    DATA(o_log) = NEW zcl_ap_log( object = 'MES_CARIN'
+                                  report = 'ZCL_SI_CARIN_M2S_INB'
+                                  clave  = zcl_ap_proxy=>GET_MSGGUID( ) ).
+
+*------------------------------------------------------------------------------------------
+*   recuperamos los destinatios del mail en caso de que la interface genere errores.
+    SELECT * FROM ztmes_mail
+      INTO TABLE @DATA(t_mail)
+      WHERE interface = 'CAL'.
+
+
+
+    LOOP AT input-mt_carin-row INTO wa_row.
+      o_log->log( msgty = 'I'
+                 message  = 'Inicio proceso'
+                 msgv1    = wa_row-centro
+                 msgv2    = wa_row-num_lote_mes
+                 msgv3    = wa_row-num_lote_sap ).
+
+      CLEAR: lv_mail.
+
+* Subir mayúscular para el código de lote.
+      TRANSLATE wa_row-num_lote_sap TO UPPER CASE.
+
+*     verificamos si existe un lote de inpección para el lote sap y si está liberado.
+*     en ese caso, lo clasifica.
+*     si no existe el lote ó no está liberado, crea uno nuevo.
+      SELECT prueflos , enstehdat , entstezeit FROM qals
+        INTO TABLE @DATA(lt_lotes_insp)
+*        INTO e_prueflos
+        WHERE werk  = @wa_row-centro AND
+              charg = @wa_row-num_lote_sap
+        ORDER BY enstehdat  DESCENDING ,
+                 entstezeit DESCENDING.
+      IF sy-subrc = 0.
+        e_prueflos = lt_lotes_insp[ 1 ]-prueflos.
+*      ENDIF.
+*
+*      IF sy-subrc = 0.
+
+*       verificamos que lote esté liberado
+        CONCATENATE 'QL' e_prueflos INTO lv_objnr.
+
+        SELECT SINGLE * FROM jest
+          INTO @DATA(wa_jest)
+          WHERE objnr = @lv_objnr AND
+                stat = 'I0002' AND
+                inact = ''.
+      ENDIF.
+
+* Si no hay lote de inspección creado y en estado LIB, se crea uno nuevo.
+      IF sy-subrc <> 0.
+
+* 1. Buscamos lote con kg. (excepto si está expedida, que no encontraremos ningún reg.con kg.)
+        SELECT SINGLE *
+          INTO @DATA(ls_mchb)
+          FROM mchb
+          WHERE werks = @wa_row-centro AND
+                charg = @wa_row-num_lote_sap AND
+                clabs > 0.
+
+        IF sy-subrc <> 0.
+* 2. Si kg=0, obtener kg de mov.101 del lote. ( CMS - 22/02/2021 )
+          SELECT SINGLE matnr , menge
+            INTO ( @ls_mchb-matnr , @ls_mchb-clabs )
+            FROM aufm
+            WHERE werks = @wa_row-centro       AND
+                  charg = @wa_row-num_lote_sap AND
+                  bwart = '101'.
+        ENDIF.
+
+        IF ls_mchb-matnr IS NOT INITIAL.
+* Si no es una bobina (es rollo), limpiar lote sap y salir.
+          SELECT SINGLE mtart
+            INTO @DATA(l_mtart)
+            FROM mara
+            WHERE matnr = @ls_mchb-matnr.
+          IF l_mtart <> 'ZPAP'.
+            CLEAR: wa_output.
+            wa_output-num_lote_mes = wa_row-num_lote_mes.
+            wa_output-num_lote_sap = wa_row-num_lote_sap.
+            wa_output-num_lote_inspeccion_sap = ''.
+            APPEND wa_output TO t_output.
+            output-mt_carin_response-row = t_output.
+
+            lv_mail = 'X'.
+
+            wa_return-type = 'E'.
+            wa_return-id = 'ZQM'.
+            wa_return-number = '004'.
+            wa_return-message_v1 = wa_row-num_lote_sap.
+            APPEND wa_return TO t_return .
+
+            CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+              EXPORTING
+                objeto    = 'ZSAP_MES'
+                subobjeto = 'ZLOTE_INSPECCION'
+                mensajes  = t_return[]
+                extnumber = lv_extnumber.
+
+          ENDIF.
+
+* OLD CODE SHOTIS....
+*      IF sy-subrc <> 0.
+*        SELECT * FROM mchb
+*          INTO TABLE @DATA(t_mchb)
+*          WHERE werks = @wa_row-centro AND
+*                charg = @wa_row-num_lote_sap.
+*
+*        IF sy-subrc = 0.
+*          DESCRIBE TABLE t_mchb LINES num_reg.
+*          READ TABLE t_mchb INTO DATA(wa_mchb) INDEX num_reg.
+*
+
+          IF ls_mchb-clabs IS NOT INITIAL AND lv_mail = ' '.
+*           1. con el lote de sap, hay que crear lote de inspección en sap
+            lv_qals_imp-werk        = wa_row-centro.
+            lv_qals_imp-matnr       = ls_mchb-matnr. "Número de material
+            lv_qals_imp-losmenge    = ls_mchb-clabs."Cantidad
+            lv_qals_imp-charg       = wa_row-num_lote_sap.
+            lv_qals_imp-herkunft    = '89'. "origen
+            lv_qals_imp-art         = '89'. "clase de inspección
+            lv_qals_imp-ktextlos    = wa_row-num_lote_mes.
+            lv_qals_imp-pastrterm   = sy-datum.
+
+            lv_rmqed_imp-dbs_steuer = '01'.
+            lv_rmqed_imp-dbs_flag   = 'X'.
+            lv_rmqed_imp-dbs_edunk  = 'X'.
+            lv_rmqed_imp-dbs_fdunk  = 'X'.
+            lv_rmqed_imp-dbs_noerr  = 'X'.
+            lv_rmqed_imp-dbs_nowrn  = 'X'.
+            lv_rmqed_imp-dbs_nochg  = 'X'.
+            lv_rmqed_imp-dbs_noauf  = 'X'.
+
+            CALL FUNCTION 'QPL1_INSPECTION_LOT_CREATE'
+              EXPORTING
+                qals_imp   = lv_qals_imp
+                rmqed_imp  = lv_rmqed_imp
+              IMPORTING
+*               E_KZSKIPLOT           =
+                e_prueflos = e_prueflos
+                e_qals     = e_qals
+                subrc      = lv_subrc
+*               E_SKIP_TO_STOCK       =
+              .
+            IF lv_subrc = 0.
+
+              lv_prueflos = e_prueflos.
+
+              CALL FUNCTION 'QPL1_UPDATE_MEMORY'
+                EXPORTING
+                  i_qals  = e_qals
+                  i_updkz = 'I'
+*                 I_RMQED = RMQED
+*                 I_DUMMY =
+                .
+
+              CALL FUNCTION 'QPL1_INSPECTION_LOTS_POSTING'
+*             EXPORTING
+*               I_MODE        = ' '
+                .
+
+              CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                EXPORTING
+                  wait = 'X'.
+            ELSE.
+              lv_mail = 'X'.
+
+              wa_output-num_lote_mes = wa_row-num_lote_mes.
+              wa_output-num_lote_sap = wa_row-num_lote_sap.
+              wa_output-num_lote_inspeccion_sap = ''.
+              APPEND wa_output TO t_output.
+              output-mt_carin_response-row = t_output.
+
+*             Error en la creación del lote de inspección para el lote &
+              wa_return-type = 'E'.
+              wa_return-id = 'ZQM'.
+              wa_return-number = '000'.
+              wa_return-message_v1 = wa_row-num_lote_sap.
+              APPEND wa_return TO t_return .
+
+              CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+                EXPORTING
+                  objeto    = 'ZSAP_MES'
+                  subobjeto = 'ZLOTE_INSPECCION'
+                  mensajes  = t_return[]
+                  extnumber = lv_extnumber.
+            ENDIF.
+          ELSEIF lv_mail = ' '. " Si ya està activado, se ha procesado el error anteriormente
+            lv_mail = 'X'.
+
+            wa_output-num_lote_mes = wa_row-num_lote_mes.
+            wa_output-num_lote_sap = wa_row-num_lote_sap.
+            wa_output-num_lote_inspeccion_sap = ''.
+            APPEND wa_output TO t_output.
+            output-mt_carin_response-row = t_output.
+
+*           Error, material & Lote &: no hay stock en libre utilización.
+            wa_return-type = 'E'.
+            wa_return-id = 'ZQM'.
+            wa_return-number = '002'.
+            wa_return-message_v1 = ls_mchb-matnr.
+            wa_return-message_v2 = wa_row-num_lote_sap.
+            APPEND wa_return TO t_return .
+
+            CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+              EXPORTING
+                objeto    = 'ZSAP_MES'
+                subobjeto = 'ZLOTE_INSPECCION'
+                mensajes  = t_return[]
+                extnumber = lv_extnumber.
+          ENDIF.
+
+        ELSE.
+          lv_mail = 'X'.
+
+          wa_output-num_lote_mes = wa_row-num_lote_mes.
+          wa_output-num_lote_sap = wa_row-num_lote_sap.
+          wa_output-num_lote_inspeccion_sap = ''.
+          APPEND wa_output TO t_output.
+          output-mt_carin_response-row = t_output.
+
+*         Error, el lote de SAP & que viene de MES no existe en SAP.
+          wa_return-type = 'E'.
+          wa_return-id = 'ZQM'.
+          wa_return-number = '001'.
+          wa_return-message_v1 = wa_row-num_lote_sap.
+          APPEND wa_return TO t_return .
+
+          CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+            EXPORTING
+              objeto    = 'ZSAP_MES'
+              subobjeto = 'ZLOTE_INSPECCION'
+              mensajes  = t_return[]
+              extnumber = lv_extnumber.
+        ENDIF.
+      ENDIF.
+
+      IF lv_mail IS INITIAL.
+
+*       clasificamos el lote de inspección con las características que vienen de MES:
+        SELECT * FROM qamv
+          INTO TABLE @DATA(t_qamv)
+          WHERE prueflos = @e_prueflos.
+
+
+        LOOP AT t_qamv ASSIGNING <wa_qamv>.
+          TRANSLATE <wa_qamv>-kurztext TO UPPER CASE.
+        ENDLOOP.
+
+
+        LOOP AT wa_row-caracteristicas INTO DATA(wa_caracteristicas).
+          wa_char_results-insplot = e_prueflos. "  Número lote inspección
+          wa_char_results-inspoper = '0010'. "Nº operación lote inspección
+          wa_char_results-closed = 'X'.  "Cerrar característica o muestreo
+          wa_char_results-evaluated = 'X'. "Adoptar valoración a partir de sistema externo
+*         wa_char_results-evaluation = 'R'. "Valoración del resultado de inspección
+
+          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING
+              input  = wa_caracteristicas-carac_inspeccion
+            IMPORTING
+              output = lv_verwmerkm.
+
+          READ TABLE t_qamv INTO DATA(wa_qamv) WITH KEY verwmerkm = lv_verwmerkm.
+          IF sy-subrc = 0.
+            wa_char_results-inspchar = wa_qamv-merknr. "número característica lote inspección
+          ELSE.
+            wa_char_results-inspchar = '9999'. "la característica que viene de MES no existe, por lo que le ponemos un 9999 para que la bapi falle
+            "y las papeleras se enteren con el log de errores.
+          ENDIF.
+
+          wa_char_results-mean_value = wa_caracteristicas-resultado.
+          wa_char_results-remark = wa_caracteristicas-nota_no_ok.
+
+          IF wa_caracteristicas-resultado IS NOT INITIAL. "si MES manda una características sin informar, no la paso a la BAPI
+            APPEND wa_char_results TO t_char_results.
+          ENDIF.
+        ENDLOOP.
+
+
+        lv_prueflos = e_prueflos.
+
+        CALL FUNCTION 'BAPI_INSPOPER_RECORDRESULTS'
+          EXPORTING
+            insplot      = lv_prueflos
+            inspoper     = '0010'
+*           insppointdata  = lv_insppointdata
+**        HANDHELD_APPLICATION       = ' '
+          IMPORTING
+            return       = wa_return
+          TABLES
+            char_results = t_char_results      "1. Resultado de inspección nivel de característica
+**        SAMPLE_RESULTS =                   "2.  Resultado de inspección nivel de muestra
+**        single_results = t_isingle_results "3.  Resultado inspección nivel de valor individual
+            returntable  = t_return.
+*
+
+        READ TABLE t_return INTO wa_return WITH KEY type = 'E'.
+        IF sy-subrc = 0.
+
+          wa_output-num_lote_mes = wa_row-num_lote_mes.
+          wa_output-num_lote_sap = wa_row-num_lote_sap.
+          wa_output-num_lote_inspeccion_sap = ''.
+          APPEND wa_output TO t_output.
+          output-mt_carin_response-row = t_output.
+
+          lv_mail = 'X'.
+
+          CLEAR lv_extnumber.
+          lv_extnumber = lv_prueflos.
+
+          CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+            EXPORTING
+              objeto    = 'ZSAP_MES'
+              subobjeto = 'ZLOTE_INSPECCION'
+              mensajes  = t_return[]
+              extnumber = lv_extnumber.
+        ELSE.
+          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+            EXPORTING
+              wait = 'X'.
+
+          wa_output-num_lote_mes = wa_row-num_lote_mes.
+          wa_output-num_lote_sap = wa_row-num_lote_sap.
+          wa_output-num_lote_inspeccion_sap = lv_prueflos.
+          APPEND wa_output TO t_output.
+
+          output-mt_carin_response-row = t_output.
+        ENDIF.
+      ENDIF.
+
+      LOOP AT t_return ASSIGNING FIELD-SYMBOL(<msg>).
+        IF <msg>-message IS INITIAL.
+          MESSAGE ID <msg>-id TYPE 'S' NUMBER <msg>-number
+                  WITH <msg>-message_v1 <msg>-message_v2 <msg>-message_v3 <msg>-message_v4
+                  INTO <msg>-message.
+        ENDIF.
+
+        o_log->log( msgid    = <msg>-id
+                   msgty    = <msg>-type
+                   msgno    = <msg>-number
+                   message  = <msg>-message
+                   msgv1    = wa_row-centro
+                   msgv2    = wa_row-num_lote_mes
+                   msgv3    = wa_row-num_lote_sap ).
+      ENDLOOP.
+      IF sy-subrc NE 0.
+        o_log->log( msgty = 'I'
+                   message  = 'Fin proceso'
+                   msgv1    = wa_row-centro
+                   msgv2    = wa_row-num_lote_mes
+                   msgv3    = wa_row-num_lote_sap ).
+      ENDIF.
+
+      IF lv_mail IS NOT INITIAL.
+        READ TABLE t_mail INTO DATA(ls_mails) WITH KEY werks = wa_row-centro.
+        IF sy-subrc = 0.
+
+          IF ls_mails-mail_1 NE space.
+            APPEND ls_mails-mail_1 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_2 NE space.
+            APPEND ls_mails-mail_2 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_3 NE space.
+            APPEND ls_mails-mail_3 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_4 NE space.
+            APPEND ls_mails-mail_4 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_5 NE space.
+            APPEND ls_mails-mail_5 TO lt_addr.
+          ENDIF.
+
+*         Inicialización de la clase
+          lo_send_email = cl_bcs=>create_persistent( ).
+
+*         cuerpo del mail
+          CLEAR: lt_message.
+          REFRESH: lt_message.
+          CONCATENATE 'Se ha producido un error en la interface MES – SAP (CAL) a las' sy-uzeit 'del' sy-datum
+            INTO ls_message SEPARATED BY space.
+          APPEND ls_message TO lt_message.
+
+
+*         Crear documento
+          lv_subject = 'Error integración MES – SAP (CAL)'.
+
+          lo_document =  cl_document_bcs=>create_document( i_type    =  'HTM'
+                                                           i_subject =  lv_subject
+                                                           i_text    =  lt_message ).
+*         Enviar documento al email
+          lo_send_email->set_document( lo_document ).
+
+*         Añadir remitente
+*          SELECT SINGLE * FROM usr21
+*            INTO @DATA(wa_usr21)
+*            WHERE bname = @sy-uname.
+*
+*          IF sy-subrc = 0.
+*            SELECT SINGLE smtp_addr FROM adr6
+*              INTO  lv_sender
+*              WHERE addrnumber = wa_usr21-addrnumber AND
+*              persnumber = wa_usr21-persnumber.
+*          ENDIF.
+
+          lv_sender = 'sap@hinojosa.es'.
+
+          lo_sender = cl_cam_address_bcs=>create_internet_address( lv_sender  ).
+          lo_send_email->set_sender( i_sender = lo_sender ).
+
+*         Añadir destinatarios al email
+          DATA l_emails TYPE string.
+          LOOP AT lt_addr ASSIGNING FIELD-SYMBOL(<fs_addr>).
+            lo_recipient = cl_cam_address_bcs=>create_internet_address( <fs_addr> ).
+            lo_send_email->add_recipient( i_recipient = lo_recipient ).
+            __add_lista l_emails <fs_addr>.
+          ENDLOOP.
+
+
+*         Enviar email
+          TRY.
+              lv_sent_to_all = lo_send_email->send( i_with_error_screen = 'X' ).
+            CATCH cx_send_req_bcs .
+          ENDTRY.
+          o_log->log( p1 = 'Se ha enviado mail a ' p2 = l_emails msgty = 'I' ).
+          COMMIT WORK.
+        ELSE.
+          o_log->log( p1 = 'No se envian errores por mail porque no se encuentran destinatarios' msgty = 'E' ).
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+  ENDMETHOD.
+endclass. "ZCL_SI_CARIN_M2S_INB definition
+endclass. "ZCL_SI_CARIN_M2S_INB implementation

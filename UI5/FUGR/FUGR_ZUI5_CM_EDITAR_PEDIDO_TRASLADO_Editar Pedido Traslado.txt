@@ -1,0 +1,160 @@
+FUNCTION zui5_cm_editar_pedido_traslado.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_HEADER) TYPE  ZSUIS_CM_ENTREGAS_TRASLADOS
+*"     VALUE(I_POSITIONS) TYPE  ZSUITT_CM_POSICIONES_ENT_TRASL
+*"  EXPORTING
+*"     VALUE(E_RETURN) TYPE  BAPIRET2_T
+*"     VALUE(E_PEDIDO) TYPE  ZSUIS_CM_ENTREGAS_TRASLADOS
+*"----------------------------------------------------------------------
+  DATA: lt_return      TYPE bapiret2_t,
+        header_data    TYPE  bapiibdlvhdrchg,
+        header_control TYPE  bapiibdlvhdrctrlchg,
+        delivery       TYPE  bapishpdelivnumbtab, "bapiibdlvhdrchg-deliv_numb,
+        t_mesg         TYPE TABLE OF  mesg.
+  DATA: purchaseorder LIKE  bapimepoheader-po_number,
+        poitem        TYPE TABLE OF bapimepoitem,
+        poitemx	      TYPE TABLE OF	bapimepoitemx.
+
+  PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '056' i_header-ebeln  '' '' ''CHANGING e_return.
+
+  IF i_header-estado_ee = 'A' OR i_header-estado_ee IS INITIAL.
+*1.Borrar Entrega Entrante generada (BAPI_INB_DELIVERY_CHANGE)
+    "Si entrega entrante esta vacio recuperamos de base de datos la EE.
+    SELECT vbeln
+      FROM vbfa
+      INTO TABLE @DATA(lt_ent_entrante)
+      WHERE  vbelv = @i_header-vbeln
+       AND vbtyp_n = '7'.
+    IF sy-subrc = 0.
+      i_header-vbeln_entrante = lt_ent_entrante[ 1 ]-vbeln.
+*    ENDIF.
+*
+*    IF i_header-vbeln_entrante IS NOT INITIAL.
+      PERFORM borrar_entrega_entrante USING i_header-vbeln_entrante CHANGING lt_return.
+      APPEND LINES OF lt_return TO e_return.
+    ENDIF.
+
+    READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+      "2.Anular contabilización Entrega de Salida (VL09)
+      SELECT SINGLE wbstk
+        FROM vbuk
+        INTO @DATA(lv_estado)
+        WHERE vbeln = @i_header-vbeln.
+      IF lv_estado = 'C'. "comprobamos que este contabilizada la SM para anular
+        PERFORM anular_salida_mercancias USING i_header-vbeln
+                                               'J'
+                                         CHANGING lt_return.
+      ELSE.
+        PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '040' i_header-vbeln '' '' ''CHANGING e_return.
+      ENDIF.
+      APPEND LINES OF lt_return TO e_return.
+
+      READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc NE 0.
+        "3. Quitar Status de Transporte ?????
+        PERFORM borrar_status_trans  USING    i_header-tknum
+                                 CHANGING lt_return.
+        APPEND LINES OF lt_return TO e_return.
+        READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+        IF sy-subrc NE 0.
+
+          PERFORM borrar_asig_ent_trans USING i_header-vbeln i_header-tknum CHANGING lt_return.
+          APPEND LINES OF lt_return TO e_return.
+        ENDIF.
+
+      ENDIF.
+      READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc NE 0.
+
+        "Comprobamos que no hemos añadido ninguna posición nueva en el pedido.
+        LOOP AT i_positions TRANSPORTING NO FIELDS WHERE ebeln IS INITIAL.
+          EXIT.
+        ENDLOOP.
+        IF sy-subrc = 0.
+*  "4.Borrar Entrega de Salida((BAPI_OUTB_DELIVERY_CHANGE)
+          "Borramos HU de la entrega
+          PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '054' i_header-vbeln  '' '' ''CHANGING e_return.
+          CLEAR: lt_return.
+          CALL FUNCTION 'ZUI5_CM_DELETE_HU_ENTREGA'
+            DESTINATION 'NONE'
+            EXPORTING
+              i_vbeln  = i_header-vbeln
+            IMPORTING
+              e_return = lt_return.
+          APPEND LINES OF lt_return TO e_return.
+*  "Borrar entrega
+          PERFORM borrar_entrega USING i_header-vbeln
+                                 CHANGING lt_return.
+          APPEND LINES OF lt_return TO e_return.
+
+        ELSE.
+          PERFORM desembalar_entrega_po USING i_header-vbeln
+                          CHANGING lt_return.
+          APPEND LINES OF lt_return TO e_return.
+        ENDIF.
+      ENDIF.
+
+      READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc NE 0.
+
+        "5.Modificar pedido de compras. (BAPI_PO_CHANGE) -> EKPO-LOEKZ=L
+        PERFORM modificar_pedido_po USING i_header i_positions CHANGING lt_return.
+        APPEND LINES OF lt_return TO e_return.
+
+        "Crear entrega de Salida
+        READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+        IF sy-subrc NE 0.
+          PERFORM modificar_entrega_po USING i_header i_positions CHANGING lt_return delivery.
+          APPEND LINES OF lt_return TO e_return.
+          READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+          IF sy-subrc NE 0.
+            "Contabilizamos entrga po
+            LOOP AT delivery INTO DATA(ls_delivery).
+              PERFORM embalar_entrega_po USING i_positions ls_delivery-deliv_numb CHANGING lt_return.
+              APPEND LINES OF lt_return TO e_return.
+            ENDLOOP.
+
+            "Asignamos entrega al transporte
+            READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+            IF sy-subrc NE 0 AND i_header-tknum IS NOT INITIAL.
+              LOOP AT delivery INTO ls_delivery.
+                PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '025' ls_delivery-deliv_numb i_header-tknum '' ''CHANGING e_return.
+                CALL FUNCTION 'ZUI5_CM_ASIGNAR_ENT_TRANSPORTE'
+                  EXPORTING
+                    i_transporte = i_header-tknum
+                    i_entrega    = ls_delivery-deliv_numb
+                  IMPORTING
+                    o_return     = lt_return.
+                APPEND LINES OF lt_return TO e_return.
+              ENDLOOP.
+
+              READ TABLE e_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+              IF sy-subrc NE 0.
+                PERFORM change_status_trans USING i_header-tknum  CHANGING lt_return.
+                APPEND LINES OF lt_return TO e_return.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ELSE.
+    APPEND INITIAL LINE TO e_return ASSIGNING FIELD-SYMBOL(<ls_return>).
+    <ls_return>-id = 'ZUI5_CM'.
+    <ls_return>-type = 'E'.
+    <ls_return>-number = '014'.
+    <ls_return>-message_v1 = |{ i_header-ebeln ALPHA = OUT }|.
+    <ls_return>-message_v2 = |{ i_header-vbeln_entrante ALPHA = OUT }|.
+
+  ENDIF.
+
+  PERFORM comprueba_existe_ee USING delivery CHANGING lt_return.
+  APPEND LINES OF lt_return TO e_return.
+
+  e_pedido = i_header.
+
+  PERFORM guardar_log_traslado USING i_header-ebeln e_return.
+ENDFUNCTION.

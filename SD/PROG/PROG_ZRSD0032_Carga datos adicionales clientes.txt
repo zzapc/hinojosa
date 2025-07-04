@@ -1,0 +1,316 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRSD0032
+*&
+*&---------------------------------------------------------------------*
+*& GAPSD100 - Programa carga pestaña datos hinojosa en clientes
+*& Javier Calás. 18.01.24
+*&---------------------------------------------------------------------*
+REPORT zrsd0032.
+
+**********************
+* Tipos de datos
+**********************
+TYPES: BEGIN OF st_alv.
+         INCLUDE TYPE zrsd0032_s_alv.
+       TYPES END OF st_alv.
+
+
+**********************
+* Variables globales
+**********************
+DATA: tg_alv TYPE STANDARD TABLE OF st_alv WITH DEFAULT KEY.
+DATA: wg_alv LIKE LINE OF tg_alv.
+DATA: rg_alv TYPE REF TO cl_salv_table.
+
+**********************
+* Pantalla de selección
+**********************
+
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-t01.
+PARAMETERS: p_path   TYPE localfile.
+SELECTION-SCREEN END OF BLOCK b01.
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_path.
+  PERFORM f_f4_fichero USING p_path.
+
+
+
+START-OF-SELECTION.
+  PERFORM f_start_of_selection.
+
+END-OF-SELECTION.
+  PERFORM f_mostrar_alv.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_F4_FICHERO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_PATH  text
+*----------------------------------------------------------------------*
+FORM f_f4_fichero  USING  p_path.
+  DATA: tl_file_table TYPE TABLE OF file_table,
+        vl_rc         TYPE i.
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      file_filter = 'Excel 2007-2021 (*.xlsx)|*.xlsx'
+    CHANGING
+      file_table  = tl_file_table
+      rc          = vl_rc.
+  READ TABLE tl_file_table ASSIGNING FIELD-SYMBOL(<fs_file_table>) INDEX 1.
+  IF sy-subrc = 0.
+    p_path = <fs_file_table>-filename.
+  ENDIF.
+ENDFORM.
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_START_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+
+FORM f_start_of_selection .
+
+  DATA tl_fieldcatalog TYPE lvc_t_fcat.
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = 'ZRSD0032_S_EXCEL'
+    CHANGING
+      ct_fieldcat            = tl_fieldcatalog
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+
+
+  DATA: tl_excel TYPE TABLE OF zrsd0032_s_excel.
+  TRY.
+      DATA(rl_excel_reader) = NEW zcl_excel_reader_2007( ).
+      DATA(rl_excel)        = rl_excel_reader->zif_excel_reader~load_file( p_path ).
+      DATA(rl_worksheet)    = rl_excel->get_active_worksheet( ).
+
+      DATA: vl_row    TYPE int4 VALUE 2,
+            vl_column TYPE int4 VALUE 1,
+            vl_value  TYPE zexcel_cell_value.
+
+      data(vl_highest_row)    = rl_worksheet->get_highest_row( ).
+      data(vl_highest_column) = rl_worksheet->get_highest_column( ).
+
+      WHILE vl_row <= vl_highest_row.
+        APPEND INITIAL LINE TO tl_excel ASSIGNING FIELD-SYMBOL(<fs_excel>).
+        WHILE vl_column <= vl_highest_column.
+
+          rl_worksheet->get_cell( EXPORTING ip_column = vl_column
+                                            ip_row    = vl_row
+                                 IMPORTING ep_value = vl_value ).
+          READ TABLE tl_fieldcatalog ASSIGNING FIELD-SYMBOL(<fs_fieldcatalog>) INDEX vl_column.
+          IF sy-subrc = 0.
+            ASSIGN COMPONENT <fs_fieldcatalog>-fieldname OF STRUCTURE <fs_excel> TO FIELD-SYMBOL(<fs_campo>).
+          ENDIF.
+          IF sy-subrc = 0.
+            IF <fs_fieldcatalog>-inttype = 'D'.
+              <fs_campo> = zcl_excel_common=>excel_string_to_date( vl_value ).
+            ELSEIF <fs_fieldcatalog>-convexit = 'ALPHA'.
+              CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+                EXPORTING
+                  input  = vl_value
+                IMPORTING
+                  output = <fs_campo>.
+            ELSE.
+              <fs_campo> = vl_value.
+            ENDIF.
+          ENDIF.
+
+          ADD 1 TO vl_column.
+        ENDWHILE.
+        vl_column = 1.
+        ADD 1 TO vl_row.
+      ENDWHILE.
+    CATCH zcx_excel INTO DATA(rl_zcx_excel).
+      MESSAGE rl_zcx_excel->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+
+  LOOP AT tl_excel ASSIGNING <fs_excel>.
+    APPEND INITIAL LINE TO tg_alv ASSIGNING FIELD-SYMBOL(<fs_alv>).
+    MOVE-CORRESPONDING <fs_excel> TO <fs_alv>.
+
+    <fs_alv>-semaforo = icon_led_inactive.
+  ENDLOOP.
+
+ENDFORM.
+
+
+
+*---------------------------------------------------------------------*
+*       CLASS class_handle_events DEFINITION
+*---------------------------------------------------------------------*
+*  define a local class for handling events of cl_salv_table
+*---------------------------------------------------------------------*
+CLASS lcl_handle_events DEFINITION.
+  PUBLIC SECTION.
+    METHODS: on_user_command FOR EVENT added_function OF cl_salv_events IMPORTING e_salv_function.
+
+ENDCLASS.                    "lcl_handle_events DEFINITION
+
+
+*---------------------------------------------------------------------*
+*       CLASS lcl_handle_events IMPLEMENTATION
+*---------------------------------------------------------------------*
+* implement the events for handling the events of cl_salv_table
+*---------------------------------------------------------------------*
+CLASS lcl_handle_events IMPLEMENTATION.
+
+  METHOD on_user_command.
+
+    CASE e_salv_function.
+      WHEN 'SAVE'.
+        DATA vl_answer TYPE c.
+
+        CALL FUNCTION 'POPUP_TO_CONFIRM'
+          EXPORTING
+            text_question  = 'Se van a actualizar los datos de los clientes indicados. ¿Desea continuar?'
+          IMPORTING
+            answer         = vl_answer
+          EXCEPTIONS
+            text_not_found = 1
+            OTHERS         = 2.
+        IF vl_answer = '1'.
+          PERFORM f_actualizar_clientes.
+        ENDIF.
+
+    ENDCASE.
+  ENDMETHOD.
+
+ENDCLASS.                    "lcl_handle_events IMPLEMENTATION
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_MOSTRAR_ALV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_mostrar_alv .
+  IF tg_alv IS INITIAL.
+    MESSAGE 'No se han encontrado datos' TYPE 'S' DISPLAY LIKE 'W'.
+    RETURN.
+  ENDIF.
+
+
+
+  TRY.
+      cl_salv_table=>factory( IMPORTING r_salv_table = rg_alv
+                              CHANGING  t_table      = tg_alv ).
+
+      rg_alv->set_screen_status( pfstatus       = 'STA_01'  "Nuestro STATUS GUI
+                                 report         = sy-repid
+                                 set_functions  = rg_alv->c_functions_all ).
+
+
+      DATA(rl_handler) = NEW lcl_handle_events( ).
+      SET HANDLER rl_handler->on_user_command FOR rg_alv->get_event( ).
+
+    CATCH cx_salv_msg.
+      RETURN.
+  ENDTRY.
+
+
+  DATA(wl_key) = VALUE salv_s_layout_key( report = sy-repid ).
+
+  rg_alv->get_layout( )->set_key( wl_key ).
+  rg_alv->get_layout( )->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  rg_alv->get_layout( )->set_default( abap_true ).
+*  rl_alv->get_functions( )->set_all( 'X' ).
+  DATA(rl_columns) = rg_alv->get_columns( ).
+  DATA: rl_column  TYPE REF TO cl_salv_column_table.
+  rl_columns->set_optimize( ).
+*
+*  TRY.
+*      rl_column ?= rl_columns->get_column( 'MENSAJE' ).
+*      rl_column->set_output_length( 60 ).
+*    CATCH cx_salv_not_found.
+*  ENDTRY.
+
+
+
+  rg_alv->display( ).
+
+
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_ACTUALIZAR_CLIENTES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_actualizar_clientes .
+
+  LOOP AT tg_alv ASSIGNING FIELD-SYMBOL(<fs_alv>).
+    UPDATE knvv
+      SET zzkatr6	            = @<fs_alv>-zzkatr6,
+          zzkatr7	            = @<fs_alv>-zzkatr7,
+          zzkatr8	            = @<fs_alv>-zzkatr8,
+          zzkatr9	            = @<fs_alv>-zzkatr9,
+          zzkatr10            = @<fs_alv>-zzkatr10,
+          zzpallet_chep	      = @<fs_alv>-zzpallet_chep,
+          zzpallet_lpr        = @<fs_alv>-zzpallet_lpr,
+          zzpallet_logifruit  = @<fs_alv>-zzpallet_logifruit,
+          zzcita_previa	      = @<fs_alv>-zzcita_previa,
+          zzcodigo_chep	      = @<fs_alv>-zzcodigo_chep,
+          zzbrsch	            = @<fs_alv>-zzbrsch,
+          zzautofactura	      = @<fs_alv>-zzautofactura,
+          zzpallet_contraload	= @<fs_alv>-zzpallet_contraload,
+          zzcodigo_ean        = @<fs_alv>-zzcodigo_ean,
+          zzidsalesforce      = @<fs_alv>-zzidsalesforce,
+          zzidsalspot	        = @<fs_alv>-zzidsalspot,
+          zzcodigo_lpr        = @<fs_alv>-zzcodigo_lpr,
+          zzcodigo_logifruit  = @<fs_alv>-zzcodigo_logifruit,
+          zzcodigo_contraload = @<fs_alv>-zzcodigo_contraload,
+          zzpallet_def1	      = @<fs_alv>-zzpallet_def1,
+          zzcodigo_def1	      = @<fs_alv>-zzcodigo_def1,
+          zzpallet_def2	      = @<fs_alv>-zzpallet_def2,
+          zzcodigo_def2	      = @<fs_alv>-zzcodigo_def2,
+          zzpallet_retornab	  = @<fs_alv>-zzpallet_retornab,
+          zzpallet_fondoperd  = @<fs_alv>-zzpallet_fondoperd,
+          zzpallet_cobro      = @<fs_alv>-zzpallet_cobro,
+          zzsoctr	            = @<fs_alv>-zzsoctr,
+          zzgestion_picos     = @<fs_alv>-zzgestion_picos
+        WHERE kunnr	= @<fs_alv>-kunnr AND
+              vkorg	= @<fs_alv>-vkorg AND
+              vtweg	= @<fs_alv>-vtweg AND
+              spart	= @<fs_alv>-spart.
+    IF sy-subrc = 0.
+      <fs_alv>-semaforo = icon_led_green.
+      CLEAR <fs_alv>-mensaje.
+    ELSE.
+      <fs_alv>-semaforo = icon_led_red.
+      <fs_alv>-mensaje  = 'No se ha encontrado registro en la tabla KNVV'.
+    ENDIF.
+
+  ENDLOOP.
+
+  COMMIT WORK.
+  rg_alv->refresh( ).
+
+
+
+ENDFORM.

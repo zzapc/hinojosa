@@ -1,0 +1,161 @@
+FUNCTION z_hr_conc_contab_mod.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(POS_DOCUMENT_DATA) TYPE  CTE_S_FIN_POST_DOCUMENT
+*"       OPTIONAL
+*"     REFERENCE(ADV_DOCUMENT_DATA) TYPE  CTE_S_FIN_POST_AD_DOCUMENT
+*"       OPTIONAL
+*"     VALUE(TIPO) TYPE  ZHR_POST_TYPE
+*"     REFERENCE(ACCREL) TYPE  CTE_T_FIN_POST_ENTRY_ITEM_REL OPTIONAL
+*"  CHANGING
+*"     VALUE(CT_ACCIT) TYPE  CTE_T_ACCIT
+*"----------------------------------------------------------------------
+
+
+  DATA: ls_concur TYPE zhr_concur.
+  SELECT SINGLE * INTO ls_concur
+  FROM zhr_concur.
+
+  IF ls_concur-contabilizacion <> 'X'.
+    EXIT.
+  ENDIF.
+
+  DATA: ls_accit        TYPE accit.
+  DATA: ls_acchd        TYPE acchd.
+  DATA: ls_accfi        TYPE accfi.
+  DATA: ls_personal_pay TYPE string..
+  DATA: ls_journal_data TYPE cte_s_fin_post_doc_cashadvance.
+  DATA: lv_lifnr        TYPE lifnr.
+  DATA: ls_post_data    TYPE cte_s_fin_post_doc_entry.
+  DATA: ls_report_data  TYPE cte_s_additional_data.
+  DATA: lv_personal     TYPE xfeld.
+  DATA: ls_header       TYPE zhr_conc_conf_po.
+  DATA: lt_lines        TYPE TABLE OF zhr_conc_conf_li.
+  DATA: ls_lines        TYPE zhr_conc_conf_li.
+  DATA: lv_tipo_pago    TYPE char12.
+
+* Buscamos el lifnr
+  CASE tipo.
+    WHEN 'ADV'.
+      lv_lifnr = adv_document_data-vendor_id.
+    WHEN 'POS'.
+      lv_lifnr = pos_document_data-vendor_id.
+  ENDCASE.
+
+* Seleccionamos los registros necesarios.
+  CLEAR ls_header.
+  SELECT SINGLE * INTO ls_header
+  FROM zhr_conc_conf_po
+  WHERE adv_type    = tipo
+    AND begda      <= sy-datum
+    AND endda      >= sy-datum.
+
+  CLEAR lt_lines[].
+  SELECT * INTO TABLE lt_lines
+  FROM zhr_conc_conf_li
+  WHERE adv_type = ls_header-adv_type
+    AND begda = ls_header-begda
+    AND endda = ls_header-endda.
+
+
+  CASE tipo.
+    WHEN 'ADV'.
+* Flag GSBER
+      IF ls_header-gsber = 'X'.
+        READ TABLE adv_document_data-additional_data INTO ls_report_data
+        WITH KEY name = ls_header-gsber_txt.
+        LOOP AT ct_accit INTO ls_accit.
+          ls_accit-gsber = ls_report_data-value.
+          MODIFY ct_accit FROM ls_accit.
+        ENDLOOP.
+      ENDIF.
+
+
+    WHEN 'POS'.
+* Flag GSBER
+      IF ls_header-gsber = 'X'.
+        READ TABLE pos_document_data-additional_data INTO ls_report_data
+        WITH KEY name = ls_header-gsber_txt.
+        LOOP AT ct_accit INTO ls_accit.
+          ls_accit-gsber = ls_report_data-value.
+          MODIFY ct_accit FROM ls_accit.
+        ENDLOOP.
+      ENDIF.
+
+  ENDCASE.
+
+* Flag pernr
+  IF ls_header-pernr = 'X'.
+    LOOP AT ct_accit INTO ls_accit.
+      SELECT SINGLE pernr INTO ls_accit-pernr
+      FROM lfb1
+      WHERE lifnr = lv_lifnr
+      AND bukrs = ls_accit-bukrs.
+      MODIFY ct_accit FROM ls_accit.
+    ENDLOOP.
+  ENDIF.
+
+
+* Realizamos las mod pedidas
+  SORT lt_lines BY seqnr.
+  LOOP AT lt_lines INTO ls_lines.
+
+    LOOP AT ct_accit INTO ls_accit WHERE hkont = ls_lines-hkont_in
+                                     AND bschl = ls_lines-bschl_in
+                                     AND shkzg = ls_lines-shkzg_in.
+*   Revisamos el tipo de pago.
+      IF ls_lines-pat_key IS NOT INITIAL.
+        CLEAR lv_tipo_pago.
+        PERFORM get_tipo_pago USING pos_document_data
+                                    accrel
+                                    ls_accit
+                           CHANGING lv_tipo_pago.
+
+        IF lv_tipo_pago <> ls_lines-pat_key.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+*     Revisamos si el registro y la linia son personales, en caso de no coincidir, no la tratamos.
+      IF ls_lines-personal_in = 'X'.
+        CLEAR lv_personal.
+        PERFORM es_personal USING pos_document_data
+                                  accrel
+                                  ls_accit
+                       CHANGING lv_personal.
+        IF lv_personal <> ls_lines-personal_in.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+
+      IF ls_lines-bschl_chk IS NOT INITIAL.
+        ls_accit-bschl = ls_lines-bschl_out.
+      ENDIF.
+      IF ls_lines-umskz_chk IS NOT INITIAL.
+        ls_accit-umskz =  ls_lines-umskz_out.
+      ENDIF.
+      IF ls_lines-hkont_chk IS NOT INITIAL.
+        ls_accit-hkont = ls_lines-hkont_out.
+      ENDIF.
+      CASE 'X'.
+        WHEN ls_lines-lifnr_chk.
+          ls_accit-lifnr = lv_lifnr.
+        WHEN ls_lines-lifnr_vend_chk.
+          IF pos_document_data-vendor_id IS NOT INITIAL.
+            ls_accit-lifnr = pos_document_data-vendor_id.
+          ELSE.
+            ls_accit-lifnr = adv_document_data-vendor_id.
+          ENDIF.
+        WHEN  ls_lines-lifnr_lock_chk.
+          ls_accit-lifnr = ls_lines-lifnr_lock_out.
+      ENDCASE.
+
+      IF ls_lines-zlsch_chk IS NOT INITIAL.
+        ls_accit-zlsch = ls_lines-zlsch_out.
+      ENDIF.
+
+      MODIFY ct_accit FROM ls_accit.
+    ENDLOOP.
+  ENDLOOP.
+
+ENDFUNCTION.

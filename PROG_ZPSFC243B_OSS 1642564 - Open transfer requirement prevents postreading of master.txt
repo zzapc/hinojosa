@@ -1,0 +1,186 @@
+*&---------------------------------------------------------------------*
+*& Report  ZPSFC243B
+*&---------------------------------------------------------------------*
+*& This report looks for orders where transport requests are deleted   *
+*& but TR quantities already requested remain.                         *
+*& With initial number range, all orders will be selected.             *
+*& If flag TESTMODE is set, no database update will occur.             *
+*&---------------------------------------------------------------------*
+*& Version:      1.2                                                   *
+*& Author:       SAP                                                   *
+*& Date:         10.01.2013                                            *
+*& Last Changed: 11.01.2013 (AK, added RSART to LTBP handling)         *
+*&               11.09.2013 (AK, prevent negative TBMNG)               *
+*&---------------------------------------------------------------------*
+
+REPORT  zpsfc243b.
+
+INCLUDE lcokotyp.                                          "#EC INCL_OK
+
+TABLES: caufv.                                              "#EC NEEDED
+
+DATA: BEGIN OF ls_order,                                    "#EC NEEDED
+        aufnr TYPE caufv-aufnr,
+        rsnum TYPE caufv-rsnum,
+      END OF ls_order.
+DATA  lt_order LIKE TABLE OF ls_order.                      "#EC NEEDED
+DATA: BEGIN OF ls_resb,                                     "#EC NEEDED
+        rsnum TYPE rsnum,
+        rspos TYPE rspos,
+        rsart TYPE rsart,
+        posnr TYPE aposn,
+        matnr TYPE matnr,
+        tbmng TYPE tbmng,
+      END OF ls_resb.
+DATA  lt_resb LIKE TABLE OF ls_resb.                        "#EC NEEDED
+DATA: BEGIN OF ls_ltbk,                                     "#EC NEEDED
+        lgnum TYPE lgnum,
+        tbnum TYPE tbnum,
+        rsnum TYPE rsnum,
+      END OF ls_ltbk.
+DATA  lt_ltbk LIKE TABLE OF ls_ltbk.                        "#EC NEEDED
+DATA: BEGIN OF ls_ltbp,                                     "#EC NEEDED
+        lgnum TYPE lgnum,
+        tbnum TYPE tbnum,
+        tbpos TYPE tbpos,
+        matnr TYPE matnr,
+        rspos TYPE rspos,
+        rsart TYPE rsart,
+        menge TYPE ltbp_menge,
+      END OF ls_ltbp.
+DATA  lt_ltbp LIKE TABLE OF ls_ltbp.                        "#EC NEEDED
+
+DATA l_tbmng TYPE tbmng.                                    "#EC NEEDED
+DATA l_items TYPE sydbcnt VALUE IS INITIAL.                 "#EC NEEDED
+DATA l_entries TYPE sydbcnt VALUE IS INITIAL.               "#EC NEEDED
+
+SELECTION-SCREEN COMMENT /1(80) text1.
+SELECTION-SCREEN COMMENT /1(80) text2.
+SELECTION-SCREEN COMMENT /1(80) text3.
+SELECTION-SCREEN ULINE.
+SELECTION-SCREEN COMMENT /1(80) text_1.
+SELECT-OPTIONS r_aufnr FOR caufv-aufnr OBLIGATORY.
+SELECTION-SCREEN COMMENT /1(80) text_2.
+SELECTION-SCREEN COMMENT /1(80) text_3.
+SELECTION-SCREEN ULINE.
+SELECTION-SCREEN BEGIN OF BLOCK block WITH FRAME TITLE title.
+SELECTION-SCREEN COMMENT /1(72) text_4.
+SELECTION-SCREEN BEGIN OF BLOCK block2 WITH FRAME.
+PARAMETERS: testmode RADIOBUTTON GROUP mode DEFAULT 'X'.
+PARAMETERS: update RADIOBUTTON GROUP mode.
+SELECTION-SCREEN END OF BLOCK block2.
+SELECTION-SCREEN COMMENT /1(72) text_5.
+SELECTION-SCREEN END OF BLOCK block.
+
+INITIALIZATION.
+
+  text1 = 'This report checks if the TR quantity already requested'.
+  text2 = 'of order reservation items matches the transport requests.'.
+  text3 = 'An adaption might be necessary when TRs were deleted.'.
+  text_1 = 'Please specify order numbers of orders to be processed.'.
+  text_2 = 'With initial number range, all orders will be selected!'.
+  text_3 = 'Please consider that this might result in a long runtime!'.
+  text_4 = 'If TESTMODE is set, no database update will occur.'.
+  text_5 = 'Set radio button UPDATE for updating the database entries.'.
+  title = 'Mode'.
+
+START-OF-SELECTION.
+
+* select process orders and production orders in specified range
+  SELECT aufnr rsnum
+         FROM  caufv
+         INTO  TABLE lt_order
+         WHERE aufnr IN r_aufnr
+         AND ( autyp = auftragstyp-fert OR
+               autyp = auftragstyp-bord ).
+  IF NOT sy-subrc IS INITIAL.
+    WRITE: / 'No orders were found in the specified range.'.
+    RETURN.
+  ENDIF.
+
+* select reservations
+  SELECT rsnum rspos rsart posnr matnr tbmng
+         FROM  resb
+         INTO  TABLE lt_resb
+         FOR ALL ENTRIES IN lt_order
+         WHERE rsnum = lt_order-rsnum
+           AND tbmng <> 0.
+  IF NOT sy-subrc IS INITIAL.
+    WRITE: / 'No reservation items with TBMNG <> 0 were found.'.
+    RETURN.
+  ELSE.
+    DESCRIBE TABLE lt_resb LINES l_items.
+  ENDIF.
+
+* select TRs
+* select TR headers - this might require an index!
+  SELECT lgnum tbnum rsnum
+         FROM  ltbk
+         INTO TABLE lt_ltbk
+         FOR ALL ENTRIES IN lt_resb
+         WHERE rsnum = lt_resb-rsnum.
+* select TR items
+  IF sy-subrc = 0.
+    SELECT lgnum tbnum tbpos matnr rspos rsart menge
+           FROM  ltbp
+           INTO TABLE lt_ltbp
+           FOR ALL ENTRIES IN lt_ltbk
+           WHERE lgnum = lt_ltbk-lgnum
+             AND tbnum = lt_ltbk-tbnum.
+  ENDIF.
+
+  LOOP AT lt_resb INTO ls_resb.
+    CLEAR l_tbmng.
+    LOOP AT lt_ltbk INTO ls_ltbk
+                    WHERE rsnum = ls_resb-rsnum.
+      LOOP AT lt_ltbp INTO ls_ltbp
+                      WHERE lgnum = ls_ltbk-lgnum
+                        AND tbnum = ls_ltbk-tbnum
+                        AND matnr = ls_resb-matnr
+                        AND rspos = ls_resb-rspos
+                        AND rsart = ls_resb-rsart.
+        l_tbmng = l_tbmng + ls_ltbp-menge.
+      ENDLOOP.
+    ENDLOOP.
+*   prevent negative value for TBMNG
+    IF l_tbmng < 0.
+      l_tbmng = 0.
+    ENDIF.
+*   now check the TR quantity
+    IF l_tbmng = ls_resb-tbmng.
+*     all is fine
+      CONTINUE.
+    ENDIF.
+*   TR quantity is incorrect
+    ADD 1 TO l_entries.
+    READ TABLE lt_order INTO ls_order
+                        WITH KEY rsnum = ls_resb-rsnum.
+    WRITE: / 'Order',       ls_order-aufnr,
+             'reservation', ls_resb-rsnum, ls_resb-rspos, ls_resb-rsart,
+             'material',    ls_resb-matnr.
+    WRITE: / 'TR quantity', ls_resb-tbmng,              "#EC UOM_IN_MES
+             'is incorrect' COLOR COL_NEGATIVE,
+             'and should be', l_tbmng.                  "#EC UOM_IN_MES
+    IF testmode IS INITIAL.
+      UPDATE resb SET tbmng = l_tbmng
+                  WHERE rsnum = ls_resb-rsnum
+                    AND rspos = ls_resb-rspos
+                    AND rsart = ls_resb-rsart.
+      WRITE: 'Database entry updated.' COLOR COL_POSITIVE.
+    ENDIF.
+  ENDLOOP.
+
+  ULINE.
+  WRITE: / l_items, 'reservation items were checked.'.
+  ULINE.
+  IF l_entries = 1.
+    WRITE: / 'For one reservation item,'.
+  ELSE.
+    WRITE: / 'For', l_entries, 'reservation items,'.
+  ENDIF.
+  IF NOT testmode IS INITIAL.
+    WRITE 'the TR quantity has to be corrected.'.
+  ELSE.
+    WRITE 'the TR quantity was corrected.'.
+  ENDIF.
+  ULINE.

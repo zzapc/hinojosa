@@ -1,0 +1,370 @@
+
+class ZCL_EXITS_SD definition
+  public
+  inheriting from ZCL_AP_EXITS
+  final
+  create public .
+
+public section.
+
+  data O_CORE_WRK type ref to ZHCL_CORE_WRK .
+
+  methods CONSTRUCTOR
+    importing
+      !EXIT type ANY
+      !INCLUDE type ANY default ''
+      !CLAVE type ANY default ''
+      !FORM type ANY default ''
+      !UNAME type SY-UNAME default SY-UNAME .
+  methods CUMPLE_CONDICIONES
+    importing
+      !VBAK type VBAK optional
+      !VBAP type VBAP optional
+    returning
+      value(SI) type ABAP_BOOL .
+  class-methods AUTORIZACION_MARGEN_CONTRIB
+    importing
+      !WF type ABAP_BOOL default ''
+      !MODO_CT type BDCMODE default 'N'
+      !SOLO_GRABAR type ABAP_BOOL default ''
+    changing
+      !VBAK type VBAK
+      !XVBAP type VA_VBAPVB_T
+      !XKOMV type KOMV_T
+      !YVBAP type VA_VBAPVB_T .
+protected section.
+private section.
+endclass. "ZCL_EXITS_SD definition
+class ZCL_EXITS_SD implementation.
+  METHOD autorizacion_margen_contrib.
+    DATA: l_tprin   TYPE ztsd0011-tprin,
+          lr_cnfidx TYPE REF TO ycl_hp_idx,
+          i_var     TYPE apb_lpd_t_key_value,
+          l_return  TYPE  bapiret2,
+          i_config  TYPE TABLE OF ztsd0011.
+*          l_vbap_old TYPE vbap,
+*          l_vbap     TYPE vbap.
+
+    CHECK vbak-vbtyp = 'B'. "Sólo ofertas
+
+    DATA(o_exit) = NEW zcl_exits_sd(
+        exit    = 'AUTORIZACION_MARGEN_CONTRIBUCION'
+        include = 'MV45AFZZ'
+        form    = 'USEREXIT_SAVE_DOCUMENT_PREPARE'
+        clave   = vbak-vbeln ).
+
+    CHECK o_exit->activa( ) = 'X'.
+
+    SELECT SINGLE zzbrsch FROM knvv
+      INTO @DATA(l_zzbrsch)
+     WHERE kunnr = @vbak-kunnr
+       AND vkorg = @vbak-vkorg
+       AND vtweg = @vbak-vtweg
+       AND spart = @vbak-spart.
+
+    CHECK NOT l_zzbrsch IS INITIAL.
+
+
+    i_var = VALUE #( ( key = '{PEDIDO}' value = condense( |{ vbak-vbeln ALPHA = OUT }| ) )
+                     ( key = '{OFERTA}' value = condense( |{ vbak-vbeln ALPHA = OUT }| ) )
+                     ( key = '{MERCADO}' value = |{ l_zzbrsch }| )
+                     ( key = '{CLIENTE}' value = condense( |{ vbak-kunnr ALPHA = OUT }| ) )
+                     ( key = '{NOMBRE_CLIENTE}' value = zcl_ap_cliente=>get_nombre( vbak-kunnr ) )
+                   ).
+
+
+    LOOP AT xvbap ASSIGNING FIELD-SYMBOL(<vbap>) WHERE updkz NE 'D' AND updkz NE '' AND uepos IS INITIAL.
+* Recuperamos el valor precio, si fuera por la exit lo podemos coger de la tabla, si no el que hemos calcualdo por la función WF
+      IF wf IS INITIAL.
+        SELECT SINGLE zstatp FROM vbap
+          INTO @DATA(l_stat_bd)
+         WHERE vbeln = @<vbap>-vbeln
+           AND posnr = @<vbap>-posnr.
+      ELSE.
+        ASSIGN yvbap[ posnr = <vbap>-posnr ] TO FIELD-SYMBOL(<yvbap>).
+        IF sy-subrc = 0.
+          l_stat_bd = <yvbap>-zstatp.
+        ENDIF.
+      ENDIF.
+
+      READ TABLE xkomv ASSIGNING FIELD-SYMBOL(<komv>) WITH KEY kposn = <vbap>-posnr
+                                                               kschl = 'ZP10'.
+      IF sy-subrc = 0.
+* Verificamos sin TPRIN que cuesta más
+*        SELECT tprin, stat_new, grupo, codigo, email
+        SELECT *
+          FROM ztsd0011
+          INTO CORRESPONDING FIELDS OF TABLE @i_config
+         WHERE vkorg = @vbak-vkorg
+           AND vtweg = @vbak-vtweg
+           AND spart = @vbak-spart
+           AND werks = @<vbap>-werks
+           AND brsch = @l_zzbrsch
+           AND ( stat_bd = ''
+              OR stat_bd = @l_stat_bd )
+           AND stat  = @<vbap>-zstatp
+           AND zp10_desde < @<komv>-kwert
+           AND zp10_hasta >=  @<komv>-kwert.
+        IF sy-subrc = 0.
+          CLEAR l_tprin.
+          TRY.
+              lr_cnfidx ?= ycl_hp_idx=>/vcxi/if_ckx_object~get_instance( if_guid = CONV /vcxi/ckx_guid( <vbap>-cuobj ) ).
+              IF lr_cnfidx IS BOUND.
+                lr_cnfidx->get_data(
+                         IMPORTING
+                           et_spec_db  = DATA(lt_spec)  " HP: IndexDB - Specification - DB
+                           et_board_db = DATA(lt_board) " HP: IndexDB - Board - DB
+                           et_print_db = DATA(lt_print) " HP: IndexDB - Printing- DB
+                           et_shipu_db = DATA(lt_shipu)  " HP: IndexDB - Shipping Units - DB
+                           et_rte_db   = DATA(lt_rte_db)     " HP: IndexDB - Routing - DB
+                      ).
+                IF NOT lt_print IS INITIAL. "Hay alguna impresión
+                  l_tprin = '?'.
+                  LOOP AT lt_print ASSIGNING FIELD-SYMBOL(<print>) WHERE NOT prtyp IS INITIAL."Si hubiera varias nos quedamos con la primera que este en la configuración
+                    IF line_exists( i_config[ tprin = <print>-prtyp ] ).
+                      l_tprin = <print>-prtyp.
+                      EXIT.
+                    ENDIF.
+                  ENDLOOP.
+                ENDIF.
+              ENDIF.
+            CATCH /vcxi/cx_ckx.
+          ENDTRY.
+          DELETE i_config WHERE tprin NE l_tprin.
+
+          LOOP AT i_config ASSIGNING FIELD-SYMBOL(<config>).
+            DATA(l_proceso) = ''.
+            o_exit->log( p1 = |Pos. { <vbap>-posnr ALPHA = OUT } Encontrada condición para mercado { l_zzbrsch } TPRIN { <config>-tprin } ZP10 = { <komv>-kwert }| msgty = 'S' ).
+            IF NOT <config>-stat_new IS INITIAL AND
+              <config>-stat_new NE <vbap>-zstatp.
+              l_proceso = 'X'.
+              IF solo_grabar IS INITIAL.
+                CALL FUNCTION 'ZSD_UPD_USER_STATUS_4_VBAP'
+                  EXPORTING
+                    i_objnr       = <vbap>-objnr
+                    i_new_status  = <config>-stat_new
+                    i_stat_memory = <vbap>-zstatp
+*                   I_COMMIT      =
+                  IMPORTING
+                    e_return      = l_return
+                  EXCEPTIONS
+                    no_changed    = 1
+                    OTHERS        = 2.
+                IF sy-subrc = 0 AND l_return-type NE 'E'.
+                  IF <vbap>-updkz IS INITIAL.
+                    IF NOT line_exists( yvbap[ posnr = <vbap>-posnr ] ).
+                      APPEND <vbap> TO yvbap.
+                    ENDIF.
+                    <vbap>-updkz = 'U'.
+                  ENDIF.
+                  o_exit->log( p1 = |Cambiamos estado desde { <vbap>-zstatp } a { <config>-stat_new }| msgty = 'S' ).
+                  <vbap>-zstatp = <config>-stat_new.
+
+* Modificamos por WF
+                  IF wf = 'X'.
+                    DATA: o_bi      TYPE REF TO zcl_ap_batch_input,
+                          l_mensaje TYPE bapireturn1-message.
+                    CREATE OBJECT o_bi.
+
+                    o_bi->inicio( ).
+
+                    o_bi->dynpro( program = 'SAPMV45A' dynpro = '0102' okcode = '=UER1').
+                    o_bi->campos( campo = 'VBAK-VBELN' valor = vbak-vbeln ). " Documento de ventas
+
+
+                    o_bi->dynpro( program = 'SAPMV45A' dynpro = '4001' okcode = '=POPO').
+
+                    o_bi->dynpro( program = 'SAPMV45A' dynpro = '0251' okcode = '=POSI').
+                    o_bi->campos( campo = 'RV45A-POSNR' valor = <vbap>-posnr ). " Número de posición del documento comercial
+
+                    o_bi->dynpro( program = 'SAPMV45A' dynpro = '4001' okcode = '/00').
+                    o_bi->campos( campo = 'VBAP-ZSTATP(01)' valor = <vbap>-zstatp ).
+
+                    o_bi->dynpro( program = 'SAPMV45A' dynpro = '4001' okcode = '=SICH').
+                    SET PARAMETER ID 'ZPERM_CAMBIO_STATUS' FIELD 'X'.
+                    DO 30 TIMES.
+                      DATA(msg) = o_bi->llamar_transaccion( tcode = 'VA22' modo = modo_ct ).
+                      IF msg CS 'tratando'.
+                        WAIT UP TO 1 SECONDS.
+                      ELSE.
+                        EXIT.
+                      ENDIF.
+                    ENDDO.
+
+                    SELECT SINGLE vbeln FROM vbap
+                      INTO vbak-vbeln
+                     WHERE vbeln = vbak-vbeln
+                       AND posnr = <vbap>-posnr
+                       AND zstatp = <vbap>-zstatp.
+                    IF sy-subrc = 0.
+                      o_exit->log( p1 = |Se modifica correctamente por call transaction| msgty = 'S' ).
+                    ELSE.
+                      msg = o_exit->log( p1 = |Error en call transaction { msg }| msgty = 'E' ).
+                      DATA(l_error_cambio_estado) = 'X'.
+                    ENDIF.
+                  ENDIF.
+
+
+*                  READ TABLE yvbap ASSIGNING FIELD-SYMBOL(<yvbap>) WITH KEY posnr = <vbap>-posnr.
+*                  IF sy-subrc = 0.
+*                    MOVE-CORRESPONDING <yvbap> TO l_vbap_old.
+*                  ENDIF.
+*                  MOVE-CORRESPONDING <vbap> TO l_vbap.
+*
+** Para que se refresque el configurador, tiene que esta en memoria la posición que queremos actualizar
+*                  ASSIGN ('(SAPMV45A)VBAP') TO FIELD-SYMBOL(<vbap_global>).
+*                  IF sy-subrc = 0.
+*                    MOVE-CORRESPONDING <vbap> TO <vbap_global>.
+*                  ENDIF.
+*                  DATA lv_stch(1).
+*                  DATA(lv_cad_ok) = ycl_hp_sdu=>move_field_to_vbap( EXPORTING if_tabix    = l_tabix
+*                                                                              is_old_vbap = l_vbap_old
+*                                                                              is_vbak     = vbak
+*                                                                    IMPORTING ef_stch = lv_stch
+*                                                                    CHANGING  cs_vbap     = l_vbap
+*                                                                              ct_xvbap    = xvbap[]
+*                                                                       ).
+*                  IF lv_cad_ok IS INITIAL.
+*                    DATA(l_msg) = o_exit->log( p1 = |Error modificando estado desde { <vbap>-zstatp } a { <config>-stat_new } usando API de AICOMP| msgty = 'E' ).
+*                    MESSAGE l_msg TYPE 'I'.
+*                    DATA(l_error_cambio_estado) = 'X'.
+*                  ENDIF.
+
+                ELSE.
+                  o_exit->log( p1 = |Error modificando estado desde { <vbap>-zstatp } a { <config>-stat_new }: { l_return-message }| msgty = 'E' ).
+                  l_error_cambio_estado = 'X'.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+            IF l_error_cambio_estado IS INITIAL.
+              IF NOT <config>-grupo IS INITIAL AND NOT <config>-codigo IS INITIAL AND NOT <config>-email IS INITIAL.
+                l_proceso = 'X'.
+                IF solo_grabar IS INITIAL.
+                  o_exit->log( p1 = |Enviamos mail { <config>-codigo } a { <config>-email }| msgty = 'S' ).
+
+                  DELETE i_var WHERE key = '{POSICION}' OR key = '{MATERIAL}' OR key = '{MDC_KM2}' OR key = '{ZP10}' OR key = '{PRECIO}'.
+
+                  APPEND VALUE #( key = '{POSICION}' value = condense( |{ <vbap>-posnr ALPHA = OUT }| ) ) TO i_var.
+                  APPEND VALUE #( key = '{MATERIAL}' value = <vbap>-arktx ) TO i_var.
+                  APPEND VALUE #( key = '{MDC_KM2}' value = |{ <komv>-kbetr }| ) TO i_var.
+                  APPEND VALUE #( key = '{ZP10}' value = |{ <komv>-kwert }| ) TO i_var.
+                  READ TABLE xkomv ASSIGNING FIELD-SYMBOL(<zprc>) WITH KEY kposn = <vbap>-posnr
+                                                                           kschl = 'ZPRC'.
+                  IF sy-subrc = 0.
+                    APPEND VALUE #( key = '{PRECIO}' value = |{ <zprc>-kbetr }| ) TO i_var.
+                  ELSE.
+                    APPEND VALUE #( key = '{PRECIO}' value = 'NO ENCONTRADO' ) TO i_var.
+                  ENDIF.
+
+
+                  DATA(l_email) = <config>-email.
+                  IF l_email = 'CREADOR_OFERTA'.
+                    l_email = zcl_ap_usuario=>get_email( vbak-ernam ).
+                    IF l_email IS INITIAL.
+                      l_email = vbak-ernam.
+                    ENDIF.
+                  ENDIF.
+
+                  zcl_ap_envio_mail=>mail( EXPORTING grupo = <config>-grupo
+                                                     codigo = <config>-codigo
+                                                     direccion = l_email
+                                                     variables = i_var
+                                                     parar_en_error = ''
+                                                     clave = vbak-vbeln
+                                           IMPORTING message = DATA(l_msg_mail) ).
+                  IF NOT l_msg_mail IS INITIAL.
+                    o_exit->log( p1 = |Error enviando mail { l_msg_mail }| msgty = 'E' ).
+                  ELSE.
+                    o_exit->log( p1 = |Se ha enviado mail a  { l_email }| msgty = 'S' ).
+                  ENDIF.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+
+            IF solo_grabar = 'X' AND l_proceso = 'X'.
+              o_exit->log( p1 = |Grabamos entrada en tabla ZTSD0014 para proceso posterior| msgty = 'S' ).
+* Si existen entradas previas sin procesar las marcamos como tratadas
+              SELECT * FROM ztsd0014
+                INTO TABLE @DATA(i_prev)
+               WHERE vbeln = @<vbap>-vbeln
+                 AND posnr = @<vbap>-posnr
+                 AND status = ''.
+              LOOP AT i_prev ASSIGNING FIELD-SYMBOL(<prev>).
+                IF <prev>-stat_bd = <config>-stat_bd AND
+                   <prev>-stat_new = <config>-stat_new AND
+                   <prev>-stat = <config>-stat.
+                  DELETE ztsd0014 FROM <prev>.
+                ELSE.
+                  <prev>-status = 'M'.
+                  <prev>-aedat = sy-datum.
+                  <prev>-aezet = sy-uzeit.
+                  MODIFY ztsd0014 FROM <prev>.
+                ENDIF.
+              ENDLOOP.
+
+              DATA ztsd0014 TYPE ztsd0014.
+              CLEAR ztsd0014.
+              MOVE-CORRESPONDING <config> TO ztsd0014.
+              ztsd0014-vbeln = <vbap>-vbeln.
+              ztsd0014-posnr = <vbap>-posnr.
+              ztsd0014-kwert = <komv>-kwert.
+              ztsd0014-kbetr = <komv>-kbetr.
+              READ TABLE xkomv ASSIGNING <zprc> WITH KEY kposn = <vbap>-posnr
+                                                         kschl = 'ZPRC'.
+              IF sy-subrc = 0.
+                ztsd0014-zprc_kbetr = <zprc>-kbetr.
+              ENDIF.
+              ztsd0014-erdat = sy-datum.
+              ztsd0014-erzet = sy-uzeit.
+              MODIFY ztsd0014 FROM ztsd0014.
+            ENDIF.
+          ENDLOOP.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+  ENDMETHOD.
+  METHOD CONSTRUCTOR.
+    CALL METHOD super->constructor
+      EXPORTING
+        exit    = exit
+        include = include
+        clave   = clave
+        form    = form
+        uname   = sy-uname.
+
+    o_core_wrk = NEW #( ).
+
+  ENDMETHOD.
+  METHOD CUMPLE_CONDICIONES.
+    DATA: l_cumple,
+          l_valor_cond TYPE string,
+          l_cond       TYPE zap_exits_par.
+
+    FIELD-SYMBOLS <fs> TYPE any.
+
+    IF i_condiciones IS INITIAL.
+      si = 'X'.
+    ELSE.
+      LOOP AT i_condiciones_agrup INTO l_cond.
+        CASE l_cond-clave.
+          WHEN OTHERS.
+            ASSIGN (l_cond-clave) TO <fs>.
+            IF sy-subrc = 0.
+              l_valor_cond = <fs>.
+            ELSE.
+              log( p1 = 'Condición' p2 = l_cond-clave p3 = 'desconocida' ).
+            ENDIF.
+        ENDCASE.
+
+        l_cumple = eval_cond( clave = l_cond-clave valor = l_valor_cond ).
+        IF l_cumple IS INITIAL.
+          EXIT.
+        ENDIF.
+      ENDLOOP.
+      IF l_cumple = 'X'.
+        si = 'X'.
+      ENDIF.
+    ENDIF.
+
+  ENDMETHOD.

@@ -1,0 +1,167 @@
+FUNCTION ZPD_WC_AS_NO_GR.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(IS_HEADER) LIKE  /COCKPIT/SHDR_IF STRUCTURE
+*"        /COCKPIT/SHDR_IF
+*"     REFERENCE(IC_PROCESS) TYPE  /COCKPIT/DPROCESS_TYPE
+*"     REFERENCE(IC_WEBCYCLE_ID) LIKE  /COCKPIT/SWC_WEBCYCLE-WC_ID
+*"  EXPORTING
+*"     REFERENCE(EB_START_WF) TYPE  BOOLE-BOOLE
+*"  TABLES
+*"      IT_ITEM STRUCTURE  /COCKPIT/SITEM_IF
+*"      IT_ACCOUNT STRUCTURE  /COCKPIT/SACCT_IF
+*"      IT_TAX STRUCTURE  /COCKPIT/STAX_IF
+*"      ET_MESSAGES STRUCTURE  BAPIRET2 OPTIONAL
+*"  EXCEPTIONS
+*"      ERROR_OCCURED
+*"----------------------------------------------------------------------
+INCLUDE: /cockpit/constants.
+  DATA:
+        ls_header    TYPE /cockpit/thdr,
+        ls_item      TYPE /cockpit/titem,
+        lt_item      LIKE TABLE OF /cockpit/titem WITH HEADER LINE,
+        ls_po_header LIKE bapiekkol,
+        lt_po_item   LIKE TABLE OF bapiekpo,
+        ls_po_item   LIKE LINE OF lt_po_item,
+        ls_last_item TYPE /cockpit/titem,
+        lc_po_no     LIKE /cockpit/titem-po_number.
+
+  DATA:
+        lt_item_merged  LIKE TABLE OF /cockpit/titem,
+        lt_dummy_accass LIKE TABLE OF /cockpit/taccas,
+        lt_dummy_tax    TYPE TABLE OF /cockpit/ttax,
+        li_subrc        LIKE sy-subrc,
+        lb_merged       LIKE boole-boole.
+
+  DATA:
+        ls_ekpo          LIKE ekpo,
+        lt_ekbez         LIKE ekbez OCCURS 0 WITH HEADER LINE,
+        lt_ekbe          LIKE ekbe OCCURS 0 WITH HEADER LINE,
+        lt_ekbes         LIKE ekbes OCCURS 0 WITH HEADER LINE,
+        lt_ekbnk         LIKE ekbnk OCCURS 0 WITH HEADER LINE,
+        lt_ekbz          LIKE ekbz OCCURS 0 WITH HEADER LINE,
+        lp_open_quantity LIKE bapiekbes-deliv_qty,
+        lb_lebre         LIKE ekpo-webre,
+        lv_bsart         LIKE ekko-bsart.
+
+* Check only for invoices
+  CHECK: is_header-invoice_ind EQ con_true,
+         is_header-fi_mm_flg   EQ con_type_mm.
+
+IF is_header-status     EQ 01 OR
+    is_header-status     EQ 02.
+
+* Map tables
+  CALL FUNCTION '/COCKPIT/MAP_EXTERN_TO_INTERN'
+    TABLES
+      i_tab_item_if = it_item
+      e_tab_item    = lt_item.
+
+  MOVE-CORRESPONDING is_header TO ls_header.
+
+* Merge the lines
+  PERFORM lines_merge IN PROGRAM /cockpit/saplprocess
+                          TABLES   lt_item
+                                   lt_item_merged
+                                   lt_dummy_accass
+                                   lt_dummy_accass
+                                   lt_dummy_tax
+                                   lt_dummy_tax
+                                   et_messages
+                          USING    ls_header
+                          CHANGING li_subrc
+                                   lb_merged.
+
+  LOOP AT lt_item_merged INTO ls_item
+                         WHERE NOT po_number IS INITIAL AND
+                               NOT po_item   IS INITIAL AND
+                               tbtkz IS INITIAL.
+
+*   take 'buffer' to not read po detail all the time
+    IF lc_po_no NE ls_item-po_number.
+      lc_po_no = ls_item-po_number.
+      CALL FUNCTION '/COCKPIT/BAPI_PO_GETDETAIL'
+        EXPORTING
+          purchaseorder  = ls_item-po_number
+          items          = con_true
+          history        = con_true
+        IMPORTING
+          po_header      = ls_po_header
+        TABLES
+          po_items       = lt_po_item
+        EXCEPTIONS
+          error_or_abort = 1
+          OTHERS         = 2.
+      IF sy-subrc NE 0.
+        EXIT.
+      ENDIF.
+    ENDIF.
+
+    CLEAR ls_po_item.
+    READ TABLE lt_po_item INTO ls_po_item
+                          WITH KEY po_item = ls_item-po_item.
+    CHECK ls_po_item-gr_ind EQ con_true.
+
+*   for service PO item check Srv based IV
+    IF ls_po_item-item_cat EQ '9'.
+      CLEAR lb_lebre.
+      PERFORM get_flag_lebre IN PROGRAM /cockpit/saplcheck
+                             USING ls_po_item
+                             CHANGING lb_lebre.
+    ENDIF.
+
+    CHECK ls_po_item-item_cat NE '1'.
+    CHECK NOT ( ls_po_item-item_cat EQ '9' AND
+                lb_lebre EQ con_false ).
+
+    IF ls_item NE ls_last_item.
+      MOVE-CORRESPONDING ls_item TO ls_last_item.
+
+      REFRESH: lt_ekbe, lt_ekbes, lt_ekbez, lt_ekbnk, lt_ekbz.
+      CALL FUNCTION 'ME_READ_HISTORY'
+        EXPORTING
+          ebeln  = ls_item-po_number
+          ebelp  = ls_item-po_item
+          webre  = ls_po_item-gr_basediv
+        TABLES
+          xekbe  = lt_ekbe
+          xekbes = lt_ekbes
+          xekbez = lt_ekbez
+          xekbnk = lt_ekbnk
+          xekbz  = lt_ekbz.
+    ENDIF.
+    READ TABLE lt_ekbez WITH KEY lfgja = ls_item-ref_doc_year
+                                 lfbnr = ls_item-ref_doc
+                                 lfpos = ls_item-ref_doc_it.
+    IF sy-subrc <> 0.
+      eb_start_wf = con_true.
+      EXIT.
+    ENDIF.
+*   Calculate invoice quantity - total of GR
+    lp_open_quantity = lt_ekbez-wemng - lt_ekbez-remng.
+
+    IF lp_open_quantity = 0.
+      eb_start_wf = con_true.
+      EXIT.
+    ENDIF.
+
+  ENDLOOP.
+*************************
+  IF sy-tabix = 1.
+      SELECT SINGLE bsart FROM ekko
+      INTO lv_bsart WHERE
+      ebeln EQ lt_item-po_number .
+
+      IF lv_bsart <> 'ZPE2'.
+      eb_start_wf = con_false.
+      ENDIF.
+      EXIT.
+
+    ENDIF.
+******************************
+
+  ELSE. "STATUS 1 o 2
+    eb_start_wf = con_false.
+  ENDIF.
+ENDFUNCTION.

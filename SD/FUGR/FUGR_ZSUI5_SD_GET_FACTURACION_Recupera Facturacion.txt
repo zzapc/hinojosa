@@ -1,0 +1,173 @@
+FUNCTION zsui5_sd_get_facturacion.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_KUNNR) TYPE  KUNNR OPTIONAL
+*"     VALUE(I_EJERCICIO) TYPE  MJAHR OPTIONAL
+*"     VALUE(I_BACKOFFICE) TYPE  LIFNR OPTIONAL
+*"     VALUE(I_REGIO) TYPE  REGIO OPTIONAL
+*"     VALUE(I_CP) TYPE  PSTLZ OPTIONAL
+*"     VALUE(I_HISTORICO) TYPE  FLAG OPTIONAL
+*"     VALUE(IR_VKORG) TYPE  RSELOPTION OPTIONAL
+*"  EXPORTING
+*"     VALUE(E_RETURN) TYPE  BAPIRET2_T
+*"     VALUE(E_FACTURACION) TYPE  ZSUI5TT_SD_FACTURACION
+*"----------------------------------------------------------------------
+  DATA: ls_return      TYPE bapiret2,
+        lv_datum       TYPE sy-datum,
+        ls_facturacion TYPE zsui5s_sd_facturacion,
+        it_lines       TYPE TABLE OF tline,
+        lv_name        TYPE thead-tdname.
+  DATA: r_vkorg     TYPE sd_vkorg_ranges.
+  DATA:
+    r_kunnr TYPE RANGE OF kunnr,
+    r_regio TYPE RANGE OF regio,
+    r_cp    TYPE RANGE OF pstlz.
+
+  DATA: r_back_ofiice TYPE RANGE OF lifnr.
+  IF i_backoffice IS NOT INITIAL.
+    r_back_ofiice = VALUE #( ( sign = 'I' option = 'EQ' low = i_backoffice ) ) .
+  ENDIF.
+
+
+  IF i_ejercicio IS INITIAL.
+    i_ejercicio = sy-datum(4) .
+  ENDIF.
+
+  IF i_kunnr IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_kunnr ASSIGNING FIELD-SYMBOL(<ls_kunnr>).
+    <ls_kunnr>-option = 'EQ'.
+    <ls_kunnr>-sign = 'I'.
+    <ls_kunnr>-low = i_kunnr.
+  ENDIF.
+
+  IF i_cp IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_cp ASSIGNING FIELD-SYMBOL(<ls_cp>).
+    <ls_cp>-option = 'EQ'.
+    <ls_cp>-sign = 'I'.
+    <ls_cp>-low = i_cp.
+  ENDIF.
+
+  IF i_regio IS NOT INITIAL.
+    APPEND INITIAL LINE TO r_regio ASSIGNING FIELD-SYMBOL(<ls_regio>).
+    <ls_regio>-option = 'EQ'.
+    <ls_regio>-sign = 'I'.
+    <ls_regio>-low = i_regio.
+  ENDIF.
+
+  "Obtenemos los VKORG del usuario
+  CALL FUNCTION 'ZSUI5_SD_GET_VKORG'
+* EXPORTING
+*   I_OBJCT        =
+    IMPORTING
+      et_vkorg = r_vkorg.
+
+  SELECT a~vbeln, a~bukrs, a~kunnr, ka~name1 AS kunnrname, a~gjahr, a~belnr, a~blart, a~dmbtr, a~waers, b~fkdat, ( b~netwr + b~mwsbk ) AS netwr, c~fdtag ", p~posnr, p~vgbel
+    FROM knvp AS vp
+    INNER JOIN kna1 AS ka ON ka~kunnr = vp~kunnr
+*    INNER JOIN kna1 AS k2 ON ka~kunnr = vp~kunn2
+    INNER JOIN bsid AS a ON a~kunnr = ka~kunnr
+    INNER JOIN vbrk AS b ON b~vbeln = a~vbeln and b~vkorg = vp~vkorg
+*    INNER JOIN vbrp AS p ON p~vbeln = b~vbeln
+    INNER JOIN bseg AS c ON c~belnr = a~belnr AND c~bukrs = a~bukrs AND c~gjahr = a~gjahr AND c~fdtag NE 00000000
+    INTO TABLE @DATA(lt_data)
+    WHERE a~bukrs = '2000'
+    AND vp~lifnr in @r_back_ofiice AND vp~parvw = 'A1'
+    AND ka~regio IN @r_regio
+    AND ka~pstlz IN @r_cp
+    AND a~kunnr IN @r_kunnr
+    AND a~gjahr = @i_ejercicio
+    ORDER BY a~vbeln.
+  IF sy-subrc NE 0.
+    CLEAR ls_return.
+    ls_return-id = 'ZSSD_UI5'.
+    ls_return-type = 'E'.
+    ls_return-number = '001'.
+    ls_return-message_v1 = |{ i_backoffice ALPHA = OUT }|.
+    APPEND ls_return TO e_return.
+  ELSE.
+    "Obtenemos los albaranes relacionado con las facturas
+    SELECT DISTINCT a~vbeln, a~vgbel, b~vbtyp, c~lfart
+      FROM vbrp AS a
+      LEFT JOIN vbak AS b ON b~vbeln = a~vgbel
+      LEFT JOIN likp AS c ON c~vbeln =  a~vgbel
+      INTO TABLE @DATA(lt_albaranes)
+      FOR ALL ENTRIES IN @lt_data
+      WHERE a~vbeln = @lt_data-vbeln.
+    IF sy-subrc = 0.
+      SORT lt_albaranes BY vbeln vgbel.
+    ENDIF.
+
+    "Obtenemos la ruta para el WebGUI de la Tx XD02
+    DATA: lv_hostname TYPE string,
+          lv_port     TYPE string.
+    CALL FUNCTION 'TH_GET_VIRT_HOST_DATA'
+      EXPORTING
+        protocol       = 0
+        virt_idx       = 0
+*       LOCAL          = 1
+      IMPORTING
+        hostname       = lv_hostname
+        port           = lv_port
+      EXCEPTIONS
+        not_found      = 1
+        internal_error = 2
+        OTHERS         = 3.
+    IF sy-subrc = 0.
+
+      LOOP AT lt_data INTO DATA(ls_data).
+        CLEAR ls_facturacion.
+        ls_facturacion-vbeln = ls_data-vbeln.
+        ls_facturacion-fkdat = ls_data-fkdat.
+        ls_facturacion-fdtag = ls_data-fdtag.
+        ls_facturacion-waers = ls_data-waers.
+        ls_facturacion-bukrs = ls_data-bukrs.
+        ls_facturacion-kunnr = ls_data-kunnr.
+        ls_facturacion-kunnrname = ls_data-kunnrname.
+        ls_facturacion-gjahr = ls_data-gjahr.
+        CASE ls_data-blart.
+          WHEN 'DZ'.
+            SUBTRACT ls_data-dmbtr FROM ls_facturacion-dmbtr_pendiente.
+            ADD ls_data-dmbtr TO ls_facturacion-dmbtr_cobrado.
+          WHEN OTHERS.
+            ADD ls_data-dmbtr TO ls_facturacion-dmbtr_pendiente.
+        ENDCASE.
+        ADD ls_data-netwr TO ls_facturacion-netwr.
+        AT END OF vbeln.
+          ls_facturacion-url_factura = 'http://'&& lv_hostname && ':' && lv_port && '/sap/bc/gui/sap/its/webgui?~transaction=*VF03%20VBRK-VBELN=' && ls_facturacion-vbeln && ';DYNP_OKCODE=/'.
+          ls_facturacion-url_kunnr = 'http://'&& lv_hostname && ':' && lv_port && '/sap/bc/gui/sap/its/webgui?~transaction=*XD03%20RF02D-KUNNR=' && ls_facturacion-kunnr .
+          ls_facturacion-url_albaran = 'http://'&& lv_hostname && ':' && lv_port && '/sap/bc/gui/sap/its/webgui?~transaction=*VL03N%20LIKP-VBELN=' .
+          ls_facturacion-url_albaran_ped = 'http://'&& lv_hostname && ':' && lv_port && '/sap/bc/gui/sap/its/webgui?~transaction=*VA03%20VBAK-VBELN=' .
+
+          "Concatenamos los albaranes relacionados con la factura.
+          LOOP AT lt_albaranes INTO DATA(ls_albaran) WHERE vbeln = ls_facturacion-vbeln.
+            IF ls_facturacion-albaranes IS INITIAL.
+              ls_facturacion-albaranes = ls_albaran-vgbel.
+              IF ls_albaran-vbtyp IS NOT INITIAL.
+                ls_facturacion-tipo_documento = 'P'.
+              ELSEIF ls_albaran-lfart IS NOT INITIAL.
+                ls_facturacion-tipo_documento = 'E'.
+              ELSE.
+                ls_facturacion-tipo_documento = ','.
+              ENDIF.
+            ELSE.
+              CONCATENATE ls_facturacion-albaranes ls_albaran-vgbel INTO ls_facturacion-albaranes SEPARATED BY ','.
+              IF ls_albaran-vbtyp IS NOT INITIAL.
+                CONCATENATE ls_facturacion-tipo_documento 'P' INTO ls_facturacion-tipo_documento SEPARATED BY ','.
+                ls_facturacion-tipo_documento = 'P'.
+              ELSEIF ls_albaran-lfart IS NOT INITIAL.
+                CONCATENATE ls_facturacion-tipo_documento 'E' INTO ls_facturacion-tipo_documento SEPARATED BY ','.
+              ELSE.
+                CONCATENATE ls_facturacion-tipo_documento ' ' INTO ls_facturacion-tipo_documento SEPARATED BY ','.
+              ENDIF.
+            ENDIF.
+          ENDLOOP.
+          APPEND ls_facturacion TO e_facturacion.
+          CLEAR ls_facturacion.
+        ENDAT.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+
+ENDFUNCTION.

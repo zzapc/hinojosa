@@ -1,0 +1,207 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZXZSFID300_BTE_038
+*&---------------------------------------------------------------------*
+FORM acuerdo_vacaciones_cli TABLES t_bkpf    STRUCTURE bkpf
+                                   t_bseg    STRUCTURE bseg
+                                   t_bsegsub STRUCTURE bseg_subst.
+
+  DATA: incrementar_mes(1)    VALUE ' '.
+  DATA: meses_inc             TYPE i.
+  DATA: posicionado(1)        VALUE ' '.
+  DATA: fechaini              LIKE sy-datum.
+  DATA: fechafin              LIKE sy-datum.
+  DATA: ls_knb1               TYPE knb1.
+  DATA: ls_tvko               TYPE tvko.
+  DATA: lv_bdatu              TYPE bdatu_052r.
+  DATA: lv_vdatu              TYPE vdatu_052r.
+  DATA: lv_zfbdt              TYPE dzfbdt.
+  DATA: wa_sklin              TYPE sklin.
+  DATA: ultimo_dia            LIKE sy-datum.
+  DATA: calendario            LIKE casdayattr OCCURS 0 WITH HEADER LINE.
+  DATA: calendario1           LIKE casdayattr OCCURS 0 WITH HEADER LINE.
+
+* Comprobamos que este activo el perform por parametrización
+  GET PARAMETER ID 'BUK' FIELD vbukrs.
+
+  SELECT SINGLE * FROM zsfit300_bte_001 CLIENT SPECIFIED
+         WHERE mandt     = sy-mandt
+         AND   bukrs     = vbukrs
+         AND   progrname = program
+         AND   formname  = 'ACUERDO_VACACIONES_CLI'
+         AND   act       = 'X'.
+
+  CHECK sy-subrc = 0.
+
+  CLEAR: calendario[], calendario1[], fechaini, fechafin, calendario1[], calendario[], meses_inc.
+
+* La fecha inicial es el menor de los vencimientos
+  fechaini = '99991231'.
+  LOOP AT t_bseg WHERE koart EQ 'D' AND bschl = '01'.
+    IF fechaini GT t_bseg-zfbdt.
+      fechaini = t_bseg-zfbdt.
+    ENDIF.
+  ENDLOOP.
+  IF fechaini IS INITIAL.
+    fechaini = sy-datum.
+  ENDIF.
+* La fecha final es incrementarle dos años
+  fechafin = fechaini + ( 2 * 365 ).
+
+* Miro si existe alguna posición de deudor con clave de contab. 01
+  LOOP AT t_bseg WHERE koart = 'D' AND bschl = '01'.
+    EXIT.
+  ENDLOOP.
+  CHECK sy-subrc = 0.
+
+* Recogemos datos del maestro de proveedores...
+  SELECT SINGLE * INTO CORRESPONDING FIELDS OF ls_knb1 FROM knb1 CLIENT SPECIFIED
+         WHERE  mandt  = sy-mandt
+         AND    kunnr  = t_bseg-kunnr
+         AND    bukrs  = vbukrs.
+* Si es 4 "No aplicar vacaciones", ni tenga marcado la opción días fijos de pago x empresa, salimos del FORM...
+  CHECK ls_knb1-zzforma_calc <> '4' AND ls_knb1-zzforma_calc IS NOT INITIAL AND ls_knb1-urlid IS NOT INITIAL.
+
+* Buscamos el calendario de la org. de ventas, sino existe es 'ES'
+  SELECT SINGLE * INTO ls_tvko FROM  tvko CLIENT SPECIFIED
+         WHERE  mandt  = sy-mandt
+         AND    vkorg  = t_bseg-bukrs.
+  IF ls_tvko-vkokl IS INITIAL.
+    ls_tvko-vkokl = 'ES'.
+  ENDIF.
+
+  CALL FUNCTION 'DAY_ATTRIBUTES_GET'
+    EXPORTING
+      holiday_calendar           = ls_tvko-vkokl
+      date_from                  = fechaini
+      date_to                    = fechafin
+    TABLES
+      day_attributes             = calendario
+    EXCEPTIONS
+      factory_calendar_not_found = 1
+      holiday_calendar_not_found = 2
+      date_has_invalid_format    = 3
+      date_inconsistency         = 4
+      OTHERS                     = 5.
+
+  LOOP AT t_bseg WHERE koart EQ 'D' AND bschl = '01'.
+
+    indice = sy-tabix.
+    CLEAR: meses_inc, wa_sklin, lv_zfbdt.
+    calendario1[] = calendario[].
+
+*   Obtenemos el rango de fechas de vacaciones
+    LOOP AT calendario1.
+      calendario1-freeday = space.
+      ">JGM 06.02.2024 GAPFI003 Acuerdo de Vacaciones:
+      "Tener en cuenta también si cae festivo, en lógica del campo freeday para los casos zzforma_calc con el calendario1.
+      IF calendario1-holiday EQ 'X'.
+        calendario1-freeday = calendario1-holiday.
+      ENDIF.
+      "<.
+      MODIFY calendario1.
+    ENDLOOP.
+    SELECT bdatu vdatu INTO (lv_bdatu, lv_vdatu) FROM t052r CLIENT SPECIFIED
+           WHERE  mandt  = sy-mandt
+           AND    urlid  = ls_knb1-urlid.
+      LOOP AT calendario1 WHERE date+4(4) GE lv_vdatu+4(4) AND date+4(4) LE lv_bdatu+4(4).
+        calendario1-freeday = 'X'.
+        MODIFY calendario1.
+      ENDLOOP.
+      LOOP AT calendario WHERE date+4(4) GE lv_vdatu+4(4) AND date+4(4) LE lv_bdatu+4(4).
+        calendario-freeday = 'X'.
+        MODIFY calendario.
+      ENDLOOP.
+    ENDSELECT.
+
+*   Obtengo a partir de ZTERM y ZFBDT, fecha base + días...
+    CALL FUNCTION 'NET_DUE_DATE_GET'
+      EXPORTING
+        i_zfbdt = t_bseg-zfbdt
+        i_zbd1t = t_bseg-zbd1t
+        i_zbd2t = t_bseg-zbd2t
+        i_zbd3t = t_bseg-zbd3t
+        i_shkzg = t_bseg-shkzg
+        i_rebzg = t_bseg-rebzg
+        i_koart = 'D'
+      IMPORTING
+        e_faedt = lv_zfbdt.
+
+*   Solo cuando el vto caiga en periodo vacacional
+    READ TABLE calendario1 WITH KEY date = lv_zfbdt freeday = 'X'.
+    CHECK sy-subrc = 0.
+
+    IF ls_knb1-zzforma_calc = '3'.     "Trasladar a...
+      CLEAR: calendario1.
+      lv_zfbdt+6(2) = ls_knb1-zztraslado_a.
+      DO.
+        READ TABLE calendario1 WITH KEY freeday = space date = lv_zfbdt.
+        IF sy-subrc EQ 0.
+          EXIT.
+        ENDIF.
+        CALL FUNCTION 'BKK_ADD_MONTH_TO_DATE'
+          EXPORTING
+            months  = 1
+            olddate = lv_zfbdt
+          IMPORTING
+            newdate = lv_zfbdt.
+      ENDDO.
+    ELSEIF ls_knb1-zzforma_calc = '2'.     "Siguiente día laborable...
+*     Nos quedamos con el primer dia laborable a partir de la fecha
+      CLEAR: calendario, calendario1.
+*      LOOP AT calendario WHERE freeday EQ space AND date GE lv_zfbdt.
+      LOOP AT calendario WHERE freeday EQ space AND holiday EQ space AND date GE lv_zfbdt.   "JGM 06.02.2024 GAPFI003.
+        EXIT.
+      ENDLOOP.
+      calendario1-date = calendario-date.
+    ELSEIF ls_knb1-zzforma_calc = '1'.     "Siguiente día dijo...
+      DO.
+        READ TABLE calendario1 WITH KEY freeday = space date = lv_zfbdt.
+        IF sy-subrc EQ 0.
+          EXIT.
+        ENDIF.
+        CALL FUNCTION 'BKK_ADD_MONTH_TO_DATE'
+          EXPORTING
+            months  = 1
+            olddate = lv_zfbdt
+          IMPORTING
+            newdate = lv_zfbdt.
+      ENDDO.
+    ENDIF.
+
+    IF calendario1-date IS NOT INITIAL.
+      READ TABLE t_bsegsub INDEX indice.
+      t_bsegsub-fdtag = calendario1-date.
+      t_bsegsub-zfbdt = calendario1-date.
+      CLEAR t_bsegsub-zbd1t.
+      CLEAR t_bsegsub-zterm.
+      MODIFY t_bsegsub INDEX indice.
+*     Necesario para controles posteriores en las fechas
+      t_bseg-fdtag = calendario1-date.
+      t_bseg-zfbdt = calendario1-date.
+      CLEAR t_bseg-zbd1t.
+      CLEAR t_bseg-zterm.
+      MODIFY t_bseg.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    "acuerdo_vacaciones_cli
+
+*&---------------------------------------------------------------------*
+*&      Form  sig_periodo
+*&---------------------------------------------------------------------*
+FORM next_periodo CHANGING i_periodo TYPE spmon.
+
+  DATA: aux_mes(2) TYPE n .
+  DATA: aux_ano(4) TYPE n .
+  aux_ano = i_periodo(4) .
+  aux_mes = i_periodo+4(2) .
+  IF aux_mes NE '12' .
+    aux_mes = aux_mes + 1 .
+  ELSE.
+    aux_mes = '01' .
+    aux_ano = aux_ano + 1 .
+  ENDIF .
+  CONCATENATE aux_ano aux_mes INTO i_periodo .
+
+ENDFORM.                    "sig_periodo

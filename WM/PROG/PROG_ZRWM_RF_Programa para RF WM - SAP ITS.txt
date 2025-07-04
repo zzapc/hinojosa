@@ -1,0 +1,120 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRWM_RF
+*&
+*&---------------------------------------------------------------------*
+*& Proyecto: WM Cartonajes Bernabeu
+*&
+*& Autor: Carlos Vivó Jiménez
+*& Fecha: 11/03/2019
+*&
+*& Descripción: programa para ejecutar desde el servicio ITS y así poder
+*&  ejecutar lógica antes de la transacción LM01
+*&---------------------------------------------------------------------*
+REPORT zrwm_rf.
+
+DATA: gs_param        TYPE zwm_param, " parametros generales->Transaccion
+      gs_lrf          TYPE lrf_wkqu, " parámetros tx LRFMD
+      gt_func         TYPE TABLE OF zwm_rf_func WITH HEADER LINE, " funcionalidades RF activadas
+      g_lgnum         TYPE lgnum,
+      g_operario      TYPE zlnum_oper,
+      g_operario_aux  TYPE zlnum_oper,
+      g_hora          TYPE syuzeit,
+      gt_prl          TYPE TABLE OF zwm_rf_prl,
+      prl             TYPE zwm_rf_prl,
+      g_condition(20),
+      gt_lineas       TYPE TABLE OF char20,
+      gt_texto        TYPE TABLE OF esh_e_om_field_text,
+      g_texto(60),
+      gr_lineas       TYPE REF TO char20,
+      len             TYPE int4,
+      string          TYPE string.
+
+INITIALIZATION.
+
+  SELECT SINGLE * FROM lrf_wkqu INTO gs_lrf
+    WHERE bname EQ sy-uname
+      AND statu NE space.
+
+  g_lgnum = gs_lrf-lgnum.
+
+  CONCATENATE 'LG' g_lgnum ' NE space'  INTO g_condition.
+
+  SELECT * FROM zwm_rf_func INTO TABLE gt_func
+    WHERE (g_condition).
+
+* ----------- Funcionalidad: número de operario adicional -----------------------------
+  READ TABLE gt_func WITH KEY func = 'NUM_OPERARIO' TRANSPORTING NO FIELDS.
+
+  IF sy-subrc EQ 0.
+    GET PARAMETER ID 'ZNUM_OPER' FIELD g_operario.
+
+    IF g_operario IS INITIAL. " si no hay, lo pedimos
+      CALL TRANSACTION 'ZWM_RF_018'.
+    ENDIF.
+  ENDIF.
+
+* ----------- Funcionalidad: cuestionario PRL -----------------------------
+  READ TABLE gt_func WITH KEY func = 'PRL' TRANSPORTING NO FIELDS.
+
+  IF sy-subrc EQ 0.
+    GET PARAMETER ID 'ZNUM_OPER' FIELD g_operario.
+
+    SELECT SINGLE MAX( hora ) operario FROM zwm_rf_prl_log
+      INTO (g_hora,g_operario_aux)
+      WHERE fecha EQ sy-datum
+        AND lgnum EQ g_lgnum
+        AND usuario EQ sy-uname
+      GROUP BY operario.
+
+    IF sy-subrc EQ 0 AND g_operario_aux EQ g_operario.
+      " el último en responder ha sido él mismo, así que no preguntamos
+    ELSE.
+      SELECT * FROM zwm_rf_prl
+        INTO TABLE gt_prl
+        WHERE lgnum EQ g_lgnum.
+
+      LOOP AT gt_prl INTO prl.
+        CLEAR: gr_lineas, string, len.
+        REFRESH: gt_lineas, gt_texto.
+
+        FREE MEMORY ID: 'ZWM_RF_PRL', 'TEXTO1_PRL', 'TEXTO2_PRL', 'TEXTO3_PRL'. " limpiamos la pregunta anterior
+
+        SPLIT prl-texto AT space INTO TABLE gt_lineas. " montamos las líneas de texto
+
+        LOOP AT gt_lineas REFERENCE INTO gr_lineas.
+          len = strlen( string ) + strlen( gr_lineas->* ).
+          IF len LT 60.
+            IF string IS NOT INITIAL.
+              CONCATENATE string gr_lineas->* INTO string SEPARATED BY space.
+            ELSE.
+              string = gr_lineas->*.
+            ENDIF.
+          ELSE.
+            APPEND string TO gt_texto.
+            string = gr_lineas->*.
+            CLEAR len. " para controlar que pasa por aquí
+          ENDIF.
+        ENDLOOP.
+
+        APPEND string TO gt_texto. " última línea
+
+        LOOP AT gt_texto INTO g_texto.
+          CASE sy-tabix.
+            WHEN 1.
+              EXPORT p1 = g_texto TO MEMORY ID 'TEXTO1_PRL'.
+            WHEN 2.
+              EXPORT p1 = g_texto TO MEMORY ID 'TEXTO2_PRL'.
+            WHEN 3.
+              EXPORT p1 = g_texto TO MEMORY ID 'TEXTO3_PRL'.
+          ENDCASE.
+        ENDLOOP.
+
+        EXPORT p1 = prl TO MEMORY ID 'ZWM_RF_PRL'.
+
+        CALL TRANSACTION 'ZWM_RF_019'.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+* ----------- Ejecutar RF estándar LM01 -----------------------------
+  CALL TRANSACTION 'LM01'.

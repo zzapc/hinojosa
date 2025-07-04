@@ -1,0 +1,283 @@
+FUNCTION zui5_cm_crear_entrega.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_HEADER) TYPE  ZSUIS_CM_ENTREGAS
+*"     VALUE(I_POSITIONS) TYPE  ZSUITT_CM_POSICIONES_ENTREGA
+*"  EXPORTING
+*"     VALUE(O_RETURN) TYPE  BAPIRET2_T
+*"     VALUE(O_ENTREGA) TYPE  ZSUIS_CM_ENTREGAS
+*"----------------------------------------------------------------------
+  DATA: order_header_in     LIKE  bapisdhd1,
+        order_header_inx    LIKE  bapisdhd1x,
+        salesdocument       LIKE  bapivbeln-vbeln,
+        order_items_in      TYPE TABLE OF bapisditm,
+        order_items_inx     TYPE TABLE OF  bapisditmx,
+        order_partners      TYPE TABLE OF bapiparnr,
+        order_schedules_in  TYPE TABLE OF bapischdl,
+        order_schedules_inx	TYPE TABLE OF	bapischdlx,
+        headerdata          LIKE  bapishipmentheader,
+        headerdataaction    LIKE  bapishipmentheaderaction,
+        header_data         LIKE  bapiobdlvhdrcon,
+        header_control      LIKE  bapiobdlvhdrctrlcon,
+        delivery            LIKE  bapiobdlvhdrchg-deliv_numb,
+        ls_parametros       TYPE zcmventa,
+        lt_return           TYPE bapiret2_t,
+        cont                TYPE i,
+        sales_order_items	  TYPE TABLE OF	bapidlvreftosalesorder,
+        item_data           TYPE TABLE OF  bapiobdlvitemcon,
+        item_control        TYPE TABLE OF   bapiobdlvitemctrlcon.
+
+  DATA vl_charg_2d TYPE charg_d.
+  DATA vl_charg_3d TYPE charg_d.
+
+  PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '042' 'ZUI5_CM_CREAR_ENTREGA' '' '' ''CHANGING o_return.
+
+  "Eliminar status del transporte.????
+
+  LOOP AT i_positions ASSIGNING FIELD-SYMBOL(<fs_positions>) WHERE charg IS INITIAL.
+
+    "Si la posición no es por referencia creamos o seleccionamos 1ote
+    IF <fs_positions>-refdoc IS INITIAL AND <fs_positions>-charg IS INITIAL.
+      PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '076' <fs_positions>-matnr '' '' ''CHANGING o_return.
+
+      CALL FUNCTION 'ZUI5_CM_GET_NUMBER_CHARG_DEV'
+        EXPORTING
+          i_werks    = <fs_positions>-werks
+          i_lgort    = <fs_positions>-lgort
+          i_matnr    = <fs_positions>-matnr
+          i_montado  = <fs_positions>-flagmontado
+          i_kunnr    = i_header-kunag
+        IMPORTING
+          e_charg_2d = vl_charg_2d
+          e_charg_3d = vl_charg_3d
+          t_return   = lt_return.
+      APPEND LINES OF lt_return TO o_return.
+
+      IF NOT line_exists( lt_return[ type = 'E' ] ).
+
+        IF <fs_positions>-flagmontado IS INITIAL.
+          <fs_positions>-charg = vl_charg_2d.
+        ELSE.
+          <fs_positions>-charg = vl_charg_3d.
+        ENDIF.
+
+      ELSE.
+        DATA(vv_error) = 'X'.
+      ENDIF.
+    ELSEIF <fs_positions>-refdoc IS NOT INITIAL AND <fs_positions>-charg IS NOT INITIAL.
+      PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '076' <fs_positions>-matnr '' '' ''CHANGING o_return.
+
+      SELECT SINGLE werks, lgort, sort2
+                FROM twlad
+                INNER JOIN adrc ON adrc~addrnumber EQ twlad~adrnr
+                INTO @DATA(wa_adrc)
+                WHERE werks EQ @<fs_positions>-werks
+                  AND lgort EQ @<fs_positions>-lgort.
+      IF sy-subrc = 0.
+        DATA(lv_charg) = |{ wa_adrc-sort2(1) && 'R' }|.
+        IF <fs_positions>-charg(2) = lv_charg.
+          <fs_positions>-charg = |{ wa_adrc-sort2(1) && <fs_positions>-charg+2 }|.
+          <fs_positions>-regularizado = 'X'.
+        ELSEIF <fs_positions>-charg(1) = 'R'.
+          <fs_positions>-charg = |{ <fs_positions>-charg+1 }|.
+          <fs_positions>-regularizado = 'X'.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+  " INI: PMP 19.09.2024 Revisar el loop anterior:
+  LOOP AT i_positions ASSIGNING <fs_positions>
+    WHERE refdoc IS INITIAL
+      AND charg IS NOT INITIAL.
+
+    PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '076' <fs_positions>-matnr '' '' ''CHANGING o_return.
+
+    IF <fs_positions>-charg(1) EQ 'R' OR <fs_positions>-charg+1(1) = 'R'.
+        <fs_positions>-regularizado = 'X'.
+    ENDIF.
+
+*    SELECT SINGLE werks, lgort, sort2
+*              FROM twlad
+*              INNER JOIN adrc ON adrc~addrnumber EQ twlad~adrnr
+*              INTO @wa_adrc
+*              WHERE werks EQ @<fs_positions>-werks
+*                AND lgort EQ @<fs_positions>-lgort.
+*    IF sy-subrc = 0.
+*      lv_charg = |{ wa_adrc-sort2(1) && 'R' }|.
+*      IF <fs_positions>-charg(2) = lv_charg.
+*        <fs_positions>-regularizado = 'X'.
+*      ELSEIF <fs_positions>-charg(1) = 'R'.
+*        <fs_positions>-regularizado = 'X'.
+*      ENDIF.
+*    ENDIF.
+
+  ENDLOOP.
+  " FIN: PMP 19.09.2024 Revisar el loop anterior
+
+  READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+  IF sy-subrc NE 0.
+    PERFORM borrar_status_trans USING i_header-tknum CHANGING lt_return.
+    APPEND LINES OF lt_return TO o_return.
+
+    READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+      PERFORM crear_pedido USING i_header
+                                 i_positions
+                           CHANGING lt_return
+                                    salesdocument.
+
+      APPEND LINES OF lt_return TO o_return.
+      "Eliminamos los documentos anteriores si da error la asignación.
+      READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc NE 0.
+        "Crear Entrega
+        PERFORM crear_entrega USING salesdocument
+                           CHANGING lt_return delivery.
+        APPEND LINES OF lt_return TO o_return.
+
+        "Eliminamos los documentos anteriores si da error la asignación.
+        READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+        IF sy-subrc = 0.
+
+          PERFORM borrar_pedido USING salesdocument CHANGING lt_return.
+          APPEND LINES OF lt_return TO o_return.
+        ELSE.
+          PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '025' delivery i_header-tknum '' ''CHANGING o_return.
+          "Asignamos Entraga al transporte
+          CALL FUNCTION 'ZUI5_CM_ASIGNAR_ENT_TRANSPORTE'
+            EXPORTING
+              i_transporte = i_header-tknum
+              i_entrega    = delivery
+            IMPORTING
+              o_return     = lt_return.
+          APPEND LINES OF lt_return TO o_return.
+          "Contabilización de status del transporte
+          READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+          IF sy-subrc NE 0.
+*            PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '027' 'ZZMONTAJE' salesdocument '' ''CHANGING o_return.
+*            "Actualiza el campo ZZMONTAJE = 'X'.
+*            SELECT a~posnr, a~charg, b~vbeln AS lvbeln, b~posnr AS lposnr FROM vbap AS a
+*              LEFT JOIN lips AS b ON b~vgbel = a~vbeln AND b~vgpos = a~posnr
+*              INTO TABLE @DATA(lt_vbap)
+*              WHERE a~vbeln = @salesdocument.
+*            IF sy-subrc = 0.
+*              LOOP AT lt_vbap INTO DATA(ls_vbap).
+*                IF strlen( ls_vbap-charg ) > 8.
+*                  UPDATE vbap SET zzmontaje = 'X' WHERE vbeln = salesdocument AND posnr = ls_vbap-posnr.
+*
+*                  "Copiamos en la entrega
+*                  UPDATE lips SET zzmontaje = 'X' WHERE vbeln = ls_vbap-lvbeln AND posnr = ls_vbap-lposnr.
+*                ENDIF.
+*              ENDLOOP.
+*              COMMIT WORK.
+*            ENDIF.
+          ELSE.
+            DATA(lv_error) = 'X'.
+
+            PERFORM borrar_entrega USING delivery CHANGING lt_return.
+            APPEND LINES OF lt_return TO o_return.
+
+            "Borrar pedido creado
+            READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+            IF sy-subrc NE 0.
+
+              PERFORM borrar_pedido USING salesdocument CHANGING lt_return.
+              APPEND LINES OF lt_return TO o_return.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ELSE.
+        "Borrar pedido creado
+        PERFORM borrar_pedido USING salesdocument CHANGING lt_return.
+        APPEND LINES OF lt_return TO o_return.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  IF lv_error IS NOT INITIAL.
+
+    "Borramos asignación entrega al transporte
+    PERFORM borrar_asig_ent_trans USING delivery i_header-tknum CHANGING lt_return.
+    APPEND LINES OF lt_return TO o_return.
+
+    "Borramos la entrega creada
+    READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc NE 0.
+
+      PERFORM borrar_entrega USING delivery CHANGING lt_return.
+      APPEND LINES OF lt_return TO o_return.
+
+      "Borrar pedido creado
+      READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc NE 0.
+
+        PERFORM borrar_pedido USING salesdocument CHANGING lt_return.
+        APPEND LINES OF lt_return TO o_return.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  "y de salida de mercancías.
+  READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+  IF sy-subrc NE 0.
+    CLEAR: lt_return.
+    PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '033' delivery '' '' ''CHANGING o_return.
+
+    CALL FUNCTION 'ZUI5_CM_SALIDA_MERCANCIAS'
+      EXPORTING
+        i_vbeln     = delivery
+        i_positions = i_positions
+      IMPORTING
+        o_return    = lt_return.
+
+    APPEND LINES OF lt_return TO o_return.
+    READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+    IF sy-subrc = 0.  "Borrar Status del transporte
+
+      PERFORM borrar_status_trans USING i_header-tknum CHANGING lt_return.
+      APPEND LINES OF lt_return TO o_return.
+
+      READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc NE 0.
+
+        "Borramos asignación entrega al transporte
+        PERFORM borrar_asig_ent_trans USING delivery i_header-tknum CHANGING lt_return.
+        APPEND LINES OF lt_return TO o_return.
+
+        "Borramos la entrega creada
+        READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+        IF sy-subrc NE 0.
+
+          PERFORM borrar_entrega USING delivery CHANGING lt_return.
+          APPEND LINES OF lt_return TO o_return.
+
+          "Borrar pedido creado
+          READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+          IF sy-subrc NE 0.
+
+            PERFORM borrar_pedido USING salesdocument CHANGING lt_return.
+            APPEND LINES OF lt_return TO o_return.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ELSE.
+      READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc NE 0.
+
+        "Contabilizamos los status del transporte
+        PERFORM change_status_trans  USING   i_header-tknum
+                                  CHANGING lt_return.
+
+        APPEND LINES OF lt_return TO o_return.
+
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  PERFORM guardar_log USING i_header-tknum o_return.
+
+  o_entrega = i_header.
+  o_entrega-vbeln = delivery.
+ENDFUNCTION.

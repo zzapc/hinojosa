@@ -1,0 +1,817 @@
+FUNCTION zmrp_planificador.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_WERKS) TYPE  WERKS_D
+*"     VALUE(I_LGORT) TYPE  LGORT_D
+*"     VALUE(I_VBELN) TYPE  VBELN
+*"     VALUE(I_POSNR) TYPE  POSNR
+*"     VALUE(I_ZPMP) TYPE  MATNR
+*"     VALUE(I_CANTIDAD_ZPMP) TYPE  MENGE_D
+*"     VALUE(I_PLANCHAS_ZPMP) TYPE  LABST
+*"     VALUE(I_ZPLP) TYPE  MATNR
+*"     VALUE(I_CANTIDAD_ZPLP) TYPE  MENGE_D
+*"     VALUE(I_PLANCHAS_ZPLP) TYPE  LABST
+*"     VALUE(I_FECHA) TYPE  DATUM
+*"     VALUE(I_OBSOLETOS_ZPMP) TYPE  XFELD OPTIONAL
+*"     VALUE(I_OBSOLETOS_ZPLP) TYPE  XFELD OPTIONAL
+*"     VALUE(I_TIPO_PEDIDO) TYPE  ZTIPO_PED_ZMRP
+*"     VALUE(I_RECONVERTIDO) TYPE  XFELD OPTIONAL
+*"  EXPORTING
+*"     VALUE(E_ERROR) TYPE  XFELD
+*"     VALUE(E_OBSOLETOS) TYPE  XFELD
+*"     VALUE(E_CANT_ZPLP) TYPE  CS_E_MNGLG
+*"     VALUE(GT_MESSAGES) TYPE  BAPIRET2_T
+*"  TABLES
+*"      T_LOTES TYPE  ZSTPP0033_ALV OPTIONAL
+*"  CHANGING
+*"     VALUE(E_ORDEN_ZPMP) TYPE  AUFNR OPTIONAL
+*"     VALUE(E_ORDEN_ZPLP) TYPE  AUFNR OPTIONAL
+*"  EXCEPTIONS
+*"      ERROR
+*"----------------------------------------------------------------------
+
+  DATA: lv_fecha             TYPE sy-datum,
+        lv_kunnr             TYPE kunnr,
+        lv_name1             TYPE name1,
+        wa_ztpi0006          TYPE ztpi0006,
+        num_reg              TYPE sy-tabix,
+        wa_lotes             TYPE zspp0033_alv,
+        lv_lote              TYPE charg_d,
+        lv_num_planchas      TYPE menge_d,
+        lv_num_planchas_zpmp TYPE menge_d,
+        lv_num_planchas_zplp TYPE menge_d,
+        lv_matnr             TYPE matnr,
+        lv_zplp              TYPE matnr,
+        lv_cant_zplp         TYPE cs_e_mnglg,
+        lv_verid             TYPE mkal-verid.
+
+
+  DATA: wa_orderdata  TYPE bapi_pi_order_change,
+        wa_orderdatax TYPE bapi_pi_order_changex,
+        t_return      TYPE TABLE OF bapiret2,
+        wa_return     TYPE bapiret2.
+
+
+  IF i_fecha IS NOT INITIAL.
+    lv_fecha = i_fecha.
+  ELSE.
+    IF i_tipo_pedido = 'PV'.
+      SELECT SINGLE erdat
+       FROM vbak
+       INTO lv_fecha
+       WHERE vbeln = i_vbeln.
+    ELSE.
+      SELECT SINGLE aedat
+       FROM ekko
+       INTO lv_fecha
+       WHERE ebeln = i_vbeln.
+    ENDIF.
+  ENDIF.
+
+
+  IF i_tipo_pedido = 'PV'.
+    SELECT SINGLE kunnr
+     FROM vbak
+     INTO lv_kunnr
+     WHERE vbeln = i_vbeln.
+
+    SELECT SINGLE name1 FROM kna1
+      INTO lv_name1
+      WHERE kunnr = lv_kunnr.
+  ELSE.
+    SELECT SINGLE lifnr
+     FROM ekko
+     INTO lv_kunnr
+     WHERE ebeln = i_vbeln.
+
+    SELECT SINGLE name1 FROM lfa1
+      INTO lv_name1
+      WHERE lifnr = lv_kunnr.
+  ENDIF.
+
+
+  SELECT SINGLE verid FROM mkal
+    INTO  lv_verid
+    WHERE matnr = i_zpmp AND
+          werks = i_werks AND
+          verid = 'V001'.
+
+  IF sy-subrc <> 0.
+    SELECT SINGLE verid FROM mkal
+       INTO  lv_verid
+       WHERE matnr = i_zpmp AND
+             werks = i_werks.
+  ENDIF.
+
+
+
+* calculamos la cantidades necesarias
+* cantidad ZPMP = cantidad pedido - cantidad de obsoletos seleccionados
+  PERFORM calcular_planchas USING i_cantidad_zpmp
+                                  i_planchas_zpmp
+                            CHANGING lv_num_planchas_zpmp.
+
+* cantidad ZPLP = cantidad BOM - cantidad de obsoletos seleccionados
+  PERFORM calcular_planchas USING i_cantidad_zplp
+                                  i_planchas_zplp
+                            CHANGING lv_num_planchas_zplp.
+
+
+* verificamos el movimiento 344
+  SELECT SINGLE * FROM ztpi0006
+    INTO wa_ztpi0006
+    WHERE bwart = '344' AND
+          werks = i_werks AND
+          lgort = '4020'.
+
+* si el PMP ni el ZPLP no tiene obsoletos, crea la orden del ZPMP por la cantidad del pedido
+* y crea la orden del ZPLP por la cantidad de la BOM
+  IF i_obsoletos_zpmp = '' AND i_obsoletos_zplp = ''.
+    PERFORM crear_orden USING i_zpmp
+                              i_werks
+                              i_cantidad_zpmp
+                              i_vbeln
+                              i_posnr
+                              lv_fecha
+                              lv_verid
+                          CHANGING e_orden_zpmp
+                                   e_error
+                                   gt_messages.
+
+    CHECK e_error IS INITIAL.
+
+    PERFORM crear_orden USING i_zplp
+                              i_werks
+                              i_cantidad_zplp
+                              i_vbeln
+                              i_posnr
+                              lv_fecha
+                              lv_verid
+                          CHANGING e_orden_zplp
+                                   e_error
+                                   gt_messages.
+  ENDIF.
+
+
+* si el PMP tiene obsoletos y el PLP no tiene obsoletos
+  IF ( i_obsoletos_zpmp = 'X' AND i_obsoletos_zplp = '' ) .
+    IF i_cantidad_zpmp = i_planchas_zpmp OR i_cantidad_zpmp < i_planchas_zpmp.
+      IF wa_ztpi0006-bwart = '344'.
+        LOOP AT t_lotes INTO wa_lotes.
+          PERFORM movimiento_344 USING wa_lotes
+                                 CHANGING e_error
+                                          gt_messages.
+
+          IF e_error IS INITIAL.
+            PERFORM reclasificar_lote USING  wa_lotes
+                                             i_vbeln
+                                             i_posnr
+                                             lv_kunnr
+                                             lv_name1
+                                      CHANGING e_error
+                                               gt_messages.
+          ELSE.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ELSEIF i_cantidad_zpmp > i_planchas_zpmp.
+*     crear orden del material del pedido (ZPMP)
+      PERFORM crear_orden USING i_zpmp
+                                i_werks
+                                lv_num_planchas_zpmp
+                                i_vbeln
+                                i_posnr
+                                lv_fecha
+                                lv_verid
+                            CHANGING e_orden_zpmp
+                                     e_error
+                                     gt_messages .
+
+      CHECK e_error IS INITIAL.
+
+*     recalculamos la cantidad del componente (ZPLP)
+      PERFORM lista_materiales USING i_zpmp
+                                     i_werks
+                                     lv_num_planchas_zpmp
+                              CHANGING lv_zplp
+                                       lv_cant_zplp.
+
+*     creamos la orden del componente (ZPLP)
+      PERFORM crear_orden USING lv_zplp
+                                i_werks
+                                lv_cant_zplp
+                                i_vbeln
+                                i_posnr
+                                lv_fecha
+                                lv_verid
+                          CHANGING e_orden_zplp
+                                   e_error
+                                   gt_messages.
+
+      CHECK e_error IS INITIAL.
+
+      IF wa_ztpi0006-bwart = '344'.
+        LOOP AT t_lotes INTO wa_lotes.
+          PERFORM movimiento_344 USING wa_lotes
+                                 CHANGING e_error
+                                          gt_messages.
+
+          IF e_error IS INITIAL.
+            PERFORM reclasificar_lote USING  wa_lotes
+                                             i_vbeln
+                                             i_posnr
+                                             lv_kunnr
+                                             lv_name1
+                                      CHANGING e_error
+                                               gt_messages.
+          ELSE.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+
+
+* si el PMP no tiene obsoletos y el PLP tiene obsoletos
+  IF ( i_obsoletos_zpmp = '' AND i_obsoletos_zplp = 'X' ) .
+    IF i_cantidad_zplp = i_planchas_zplp OR i_cantidad_zplp < i_planchas_zplp .
+      IF wa_ztpi0006-bwart = '344'.
+        IF i_cantidad_zplp < i_planchas_zplp.
+          PERFORM crear_orden USING i_zpmp
+                                    i_werks
+                                    i_cantidad_zpmp
+                                    i_vbeln
+                                    i_posnr
+                                    lv_fecha
+                                    lv_verid
+                              CHANGING e_orden_zpmp
+                                       e_error
+                                       gt_messages.
+        ENDIF.
+
+        CHECK e_error = ''.
+
+        LOOP AT t_lotes INTO wa_lotes.
+          PERFORM movimiento_344 USING wa_lotes
+                                 CHANGING e_error
+                                          gt_messages.
+
+          IF e_error IS INITIAL .
+            PERFORM reclasificar_lote USING wa_lotes
+                                            i_vbeln
+                                            i_posnr
+                                            lv_kunnr
+                                            lv_name1
+                                      CHANGING e_error
+                                               gt_messages.
+          ELSE.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+    ELSEIF i_cantidad_zplp > i_planchas_zplp .
+*     crear orden del material del pedido (ZPLP)
+      PERFORM crear_orden USING i_zplp
+                                i_werks
+                                lv_num_planchas_zplp
+                                i_vbeln
+                                i_posnr
+                                lv_fecha
+                                lv_verid
+                            CHANGING e_orden_zplp
+                                     e_error
+                                     gt_messages.
+
+      CHECK e_error IS INITIAL.
+
+      IF wa_ztpi0006-bwart = '344'.
+        LOOP AT t_lotes INTO wa_lotes.
+
+          PERFORM movimiento_344 USING wa_lotes
+                                 CHANGING e_error
+                                          gt_messages.
+
+          IF e_error IS INITIAL.
+            PERFORM reclasificar_lote USING wa_lotes
+                                            i_vbeln
+                                            i_posnr
+                                            lv_kunnr
+                                            lv_name1
+                                       CHANGING e_error
+                                                gt_messages.
+          ELSE.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+*     creamos la orden del componente (ZPMP)
+      IF i_reconvertido = ''.
+        PERFORM crear_orden USING i_zpmp
+                                  i_werks
+                                  i_cantidad_zpmp
+                                  i_vbeln
+                                  i_posnr
+                                  lv_fecha
+                                  lv_verid
+                            CHANGING e_orden_zpmp
+                                     e_error
+                                     gt_messages.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+* Tanto el PMP como el PLP tiene obsoletos
+  IF ( i_obsoletos_zpmp = 'X' AND i_obsoletos_zplp = 'X' ) .
+    IF i_cantidad_zpmp = i_planchas_zpmp  OR i_cantidad_zpmp < i_planchas_zpmp.
+      IF i_cantidad_zplp < i_planchas_zplp.
+          PERFORM crear_orden USING i_zpmp
+                                    i_werks
+                                    i_cantidad_zpmp
+                                    i_vbeln
+                                    i_posnr
+                                    lv_fecha
+                                    lv_verid
+                              CHANGING e_orden_zpmp
+                                       e_error
+                                       gt_messages.
+
+
+        ENDIF.
+
+        CHECK e_error = ''.
+
+      IF wa_ztpi0006-bwart = '344'.
+        LOOP AT t_lotes INTO wa_lotes.
+
+          PERFORM movimiento_344 USING wa_lotes
+                                 CHANGING e_error
+                                          gt_messages.
+
+          IF e_error IS INITIAL.
+            PERFORM reclasificar_lote USING wa_lotes
+                                            i_vbeln
+                                            i_posnr
+                                            lv_kunnr
+                                            lv_name1
+                                      CHANGING e_error
+                                               gt_messages.
+          ELSE.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+    ELSEIF i_cantidad_zpmp > i_planchas_zpmp.
+*     creamos la orden del componente (ZPMP)
+      PERFORM crear_orden USING i_zpmp
+                                i_werks
+                                lv_num_planchas_zpmp
+                                i_vbeln
+                                i_posnr
+                                lv_fecha
+                                lv_verid
+                          CHANGING e_orden_zpmp
+                                   e_error
+                                   gt_messages.
+
+      CHECK e_error IS INITIAL.
+
+
+      IF wa_ztpi0006-bwart = '344'.
+        LOOP AT t_lotes INTO wa_lotes.
+          PERFORM movimiento_344 USING wa_lotes
+                                 CHANGING e_error
+                                          gt_messages.
+
+          IF e_error IS INITIAL.
+            PERFORM reclasificar_lote USING wa_lotes
+                                            i_vbeln
+                                            i_posnr
+                                            lv_kunnr
+                                            lv_name1
+                                      CHANGING e_error
+                                               gt_messages.
+          ELSE.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+*     recalculamos la cantidad del componente (ZPLP)
+      PERFORM lista_materiales USING i_zpmp
+                                     i_werks
+                                     lv_num_planchas_zpmp "i_planchas_zpmp
+                              CHANGING lv_zplp
+                                       lv_cant_zplp.
+
+*     actualizo alv Obsoletos PLP con cantidad lv_cant_zplp
+      e_obsoletos = 'X'.
+      e_cant_zplp = lv_cant_zplp.
+    ENDIF.
+  ENDIF.
+
+* A la orden creada con el ZPLP, le cambiamos la Fecha de inicio extrema
+* y le ponemos la Fecha de fin extrema - 1 de la orden creada para el material
+* ZPMP
+  IF e_orden_zplp IS NOT INITIAL.
+    wa_orderdata-basic_start_date = lv_fecha - 1.
+    wa_orderdatax-basic_start_date = 'X'.
+
+    CALL FUNCTION 'BAPI_PROCORD_CHANGE'
+      EXPORTING
+        number     = e_orden_zplp
+        orderdata  = wa_orderdata
+        orderdatax = wa_orderdatax
+      IMPORTING
+        return     = wa_return
+*       ORDER_TYPE =
+*       ORDER_STATUS           =
+*       MASTER_DATA_READ       =
+      .
+
+    IF wa_return-type <> 'E'.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'
+*   IMPORTING
+*         RETURN        =
+        .
+    ENDIF.
+
+  ENDIF.
+
+
+
+
+*  DATA: lv_fecha             TYPE sy-datum,
+*        lv_kunnr             TYPE kunnr,
+*        lv_name1             TYPE name1,
+*        wa_ztpi0006          TYPE ztpi0006,
+*        num_reg              TYPE sy-tabix,
+*        wa_lotes             TYPE zspp0033_alv,
+*        lv_lote              TYPE charg_d,
+*        lv_num_planchas      TYPE menge_d,
+*        lv_num_planchas_zpmp TYPE menge_d,
+*        lv_num_planchas_zplp TYPE menge_d,
+*        lv_matnr             TYPE matnr,
+*        lv_zplp              TYPE matnr,
+*        lv_cant_zplp         TYPE cs_e_mnglg,
+*        lv_verid             TYPE mkal-verid.
+*
+*
+*  DATA: wa_orderdata  TYPE bapi_pi_order_change,
+*        wa_orderdatax TYPE bapi_pi_order_changex,
+*        t_return      TYPE TABLE OF bapiret2,
+*        wa_return     TYPE bapiret2.
+*
+*
+*  IF i_fecha IS NOT INITIAL.
+*    lv_fecha = i_fecha.
+*  ELSE.
+*    IF i_tipo_pedido = 'PV'.
+*      SELECT SINGLE erdat
+*       FROM vbak
+*       INTO lv_fecha
+*       WHERE vbeln = i_vbeln.
+*    ELSE.
+*      SELECT SINGLE aedat
+*       FROM ekko
+*       INTO lv_fecha
+*       WHERE ebeln = i_vbeln.
+*    ENDIF.
+*  ENDIF.
+*
+*
+*  IF i_tipo_pedido = 'PV'.
+*    SELECT SINGLE kunnr
+*     FROM vbak
+*     INTO lv_kunnr
+*     WHERE vbeln = i_vbeln.
+*
+*    SELECT SINGLE name1 FROM kna1
+*      INTO lv_name1
+*      WHERE kunnr = lv_kunnr.
+*  ELSE.
+*    SELECT SINGLE lifnr
+*     FROM ekko
+*     INTO lv_kunnr
+*     WHERE ebeln = i_vbeln.
+*
+*    SELECT SINGLE name1 FROM lfa1
+*      INTO lv_name1
+*      WHERE lifnr = lv_kunnr.
+*  ENDIF.
+*
+*
+*  SELECT SINGLE verid FROM mkal
+*    INTO  lv_verid
+*    WHERE matnr = i_zpmp AND
+*          werks = i_werks AND
+*          verid = 'V001'.
+*
+*  IF sy-subrc <> 0.
+*    SELECT SINGLE verid FROM mkal
+*       INTO  lv_verid
+*       WHERE matnr = i_zpmp AND
+*             werks = i_werks.
+*  ENDIF.
+*
+*
+*
+** calculamos la cantidades necesarias
+** cantidad ZPMP = cantidad pedido - cantidad de obsoletos seleccionados
+*  PERFORM calcular_planchas USING i_cantidad_zpmp
+*                                  i_planchas_zpmp
+*                            CHANGING lv_num_planchas_zpmp.
+*
+** cantidad ZPLP = cantidad BOM - cantidad de obsoletos seleccionados
+*  PERFORM calcular_planchas USING i_cantidad_zplp
+*                                  i_planchas_zplp
+*                            CHANGING lv_num_planchas_zplp.
+*
+*
+** verificamos el movimiento 344
+*  SELECT SINGLE * FROM ztpi0006
+*    INTO wa_ztpi0006
+*    WHERE bwart = '344' AND
+*          werks = i_werks AND
+*          lgort = '4020'.
+*
+** si el PMP ni el ZPLP no tiene obsoletos, crea la orden del ZPMP por la cantidad del pedido
+** y crea la orden del ZPLP por la cantidad de la BOM
+*  IF i_obsoletos_zpmp = '' AND i_obsoletos_zplp = ''.
+*    PERFORM crear_orden USING i_zpmp
+*                              i_werks
+*                              i_cantidad_zpmp
+*                              i_vbeln
+*                              i_posnr
+*                              lv_fecha
+*                              lv_verid
+*                          CHANGING e_orden_zpmp
+*                                   e_error
+*                                   gt_messages.
+*
+*    CHECK e_error IS INITIAL.
+*
+*    PERFORM crear_orden USING i_zplp
+*                              i_werks
+*                              i_cantidad_zplp
+*                              i_vbeln
+*                              i_posnr
+*                              lv_fecha
+*                              lv_verid
+*                          CHANGING e_orden_zplp
+*                                   e_error
+*                                   gt_messages.
+*  ENDIF.
+*
+*
+** si el PMP tiene obsoletos y el PLP no tiene obsoletos
+*  IF ( i_obsoletos_zpmp = 'X' AND i_obsoletos_zplp = '' ) .
+*    IF i_cantidad_zpmp = i_planchas_zpmp OR i_cantidad_zpmp < i_planchas_zpmp OR
+*       i_cantidad_zpmp > i_planchas_zpmp.
+*      IF wa_ztpi0006-bwart = '344'.
+*
+*        IF i_cantidad_zpmp > i_planchas_zpmp.
+**         crear orden del material del pedido (ZPMP)
+*          PERFORM crear_orden USING i_zpmp
+*                                    i_werks
+*                                    lv_num_planchas_zpmp
+*                                    i_vbeln
+*                                    i_posnr
+*                                    lv_fecha
+*                                    lv_verid
+*                                CHANGING e_orden_zpmp
+*                                         e_error
+*                                         gt_messages .
+*        ENDIF.
+*
+*        CHECK e_error IS INITIAL.
+*
+*        LOOP AT t_lotes INTO wa_lotes.
+*          PERFORM movimiento_344 USING wa_lotes
+*                                 CHANGING e_error
+*                                          gt_messages.
+*
+*          IF e_error IS INITIAL.
+*            PERFORM reclasificar_lote USING  wa_lotes
+*                                             i_vbeln
+*                                             i_posnr
+*                                             lv_kunnr
+*                                             lv_name1
+*                                      CHANGING e_error
+*                                               gt_messages.
+*          ELSE.
+*            EXIT.
+*          ENDIF.
+*        ENDLOOP.
+*      ENDIF.
+*    ELSE.
+**     recalculamos la cantidad del componente (ZPLP)
+*      PERFORM lista_materiales USING i_zpmp
+*                                     i_werks
+*                                     lv_num_planchas_zpmp
+*                              CHANGING lv_zplp
+*                                       lv_cant_zplp.
+*
+**     creamos la orden del componente (ZPLP)
+*      PERFORM crear_orden USING lv_zplp
+*                                i_werks
+*                                lv_cant_zplp
+*                                i_vbeln
+*                                i_posnr
+*                                lv_fecha
+*                                lv_verid
+*                          CHANGING e_orden_zplp
+*                                   e_error
+*                                   gt_messages.
+*
+*    ENDIF.
+*  ENDIF.
+*
+*
+*
+*
+** si el PMP no tiene obsoletos y el PLP tiene obsoletos
+*  IF ( i_obsoletos_zpmp = '' AND i_obsoletos_zplp = 'X' ) .
+*    IF i_cantidad_zplp = i_planchas_zplp OR i_cantidad_zplp < i_planchas_zplp .
+*      IF wa_ztpi0006-bwart = '344'.
+*        IF i_cantidad_zplp < i_planchas_zplp AND e_error IS INITIAL .
+*          PERFORM crear_orden USING i_zpmp
+*                                    i_werks
+*                                    i_cantidad_zpmp
+*                                    i_vbeln
+*                                    i_posnr
+*                                    lv_fecha
+*                                    lv_verid
+*                              CHANGING e_orden_zpmp
+*                                       e_error
+*                                       gt_messages.
+*
+*        ENDIF.
+*
+*        IF e_error = ''.
+*          LOOP AT t_lotes INTO wa_lotes.
+*
+*            PERFORM movimiento_344 USING wa_lotes
+*                                   CHANGING e_error
+*                                            gt_messages.
+*
+*            IF e_error IS INITIAL .
+*              PERFORM reclasificar_lote USING wa_lotes
+*                                              i_vbeln
+*                                              i_posnr
+*                                              lv_kunnr
+*                                              lv_name1
+*                                        CHANGING e_error
+*                                                 gt_messages.
+*            ELSE.
+*              EXIT.
+*            ENDIF.
+*          ENDLOOP.
+*        ENDIF.
+*      ENDIF.
+*
+*    ELSEIF i_cantidad_zplp > i_planchas_zplp .
+**     crear orden del material del pedido (ZPLP)
+*      PERFORM crear_orden USING i_zplp
+*                                i_werks
+*                                lv_num_planchas_zplp
+*                                i_vbeln
+*                                i_posnr
+*                                lv_fecha
+*                                lv_verid
+*                            CHANGING e_orden_zplp
+*                                     e_error
+*                                     gt_messages.
+*
+*      CHECK e_error IS INITIAL.
+*
+*      IF wa_ztpi0006-bwart = '344'.
+*        LOOP AT t_lotes INTO wa_lotes.
+*
+*          PERFORM movimiento_344 USING wa_lotes
+*                                 CHANGING e_error
+*                                          gt_messages.
+*
+*          IF e_error IS INITIAL.
+*            PERFORM reclasificar_lote USING wa_lotes
+*                                            i_vbeln
+*                                            i_posnr
+*                                            lv_kunnr
+*                                            lv_name1
+*                                       CHANGING e_error
+*                                                gt_messages.
+*          ELSE.
+*            EXIT.
+*          ENDIF.
+*        ENDLOOP.
+*      ENDIF.
+*
+**     creamos la orden del componente (ZPMP)
+*      IF i_reconvertido = ''.
+*        PERFORM crear_orden USING i_zpmp
+*                                  i_werks
+*                                  i_cantidad_zpmp
+*                                  i_vbeln
+*                                  i_posnr
+*                                  lv_fecha
+*                                  lv_verid
+*                            CHANGING e_orden_zpmp
+*                                     e_error
+*                                     gt_messages.
+*      ENDIF.
+*    ENDIF.
+*  ENDIF.
+*
+*
+** Tanto el PMP como el PLP tiene obsoletos
+*  IF ( i_obsoletos_zpmp = 'X' AND i_obsoletos_zplp = 'X' ) .
+*    IF i_cantidad_zpmp = i_planchas_zpmp  OR i_cantidad_zpmp < i_planchas_zpmp.
+*      IF wa_ztpi0006-bwart = '344'.
+*        LOOP AT t_lotes INTO wa_lotes.
+*
+*          PERFORM movimiento_344 USING wa_lotes
+*                                 CHANGING e_error
+*                                          gt_messages.
+*
+*          IF e_error IS INITIAL.
+*            PERFORM reclasificar_lote USING wa_lotes
+*                                            i_vbeln
+*                                            i_posnr
+*                                            lv_kunnr
+*                                            lv_name1
+*                                      CHANGING e_error
+*                                               gt_messages.
+*          ELSE.
+*            EXIT.
+*          ENDIF.
+*        ENDLOOP.
+*      ENDIF.
+*    ELSEIF i_cantidad_zpmp > i_planchas_zpmp.
+**     creamos la orden del componente (ZPMP)
+*      PERFORM crear_orden USING i_zpmp
+*                                i_werks
+*                                lv_num_planchas_zpmp
+*                                i_vbeln
+*                                i_posnr
+*                                lv_fecha
+*                                lv_verid
+*                          CHANGING e_orden_zpmp
+*                                   e_error
+*                                   gt_messages.
+*
+*      CHECK e_error IS INITIAL.
+*
+**     recalculamos la cantidad del componente (ZPLP)
+*      PERFORM lista_materiales USING i_zpmp
+*                                     i_werks
+*                                     i_planchas_zpmp "lv_num_planchas_zpmp
+*                              CHANGING lv_zplp
+*                                       lv_cant_zplp.
+*
+**     actualizo alv Obsoletos PLP con cantidad lv_cant_zplp
+*      e_obsoletos = 'X'.
+*      e_cant_zplp = lv_cant_zplp.
+*    ENDIF.
+*  ENDIF.
+*
+** A la orden creada con el ZPLP, le cambiamos la Fecha de inicio extrema
+** y le ponemos la Fecha de fin extrema - 1 de la orden creada para el material
+** ZPMP
+*  IF e_orden_zplp IS NOT INITIAL.
+*    wa_orderdata-basic_start_date = lv_fecha - 1.
+*    wa_orderdatax-basic_start_date = 'X'.
+*
+*    CALL FUNCTION 'BAPI_PROCORD_CHANGE'
+*      EXPORTING
+*        number     = e_orden_zplp
+*        orderdata  = wa_orderdata
+*        orderdatax = wa_orderdatax
+*      IMPORTING
+*        return     = wa_return
+**       ORDER_TYPE =
+**       ORDER_STATUS           =
+**       MASTER_DATA_READ       =
+*      .
+*
+*    IF wa_return-type <> 'E'.
+*      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+*        EXPORTING
+*          wait = 'X'
+**   IMPORTING
+**         RETURN        =
+*        .
+*    ENDIF.
+*
+*  ENDIF.
+
+ENDFUNCTION.

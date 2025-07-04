@@ -1,0 +1,140 @@
+FUNCTION zmm_inv_impacto_economico.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(DOCUM) TYPE  ZDOCINV
+*"     REFERENCE(DISPLAY) TYPE  FLAG OPTIONAL
+*"----------------------------------------------------------------------
+  DATA: lt_ztinv2_pi  TYPE TABLE OF ztinv2_pi WITH HEADER LINE,
+        lt_alv_ie     TYPE TABLE OF ztinv2_pi_scr WITH HEADER LINE,
+        lt_casuistica TYPE STANDARD TABLE OF dd07v WITH HEADER LINE,
+        lv_verpr      TYPE verpr,
+        lv_stprs      TYPE stprs,
+        lv_vprsv      TYPE vprsv,
+        lv_peinh      TYPE peinh.
+  FIELD-SYMBOLS: <ztinv2_pi> TYPE ztinv2_pi.
+
+  CLEAR: lv_verpr, lv_stprs, lv_vprsv, lv_peinh.
+  REFRESH: lt_alv_ie.
+
+  SELECT SINGLE * FROM ztinv2_ci
+    WHERE docum EQ docum.
+
+  CLEAR ztinv2_ci-impacto. " se va a recalcular
+
+  SELECT * FROM ztinv2_pi
+    INTO TABLE lt_ztinv2_pi
+    WHERE docum EQ docum.
+
+  CALL FUNCTION 'DD_DD07V_GET'
+    EXPORTING
+      domain_name    = 'ZCASUISTICA2'
+      langu          = sy-langu
+      withtext       = 'X'
+    TABLES
+      dd07v_tab      = lt_casuistica[]
+    EXCEPTIONS
+      access_failure = 1
+      OTHERS         = 2.
+
+  LOOP AT lt_ztinv2_pi ASSIGNING <ztinv2_pi>.
+    CLEAR lt_alv_ie.
+    MOVE-CORRESPONDING <ztinv2_pi> TO lt_alv_ie.
+
+    SELECT SINGLE verpr peinh stprs vprsv FROM mbew
+      INTO (lv_verpr, lv_peinh, lv_stprs, lv_vprsv)
+      WHERE matnr = <ztinv2_pi>-matnr
+        AND bwkey = ztinv2_ci-werks.
+
+    CASE lv_vprsv.
+      WHEN 'V'.
+        lt_alv_ie-vmver = lv_verpr.
+      WHEN 'S'.
+        lt_alv_ie-vmver = lv_stprs.
+    ENDCASE.
+    lt_alv_ie-peinh = lv_peinh.
+
+    CASE <ztinv2_pi>-casuistica.
+      WHEN 'A' OR 'B'.
+        IF <ztinv2_pi>-casuistica EQ 'A'.
+*          lt_alv_ie-tcode = 'MIGO 311'.
+        ENDIF.
+
+        lt_alv_ie-impacto = ( <ztinv2_pi>-menge_new - <ztinv2_pi>-menge ) * ( lt_alv_ie-vmver / lv_peinh ).
+        IF lt_alv_ie-impacto GE 0.
+*          lt_alv_ie-sign = '+'.
+*          lt_alv_ie-tcode = 'MI10 +'.
+        ELSE.
+*          lt_alv_ie-sign = '-'.
+*          lt_alv_ie-tcode = 'MI10 0'.
+        ENDIF.
+      WHEN 'C' OR 'D'.
+        IF lv_peinh IS NOT INITIAL.
+          CASE <ztinv2_pi>-casuistica .
+            WHEN 'C'.
+              lt_alv_ie-impacto = <ztinv2_pi>-menge * lt_alv_ie-vmver / lv_peinh.
+*              lt_alv_ie-sign = '+'.
+*              lt_alv_ie-tcode = 'MI10 +'.
+            WHEN 'D'.
+              lt_alv_ie-impacto = -1 * <ztinv2_pi>-menge * lt_alv_ie-vmver / lv_peinh.
+*              lt_alv_ie-sign = '-'.
+*              lt_alv_ie-zero = 'X'.
+*              lt_alv_ie-tcode = 'MI10 0'.
+          ENDCASE.
+        ENDIF.
+    ENDCASE.
+
+    SELECT SINGLE maktx FROM makt
+      INTO lt_alv_ie-maktx
+      WHERE matnr EQ lt_alv_ie-matnr.
+
+    " Descripción casuística:
+    READ TABLE lt_casuistica WITH KEY domvalue_l  = lt_alv_ie-casuistica
+                                      ddlanguage = sy-langu.
+
+    IF sy-subrc EQ 0.
+      lt_alv_ie-casuistica_txt = lt_casuistica-ddtext.
+    ELSE.
+      CLEAR lt_alv_ie-casuistica_txt.
+    ENDIF.
+
+    lt_alv_ie-moneda = 'EUR'.
+
+    APPEND lt_alv_ie.
+
+    <ztinv2_pi>-impacto = lt_alv_ie-impacto.
+    <ztinv2_pi>-moneda = 'EUR'.
+
+    ztinv2_ci-impacto = ztinv2_ci-impacto + lt_alv_ie-impacto.
+  ENDLOOP.
+
+  CALL FUNCTION 'ZMM_INV_INSERTAR_LOG'
+    EXPORTING
+      docum = docum
+      msgty = 'S'
+      msgid = 'ZMM'
+      msgno = '161'.
+
+  UPDATE ztinv2_pi FROM TABLE lt_ztinv2_pi[].
+  UPDATE ztinv2_ci SET  impacto = ztinv2_ci-impacto
+                        moneda = 'EUR'
+                  WHERE docum = docum.
+  COMMIT WORK AND WAIT.
+
+  IF display IS NOT INITIAL.
+    CALL FUNCTION 'DISPLAY_BASIC_LIST'
+      EXPORTING
+        basic_list_title    = 'Resumen de impacto económico'
+        file_name           = 'PP'
+        data_structure      = 'ZTINV2_PI_SCR'
+      TABLES
+        data_tab            = lt_alv_ie
+      EXCEPTIONS
+        download_problem    = 1
+        no_data_tab_entries = 2
+        table_mismatch      = 3
+        print_problems      = 4
+        OTHERS              = 5.
+  ENDIF.
+
+ENDFUNCTION.

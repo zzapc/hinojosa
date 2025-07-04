@@ -1,0 +1,327 @@
+
+class ZHCL_MATERIALES_CORE definition
+  public
+  final
+  create public .
+
+public section.
+
+  class-methods GET_PDF
+    importing
+      value(VP_MATNR) type MARA-MATNR
+    returning
+      value(VP_PDF) type XSTRING
+    raising
+      /IWBEP/CX_MGW_BUSI_EXCEPTION .
+protected section.
+private section.
+
+  class-methods GET_PDF_AL11
+    importing
+      value(VP_MATNR) type MARA-MATNR
+      value(VP_ALIAS_AL11) type CLIKE
+    returning
+      value(VP_PDF) type XSTRING
+    raising
+      /IWBEP/CX_MGW_BUSI_EXCEPTION .
+  class-methods GET_PDF_FTP
+    importing
+      value(VP_USER) type CLIKE
+      value(VP_PWD) type CLIKE
+      value(VP_HOST) type CLIKE
+      value(VP_DIR) type CLIKE
+      value(VP_MATNR) type MARA-MATNR
+    returning
+      value(VP_PDF) type XSTRING
+    raising
+      /IWBEP/CX_MGW_BUSI_EXCEPTION .
+endclass. "ZHCL_MATERIALES_CORE definition
+class ZHCL_MATERIALES_CORE implementation.
+  METHOD get_pdf.
+
+    SELECT *
+      INTO TABLE @DATA(tl_zparametros)
+      FROM zparametros
+      WHERE clave = 'HINIMAG'
+      ORDER BY atributo1 DESCENDING, campo ASCENDING.
+
+    SELECT marc~werks, marc~matnr
+      INTO TABLE @DATA(tl_marc)
+      FROM marc
+      WHERE marc~matnr = @vp_matnr.
+    IF sy-subrc <> 0.
+      zcl_seis_odata_utils=>lanzar_excepcion( 'No se ha encontrado el material' ).
+    ENDIF.
+
+    LOOP AT tl_marc ASSIGNING FIELD-SYMBOL(<fs_marc>).
+      READ TABLE tl_zparametros ASSIGNING FIELD-SYMBOL(<fs_zparametros>) WITH KEY campo = <fs_marc>-werks.
+      CHECK sy-subrc = 0.
+
+      DATA(vl_tipo)     = <fs_zparametros>-atributo1.
+      DATA(vl_destino)  = <fs_zparametros>-atributo2.
+      DATA(vl_ruta)     = <fs_zparametros>-atributo3.
+      DATA(vl_user)     = <fs_zparametros>-atributo4.
+      DATA(vl_pwd)      = <fs_zparametros>-atributo5.
+
+      CASE vl_tipo.
+        WHEN 'FTP'.
+          TRY.
+              vp_pdf = get_pdf_ftp( vp_matnr = <fs_marc>-matnr
+                                    vp_host  = vl_destino
+                                    vp_dir   = vl_ruta
+                                    vp_user  = vl_user
+                                    vp_pwd   = vl_pwd ).
+            CATCH /iwbep/cx_mgw_busi_exception INTO DATA(rl_busi_exception).
+          ENDTRY.
+
+        WHEN 'AL11'.
+          TRY.
+              vp_pdf = get_pdf_al11( vp_matnr       = <fs_marc>-matnr
+                                     vp_alias_al11  = vl_destino ).
+            CATCH /iwbep/cx_mgw_busi_exception INTO rl_busi_exception.
+          ENDTRY.
+
+        WHEN OTHERS.
+      ENDCASE.
+
+      IF vp_pdf IS NOT INITIAL.
+        RETURN.
+      ENDIF.
+    ENDLOOP.
+
+    IF vp_pdf IS INITIAL AND rl_busi_exception IS BOUND.
+      RAISE EXCEPTION rl_busi_exception.
+    ENDIF.
+
+
+
+  ENDMETHOD.
+  METHOD get_pdf_al11.
+    CLEAR vp_pdf.
+
+
+    DATA vl_filename TYPE epsfilnam.
+    DATA vl_path_pdf TYPE string.
+    DATA mess        TYPE string.
+
+
+    SELECT SINGLE dirname
+      INTO @DATA(vl_dirname)
+      FROM user_dir
+      WHERE aliass = @vp_alias_al11.
+    IF sy-subrc <> 0.
+      zcl_seis_odata_utils=>lanzar_excepcion( 'No se ha parametrizado el directorio' ).
+    ENDIF.
+
+
+
+    DATA(vl_dir_name) = CONV epsf-epsdirnam( vl_dirname ).
+    DATA tl_dir_list  TYPE TABLE OF epsfili.
+
+    vl_path_pdf = vl_dirname && '/' && vp_matnr && '.pdf'.
+
+    OPEN DATASET vl_path_pdf FOR INPUT IN BINARY MODE MESSAGE mess.
+    IF sy-subrc <> 0.
+      CALL FUNCTION 'EPS_GET_DIRECTORY_LISTING'
+        EXPORTING
+          dir_name               = vl_dir_name
+        TABLES
+          dir_list               = tl_dir_list
+        EXCEPTIONS
+          invalid_eps_subdir     = 1
+          sapgparam_failed       = 2
+          build_directory_failed = 3
+          no_authorization       = 4
+          read_directory_failed  = 5
+          too_many_read_errors   = 6
+          empty_directory_list   = 7
+          OTHERS                 = 8.
+
+      DATA vl_name TYPE epsfili-name.
+
+      SELECT SINGLE mtart
+        INTO @DATA(vl_mtart)
+        FROM mara
+        WHERE matnr = @vp_matnr.
+      IF sy-subrc <> 0.
+        zcl_seis_odata_utils=>lanzar_excepcion( 'Material incorrecto' ).
+      ENDIF.
+
+      vl_name = SWITCH #( vl_mtart WHEN 'ZTRO' THEN vp_matnr(13) ELSE vp_matnr ).
+      LOOP AT tl_dir_list ASSIGNING FIELD-SYMBOL(<fs_dir_list>) WHERE name CP |{ vl_name }*|.
+        vl_filename = <fs_dir_list>-name. EXIT.
+      ENDLOOP.
+      IF vl_filename IS INITIAL.
+        RETURN.
+      ENDIF.
+
+      vl_path_pdf = vl_dirname && '/' && vl_filename.
+      OPEN DATASET vl_path_pdf FOR INPUT IN BINARY MODE MESSAGE mess.
+    ENDIF.
+    IF sy-subrc <> 0.
+      zcl_seis_odata_utils=>lanzar_excepcion( mess ).
+    ENDIF.
+
+    READ DATASET vl_path_pdf INTO vp_pdf.
+    CLOSE DATASET vl_path_pdf.
+
+    IF vp_pdf IS INITIAL.
+      zcl_seis_odata_utils=>lanzar_excepcion( |No se ha encontrado fichero { vl_path_pdf } { cl_abap_char_utilities=>newline } para el material { vp_matnr ALPHA = out }| ).
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD get_pdf_ftp.
+    CLEAR vp_pdf.
+
+    TYPES: BEGIN OF st_result,
+             line(100) TYPE c,
+           END OF st_result.
+
+
+    CONSTANTS: cl_key_ftp_scramble TYPE i VALUE 26101957,
+               cl_compress         TYPE c VALUE 'N'.
+
+    DATA: tl_result   TYPE TABLE OF st_result,
+          vl_handle   TYPE i,
+          vl_command  TYPE text100,
+          tl_ficheros TYPE TABLE OF text40,
+          tl_blob     TYPE TABLE OF blob.
+
+
+    tl_ficheros = VALUE #( ( |{ vp_matnr }.pdf|  )
+                           ( |R{ vp_matnr }.pdf| )
+                           ( |S{ vp_matnr }.pdf| ) ).
+
+
+    DATA(vl_len) = strlen( vp_pwd ).
+
+    CALL FUNCTION 'HTTP_SCRAMBLE'
+      EXPORTING
+        source      = vp_pwd
+        sourcelen   = vl_len
+        key         = cl_key_ftp_scramble
+      IMPORTING
+        destination = vp_pwd.
+
+
+    CALL FUNCTION 'FTP_CONNECT'
+      EXPORTING
+        user            = vp_user
+        password        = vp_pwd
+        host            = vp_host
+        rfc_destination = 'SAPFTPA'
+      IMPORTING
+        handle          = vl_handle
+      EXCEPTIONS
+        not_connected   = 1
+        OTHERS          = 2.
+    IF sy-subrc <> 0.
+      zcl_seis_odata_utils=>lanzar_excepcion( ).
+    ENDIF.
+
+
+    CLEAR tl_result.
+    vl_command = |cd { vp_dir }|.
+    CALL FUNCTION 'FTP_COMMAND'
+      EXPORTING
+        handle        = vl_handle
+        command       = vl_command
+        compress      = cl_compress
+      TABLES
+        data          = tl_result
+      EXCEPTIONS
+        command_error = 1
+        tcpip_error   = 2.
+    IF sy-subrc <> 0.
+*      zcl_seis_odata_utils=>lanzar_excepcion( ).
+      CALL FUNCTION 'FTP_DISCONNECT'
+        EXPORTING
+          handle = vl_handle.
+      RETURN.
+    ENDIF.
+
+
+
+    LOOP AT tl_ficheros ASSIGNING FIELD-SYMBOL(<fs_ficheros>).
+      CLEAR tl_result.
+      vl_command = |get { <fs_ficheros> }|.
+      CALL FUNCTION 'FTP_COMMAND'
+        EXPORTING
+          handle        = vl_handle
+          command       = vl_command
+          compress      = cl_compress
+        TABLES
+          data          = tl_result
+        EXCEPTIONS
+          command_error = 1
+          tcpip_error   = 2.
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+
+      CLEAR tl_blob.
+      CALL FUNCTION 'FTP_CLIENT_TO_R3'
+        EXPORTING
+          fname           = <fs_ficheros>
+          rfc_destination = 'SAPFTPA'
+        IMPORTING
+          blob_length     = vl_len
+        TABLES
+          blob            = tl_blob
+        EXCEPTIONS
+          command_error   = 1
+          data_error      = 2
+          OTHERS          = 3.
+      IF sy-subrc <> 0.
+        zcl_seis_odata_utils=>lanzar_excepcion( ).
+      ENDIF.
+
+      LOOP AT tl_blob ASSIGNING FIELD-SYMBOL(<fs_blob>).
+        CONCATENATE vp_pdf <fs_blob>-content INTO vp_pdf IN BYTE MODE.
+      ENDLOOP.
+
+
+      "Borramos fichero local
+      IF vp_pdf IS NOT INITIAL.
+        CLEAR tl_result.
+        vl_command = |!rm { <fs_ficheros> }|.
+
+        CALL FUNCTION 'FTP_COMMAND'
+          EXPORTING
+            handle        = vl_handle
+            command       = vl_command
+          TABLES
+            data          = tl_result
+          EXCEPTIONS
+            tcpip_error   = 1
+            command_error = 2
+            data_error    = 3.
+*        IF sy-subrc <> 0.
+*          zcl_seis_odata_utils=>lanzar_excepcion( ).
+*        ENDIF.
+
+
+        EXIT.
+      ENDIF.
+    ENDLOOP.
+
+    CALL FUNCTION 'FTP_DISCONNECT'
+      EXPORTING
+        handle = vl_handle.
+
+
+    IF vp_pdf IS INITIAL.
+      DATA vl_message TYPE string.
+      vl_message = |No se ha encontrado fichero en: { vp_dir }/{ tl_ficheros[ 1 ] } { cl_abap_char_utilities=>newline }| &&
+                   |    { vp_dir }/{ tl_ficheros[ 2 ] } { cl_abap_char_utilities=>newline }| &&
+                   |    { vp_dir }/{ tl_ficheros[ 3 ] }|.
+
+      zcl_seis_odata_utils=>lanzar_excepcion( vl_message ).
+    ENDIF.
+
+
+
+
+
+
+  ENDMETHOD.

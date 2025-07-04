@@ -1,0 +1,334 @@
+FUNCTION zsdcom_contabilizar_provision.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IS_DATO) TYPE  ZTSDCOM_POS
+*"  EXPORTING
+*"     VALUE(E_BELNR) TYPE  BELNR_D
+*"     VALUE(E_BUKRS) TYPE  BUKRS
+*"     VALUE(E_GJAHR) TYPE  GJAHR
+*"  TABLES
+*"      ET_RETURN STRUCTURE  BAPIRET2 OPTIONAL
+*"----------------------------------------------------------------------
+
+  DATA: lti_acc_gl  TYPE TABLE OF bapiacgl09,
+        lti_curr    TYPE TABLE OF bapiaccr09,
+        lti_caracpa TYPE TABLE OF bapiackec9,
+        lti_valuepa TYPE TABLE OF bapiackev9,
+        lti_ext     TYPE TABLE OF bapiparex,
+        lti_return  TYPE TABLE OF bapiret2.
+
+  DATA: ls_header  TYPE bapiache09,
+        ls_acc_gl  TYPE bapiacgl09,
+        ls_curr    TYPE bapiaccr09,
+        ls_caracpa TYPE bapiackec9,
+        ls_valuepa TYPE bapiackev9,
+        ls_ext     TYPE bapiparex,
+        ls_return  TYPE bapiret2,
+        ls_contab  TYPE ztsdcom005.
+
+  DATA: lv_type    TYPE awtyp,
+        lv_key     TYPE awkey,
+        lv_sys     TYPE awsys,
+        lv_erkrs   TYPE erkrs,
+        lv_grcta   TYPE zsdcom_grcta,
+        lv_saknr1  TYPE saknr,
+        lv_saknr2  TYPE saknr,
+        lv_bschl_d TYPE bschl,
+        lv_bschl_h TYPE bschl,
+        lv_name1   TYPE name1_gp,
+        lv_ind     TYPE i,
+        lv_prctr   TYPE prctr,
+        lv_vkorg   TYPE vkorg,
+        lv_vtweg   TYPE vtweg,
+        lv_fkart   TYPE fkart,
+        lv_hkont   TYPE hkont.
+
+* GST - 30/07/2014 - 7000004643 ->
+  DATA: ls_acc_gl_aux   TYPE bapiacgl09.
+* GST - 30/07/2014 - 7000004643 <-
+
+
+* Sacamos el customizing del comisionista para la contabilización
+  SELECT SINGLE grcta INTO lv_grcta
+      FROM  ztsdcom002
+      WHERE bukrs = is_dato-bukrs
+      AND   lifnr = is_dato-lifnr.
+  IF sy-subrc <> 0.
+    ls_return-id          = 'ZSDCOM'.
+    ls_return-type        = 'E'.
+    ls_return-number      = '023'.
+    ls_return-message_v1  = is_dato-lifnr.
+    APPEND ls_return TO et_return.
+    EXIT.
+  ENDIF.
+
+* Sacamos los datos de contabilización
+  SELECT SINGLE * INTO ls_contab
+      FROM  ztsdcom005
+      WHERE bukrs = is_dato-bukrs
+      AND   grcta = lv_grcta
+      "AND kschl eq is_dato-kschl "EMP: 11.09.18
+      AND   tipoa = '01'. "provisión
+  IF sy-subrc <> 0.
+    SELECT SINGLE * INTO ls_contab
+        FROM  ztsdcom005
+        WHERE bukrs = is_dato-bukrs
+        AND   grcta = lv_grcta
+        AND   tipoa = '01'. "provisión
+    IF sy-subrc <> 0.
+      ls_return-id          = 'ZSDCOM'.
+      ls_return-type        = 'E'.
+      ls_return-number      = '024'.
+      ls_return-message_v1  = lv_grcta.
+      APPEND ls_return TO et_return.
+      EXIT.
+    ENDIF.
+  ENDIF.
+
+* Nombre del proveedor (comisionista)
+  SELECT SINGLE name1 INTO lv_name1
+      FROM  lfa1
+      WHERE lifnr = is_dato-lifnr.
+
+* Cargamos las cuentas del debe y el haber
+* Si nos llegan en la estructura las mantenemos
+  IF is_dato-sakn1 IS NOT INITIAL.
+*   Dependiendo del signo las cambiamos de orden para los abonos
+    IF is_dato-kwert > 0.
+      lv_saknr1 = is_dato-sakn1.
+      lv_saknr2 = is_dato-sakn2.
+    ELSE.
+      lv_saknr1 = is_dato-sakn2.
+      lv_saknr2 = is_dato-sakn1.
+    ENDIF.
+* Sino, las cogemos de la parametrización de pendiendo del signo
+  ELSE.
+    IF is_dato-kwert > 0.
+      lv_saknr1 = ls_contab-saknr_deb.
+      lv_saknr2 = ls_contab-saknr_hab.
+    ELSE.
+      lv_saknr1 = ls_contab-saknr_hab.
+      lv_saknr2 = ls_contab-saknr_deb.
+    ENDIF.
+  ENDIF.
+
+* Cargamos las claves contables
+* Si nos llegan en la estructura las mantenemos
+  IF ls_contab-bschl_deb IS NOT INITIAL.
+    lv_bschl_d = ls_contab-bschl_deb.
+    lv_bschl_h = ls_contab-bschl_hab.
+  ENDIF.
+
+
+* Rellenamos los datos de cabecera
+* ---------------------------------------------------------------------
+  ls_header-username    = sy-uname.
+  ls_header-comp_code   = is_dato-bukrs.
+  ls_header-doc_date    = is_dato-erdat.
+  ls_header-pstng_date  = is_dato-erdat.
+  ls_header-fisc_year   = is_dato-erdat(4).
+  ls_header-doc_type    = ls_contab-blart.
+  ls_header-ref_doc_no  = is_dato-vbeln.
+  ls_header-header_txt  = lv_name1.
+
+
+* Rellenamos las posiciones con las cuentas
+* ---------------------------------------------------------------------
+  CLEAR ls_acc_gl.
+  ls_acc_gl-itemno_acc = '0000000001'.
+  ls_acc_gl-gl_account = lv_saknr1.
+  ls_acc_gl-alloc_nmbr = is_dato-lifnr.
+  ls_acc_gl-bus_area = is_dato-gsber.
+
+  ls_acc_gl-ref_key_3  = is_dato-vbeln.
+  ls_acc_gl-ref_key_2  = is_dato-lifnr.
+
+  ls_acc_gl-item_text  = lv_name1.
+  APPEND ls_acc_gl TO lti_acc_gl.
+
+  CLEAR ls_acc_gl.
+  ls_acc_gl-itemno_acc = '0000000002'.
+  ls_acc_gl-gl_account = lv_saknr2.
+  ls_acc_gl-alloc_nmbr = is_dato-lifnr.
+  ls_acc_gl-bus_area = is_dato-gsber.
+  ls_acc_gl-ref_key_3  = is_dato-vbeln.
+  ls_acc_gl-ref_key_2  = is_dato-lifnr.
+  ls_acc_gl-item_text  = lv_name1.
+  APPEND ls_acc_gl TO lti_acc_gl.
+  "poner centro de coste/ centro de beneficio
+  "obtener organizacion de venta
+  IF is_dato-kwert > 0.
+    lv_hkont = lv_saknr1.
+  ELSE.
+    lv_hkont = lv_saknr2.
+  ENDIF.
+
+  SELECT SINGLE vkorg vtweg fkart  INTO (lv_vkorg, lv_vtweg, lv_fkart ) FROM vbrk
+    WHERE vbeln = is_dato-vbeln.
+
+  IF sy-subrc EQ 0.
+    SELECT SINGLE prctr INTO lv_prctr
+      FROM  zscot002
+      WHERE vkorg = lv_vkorg
+        AND vtweg = lv_vtweg
+        AND hkont = lv_hkont
+        AND fkart = lv_fkart.
+    IF sy-subrc NE 0.
+      "cogemos la entrada por defecto
+      SELECT SINGLE prctr INTO lv_prctr
+       FROM  zscot002
+       WHERE vkorg = lv_vkorg
+         AND vtweg = lv_vtweg
+         AND hkont = lv_hkont
+         AND ( fkart = '' OR fkart IS NULL ).
+
+    ENDIF.
+    LOOP AT lti_acc_gl INTO ls_acc_gl WHERE  gl_account = lv_hkont  .
+      ls_acc_gl-costcenter   = lv_prctr.
+      MODIFY lti_acc_gl FROM ls_acc_gl.
+    ENDLOOP.
+
+  ENDIF.
+
+* Añadimos las claves contables a la EXTENSION (ver BADI ZZSDCOM_BADI_ACC_DOCUMENT)
+* ---------------------------------------------------------------------
+  IF lv_bschl_d IS NOT INITIAL.
+*   Clave contable posición 1
+    CLEAR ls_ext.
+    ls_ext-structure  = 'ZSDCOM'.
+    ls_ext-valuepart1 = 'BSCHL'.
+    ls_ext-valuepart2 = '0000000001'.
+    ls_ext-valuepart3 = lv_bschl_d.
+    APPEND ls_ext TO lti_ext.
+
+*   Clave contable posición 1
+    CLEAR ls_ext.
+    ls_ext-structure  = 'ZSDCOM'.
+    ls_ext-valuepart1 = 'BSCHL'.
+    ls_ext-valuepart2 = '0000000002'.
+    ls_ext-valuepart3 = lv_bschl_h.
+    APPEND ls_ext TO lti_ext.
+  ENDIF.
+
+
+* Líneas con los importes
+* ---------------------------------------------------------------------
+  CLEAR ls_curr.
+  ls_curr-itemno_acc = '0000000001'.
+  ls_curr-curr_type  = '00'.
+  ls_curr-currency   = is_dato-waerk.
+  ls_curr-amt_doccur = is_dato-kwert.
+* Si el importe es negativo (ABONO) cambiamos el signo ya que le hemos
+* dado la vuelta a las cuentas.
+  IF is_dato-kwert < 0.
+    ls_curr-amt_doccur = -1 * ls_curr-amt_doccur.
+  ENDIF.
+  APPEND ls_curr TO lti_curr.
+
+  CLEAR ls_curr.
+  ls_curr-itemno_acc = '0000000002'.
+  ls_curr-curr_type  = '00'.
+  ls_curr-currency   = is_dato-waerk.
+  ls_curr-amt_doccur = -1 * is_dato-kwert.
+* Si el importe es negativo (ABONO) cambiamos el signo ya que le hemos
+* dado la vuelta a las cuentas.
+  IF is_dato-kwert < 0.
+    ls_curr-amt_doccur = -1 * ls_curr-amt_doccur.
+  ENDIF.
+  APPEND ls_curr TO lti_curr.
+
+
+* Recuperamos la sociedad PA de la sociedad
+* ---------------------------------------------------------------------
+  PERFORM recuperar_soc_pa USING    is_dato-bukrs
+                           CHANGING lv_erkrs.
+
+* Si tenemos sociedad PA -> Llamamos a la función para rellenar las tablas con
+* las características y valores que llevará el apunte financiero
+  IF lv_erkrs IS NOT INITIAL.
+*   Llamamos a la función que nos rellena las tablas de PA
+    CALL FUNCTION 'ZSDCOM_MAP_CAMPOSPA_DOCFI'
+      EXPORTING
+        is_dato    = is_dato
+        i_tipoa    = '01'
+      TABLES
+        et_caracpa = lti_caracpa
+        et_valuepa = lti_valuepa.
+
+
+*   Recorremos la tabla de característica poniendo la posición
+    LOOP AT lti_caracpa INTO ls_caracpa.
+      lv_ind = sy-tabix.
+*     Controlamos la imputación dependiendo de ABONOS o CARGOS
+      IF is_dato-kwert > 0.
+        ls_caracpa-itemno_acc = '0000000001'.
+      ELSE.
+        ls_caracpa-itemno_acc = '0000000002'.
+      ENDIF.
+      MODIFY lti_caracpa FROM ls_caracpa INDEX lv_ind.
+    ENDLOOP.
+
+*   Recorremos la tabla de valores poniendo la posición
+    LOOP AT lti_valuepa INTO ls_valuepa.
+      lv_ind = sy-tabix.
+*     Controlamos la imputación dependiendo de ABONOS o CARGOS
+      IF is_dato-kwert > 0.
+        ls_valuepa-itemno_acc = '0000000001'.
+      ELSE.
+        ls_valuepa-itemno_acc = '0000000002'.
+      ENDIF.
+      MODIFY lti_valuepa FROM ls_valuepa INDEX lv_ind.
+    ENDLOOP.
+  ENDIF.
+
+* Solo contabilizar si esta parametrizado como contabilizar
+  DATA l_ztsdcom002 TYPE ztsdcom002.
+  CLEAR l_ztsdcom002.
+  SELECT SINGLE * INTO l_ztsdcom002 FROM ztsdcom002
+    WHERE lifnr = is_dato-lifnr
+      AND bukrs = is_dato-bukrs
+      AND gsber = is_dato-gsber.
+  IF l_ztsdcom002-tipol <> space AND l_ztsdcom002-tipol <> '00'.
+
+* Llamamos a la función de contabilizar
+* ---------------------------------------------------------------------
+    CALL FUNCTION 'BAPI_ACC_DOCUMENT_POST'
+      EXPORTING
+        documentheader = ls_header
+      IMPORTING
+        obj_type       = lv_type
+        obj_key        = lv_key
+        obj_sys        = lv_sys
+      TABLES
+        accountgl      = lti_acc_gl
+        currencyamount = lti_curr
+        criteria       = lti_caracpa
+        valuefield     = lti_valuepa
+        return         = lti_return
+        extension2     = lti_ext.
+
+* Control de errores
+    READ TABLE lti_return INTO ls_return WITH KEY type = 'E'.
+    IF sy-subrc <> 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+    ENDIF.
+
+* Pasamos los mensajes a la tabla de salida
+    et_return[] = lti_return[].
+
+* Devolvemos el número de apunte contable
+    IF lv_key IS NOT INITIAL.
+      e_belnr = lv_key(10).
+      e_bukrs = lv_key+10(4).
+      e_gjahr = lv_key+14(4).
+    ENDIF.
+  ELSE.
+    e_belnr = '9999999999'.
+    e_bukrs = is_dato-bukrs.
+    e_gjahr = '9999'.
+  ENDIF.
+
+ENDFUNCTION.

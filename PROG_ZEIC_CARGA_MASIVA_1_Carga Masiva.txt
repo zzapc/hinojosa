@@ -1,0 +1,1030 @@
+*&---------------------------------------------------------------------*
+*& Report  ZEIC_CARGA_MASIVA_1
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT zeic_carga_masiva_1 MESSAGE-ID zeic_firma.
+
+INCLUDE zeic_constants.
+
+INCLUDE zeic_f01.
+
+INCLUDE <icon>.
+
+INCLUDE <symbol>.
+
+TYPE-POOLS: slis.
+
+CLASS cl_gui_resources DEFINITION LOAD.
+
+*tabla con los datos a mostrar en el alv
+DATA: BEGIN OF gt_tab_datos_cab OCCURS 0.
+        INCLUDE STRUCTURE zeic_datos_carga.
+DATA: zver(1),       "Campo que se utiliza para que funcione la
+      "selección de líneas
+      fecha_doc(10),
+      fecha_cont(10),
+      fecha_gener(10),
+      END OF gt_tab_datos_cab.
+
+DATA:
+  g_okcode               TYPE        sy-ucomm,
+  g_container_d0100      TYPE REF TO cl_gui_custom_container,
+  g_container_name_d0100 TYPE        scrfname VALUE 'D0100_CONTAINER',
+  g_grid_d0100           TYPE REF TO cl_gui_alv_grid.
+
+DATA: g_title             TYPE lvc_title,    " Título del formulario
+      gt_grid             TYPE lvc_s_glay,
+      gt_list_top_of_page TYPE slis_t_listheader,
+      i_structure_name    LIKE dd02l-tabname VALUE 'I_BKPF'.
+
+DATA: gt_fieldcat TYPE lvc_t_fcat WITH HEADER LINE,
+      gs_layout   TYPE lvc_s_layo,
+      gt_sort     TYPE lvc_t_sort WITH HEADER LINE,
+      is_print    TYPE slis_print_alv.
+
+DATA: gt_tab_param TYPE TABLE OF zeic_visor WITH HEADER LINE.
+
+DATA: BEGIN OF it_bukrs OCCURS 0,
+        sign(1),
+        option(2),
+        low       LIKE /cockpit/thdr-comp_code,
+        high      LIKE /cockpit/thdr-comp_code,
+      END OF it_bukrs.
+
+TABLES zeic_historicos.
+
+CONSTANTS:
+  c_pf_status_set TYPE slis_formname VALUE 'STATUS_SET',
+  c_user_command  TYPE slis_formname VALUE 'USER_COMMAND',
+  c_form_cabecera TYPE slis_formname VALUE 'CABECERA',
+  c_tipo_grande   TYPE c VALUE 'H',
+  c_hist          TYPE c VALUE '1'.
+
+***********************************************************
+* INITIALIZATION
+***********************************************************
+SELECTION-SCREEN: BEGIN OF LINE,
+                  POSITION 16.
+SELECTION-SCREEN: COMMENT 40(50) text,
+                  END OF LINE.
+
+INITIALIZATION.
+
+  text = 'Este programa NO se puede ejecutar en fondo'(043).
+***********************************************************
+* PARAMETROS DE SELECCION
+***********************************************************
+  SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-044.
+  SELECT-OPTIONS: s_bukrs FOR zeic_historicos-zeic_compcode ."sociedad
+  SELECT-OPTIONS: s_gjahr FOR zeic_historicos-zeic_fiscalyear.         "año fiscal
+  SELECT-OPTIONS: s_belnr FOR zeic_historicos-zeic_sapdocno.           "nro doc sap
+  SELECT-OPTIONS: s_date   FOR bkpf-budat .     "fecha contabilizacion
+  SELECT-OPTIONS: s_gener FOR zeic_historicos-zeic_generado.
+  PARAMETERS:     c_downl AS CHECKBOX DEFAULT 'X' .
+  SELECTION-SCREEN END OF BLOCK b1.
+
+
+
+***********************************************************
+* START-OF-SELECTION
+***********************************************************
+START-OF-SELECTION.
+
+  IF sy-batch = 'X'.
+
+    MESSAGE e701(bc) WITH 'No se puede ejecutar en fondo'(043).
+
+  ELSE.
+
+
+    PERFORM seleccionar_datos_pantalla.
+    PERFORM panel_de_alertas.
+
+  ENDIF.
+
+
+*---------------------------------------------------------------------*
+*       FORM AUTHORTY CHECK                                           *
+*---------------------------------------------------------------------*
+FORM authority_check USING ps_bukrs LIKE  /cockpit/sif-comp_code
+                           ps_lifnr LIKE  /cockpit/sif-vendor_no
+                           pb_auth_act  LIKE  boole-boole.
+
+  CLEAR: pb_auth_act.
+
+  CALL FUNCTION '/COCKPIT/AUTHORITY_CHECK'
+    EXPORTING
+      i_actvt        = con_activity_display
+      i_bukrs        = ps_bukrs
+      i_lifnr        = ps_lifnr
+    EXCEPTIONS
+      not_authorized = 1
+      error_occured  = 2
+      OTHERS         = 3.
+
+  IF sy-subrc NE 0.
+    pb_auth_act = con_true.
+  ENDIF.
+
+ENDFORM.                    "authority_check
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECCIONAR_DATOS
+*&---------------------------------------------------------------------*
+FORM seleccionar_datos_pantalla.
+
+  DATA: lt_zeic_hist LIKE zeic_historicos OCCURS 0 WITH HEADER LINE.
+  DATA: ls_zeic_hist LIKE zeic_historicos.
+
+  DATA: lt_messages LIKE bapiret2 OCCURS 0 WITH HEADER LINE.
+
+  DATA: lb_auth_act LIKE boole-boole.
+  DATA: l_tabix LIKE sy-tabix.
+
+  DATA: BEGIN OF it_soc OCCURS 0,
+          sign   TYPE c LENGTH 1,
+          option TYPE c LENGTH 2,
+          low    LIKE t001-bukrs,
+          high   LIKE t001-bukrs,
+        END OF it_soc.
+
+  DATA: lt_tab_datos_det LIKE zeic_datos_det   OCCURS 0 WITH HEADER LINE.
+  DATA: ls_datos_cab LIKE zeic_datos_carga.
+  DATA: lb_error LIKE boole-boole.
+  DATA: ic_factura TYPE /cockpit/dinv_ind.
+  DATA: no_soc LIKE boole-boole.
+
+
+
+  DATA: BEGIN OF it_bukrs OCCURS 0,
+          sign(1),
+          option(2),
+          low       LIKE /cockpit/thdr-comp_code,
+          high      LIKE /cockpit/thdr-comp_code,
+        END OF it_bukrs.
+
+  CLEAR: it_bukrs, lt_zeic_hist, gt_tab_datos_cab, gt_tab_param.
+  REFRESH: it_bukrs, lt_zeic_hist, gt_tab_datos_cab, gt_tab_param.
+
+
+
+  CLEAR: it_bukrs.
+  REFRESH: it_bukrs.
+
+* Sociedades de la parametrización
+  SELECT bukrs FROM zeic_param_visor INTO it_bukrs-low.
+    it_bukrs-sign = 'I'.
+    it_bukrs-option = 'EQ'.
+    PERFORM authority_check USING  it_bukrs-low
+                               '*'
+                               lb_auth_act.
+    IF lb_auth_act NE con_true.
+      APPEND it_bukrs.
+    ENDIF.
+  ENDSELECT.
+
+
+* Sociedades del select-options.
+  DELETE s_bukrs WHERE low = '    '.
+
+  IF s_bukrs[] IS INITIAL.
+    it_soc[] = it_bukrs[].
+  ELSE.
+    SELECT bukrs FROM t001 INTO t001-bukrs WHERE bukrs IN s_bukrs AND bukrs IN it_bukrs.
+      PERFORM authority_check USING  t001-bukrs
+                               '*'
+                               lb_auth_act.
+      IF lb_auth_act NE con_true.
+        it_soc-sign = 'I'.
+        it_soc-option = 'EQ'.
+        it_soc-low = t001-bukrs.
+        APPEND it_soc.
+      ENDIF.
+    ENDSELECT.
+    IF sy-subrc NE 0.
+      no_soc = 'X'.
+    ENDIF.
+  ENDIF.
+
+
+
+* Se rellena la tabla de parametrización según las sociedades.
+  LOOP AT it_soc.
+    l_tabix = sy-tabix.
+    CLEAR gt_tab_param.
+    SELECT SINGLE * FROM zeic_param_visor WHERE bukrs = it_soc-low.
+    IF sy-subrc EQ 0.
+      SELECT SINGLE * FROM zeic_visor INTO CORRESPONDING FIELDS OF gt_tab_param WHERE codparam = zeic_param_visor-codparam
+          AND cod_visor = c_hist.
+      IF sy-subrc EQ 0.
+        gt_tab_param-codparam = zeic_param_visor-bukrs.
+        APPEND gt_tab_param.
+      ELSE.
+        DELETE it_soc INDEX l_tabix.
+        no_soc = 'X'.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  IF it_soc[] IS INITIAL AND no_soc = 'X'.
+  ELSE.
+    SELECT * FROM zeic_historicos INTO TABLE lt_zeic_hist
+     WHERE zeic_compcode   IN it_soc AND
+*         zeic_compcode in it_bukrs and
+           zeic_fiscalyear IN s_gjahr AND
+           zeic_sapdocno   IN s_belnr AND
+           zeic_generado  IN s_gener.
+  ENDIF.
+  IF c_downl = 'X'.
+    DELETE lt_zeic_hist WHERE zeic_generado NE con_fech_ini.
+  ENDIF.
+
+
+
+  DESCRIBE TABLE lt_zeic_hist.
+  IF sy-tfill EQ 0.
+
+*   No existen datos para la selección
+    MESSAGE i000(zeic_firma).
+  ELSE.
+
+    LOOP AT lt_zeic_hist INTO ls_zeic_hist.
+      CLEAR: gt_tab_datos_cab.
+      CALL FUNCTION 'ZEIC_OBTENER_DOCUMENTO'
+        EXPORTING
+          ic_bukrs        = ls_zeic_hist-zeic_compcode
+          ic_belnr        = ls_zeic_hist-zeic_sapdocno
+          ic_gjahr        = ls_zeic_hist-zeic_fiscalyear
+        IMPORTING
+          e_datos_cab     = ls_datos_cab
+        TABLES
+          c_tab_datos_det = lt_tab_datos_det
+          e_tab_messages  = lt_messages
+        CHANGING
+          ib_error        = lb_error
+          ic_factura      = ic_factura
+        EXCEPTIONS
+          error_occured   = 1.
+
+
+      IF lb_error = con_true.
+
+* Se eliminan los registros erróneos de la tabla de históricos.
+*      delete from zeic_historicos where zeic_compcode = ls_zeic_hist-zeic_compcode and
+*                                        zeic_sapdocno = ls_zeic_hist-zeic_sapdocno and
+*                                        zeic_fiscalyear = ls_zeic_hist-zeic_fiscalyear.
+        COMMIT WORK.
+
+      ELSE.
+*   Se cambia la fecha a formato externo.
+
+        CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+          EXPORTING
+            date_internal = ls_datos_cab-bldat
+          IMPORTING
+            date_external = gt_tab_datos_cab-fecha_doc.
+
+*   Se cambia la fecha a formato externo.
+
+        CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+          EXPORTING
+            date_internal = ls_datos_cab-budat
+          IMPORTING
+            date_external = gt_tab_datos_cab-fecha_cont.
+
+
+*   Se cambia la fecha a formato externo.
+        IF ls_zeic_hist-zeic_generado NE con_fech_ini.
+          CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+            EXPORTING
+              date_internal = ls_zeic_hist-zeic_generado
+            IMPORTING
+              date_external = gt_tab_datos_cab-fecha_gener.
+        ENDIF.
+
+* Sólo se muestran los registros que cumplen fecha de contabilización.
+        IF ls_datos_cab-budat IN s_date.
+          MOVE-CORRESPONDING ls_datos_cab TO gt_tab_datos_cab.
+          IF ic_factura NE 'X'.
+* Es abono.
+            gt_tab_datos_cab-wrbtr = gt_tab_datos_cab-wrbtr * ( -1 ).
+            gt_tab_datos_cab-net_amount = gt_tab_datos_cab-net_amount * ( -1 ).
+
+            gt_tab_datos_cab-base1 = gt_tab_datos_cab-base1 * ( -1 ).
+            gt_tab_datos_cab-tax_amount1 = gt_tab_datos_cab-tax_amount1 * ( -1 ).
+
+            gt_tab_datos_cab-base2 = gt_tab_datos_cab-base2 * ( -1 ).
+            gt_tab_datos_cab-tax_amount2 = gt_tab_datos_cab-tax_amount2 * ( -1 ).
+
+            gt_tab_datos_cab-base3 = gt_tab_datos_cab-base3 * ( -1 ).
+            gt_tab_datos_cab-tax_amount3 = gt_tab_datos_cab-tax_amount3  * ( -1 ).
+
+            gt_tab_datos_cab-base4 = gt_tab_datos_cab-base4 * ( -1 ).
+            gt_tab_datos_cab-tax_amount4 = gt_tab_datos_cab-tax_amount4  * ( -1 ).
+
+            gt_tab_datos_cab-base5 = gt_tab_datos_cab-base5 * ( -1 ).
+            gt_tab_datos_cab-tax_amount5 = gt_tab_datos_cab-tax_amount5  * ( -1 ).
+
+            gt_tab_datos_cab-base6 = gt_tab_datos_cab-base6 * ( -1 ).
+            gt_tab_datos_cab-tax_amount6 = gt_tab_datos_cab-tax_amount6  * ( -1 ).
+* Abono
+          ENDIF.
+          APPEND gt_tab_datos_cab.
+        ENDIF.
+
+      ENDIF.
+    ENDLOOP.
+
+    IF gt_tab_datos_cab[] IS INITIAL.
+      MESSAGE i000(zeic_firma).
+    ENDIF.
+  ENDIF.
+
+
+
+ENDFORM.                    "seleccionar_datos_pantalla
+
+*&---------------------------------------------------------------------*
+*&      Form  panel_de_alertas
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM panel_de_alertas .
+
+  PERFORM f_alv_configuration.
+
+* Display the report.
+  PERFORM f_alv_display_report.
+
+ENDFORM.                    " panel_de_alertas
+
+*&---------------------------------------------------------------------*
+*&      Form  f_alv_configuration
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_alv_configuration .
+
+* Configure the ALV layout.
+  PERFORM f_alv_layout_configuration.
+  PERFORM f_alv_field_configuration.
+
+ENDFORM.                    " f_alv_configuration
+
+*&---------------------------------------------------------------------*
+*&      Form  f_alv_layout_configuration
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_alv_layout_configuration .
+  DATA: n          TYPE i,
+        lineas(10) TYPE n.
+
+  CLEAR: g_title, gt_grid, gs_layout, is_print.
+
+* Asignación de valores de informe
+
+
+* Asignación de valores de informe
+  DESCRIBE TABLE gt_tab_datos_cab LINES n.
+  lineas = n.
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+    EXPORTING
+      input  = lineas
+    IMPORTING
+      output = lineas.
+
+
+  CONCATENATE 'Documentos a Generar Datos de históricos ('(002) lineas ')'(003) INTO g_title.
+
+  gt_grid-top_p_only = 'X'.
+  gt_grid-eol_p_only = 'X'.
+  gt_grid-coll_end_l = 'X'.
+  gt_grid-coll_top_p = 'X'.
+  is_print-no_change_print_params = 'X'.
+
+  gs_layout-cwidth_opt = 'X'.
+  gs_layout-sel_mode = 'A'.    "'A' multiples lineas
+  gs_layout-zebra = 'X'.
+  gs_layout-box_fname = 'ZVER'.
+
+  DATA: ls_line TYPE slis_listheader.
+
+  CLEAR:ls_line, gt_list_top_of_page.
+  REFRESH: gt_list_top_of_page.
+
+  ls_line-key = 'TITULO REPORTE'.
+  ls_line-typ = c_tipo_grande.
+  ls_line-info = 'TITULO REPORTE'.
+
+  APPEND ls_line TO gt_list_top_of_page.
+
+
+ENDFORM.                    " f_alv_layout_configuration
+
+*&---------------------------------------------------------------------*
+*&      Form  f_alv_display_report
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_alv_display_report .
+  DATA: numero     TYPE i,
+        lineas(10) TYPE n.
+
+  IF NOT gt_tab_datos_cab[] IS INITIAL.
+
+    SORT gt_tab_datos_cab BY bukrs gjahr belnr.
+
+    CLEAR gt_sort.
+    REFRESH gt_sort.
+
+* Eliminar duplicados del listado.
+
+    DELETE ADJACENT DUPLICATES FROM gt_tab_datos_cab COMPARING bukrs gjahr belnr.
+
+
+    DESCRIBE TABLE gt_tab_datos_cab LINES numero.
+    lineas = numero.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = lineas
+      IMPORTING
+        output = lineas.
+
+    CONCATENATE 'Generación Datos Históricos Visor ('(004) lineas ')'(003) INTO g_title .
+
+
+    CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY_LVC'
+      EXPORTING
+        i_callback_program       = sy-repid
+* Este sólo si quieres un status determinado
+        i_callback_pf_status_set = 'STATUS_SET'
+        i_callback_user_command  = c_user_command
+        i_callback_top_of_page   = 'CABECERA'
+        i_structure_name         = i_structure_name
+        i_grid_title             = g_title
+        i_grid_settings          = gt_grid
+        is_layout_lvc            = gs_layout
+        it_fieldcat_lvc          = gt_fieldcat[]
+        it_sort_lvc              = gt_sort[]
+*       i_default                = 'X'
+*       i_save                   = 'A'
+*       is_print                 = is_print
+      TABLES
+        t_outtab                 = gt_tab_datos_cab[].
+
+  ENDIF.
+
+
+ENDFORM.                    " f_alv_display_report
+
+*&---------------------------------------------------------------------*
+*&      Form  f_alv_field_configuration
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_alv_field_configuration .
+
+  CLEAR gt_fieldcat.
+  REFRESH gt_fieldcat.
+
+* Este campo se necesita para que cree las lineas seleccionables
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'ZVER'
+                              'VER'
+                              '1'
+                              'X'.
+
+* Ya generado
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'FECHA_GENER'
+                              'Ya generado'(009)
+                              '10'
+                              ''.
+
+* Sociedad
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'BUKRS'
+                              'Sociedad'(010)
+                              '4'
+                              ''.
+* Ejercicio
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'GJAHR'
+                              'Ejercicio'(011)
+                              '4'
+                              ''.
+* Nro documento
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'BELNR'
+                              'Doc. SAP'(012)
+                              '14'
+                              ''.
+
+* Nro factura
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'XBLNR'
+                              'NúmFactura'(013)
+                              '10'
+                             ''.
+
+* Proveedor codigo
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'LIFNR'
+                              'Cod.Prov.'(014)
+                              '200'
+                              ''.
+* Proveedor nombre
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'NAME'
+                              'Nombre Prov.'(015)
+                              '200'
+                              ''.
+
+* Moneda
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'WAERS'
+                              'Moneda'(016)
+                              '5'
+                              ''.
+* Importe bruto
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'WRBTR'
+                              'Bruto'(017)
+                              '13'
+                              ''.
+
+* Importe bruto
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'NET_AMOUNT'
+                              'Neto'(018)
+                              '13'
+                              ''.
+
+* Fecha documento
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'FECHA_DOC'
+                              'Fecha doc'(019)
+                              '8'
+                              ''.
+* Fecha contabilización
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'FECHA_CONT'
+                              'Fecha contable'(020)
+                              '8'
+                              ''.
+
+* Tipo Iva1
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_RATE1'
+                              'Tipo Iva 1'(021)
+                              '7'
+                              ''.
+
+* Base Iva1
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'BASE1'
+                              'Base 1'(022)
+                              '13'
+                              ''.
+
+* Importe Iva1
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_AMOUNT1'
+                              'Importe 1'(023)
+                              '13'
+                              ''.
+
+* Tipo Iva2
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_RATE2'
+                              'Tipo Iva 2'(024)
+                              '7'
+                              ''.
+
+
+* Base Iva2
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'BASE2'
+                              'Base 2'(025)
+                              '13'
+                              ''.
+
+* Importe Iva2
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_AMOUNT2'
+                              'Importe 2'(026)
+                              '13'
+                              ''.
+
+* Tipo Iva3
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_RATE3'
+                              'Tipo Iva 3'(027)
+                              '7'
+                              ''.
+
+
+
+* Base Iva3
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'BASE3'
+                              'Base 3'(028)
+                              '13'
+                              ''.
+
+* Importe Iva3
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_AMOUNT3'
+                              'Importe 3'(029)
+                              '13'
+                              ''.
+
+
+* Tipo Iva4
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_RATE4'
+                              'Tipo Iva 4'(030)
+                              '7'
+                              ''.
+
+
+
+* Base Iva4
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'BASE4'
+                              'Base 4'(031)
+                              '13'
+                              ''.
+
+* Importe Iva4
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_AMOUNT4'
+                              'Importe 4'(032)
+                              '13'
+                              ''.
+
+* Tipo Iva5
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_RATE5'
+                              'Tipo Iva 5'(033)
+                              '7'
+                              ''.
+
+
+
+* Base Iva5
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'BASE5'
+                              'Base 5'(034)
+                              '13'
+                              ''.
+
+* Importe Iva5
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_AMOUNT5'
+                              'Importe 5'(035)
+                              '13'
+                              ''.
+
+
+* Tipo Iva6
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_RATE6'
+                              'Tipo Iva 6'(036)
+                              '7'
+                              ''.
+
+
+
+* Base Iva6
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'BASE6'
+                              'Base 6'(037)
+                              '13'
+                              ''.
+
+* Importe Iva6
+  PERFORM fill_fieldcat USING 'gt_tab_datos_cab'
+                              'TAX_AMOUNT6'
+                              'Importe 6'(038)
+                              '13'
+                              ''.
+
+ENDFORM.                    " f_alv_field_configuration
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_fieldcat
+*&---------------------------------------------------------------------*
+*   Atributos de los campos
+*----------------------------------------------------------------------*
+
+FORM fill_fieldcat USING   p_tabla
+                           p_field
+                           p_texto
+                           p_long
+                           p_ver.
+
+*  gt_fieldcat-ref_table = p_tabla.
+  gt_fieldcat-txt_field = p_field.
+  gt_fieldcat-fieldname = p_field.
+  gt_fieldcat-reptext = gt_fieldcat-seltext = p_texto.
+  gt_fieldcat-no_out = p_ver.
+  gt_fieldcat-tabname = p_tabla.
+  gt_fieldcat-outputlen = p_long.
+
+  IF ( p_field = 'BELNR' ).
+
+    gt_fieldcat-hotspot = 'X'.
+
+  ENDIF.
+
+
+* Campo de importe justificados a la dcha
+  IF p_long = 17.
+    gt_fieldcat-just = 'R'.
+  ENDIF.
+
+* para ocultar la columna (aunque realmente está) ...
+  IF p_field = 'ZVER'.
+    gt_fieldcat-checkbox = 'X'.
+    gt_fieldcat-edit = 'X'.
+  ENDIF.
+
+  APPEND gt_fieldcat.
+  CLEAR gt_fieldcat.
+
+ENDFORM.                    " fill_fieldcat
+
+*---------------------------------------------------------------------*
+*       FORM CABECERA                                                   *
+*---------------------------------------------------------------------*
+FORM cabecera.
+
+  DATA : l_logo TYPE sdydo_value.
+
+  CLEAR l_logo.
+  l_logo = 'ERASE'.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = gt_list_top_of_page.
+*     I_LOGO                   = 'ENJOY'.
+*     I_END_OF_LIST_GRID       =
+
+ENDFORM.                    "CABECERA
+
+*---------------------------------------------------------------------*
+*       FORM STATUS                                                   *
+*---------------------------------------------------------------------*
+FORM status_set USING rt_extab TYPE slis_t_extab.
+
+* Status de la barra de titulos
+  SET PF-STATUS 'STANDARD_F'. " excluding rt_extab.
+
+
+
+ENDFORM.                    "status_set
+
+*---------------------------------------------------------------------*
+*       FORM user_command                                             *
+*---------------------------------------------------------------------*
+FORM user_command USING p_ucomm LIKE sy-ucomm
+                         p_campo TYPE slis_selfield.
+
+  DATA: lt_rows TYPE lvc_t_row.
+  DATA: l_var(1).
+
+  DATA: lt_messages LIKE bapiret2 OCCURS 0 WITH HEADER LINE.
+  DATA: li_num TYPE i.
+  DATA: li_reg_proc TYPE i.
+  DATA: li_reg_error TYPE i.
+  DATA: lb_error LIKE boole-boole.
+  DATA: lb_error_proc LIKE boole-boole.
+  DATA: ls_ruta_descarga LIKE zeic_visor-ruta_descarga.
+  DATA: ls_zeic_hist LIKE zeic_historicos.
+  DATA: li_answer(1).
+  DATA: l_del_aut(1).
+
+  DATA: BEGIN OF it_sociedad OCCURS 0,
+          bukrs LIKE /cockpit/thdr-comp_code,
+        END OF it_sociedad.
+
+
+  CASE p_ucomm.
+
+    WHEN 'BACK' OR 'EXIT' OR 'CANCEL' OR '&F03'.
+
+      LEAVE TO SCREEN 0.
+
+    WHEN '&GEN'.
+      CLEAR l_del_aut.
+      CLEAR ls_ruta_descarga.
+      READ TABLE gt_tab_datos_cab WITH KEY zver = 'X'.
+
+      IF sy-subrc <> 0.
+        MESSAGE i010.
+      ELSE.
+
+        CLEAR: lt_messages.
+        REFRESH: lt_messages.
+
+        CLEAR: li_reg_proc, li_reg_error, lb_error_proc.
+
+        SORT gt_tab_datos_cab BY bukrs.
+
+        LOOP AT gt_tab_datos_cab WHERE zver = 'X'.
+
+          CLEAR ls_zeic_hist.
+          SELECT SINGLE * FROM zeic_historicos INTO ls_zeic_hist
+           WHERE zeic_sapdocno   = gt_tab_datos_cab-belnr AND
+                 zeic_compcode   = gt_tab_datos_cab-bukrs AND
+                 zeic_fiscalyear = gt_tab_datos_cab-gjahr.
+
+          IF sy-subrc = 0.
+* Sólo se intenta generar datos si campo ruta informado.
+            IF ls_zeic_hist-zeic_image IS INITIAL.
+
+            ELSE.
+              READ TABLE gt_tab_param WITH KEY codparam = gt_tab_datos_cab-bukrs.
+              it_sociedad-bukrs = gt_tab_datos_cab-bukrs.
+              APPEND it_sociedad.
+              CLEAR lb_error.
+              CALL FUNCTION 'ZEIC_OBTENER_DATOS_VISOR'
+                EXPORTING
+                  ic_bukrs       = ls_zeic_hist-zeic_compcode
+                  ic_belnr       = ls_zeic_hist-zeic_sapdocno
+                  ic_gjahr       = ls_zeic_hist-zeic_fiscalyear
+*                 ic_ruta_imagen = ls_zeic_hist-zeic_image
+                  ic_formato     = gt_tab_param-tipo_formato
+                  ic_ind_rescan  = cte_hist
+                  ic_ruta        = gt_tab_param-ruta_descarga
+*                 ic_origen      = gt_tab_datos_cab-docno " Factura generada desde Cockpit: No histórico.
+                  ic_fich_cab    = gt_tab_param-fich_cabecera
+                  ic_fich_lin    = gt_tab_param-fich_linea
+                TABLES
+                  e_tab_messages = lt_messages
+                CHANGING
+                  ib_error       = lb_error
+                EXCEPTIONS
+                  error_occured  = 1
+                  OTHERS         = 2.
+
+              IF lb_error = con_true.
+
+                lb_error_proc = con_true.
+                li_reg_error = li_reg_error + 1.
+              ELSE.
+                li_reg_proc = li_reg_proc + 1.
+
+                IF gt_tab_param-hist_elim_autom = 'X'.
+*             Una vez generado el fichero se elimina el registro de la tabla de historicos automáticamente una vez generado
+                  DELETE FROM zeic_historicos
+                        WHERE zeic_sapdocno   = gt_tab_datos_cab-belnr AND
+                              zeic_compcode  = gt_tab_datos_cab-bukrs AND
+                              zeic_fiscalyear = gt_tab_datos_cab-gjahr.
+                ELSE.
+* No se elimina el registro de la tabla de históricos y se actualiza la fecha de ya generado.
+                  SELECT SINGLE * FROM zeic_historicos INTO ls_zeic_hist
+                      WHERE zeic_sapdocno   = gt_tab_datos_cab-belnr AND
+                            zeic_compcode   = gt_tab_datos_cab-bukrs AND
+                            zeic_fiscalyear = gt_tab_datos_cab-gjahr.
+                  ls_zeic_hist-zeic_generado = sy-datum.
+                  MODIFY zeic_historicos FROM ls_zeic_hist.
+                  COMMIT WORK.
+
+                ENDIF.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+
+        ENDLOOP.
+
+        CLEAR lb_error.
+
+
+        SORT it_sociedad.
+        DELETE ADJACENT DUPLICATES FROM it_sociedad.
+
+        LOOP AT it_sociedad.
+          READ TABLE gt_tab_param WITH KEY codparam = it_sociedad-bukrs.
+
+*         Se cifra los registros que se hayan podido generar en el fichero.
+          PERFORM cifrado_datos TABLES lt_messages
+                                USING  gt_tab_param-ruta_encripta
+                                       gt_tab_param-prog_encripta
+                                       lb_error
+                                       con_true.
+
+          IF lb_error = 'X'.
+            MESSAGE i001 WITH it_sociedad-bukrs.
+          ENDIF.
+        ENDLOOP.
+
+
+        IF lb_error_proc = con_true.
+*           Se muestra el mensaje, si hubo error en algun registro se muestra
+*           cuantos registros dieron error y cuantos se generaron correctamente.
+          MESSAGE i002 WITH li_reg_error li_reg_proc.
+        ELSE.
+*           Se muestra el mensaje, se procesaron correctamente.
+          MESSAGE i003 WITH li_reg_proc.
+        ENDIF.
+
+      ENDIF.
+    WHEN '&IC1'. " HotSpot.
+      IF p_campo-fieldname = 'BELNR'.
+        READ TABLE gt_tab_datos_cab INDEX p_campo-tabindex.
+        SET PARAMETER ID 'BLN' FIELD gt_tab_datos_cab-belnr.
+        SET PARAMETER ID 'BUK' FIELD gt_tab_datos_cab-bukrs.
+        SET PARAMETER ID 'GJR' FIELD gt_tab_datos_cab-gjahr.
+        CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN .
+
+
+      ENDIF.
+    WHEN '&DEL'.  " Eliminar Registros de la tabla.
+      READ TABLE gt_tab_datos_cab WITH KEY zver = 'X'.
+
+      IF sy-subrc <> 0.
+        MESSAGE i010.
+      ELSE.
+        CALL FUNCTION 'POPUP_TO_CONFIRM'
+          EXPORTING
+            text_question         = 'Se eliminarán estos registros.  Continuar?'(005)
+            text_button_1         = 'Si'(006)
+            text_button_2         = 'No'(007)
+            default_button        = '2'
+            display_cancel_button = 'X'
+          IMPORTING
+            answer                = li_answer
+          EXCEPTIONS
+            text_not_found        = 1
+            OTHERS                = 2.
+        IF sy-subrc <> 0.
+        ENDIF.
+
+        IF li_answer = '1'.
+
+          CALL FUNCTION 'POPUP_TO_CONFIRM'
+            EXPORTING
+              text_question         = 'Se eliminarán estos registros.  Continuar?'(005)
+              text_button_1         = 'Si'(006)
+              text_button_2         = 'No'(007)
+              default_button        = '2'
+              display_cancel_button = 'X'
+            IMPORTING
+              answer                = li_answer
+            EXCEPTIONS
+              text_not_found        = 1
+              OTHERS                = 2.
+          IF sy-subrc <> 0.
+          ENDIF.
+
+          IF li_answer = '1'.
+
+            LOOP AT gt_tab_datos_cab WHERE zver = 'X'.
+              READ TABLE gt_tab_param WITH KEY codparam = gt_tab_datos_cab-bukrs.
+              IF gt_tab_param-hist_elim_autom = ' '.
+
+                DELETE FROM zeic_historicos
+                      WHERE zeic_sapdocno   = gt_tab_datos_cab-belnr AND
+                            zeic_compcode   = gt_tab_datos_cab-bukrs AND
+                            zeic_fiscalyear = gt_tab_datos_cab-gjahr.
+              ENDIF.
+            ENDLOOP.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+    WHEN '&REF'.
+      PERFORM seleccionar_datos_pantalla.
+      PERFORM panel_de_alertas.
+      SET SCREEN 0.
+      LEAVE SCREEN.
+
+
+    WHEN OTHERS.
+* AÃ?ADIR TODOS LOS CASOS DE COMMAND QUE EXISTA
+  ENDCASE.
+
+ENDFORM.                    "user_command

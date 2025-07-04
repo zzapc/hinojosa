@@ -1,0 +1,118 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZDYN_AP_I_MD_SUPPLIER_RSO
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  md_get_supplier_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_GT_SUPPLIER  text
+*----------------------------------------------------------------------*
+FORM md_get_supplier_data
+  TABLES   gt_supplier_tmp STRUCTURE gs_supplier_tmp
+           gt_supplier     STRUCTURE gs_supplier
+  USING    uptorows
+  CHANGING cb_exit_loop.
+
+  DATA:
+    li_lines TYPE i,
+    lt_lfas  TYPE TABLE OF lfas,
+    lwa_lfas TYPE lfas.
+
+  SELECT *
+         FROM zdyn_iv_v_vmde_o
+         INTO CORRESPONDING FIELDS OF TABLE gt_supplier_tmp
+         UP TO uptorows ROWS
+         WHERE lifnr IN lifnr
+           AND land1 IN land1
+           AND ktokk IN ktokk
+           AND bukrs IN bukrs
+           AND loevm IN loevm
+           AND sperr IN sperr
+           AND lifnr > gs_sup_last_row-lifnr
+         ORDER BY lifnr land1 bukrs.
+  IF sy-subrc <> 0. cb_exit_loop = 'X'. EXIT. ENDIF.
+
+* Find last lifnr - new selection must start from saved lifnr
+  DESCRIBE TABLE gt_supplier_tmp LINES li_lines.
+  READ TABLE gt_supplier_tmp INTO gs_sup_last_row INDEX li_lines.
+
+* We need to process all entries of last lifnr in one batch.
+* Select above can skip some of them.
+  SELECT *
+        FROM zdyn_iv_v_vmde_o
+        APPENDING CORRESPONDING FIELDS OF TABLE gt_supplier_tmp
+        WHERE lifnr = gs_sup_last_row-lifnr
+           AND land1 IN land1
+           AND ktokk IN ktokk
+           AND bukrs IN bukrs
+           AND loevm IN loevm
+           AND sperr IN sperr
+        ORDER BY lifnr land1 bukrs.
+
+  SORT gt_supplier_tmp BY lifnr land1 bukrs.
+
+  IF bukrschk = con_true.
+*   Export of data, which are company code dependend
+    DELETE ADJACENT DUPLICATES FROM gt_supplier_tmp
+      COMPARING lifnr land1 bukrs.
+  ELSE.
+*   Export of data, which are NOT company code dependend
+    DELETE ADJACENT DUPLICATES FROM gt_supplier_tmp
+      COMPARING lifnr land1.
+  ENDIF.
+
+  CLEAR:
+    gc_land1,
+    gc_landx.
+
+* Get all other VAT numbers (if needed)
+  IF p_supcca EQ abap_true.
+    FREE lt_lfas.
+    SELECT * FROM lfas INTO TABLE lt_lfas FOR ALL ENTRIES IN gt_supplier_tmp
+      WHERE lifnr EQ gt_supplier_tmp-lifnr.
+  ENDIF.
+
+* Copy Supplier data to target table (EMEIC1301)
+  LOOP AT gt_supplier_tmp INTO gs_supplier_tmp.
+    CLEAR:
+      gs_supplier.
+
+*   Do not send empty VAT number
+    IF gs_supplier_tmp-stceg IS INITIAL.
+      gs_supplier_tmp-stceg = con_no_vat.
+    ENDIF.
+
+*   see EBY8346-828 for more explainations EMEIC1337
+    IF gc_land1 NE gs_supplier_tmp-land1.
+      gc_land1 = gs_supplier_tmp-land1.
+      SELECT SINGLE landx FROM t005t
+                          INTO gc_landx
+                         WHERE land1 EQ gs_supplier_tmp-land1 AND
+                               spras EQ sy-langu.
+      IF sy-subrc NE 0.
+        SELECT SINGLE landx FROM t005t
+                            INTO gc_landx
+                           WHERE land1 EQ gs_supplier_tmp-land1 AND
+                                 spras EQ 'E'.
+        IF sy-subrc NE 0.
+          gc_landx = space.  " no translation found
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    MOVE-CORRESPONDING gs_supplier_tmp TO gs_supplier.
+    gs_supplier-landx = gc_landx.
+
+    APPEND gs_supplier TO gt_supplier.
+
+*   Now add other VAT nr (if found and request)
+    IF p_supcca EQ abap_true.
+      LOOP AT lt_lfas INTO lwa_lfas WHERE lifnr EQ gs_supplier-lifnr.
+        gs_supplier-stceg = lwa_lfas-stceg.
+        APPEND gs_supplier TO gt_supplier.
+      ENDLOOP.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                     " md_get_supplier_data

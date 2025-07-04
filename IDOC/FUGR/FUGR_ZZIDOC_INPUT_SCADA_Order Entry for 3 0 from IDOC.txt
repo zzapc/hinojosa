@@ -1,0 +1,592 @@
+FUNCTION zzidoc_input_scada.
+*"----------------------------------------------------------------------
+*"*"Interfase global
+*"  IMPORTING
+*"     VALUE(INPUT_METHOD) LIKE  BDWFAP_PAR-INPUTMETHD
+*"     VALUE(MASS_PROCESSING) LIKE  BDWFAP_PAR-MASS_PROC
+*"  EXPORTING
+*"     VALUE(WORKFLOW_RESULT) LIKE  BDWFAP_PAR-RESULT
+*"     VALUE(APPLICATION_VARIABLE) LIKE  BDWFAP_PAR-APPL_VAR
+*"     VALUE(IN_UPDATE_TASK) LIKE  BDWFAP_PAR-UPDATETASK
+*"     VALUE(CALL_TRANSACTION_DONE) LIKE  BDWFAP_PAR-CALLTRANS
+*"     VALUE(DOCUMENT_NUMBER) LIKE  VBAK-VBELN
+*"  TABLES
+*"      IDOC_CONTRL STRUCTURE  EDIDC
+*"      IDOC_DATA STRUCTURE  EDIDD
+*"      IDOC_STATUS STRUCTURE  BDIDOCSTAT
+*"      RETURN_VARIABLES STRUCTURE  BDWFRETVAR
+*"      SERIALIZATION_INFO STRUCTURE  BDI_SER
+*"      EDI_TEXT STRUCTURE  EDIORDTXT1 OPTIONAL
+*"      EDI_TEXT_LINES STRUCTURE  EDIORDTXT2 OPTIONAL
+*"  EXCEPTIONS
+*"      WRONG_FUNCTION_CALLED
+*"      OTHERS
+*"----------------------------------------------------------------------
+*ENHANCEMENT-POINT IDOC_INPUT_ORDERS_G1 SPOTS ES_SAPLVEDA.
+
+  DATA: lt_header LIKE bapi_rcomhapi OCCURS 0.
+  DATA: ls_header TYPE bapi_rcomhapi.
+  DATA: lt_charac LIKE bapi_rcomeapi OCCURS 0.
+  DATA: ls_charac TYPE bapi_rcomeapi.
+  DATA: lt_process LIKE bapi_rcomh OCCURS 0.
+  DATA: ls_process TYPE bapi_rcomh.
+  DATA: lt_headerreturn LIKE bapi_rcomhrtc OCCURS 0.
+  DATA: ls_headerreturn TYPE bapi_rcomhrtc.
+  DATA: lt_characreturn LIKE bapi_rcomertc OCCURS 0.
+  DATA: ls_characreturn TYPE bapi_rcomertc.
+  DATA: lt_return LIKE bapiret2 OCCURS 0.
+  DATA: ls_return TYPE bapiret2.
+  DATA: lv_id_tmp TYPE co_msid2.
+
+  DATA: ls_idoc_status TYPE bdidocstat,
+        ls_idoc_contrl TYPE edidc.
+
+  DATA: ls_cab TYPE zppcabp.
+  DATA: ls_pos TYPE zppmenp.
+  DATA: lt_pos TYPE TABLE OF zppmenp.
+  DATA: lt_pos_aux TYPE TABLE OF zppmenp.
+  DATA: ls_pos_aux TYPE zppmenp.
+  DATA: lt_pos_charg TYPE TABLE OF zppmenp.
+  DATA: ls_pos_charg TYPE zppmenp.
+  DATA: ls_idoc_act TYPE edidd,
+        lv_ind      LIKE sy-tabix.
+  DATA: lv_aufnr      TYPE aufnr,
+        lv_licha      TYPE lichn,
+        lv_matnr      TYPE matnr,
+        lv_unit_iso   TYPE msehi,
+        lv_unit_sap   TYPE msehi,
+        lv_char_value TYPE atwrt.
+
+* GST - 14/04/2015 ->
+  DATA: lv_charg     TYPE charg_d,
+        lv_charg_aux TYPE charg_d,
+        lv_xchpf     TYPE xchpf,
+        lv_cons_er   TYPE xflag.
+* GST - 14/04/2015 <-
+
+* GST - 21/10/2015 ->
+  DATA: ls_charac_aux   TYPE bapi_rcomeapi,
+        ls_charac_aux_2 TYPE bapi_rcomeapi,
+        lv_pulper       TYPE xflag,
+        lv_reproceso    TYPE xflag,
+        lv_no_vacio     TYPE xflag,
+        lv_no_motivo    TYPE xflag.
+* GST - 21/10/2015 <-
+
+  in_update_task = 'X'.
+
+  CLEAR: lt_pos, lt_pos_aux, lt_pos_charg.
+  REFRESH: lt_pos, lt_pos_aux, lt_pos_charg.
+
+* SABER QUE MENSAJE DE PROCESO SE DEBE CREAR
+  READ TABLE idoc_data INTO ls_idoc_act
+  WITH KEY segnam = 'ZPPCABP'.
+  IF sy-subrc = 0.
+    ls_cab = ls_idoc_act-sdata.
+
+*RECUPERAMOS TODAS LAS POSICIONES
+    LOOP AT idoc_data INTO ls_idoc_act WHERE segnam = 'ZPPMENP'.
+      CLEAR ls_pos.
+      ls_pos = ls_idoc_act-sdata.
+      APPEND ls_pos TO lt_pos.
+    ENDLOOP.
+  ENDIF.
+
+* NOS QUEDAMOS EN LA TABLA AUXILIAR LAS DIFERENTES POSICIONES
+  lt_pos_aux[] = lt_pos[].
+  lt_pos_charg[] = lt_pos[].
+  SORT lt_pos_aux ASCENDING BY posnr.
+  DELETE ADJACENT DUPLICATES FROM lt_pos_aux COMPARING posnr .
+
+  CLEAR: lt_header, ls_header, lt_charac, lt_process, lt_return, lt_characreturn, lt_headerreturn.
+  REFRESH: lt_header, lt_charac, lt_process, lt_return, lt_characreturn, lt_headerreturn.
+
+  LOOP AT lt_pos_aux INTO ls_pos_aux.
+
+    CLEAR: ls_process, lv_id_tmp.
+    lv_id_tmp = 1.
+    ls_process-proc_mess_id_tmp = lv_id_tmp.
+    APPEND ls_process TO lt_process.
+
+    CLEAR: ls_header.
+    ls_header-proc_mess_id_tmp = lv_id_tmp.
+    ls_header-sender_name = ls_cab-sender_name.
+    ls_header-plant = ls_cab-plant.
+    ls_header-proc_mess_category = ls_cab-proc_mess_category.
+    APPEND ls_header TO lt_header.
+
+* GST - 14/04/2015 ->
+    CLEAR lv_charg.
+    CLEAR lv_cons_er.
+* GST - 14/04/2015 <-
+
+    LOOP AT lt_pos INTO ls_pos WHERE posnr = ls_pos_aux-posnr.
+**************************************
+* PARA LOS MENSAJES DE CLASIFICAR LOTE BOBINA TENEMOS QUE IR A BUSCAR EL LOTE DEL MATERIAL CREADO POR SAP
+* PARA ELLOS EN LA CREACION DEL LOTE HEMOS GUARDADO EN EL CAMPO "LOTE PROVEEDOR" EL NUMERO DE LA ORDEN + CONTADOR DE BOBINA DE LA ORDEN
+
+* GST - 01/04/2015 - Se recupera el lote para ZI_BT_CL y para ZI_PROD3
+      IF ls_cab-proc_mess_category = 'ZI_BT_CL' OR ls_cab-proc_mess_category = 'ZI_PROD3' OR ls_cab-proc_mess_category = 'ZI_PROD1'.
+        CASE ls_pos-name_char.
+          WHEN 'PPPI_BATCH'.
+            IF ls_pos-char_value IS INITIAL.
+
+              CLEAR ls_pos_charg.
+              READ TABLE lt_pos_charg INTO ls_pos_charg
+              WITH KEY name_char = 'PPPI_PROCESS_ORDER'.
+              IF sy-subrc = 0.
+                CLEAR: lv_aufnr, lv_licha.
+                lv_aufnr = ls_pos_charg-char_value.
+
+                CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+                  EXPORTING
+                    input  = lv_aufnr
+                  IMPORTING
+                    output = lv_aufnr.
+
+                CONCATENATE lv_aufnr ls_pos-countid_kk INTO lv_licha.
+
+                CLEAR: ls_pos_charg, lv_matnr.
+                READ TABLE lt_pos_charg INTO ls_pos_charg
+                WITH KEY name_char = 'PPPI_MATERIAL'.
+
+                lv_matnr = ls_pos_charg-char_value.
+
+                SELECT SINGLE charg INTO ls_pos-char_value
+                FROM mch1
+                WHERE matnr = lv_matnr
+                AND licha = lv_licha.
+
+* GST - 14/04/2015 ->
+                lv_charg = ls_pos-char_value.
+* GST - 14/04/2015 <-
+
+              ENDIF.
+* GST - 14/04/2015 ->
+            ELSE.
+              lv_charg = ls_pos-char_value.
+* GST - 21/04/2015 ->
+              CLEAR: ls_pos_charg, lv_matnr.
+              READ TABLE lt_pos_charg INTO ls_pos_charg
+              WITH KEY name_char = 'PPPI_MATERIAL'.
+
+              lv_matnr = ls_pos_charg-char_value.
+
+              CLEAR lv_charg_aux.
+              SELECT SINGLE charg INTO lv_charg_aux
+              FROM mch1
+              WHERE matnr = lv_matnr
+              AND charg = lv_charg.
+
+              IF lv_charg_aux IS INITIAL.
+                CLEAR lv_charg.
+              ENDIF.
+* GST - 21/04/2015 <-
+* GST - 14/04/2015 <-
+            ENDIF.
+          WHEN 'PPPI_UNIT_OF_MEASURE'.
+            CLEAR: lv_unit_iso, lv_unit_sap.
+            lv_unit_iso = ls_pos_charg-char_value.
+
+            CALL FUNCTION 'ISO_TO_SAP_MEASURE_UNIT_CODE'
+              EXPORTING
+                iso_code  = lv_unit_iso
+              IMPORTING
+                sap_code  = lv_unit_sap
+*               UNIQUE    =
+              EXCEPTIONS
+                not_found = 1
+                OTHERS    = 2.
+            IF sy-subrc <> 0.
+* Implement suitable error handling here
+            ELSE.
+              CLEAR ls_pos_charg-char_value.
+              ls_pos_charg-char_value = lv_unit_sap.
+            ENDIF.
+          WHEN OTHERS.
+        ENDCASE.
+      ENDIF.
+
+* GST - 15/04/2015 ->
+* Bobina PULPER: Rellenar para el material PULPER el lote:
+      IF ls_cab-proc_mess_category = 'ZI_CONS' AND ls_cab-sender_name = 'SCADA_BOBINA'.
+        CASE ls_pos-name_char.
+          WHEN 'PPPI_BATCH'.
+            IF ls_pos-char_value IS INITIAL.
+              CLEAR ls_pos_charg.
+              READ TABLE lt_pos_charg INTO ls_pos_charg
+              WITH KEY name_char = 'PPPI_PROCESS_ORDER'
+                       posnr = ls_pos_aux-posnr
+                       countid_kk = ls_pos-countid_kk.
+              IF sy-subrc = 0.
+                CLEAR: lv_aufnr, lv_licha.
+                lv_aufnr = ls_pos_charg-char_value.
+
+                CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+                  EXPORTING
+                    input  = lv_aufnr
+                  IMPORTING
+                    output = lv_aufnr.
+
+                CONCATENATE lv_aufnr ls_pos-countid_kk INTO lv_licha.
+
+                CLEAR: ls_pos_charg, lv_matnr.
+                READ TABLE lt_pos_charg INTO ls_pos_charg
+                WITH KEY name_char = 'PPPI_MATERIAL'
+                         posnr = ls_pos_aux-posnr
+                         countid_kk = ls_pos-countid_kk.
+
+                lv_matnr = ls_pos_charg-char_value.
+
+                IF lv_matnr = '2001771' OR lv_matnr = '000000000002001771' OR
+                  lv_matnr = '2001764' OR lv_matnr = '000000000002001764'.
+                  SELECT SINGLE charg INTO ls_pos-char_value
+                  FROM mch1
+                  WHERE matnr = lv_matnr
+                  AND licha = lv_licha.
+
+                  lv_charg = ls_pos-char_value.
+                ENDIF.
+              ENDIF.
+            ELSE.
+              lv_charg = ls_pos-char_value.
+            ENDIF.
+          WHEN OTHERS.
+        ENDCASE.
+      ENDIF.
+
+* GST - 15/04/2015 <-
+
+* GST - 21/04/2015 ->
+* Rollo: Materiales sujetos a lote:
+      IF ls_cab-proc_mess_category = 'ZI_CONS' AND ls_cab-sender_name = 'SCADA_ROLLO'.
+        CASE ls_pos-name_char.
+          WHEN 'PPPI_BATCH'.
+            IF ls_pos-char_value IS INITIAL.
+
+              CLEAR: ls_pos_charg, lv_matnr.
+              READ TABLE lt_pos_charg INTO ls_pos_charg
+              WITH KEY name_char = 'PPPI_MATERIAL'
+                       posnr = ls_pos_aux-posnr
+                       countid_kk = ls_pos-countid_kk.
+
+              lv_matnr = ls_pos_charg-char_value.
+
+              CLEAR lv_xchpf.
+              SELECT SINGLE xchpf INTO lv_xchpf
+                FROM mara
+                WHERE matnr = lv_matnr.
+
+              IF lv_xchpf = 'X'.
+                lv_cons_er = 'X'.
+              ENDIF.
+
+            ELSE.
+
+              lv_charg = ls_pos-char_value.
+
+              CLEAR: ls_pos_charg, lv_matnr.
+              READ TABLE lt_pos_charg INTO ls_pos_charg
+              WITH KEY name_char = 'PPPI_MATERIAL'
+                       posnr = ls_pos_aux-posnr
+                       countid_kk = ls_pos-countid_kk.
+
+              lv_matnr = ls_pos_charg-char_value.
+
+              CLEAR: lv_charg_aux, lv_xchpf.
+              SELECT SINGLE charg INTO lv_charg_aux
+              FROM mch1
+              WHERE matnr = lv_matnr
+              AND charg = lv_charg.
+
+              SELECT SINGLE xchpf INTO lv_xchpf
+                FROM mara
+                WHERE matnr = lv_matnr.
+
+              IF lv_charg_aux IS INITIAL.
+                CLEAR lv_charg.
+              ENDIF.
+
+              IF lv_charg IS INITIAL AND lv_xchpf = 'X'.
+                lv_cons_er = 'X'.
+              ENDIF.
+
+            ENDIF.
+          WHEN OTHERS.
+        ENDCASE.
+      ENDIF.
+* GST - 21/04/2015 <-
+
+**********************************************************************************
+**********************************************************************************
+* CONVERTIR TODAS LAS UNIDADES ISO A UNIDADES SAP
+      CASE ls_pos-name_char.
+        WHEN 'PPPI_UNIT_OF_MEASURE'.
+          CLEAR: lv_unit_iso, lv_unit_sap.
+          lv_unit_iso = ls_pos-char_value.
+
+          CALL FUNCTION 'ISO_TO_SAP_MEASURE_UNIT_CODE'
+            EXPORTING
+              iso_code  = lv_unit_iso
+            IMPORTING
+              sap_code  = lv_unit_sap
+*             UNIQUE    =
+            EXCEPTIONS
+              not_found = 1
+              OTHERS    = 2.
+          IF sy-subrc <> 0.
+* Implement suitable error handling here
+          ELSE.
+            CLEAR ls_pos_charg-char_value.
+            ls_pos-char_value = lv_unit_sap.
+          ENDIF.
+        WHEN OTHERS.
+      ENDCASE.
+**
+
+      CLEAR: ls_charac.
+      ls_charac-proc_mess_id_tmp = lv_id_tmp.
+      ls_charac-name_char = ls_pos-name_char.
+      ls_charac-char_value = ls_pos-char_value.
+      ls_charac-data_type = ls_pos-data_type.
+      APPEND ls_charac TO lt_charac.
+
+*Para el caso de la creación del lote en las bobinas añadir la caract "Z_LOTE_PROVEEDOR"
+      IF ls_cab-proc_mess_category = 'ZI_BT_CB'.
+        CASE ls_pos-name_char.
+          WHEN 'PPPI_PROCESS_ORDER'.
+            IF NOT ls_pos-char_value IS INITIAL.
+
+              CLEAR lv_char_value.
+              CONCATENATE ls_pos-char_value ls_pos-countid_kk INTO lv_char_value.
+              CONDENSE lv_char_value.
+
+              CLEAR ls_charac.
+              ls_charac-proc_mess_id_tmp = lv_id_tmp.
+              ls_charac-name_char = 'Z_LOTE_PROVEEDOR'.
+              ls_charac-char_value = lv_char_value.
+              ls_charac-data_type = 'CHAR'.
+              APPEND ls_charac TO lt_charac.
+
+            ENDIF.
+        ENDCASE.
+      ENDIF.
+
+* GST - 08/04/2015 ->
+* Añadir característica lote ZPPI_LOTE al mensaje ZI_ETQ3:
+      IF ls_cab-proc_mess_category = 'ZI_ETQ3'.
+        CASE ls_pos-name_char.
+          WHEN 'PPPI_PROCESS_ORDER'.
+            IF NOT ls_pos-char_value IS INITIAL.
+
+              CLEAR ls_pos_charg.
+              READ TABLE lt_pos_charg INTO ls_pos_charg
+              WITH KEY name_char = 'PPPI_PROCESS_ORDER'.
+              IF sy-subrc = 0.
+                CLEAR: lv_aufnr, lv_licha.
+                lv_aufnr = ls_pos_charg-char_value.
+
+                CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+                  EXPORTING
+                    input  = lv_aufnr
+                  IMPORTING
+                    output = lv_aufnr.
+
+                CONCATENATE lv_aufnr ls_pos-countid_kk INTO lv_licha.
+
+                CLEAR: ls_pos_charg, lv_matnr.
+                READ TABLE lt_pos_charg INTO ls_pos_charg
+                WITH KEY name_char = 'PPPI_MATERIAL'.
+
+                lv_matnr = ls_pos_charg-char_value.
+
+                SELECT SINGLE charg INTO lv_charg
+                FROM mch1
+                WHERE matnr = lv_matnr
+                AND licha = lv_licha.
+
+* GST - 14/04/2015 ->
+                IF lv_charg IS NOT INITIAL.
+* GST - 14/04/2015 <-
+                  CLEAR ls_charac.
+                  ls_charac-proc_mess_id_tmp = lv_id_tmp.
+                  ls_charac-name_char = 'ZPPI_LOTE'.
+                  ls_charac-char_value = lv_charg.
+                  ls_charac-data_type = 'CHAR'.
+                  APPEND ls_charac TO lt_charac.
+* GST - 14/04/2015 ->
+                ELSE.
+                  CLEAR lv_charg.
+                ENDIF.
+* GST - 14/04/2015 <-
+              ENDIF.
+            ENDIF.
+        ENDCASE.
+      ENDIF.
+
+* GST - 21/04/2015 ->
+* Comprobar lote creado en la etiqueta de ROLLO:
+      IF ls_cab-proc_mess_category = 'ZI_ETQ1'.
+        CASE ls_pos-name_char.
+          WHEN 'PPPI_BATCH'.
+            IF ls_pos-char_value IS INITIAL.
+              CLEAR lv_charg.
+            ELSE.
+              lv_charg = ls_pos-char_value.
+
+              CLEAR: ls_pos_charg, lv_matnr.
+              READ TABLE lt_pos_charg INTO ls_pos_charg
+              WITH KEY name_char = 'PPPI_MATERIAL'.
+
+              lv_matnr = ls_pos_charg-char_value.
+
+              CLEAR lv_charg_aux.
+              SELECT SINGLE charg INTO lv_charg_aux
+              FROM mch1
+              WHERE matnr = lv_matnr
+              AND charg = lv_charg.
+              IF lv_charg_aux IS INITIAL.
+                CLEAR lv_charg.
+              ENDIF.
+            ENDIF.
+        ENDCASE.
+      ENDIF.
+* GST - 21/04/2015 <-
+* GST - 08/04/2015 <-
+
+    ENDLOOP.
+
+* GST - 14/04/2015 ->
+    IF ( ( ls_cab-proc_mess_category = 'ZI_BT_CL' OR ls_cab-proc_mess_category = 'ZI_PROD3' OR ls_cab-proc_mess_category = 'ZI_ETQ3' OR
+         ls_cab-proc_mess_category = 'ZI_PROD1' OR ls_cab-proc_mess_category = 'ZI_ETQ1') AND lv_charg IS INITIAL )
+      OR
+      ( ls_cab-proc_mess_category = 'ZI_CONS' AND lv_charg IS INITIAL AND ls_cab-sender_name = 'SCADA_BOBINA')
+      OR
+      ( ls_cab-proc_mess_category = 'ZI_CONS' AND lv_cons_er = 'X' AND ls_cab-sender_name = 'SCADA_ROLLO').
+
+      " Error IDOC: El lote no se ha creado
+
+      CLEAR: ls_idoc_status, ls_idoc_contrl.
+      READ TABLE idoc_contrl INTO ls_idoc_contrl
+    INDEX 1.
+      ls_idoc_status-docnum = ls_idoc_contrl-docnum.
+
+      ls_idoc_status-status = '51'.
+      ls_idoc_status-msgty = 'E'.
+      ls_idoc_status-msgid = 'ZIDOCS'.
+      ls_idoc_status-msgno = '001'.
+*      ls_idoc_status-msgv1 = ls_characreturn-message_v1.
+*      ls_idoc_status-msgv2 = ls_characreturn-message_v2.
+*      ls_idoc_status-msgv3 = ls_characreturn-message_v3.
+*      ls_idoc_status-msgv4 = ls_characreturn-message_v4.
+
+      APPEND ls_idoc_status TO idoc_status.
+
+    ELSE.
+* GST - 14/04/2015 <-
+
+* GST - 21/10/2015 ->
+*Miramos si es un motivo de rechazo PULPER:
+      CLEAR: ls_charac_aux, ls_charac_aux_2, lv_pulper, lv_reproceso, lv_no_vacio, lv_no_motivo.
+      READ TABLE lt_charac INTO ls_charac_aux WITH KEY name_char = 'PPPI_BATCH_CHARAC_NAME'
+                                                       char_value = 'Z_MOTIVO_RECHAZO'.
+
+      IF ls_charac_aux IS NOT INITIAL.
+        lv_pulper = 'X'.
+        READ TABLE lt_charac INTO ls_charac_aux_2 WITH KEY name_char = 'PPPI_BATCH_CHARAC_VALUE'.
+        IF ls_charac_aux_2-char_value IS NOT INITIAL AND ls_charac_aux_2-char_value <> ' '.
+          lv_no_vacio = 'X'.
+        ENDIF.
+      ENDIF.
+
+* Miramos si es un motivo de reproceso:
+      CLEAR: ls_charac_aux, ls_charac_aux_2.
+      READ TABLE lt_charac INTO ls_charac_aux WITH KEY name_char = 'PPPI_BATCH_CHARAC_NAME'
+                                                       char_value = 'Z_MOTIVO_REPROCESO_BOBINA'.
+      IF ls_charac_aux IS NOT INITIAL.
+        lv_reproceso = 'X'.
+        READ TABLE lt_charac INTO ls_charac_aux_2 WITH KEY name_char = 'PPPI_BATCH_CHARAC_VALUE'.
+        IF ls_charac_aux_2-char_value IS NOT INITIAL AND ls_charac_aux_2-char_value <> ' '.
+          lv_no_vacio = 'X'.
+        ENDIF.
+      ENDIF.
+
+* Si no es motivo:
+      IF lv_pulper <> 'X' AND lv_reproceso <> 'X'.
+        lv_no_motivo = 'X'.
+      ENDIF.
+
+      IF lv_no_motivo = 'X' OR ( lv_pulper = 'X' AND lv_no_vacio = 'X' )
+                            OR ( lv_reproceso = 'X' AND lv_no_vacio = 'X' ).
+* GST - 21/10/2015 <-
+
+        CALL FUNCTION 'BAPI_PROCESS_MESSAGE_CREATEMLT'
+          TABLES
+            procmessheader       = lt_header
+            procmesscharac       = lt_charac
+*           PROCMESSTEXTLINES    =
+            processmessagenew    = lt_process
+            procmessheaderreturn = lt_headerreturn
+            procmesscharacreturn = lt_characreturn
+            return               = lt_return.
+
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+
+        READ TABLE lt_headerreturn
+        WITH KEY type = 'E' TRANSPORTING NO FIELDS.
+        IF sy-subrc = 0.
+
+          CLEAR: ls_idoc_status, ls_idoc_contrl.
+          READ TABLE idoc_contrl INTO ls_idoc_contrl
+        INDEX 1.
+          ls_idoc_status-docnum = ls_idoc_contrl-docnum.
+
+          READ TABLE lt_characreturn INTO ls_characreturn
+          WITH KEY type = 'E'.
+
+          ls_idoc_status-status = '51'.
+          ls_idoc_status-msgty = ls_characreturn-type.
+          ls_idoc_status-msgid = ls_characreturn-id.
+          ls_idoc_status-msgno = ls_characreturn-number.
+          ls_idoc_status-msgv1 = ls_characreturn-message_v1.
+          ls_idoc_status-msgv2 = ls_characreturn-message_v2.
+          ls_idoc_status-msgv3 = ls_characreturn-message_v3.
+          ls_idoc_status-msgv4 = ls_characreturn-message_v4.
+
+          APPEND ls_idoc_status TO idoc_status.
+
+        ENDIF.
+
+* GST - 22/10/2015 ->
+      ENDIF.
+* GST - 22/10/2015 <-
+
+* GST - 14/04/2015 ->
+    ENDIF.
+* GST - 14/04/2015 <-
+
+    CLEAR: lt_header, ls_header, lt_charac, lt_process, lt_return, lt_characreturn, lt_headerreturn.
+    REFRESH: lt_header, lt_charac, lt_process, lt_return, lt_characreturn, lt_headerreturn.
+
+  ENDLOOP.
+
+  IF idoc_status[] IS INITIAL.
+    CLEAR: ls_idoc_status, ls_idoc_contrl.
+    READ TABLE idoc_contrl INTO ls_idoc_contrl
+    INDEX 1.
+    ls_idoc_status-docnum = ls_idoc_contrl-docnum.
+    ls_idoc_status-status = '53'.
+*      ls_idoc_status
+*      ls_idoc_status
+*      ls_idoc_status
+*      ls_idoc_status
+*      ls_idoc_status
+*      ls_idoc_status
+
+    APPEND ls_idoc_status TO idoc_status.
+  ENDIF.
+
+
+ENDFUNCTION.

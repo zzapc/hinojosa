@@ -1,0 +1,532 @@
+FUNCTION zui5_cm_crea_entrega_entrante.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(IV_HEAD) TYPE  ZSUIST_CREA_ENTREGA_HEAD
+*"     VALUE(IT_POSICIONES) TYPE  ZSUITT_CREA_ENTREGA_POS
+*"  EXPORTING
+*"     VALUE(O_RETURN) TYPE  BAPIRET2_T
+*"     VALUE(E_VBELN) TYPE  VBELN_VL
+*"----------------------------------------------------------------------
+*  RM06EANL
+
+  DATA xvbsk TYPE vbsk.
+  DATA: open_qty LIKE ekpo-menge,   "offene Menge
+        count    TYPE i,               "Zähler für gebuchte Positionen
+        count1   TYPE i.              "Zähler für Protokollzeilen
+
+  DATA:      gf_dlv_type LIKE likp-lfart. "Delivery Type
+  DATA: gf_ibtyp    LIKE t163d-ibtyp,                       "n_2676403
+        gv_sit_flag TYPE xfeld.                             "n_2676403
+  DATA:      gf_ebtyp    LIKE t163d-ebtyp.
+  DATA:      po_status   LIKE sy-subrc.                     "733035
+  DATA:      wabwe_act(1) TYPE c.
+  DATA: wl_ekko TYPE ekko.
+  DATA tl_eket TYPE STANDARD TABLE OF beket.
+  DATA:  wl_xkomdlgn TYPE komdlgn.
+  DATA:  tl_xkomdlgn TYPE STANDARD TABLE OF komdlgn.
+  DATA wl_lfm1 TYPE lfm1.
+  DATA tl_xvbfs    TYPE STANDARD TABLE OF vbfs.
+  DATA tl_xvbls    TYPE STANDARD TABLE OF vbls.
+  DATA tl_xlips    TYPE STANDARD TABLE OF lips.
+  DATA tl_ekkn TYPE STANDARD TABLE OF ekkn.
+  STATICS: h_grkor LIKE lips-grkor,      "Liefergruppe          "n_572944
+           h_bsmng LIKE ekpo-menge.         "Bestellmenge übergeordnete Pos.
+
+  PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '070' 'ZUI5_CM_CREA_ENTREGA_ENTRANTE' '' '' ''CHANGING o_return.
+
+  SELECT ebeln, ebelp, menge, meins, matnr, werks, lgort, bstae, loekz, elikz,
+         lmein, umrez, umren, insmk, pstyp, sobkz, knttp, kzfme, kzvbr, "384051
+         ematn, mfrnr, mfrpn, emnfr, cuobj, uebto, untto, uebtk, bwtar, idnlf,
+         txz01, mfrgr, gewei, voleh, ntgew, brgew, volum, ean11, aktnr, abeln,
+         abelp, aurel, matkl, upvor, uptyp, uebpo, wepos, ko_prctr, wabwe, inco1, inco2,  "950460 "2607364
+         inco2_l, inco3_l, handoverloc, sgt_scat
+          INTO  TABLE @DATA(tv_ekpo)
+          FROM ekpo FOR ALL ENTRIES IN @it_posiciones
+           WHERE ebeln = @it_posiciones-ebeln
+             AND ebelp = @it_posiciones-ebelp
+             AND loekz EQ @space
+             AND elikz EQ @space
+             AND retpo EQ @space .
+
+  IF sy-subrc = 0.
+
+    LOOP AT tv_ekpo INTO DATA(wv_ekpo).
+
+      IF wv_ekpo-wabwe NE space.
+
+        APPEND VALUE #( type = 'I' id = 'M6' number = '002' ) TO o_return.
+
+        CONTINUE.
+      ENDIF.
+
+      AT NEW ebeln.
+
+        CALL FUNCTION 'ENQUEUE_EMEKKOS'
+          EXPORTING
+            ebeln          = wv_ekpo-ebeln
+          EXCEPTIONS
+            foreign_lock   = 2
+            system_failure = 3.
+        IF sy-subrc = 0.
+          CALL FUNCTION 'ENQUEUE_EMEKPOE'
+            EXPORTING
+              ebeln          = wv_ekpo-ebeln
+            EXCEPTIONS
+              foreign_lock   = 2
+              system_failure = 3.
+          IF sy-subrc = 0.
+            DATA(vl_po_status) = 0.
+          ELSE.
+            vl_po_status = 1.
+          ENDIF.
+        ELSE.
+          vl_po_status = 1.
+        ENDIF.
+
+        IF po_status = 0.                                        "v_n_2676403
+          gf_ibtyp = '2'.
+          CLEAR gf_dlv_type.
+          IF cl_ops_switch_check=>mm_sfws_sit( ) IS NOT INITIAL.
+            gv_sit_flag = cl_mm_im_sit_info=>get_sit_info_weora(
+                                             iv_ebeln = wv_ekpo-ebeln ).
+          ENDIF.
+          CALL FUNCTION 'ME_CONFIRMATION_DELIVERY_TYPE'
+            EXPORTING
+              i_func              = '1'
+              iv_sit              = gv_sit_flag
+            CHANGING
+              c_ibtyp             = gf_ibtyp
+              c_lfart             = gf_dlv_type
+            EXCEPTIONS
+              function_not_valid  = 1
+              param_value_missing = 2
+              no_item_found       = 3.
+
+          IF gf_dlv_type IS INITIAL.
+            gf_dlv_type = 'EL'.
+          ENDIF.
+        ENDIF.
+
+      ENDAT.
+
+      IF vl_po_status = 0.
+        CALL FUNCTION 'ME_EKKO_SINGLE_READ'
+          EXPORTING
+            pi_ebeln         = wv_ekpo-ebeln
+          IMPORTING
+            po_ekko          = wl_ekko
+          EXCEPTIONS
+            no_records_found = 1
+            OTHERS           = 2.
+        IF sy-subrc EQ 0 AND
+       ( wl_ekko-bstyp EQ 'F' OR wl_ekko-bstyp EQ 'L' ) AND
+         wl_ekko-frgrl IS INITIAL AND wl_ekko-memory IS INITIAL.
+*- disporelevante Mengen und Termine ermitteln. In XEKET stehen nur
+*- disporel. Mengen > 0 und sowohl Einteilungen als auch Bestätigungen
+          CALL FUNCTION 'ME_CONFIRMATION_ANL_QTY'
+            EXPORTING
+              i_ebeln = wv_ekpo-ebeln
+              i_ebelp = wv_ekpo-ebelp
+              i_eindt = iv_head-wadat_ist
+              i_bstae = wv_ekpo-bstae                      "n_631132
+              i_uptyp = wv_ekpo-uptyp                      "n_631132
+            TABLES
+              xeket   = tl_eket.
+          IF NOT tl_eket[] IS INITIAL.
+            CLEAR xvbsk.
+            xvbsk-mandt = sy-mandt.
+            xvbsk-ernam = sy-uname.
+            xvbsk-erdat = iv_head-wadat_ist.
+            xvbsk-uzeit = sy-uzeit.
+            xvbsk-smart = 'L'.
+*- Nummer VBSK vergeben -----------------------------------------------*
+            SELECT SINGLE numki INTO @DATA(vv_numki) FROM tvsa WHERE smart = @xvbsk-smart.
+            IF sy-subrc = 0.
+              CALL FUNCTION 'NUMBER_GET_NEXT'
+                EXPORTING
+                  nr_range_nr = vv_numki
+                  object      = 'RV_SAMMG'
+                IMPORTING
+                  number      = xvbsk-sammg
+                EXCEPTIONS
+                  OTHERS      = 01.
+              IF sy-subrc NE 0.
+                APPEND VALUE #( type = 'E' id = 'ME' number = '700' message_v1 = vv_numki message_v2 = 'Proc.col.' ) TO o_return.
+                CONTINUE.
+*                MESSAGE e700(me) WITH vv_numki text-007.
+              ENDIF.
+            ELSE.
+              APPEND VALUE #( type = 'E' id = 'ME' number = '700' message_v1 = vv_numki message_v2 = 'Proc.col.' ) TO o_return.
+              CONTINUE.
+            ENDIF.
+            CLEAR wl_xkomdlgn.
+            LOOP AT it_posiciones INTO DATA(ls_posiciones) WHERE ebeln = wv_ekpo-ebeln AND ebelp = wv_ekpo-ebelp.
+              CLEAR wl_xkomdlgn.
+              LOOP AT tl_eket INTO DATA(wl_eket).
+                open_qty = ls_posiciones-menge.
+*              PERFORM wl_xkomdlgn_fill USING open_qty wl_eket-eindt wl_eket-licha
+*                                                   wl_eket-charg wl_eket-uzeit
+*                                                   wl_eket-handoverdate
+*                                                   wl_eket-handovertime.
+
+                CLEAR wl_xkomdlgn.                          "457620
+
+* Eliminieren von Komponenten bei Set, Lot, Display             "578259
+                CHECK wv_ekpo-uptyp NE '5'  " Lot                         "578259
+                  AND wv_ekpo-uptyp NE '6'  " Display                     "578259
+                  AND wv_ekpo-uptyp NE '7'  " VK-Set                      "578259
+                  AND wv_ekpo-uptyp NE 'H'. " GT-Stückliste               "622794
+
+* Eliminieren der Kopfposition bei Retail-Sammelartikeln und GT "525119
+                                                            "622794
+                IF wv_ekpo-uebpo IS INITIAL                 "525119
+                   AND ( wv_ekpo-upvor CA '1IPS' OR         "n_1119307 "n_1598143
+                         wv_ekpo-upvor = 'X' ).             "n_1938399
+                  CHECK 1 = 2.                              "525119
+                ENDIF.                                      "525119
+
+* Eliminieren von SLS-BOM's                                  "n_1143685
+                CHECK wv_ekpo-uptyp NE '9'                  "n_1143685
+                  AND wv_ekpo-upvor NE '9'.                 "n_1143685
+
+                IF NOT wl_ekko-lifnr IS INITIAL.
+                  CALL FUNCTION 'VENDOR_MASTER_DATA_SELECT_12'
+                    EXPORTING
+                      pi_lifnr       = wl_ekko-lifnr
+                      pi_ekorg       = wl_ekko-ekorg
+                    IMPORTING
+                      pe_lfm1        = wl_lfm1
+                    EXCEPTIONS
+                      no_entry_found = 1
+                      OTHERS         = 2.
+
+* Consider shipping conditions                              "v_2280771
+                  IF cl_ops_switch_check=>ops_sfws_sc_erptms( ) = abap_true AND
+                     wl_ekko-shipcond IS NOT INITIAL.
+                    wl_xkomdlgn-vsbed = wl_ekko-shipcond.
+                  ELSE.
+                    wl_xkomdlgn-vsbed = wl_lfm1-vsbed.
+                  ENDIF.                                    "^_2280771
+                ELSE.
+                  CLEAR wl_xkomdlgn-vsbed.
+                ENDIF.
+
+                wl_xkomdlgn-lifex = iv_head-lifex.
+                wl_xkomdlgn-datum = iv_head-wadat_ist.      "n_667436
+                wl_xkomdlgn-adrnr_li = wl_ekko-adrnr.       "n_667436
+                wl_xkomdlgn-lifnr = wl_ekko-lifnr.
+                wl_xkomdlgn-inco1 = wl_ekko-inco1.          "363954
+                wl_xkomdlgn-inco2 = wl_ekko-inco2.          "363954
+*  *- only for TM relevant systems                            "^2607364
+                IF cl_ops_switch_check=>ops_sfws_sc_erptms( ) = abap_true
+                  AND wv_ekpo-inco1 IS NOT INITIAL.
+                  IF cl_ops_switch_check=>mm_sfws_inco_versions( ) EQ abap_true.
+                    wl_xkomdlgn-incov = wl_ekko-incov.
+                    wl_xkomdlgn-inco1 = wv_ekpo-inco1.
+                    wl_xkomdlgn-inco2_l = wv_ekpo-inco2_l.
+                    wl_xkomdlgn-inco3_l = wv_ekpo-inco3_l.
+                  ELSE.
+                    wl_xkomdlgn-inco1 = wv_ekpo-inco1.
+                    wl_xkomdlgn-inco2 = wv_ekpo-inco2.
+                  ENDIF.
+                ELSE.
+                  IF cl_ops_switch_check=>mm_sfws_inco_versions( ) EQ abap_true.
+                    wl_xkomdlgn-incov = wl_ekko-incov.
+                    wl_xkomdlgn-inco2_l = wl_ekko-inco2_l.
+                    wl_xkomdlgn-inco3_l = wl_ekko-inco3_l.
+                  ENDIF.
+                ENDIF.                                      "v2607364
+                wl_xkomdlgn-exnum = wl_ekko-exnum.          "363954
+                wl_xkomdlgn-bukrs_best = wl_ekko-bukrs.     "363954
+                wl_xkomdlgn-matnr = wv_ekpo-matnr.
+                wl_xkomdlgn-werks = wv_ekpo-werks.
+                wl_xkomdlgn-lgort = wv_ekpo-lgort.
+
+* wl_xkomdlgn-charg = ?
+                wl_xkomdlgn-vrkme = wv_ekpo-meins.
+                wl_xkomdlgn-meins = wv_ekpo-lmein.
+                wl_xkomdlgn-umvkz = wv_ekpo-umrez.
+                wl_xkomdlgn-umvkn = wv_ekpo-umren.
+                wl_xkomdlgn-prctr = wv_ekpo-ko_prctr.       "n_950460
+                IF wv_ekpo-matnr EQ space.
+                  wl_xkomdlgn-meins = wv_ekpo-meins.
+                  wl_xkomdlgn-umvkz = 1.
+                  wl_xkomdlgn-umvkn = 1.
+                ENDIF.
+                wl_xkomdlgn-insmk = wv_ekpo-insmk.
+* Updating stock category for WME as same as stock type value
+                IF wv_ekpo-insmk = 'X'.                   "v_n_2149690
+                  wl_xkomdlgn-bestq = 'Q'.
+                ELSE.
+                  wl_xkomdlgn-bestq = wv_ekpo-insmk.
+                ENDIF.                                        "^_n_2149690
+                wl_xkomdlgn-kzfme = wv_ekpo-kzfme.
+                wl_xkomdlgn-kzvbr = wv_ekpo-kzvbr.           "note 384051
+                wl_xkomdlgn-lfimg = open_qty.
+                wl_xkomdlgn-lfdat = wl_eket-eindt.
+                wl_xkomdlgn-lfuhr = wl_eket-uzeit.
+* wl_xkomdlgn-vstel = ?
+* wl_xkomdlgn-vkorg = ?
+* wl_xkomdlgn-vtweg = ?
+* wl_xkomdlgn-spart = ?
+                wl_xkomdlgn-vgbel = ls_posiciones-ebeln.
+                wl_xkomdlgn-vgpos = ls_posiciones-ebelp.
+                wl_xkomdlgn-lfart = gf_dlv_type.
+                wl_xkomdlgn-vgtyp = 'V'.
+                wl_xkomdlgn-kzazu = 'X'.                "??? what's that for ????
+                wl_xkomdlgn-knttp = wv_ekpo-knttp.
+                wl_xkomdlgn-sobkz = wv_ekpo-sobkz.
+                wl_xkomdlgn-handoverloc  = wv_ekpo-handoverloc. "note 2128205
+                wl_xkomdlgn-handoverdate = wl_eket-handoverdate.          "note 2128205
+                wl_xkomdlgn-handovertime = wl_eket-handovertime.          "note 2128205
+
+                SELECT SINGLE * FROM t163g INTO @DATA(wv_t163g) WHERE bstae EQ @wv_ekpo-bstae
+                                      AND ebtyp EQ @gf_ebtyp.
+                IF sy-subrc = 0.
+* Prüfen, ob Lieferavis WE-Zuordnung hat (Vorauss. für WE über VL32)
+* und wepos prüfen
+                  IF wv_t163g-wezuo EQ space OR wv_ekpo-wepos EQ space.
+                    wl_xkomdlgn-nowab = 'X'.
+                  ELSE.
+                    CLEAR wl_xkomdlgn-nowab.
+                  ENDIF.
+                ENDIF.
+
+                IF wv_ekpo-matnr IS INITIAL OR wv_ekpo-pstyp = '6'.
+                  wl_xkomdlgn-posar = 'B'.
+                ENDIF.
+                wl_xkomdlgn-ematn = wv_ekpo-ematn.
+                wl_xkomdlgn-mfrnr = wv_ekpo-mfrnr.
+                wl_xkomdlgn-mfrpn = wv_ekpo-mfrpn.
+                wl_xkomdlgn-emnfr = wv_ekpo-emnfr.
+                wl_xkomdlgn-cuobj = wv_ekpo-cuobj.
+                wl_xkomdlgn-uebto = wv_ekpo-uebto.
+                wl_xkomdlgn-untto = wv_ekpo-untto.
+                wl_xkomdlgn-uebtk = wv_ekpo-uebtk.
+                wl_xkomdlgn-lichn = wl_eket-licha.
+                wl_xkomdlgn-charg = wl_eket-charg.
+                SELECT SINGLE bwtar FROM mbew
+                  INTO @DATA(vv_bwtar)
+                  WHERE matnr = @wv_ekpo-matnr
+                  AND bwkey = @wv_ekpo-werks "'2000'
+                  AND bwtar = 'COMPRA'.
+                IF sy-subrc = 0.
+
+                  wl_xkomdlgn-bwtar = vv_bwtar.
+
+                ELSE.
+
+                  SELECT SINGLE bklas FROM mbew
+                    INTO @DATA(vv_bklas)
+                    WHERE matnr = @wv_ekpo-matnr
+                    AND bwkey = @wv_ekpo-werks "'2000'
+                    AND bwtar = ''.
+
+                  CALL METHOD zspp_clase_valoracion_of=>crear_clase_valoracion
+                    EXPORTING
+                      i_matnr = wv_ekpo-matnr
+*                     i_aufnr =
+                      i_werks = wv_ekpo-werks
+                      i_bwtar = CONV bwtar_d( 'COMPRA' )
+                      i_bklas = vv_bklas
+                    RECEIVING
+                      o_clase = wl_xkomdlgn-bwtar.
+
+                ENDIF.
+
+                wl_xkomdlgn-kdmat = wv_ekpo-idnlf.
+                wl_xkomdlgn-arktx = wv_ekpo-txz01.
+                wl_xkomdlgn-mfrgr = wv_ekpo-mfrgr.
+                wl_xkomdlgn-gewei = wv_ekpo-gewei.
+                wl_xkomdlgn-voleh = wv_ekpo-voleh.
+                wl_xkomdlgn-ntgew = wv_ekpo-ntgew * wl_xkomdlgn-lfimg.
+                wl_xkomdlgn-brgew = wv_ekpo-brgew * wl_xkomdlgn-lfimg.
+                wl_xkomdlgn-volum = wv_ekpo-volum * wl_xkomdlgn-lfimg.
+                wl_xkomdlgn-ean11 = wv_ekpo-ean11.
+
+                SELECT SINGLE podrel INTO @DATA(vv_podrel) FROM t163l WHERE bstae = @wv_ekpo-bstae.
+                "^_n_1250850
+                wl_xkomdlgn-podrel = vv_podrel.
+                wl_xkomdlgn-aktnr = wv_ekpo-aktnr.
+                wl_xkomdlgn-abeln = wv_ekpo-abeln.
+                wl_xkomdlgn-abelp = wv_ekpo-abelp.
+* wl_xkomdlgn-ltssf = only sort criteria in vl31n
+                wl_xkomdlgn-aurel = wv_ekpo-aurel.
+                wl_xkomdlgn-idnlf = wv_ekpo-idnlf.
+                wl_xkomdlgn-matkl = wv_ekpo-matkl.
+
+* Leergut-Stückliste übernehmen
+                CLEAR wl_xkomdlgn-grkor.
+                CLEAR wl_xkomdlgn-kmpmg.
+                CLEAR wl_xkomdlgn-uepos.
+                CLEAR wl_xkomdlgn-uepvw.                    "549736
+                IF wv_ekpo-upvor CA '3X'.
+                  h_grkor = h_grkor + 1.
+                  wl_xkomdlgn-grkor = h_grkor.
+                  h_bsmng = wv_ekpo-menge.
+                ENDIF.
+                IF NOT wv_ekpo-uebpo IS INITIAL AND
+                       wv_ekpo-uptyp CA '3X'.
+                  wl_xkomdlgn-uepvw = 'G'.                  "549736
+                  wl_xkomdlgn-uepos = wv_ekpo-uebpo.
+                  wl_xkomdlgn-grkor = h_grkor.
+                  IF h_bsmng NE 0.
+                    wl_xkomdlgn-kmpmg = wv_ekpo-menge / h_bsmng.
+                  ENDIF.
+                ENDIF.
+                IF wv_ekpo-uptyp EQ 'U'.                    "1802848
+                  "determine usage for IUID Embedded item                 "1802848
+                  SELECT SINGLE vwpos INTO wl_xkomdlgn-vwpos "1802848
+                           FROM tvvw WHERE vwpos EQ 'UIIE'. "1802848
+                ENDIF.                                      "1802848
+
+*- Konsignation - SOBKZ 'K' hart reinsetzen, da  von Pstyp abhäng......
+                IF wv_ekpo-pstyp EQ '2'.
+                  wl_xkomdlgn-sobkz = 'K'.
+                  IF wl_ekko-lifnr CO ' 0123456789'.                         "v_n_1157081
+                    UNPACK wl_ekko-lifnr TO wl_xkomdlgn-sonum.
+                  ELSE.
+                    wl_xkomdlgn-sonum = wl_ekko-lifnr.      "n_1089897
+                  ENDIF.                                                  "^_n_1157081
+                ENDIF.
+* Kontierungsfelder
+                IF wv_ekpo-sobkz EQ 'E' OR wv_ekpo-sobkz EQ 'Q'.
+
+                  CALL FUNCTION 'MMPUR_EKKN_READ_EBELN_EBELP'
+                    EXPORTING
+                      pi_ebeln             = wv_ekpo-ebeln
+                      pi_ebelp             = wv_ekpo-ebelp
+*                     PI_BYPASSING_BUFFER  =
+*                     PI_REFRESH_BUFFER    =
+                    TABLES
+                      pto_ekkn_po          = tl_ekkn
+                    EXCEPTIONS
+                      no_records_requested = 1
+                      OTHERS               = 2.
+
+                  IF sy-subrc EQ 0.
+                    READ TABLE tl_ekkn INTO DATA(wv_ekkn) INDEX 1.
+                    wl_xkomdlgn-ps_psp_pnr = wv_ekkn-ps_psp_pnr.
+                    wl_xkomdlgn-vbelv      = wv_ekkn-vbeln.
+                    wl_xkomdlgn-posnv      = wv_ekkn-vbelp.
+                  ENDIF.
+                ENDIF.
+
+                IF cl_ops_switch_check=>sfsw_segmentation( ) = abap_on.
+                  wl_xkomdlgn-sgt_scat = wv_ekpo-sgt_scat.
+                ENDIF.
+
+                INSERT wl_xkomdlgn INTO TABLE tl_xkomdlgn.
+              ENDLOOP.
+            ENDLOOP.
+          ELSE.
+            APPEND VALUE #( type = 'E' id = 'ZUI5_CM' number = '062' message_v1 = wv_ekpo-ebelp message_v2 = wv_ekpo-ebeln ) TO o_return.
+            CONTINUE.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+*
+*              ENDAT.
+*
+*    ENDIF.
+
+*
+      CLEAR vl_po_status.
+
+    ENDLOOP.
+
+    IF NOT tl_xkomdlgn[] IS INITIAL.
+      CALL FUNCTION 'ME_CONFIRMATIONS_REFRESH'.
+
+      CALL FUNCTION 'GN_DELIVERY_CREATE'
+        EXPORTING
+          vbsk_i   = xvbsk
+        TABLES
+          xkomdlgn = tl_xkomdlgn
+          xvbfs    = tl_xvbfs
+          xvbls    = tl_xvbls
+          xxlips   = tl_xlips.
+
+      COMMIT WORK.
+
+      SORT tl_xvbfs.                          "damit die ohne Beleg zuerst
+      LOOP AT tl_xvbfs INTO DATA(wv_vbfs).
+        IF wv_vbfs-vbeln EQ space.
+
+          APPEND VALUE #( type = wv_vbfs-msgty id = wv_vbfs-msgid number = wv_vbfs-msgno message_v1 = wv_vbfs-msgv1
+                          message_v2 = wv_vbfs-msgv2 message_v3 = wv_vbfs-msgv3 message_v4 = wv_vbfs-msgv4 ) TO o_return.
+          CONTINUE.
+        ENDIF.
+        IF wv_vbfs-posnr EQ '000000'.
+          APPEND VALUE #( type = wv_vbfs-msgty id = wv_vbfs-msgid number = wv_vbfs-msgno message_v1 = wv_vbfs-msgv1
+                    message_v2 = wv_vbfs-msgv2 message_v3 = wv_vbfs-msgv3 message_v4 = wv_vbfs-msgv4 ) TO o_return.
+
+        ELSE.
+          LOOP AT tl_xkomdlgn INTO DATA(wv_xkomdlgn_mess) WHERE vgpos EQ wv_vbfs-posnr.
+            EXIT.
+          ENDLOOP.
+          APPEND VALUE #( type = 'I' id = 'ME' number = '157' message_v1 = wv_xkomdlgn_mess-matnr
+                    message_v2 = wv_xkomdlgn_mess-werks message_v3 = wv_xkomdlgn_mess-lifnr message_v4 = space ) TO o_return.
+          APPEND VALUE #( type = wv_vbfs-msgty id = wv_vbfs-msgid number = wv_vbfs-msgno message_v1 = wv_vbfs-msgv1
+                    message_v2 = wv_vbfs-msgv2 message_v3 = wv_vbfs-msgv3 message_v4 = wv_vbfs-msgv4 ) TO o_return.
+
+        ENDIF.
+      ENDLOOP.
+      IF NOT line_exists( o_return[ type = 'E' ] ).
+
+        APPEND VALUE #( type = 'S' id = 'ZUI5_CM' number = '067' message_v1 = tl_xvbls[ 1 ]-vbeln_lif
+              message_v2 = space message_v3 = space message_v4 = space ) TO o_return.
+
+        TRY .
+            e_vbeln = tl_xvbls[ 1 ]-vbeln_lif.
+            IF NOT e_vbeln IS INITIAL.
+
+              LOOP AT it_posiciones INTO DATA(wv_posiciones).
+
+                UPDATE lips SET zzmatpal = wv_posiciones-zzmatpal
+                                zzcantpal = wv_posiciones-zzcantpal
+                                zzcanxpal = wv_posiciones-zzcanxpal
+                            WHERE vgbel = wv_posiciones-ebeln
+                             AND  vgpos = wv_posiciones-ebelp.
+
+                COMMIT WORK AND WAIT .
+
+              ENDLOOP.
+
+            ENDIF.
+          CATCH cx_sy_itab_line_not_found INTO DATA(vv_error_).
+
+        ENDTRY.
+
+      ENDIF.
+
+    ENDIF.
+
+    CALL FUNCTION 'DEQUEUE_EMEKKOS'                            "598606
+      EXPORTING                                             "598606
+        ebeln = wv_ekpo-ebeln.                       "598606
+    CALL FUNCTION 'DEQUEUE_EMEKPOE'                           "1023319
+      EXPORTING                                            "1023319
+        ebeln = wv_ekpo-ebeln.
+
+  ENDIF.
+  PERFORM guardar_log USING wv_ekpo-ebeln o_return.
+
+ENDFUNCTION.
+FORM wl_xkomdlgn_fill USING    p_open_qty LIKE ekpo-menge
+                            p_eindt    LIKE eket-eindt
+                            p_licha    LIKE eket-licha
+                            p_charg    LIKE eket-charg
+                            p_uzeit    LIKE eket-uzeit
+                            p_handoverdate LIKE eket-handoverdate
+                            p_handovertime LIKE eket-handovertime.
+
+
+
+  "SO7K024125 RAMN
+
+*$*$-End:   RM06EANL_03-------------------------------------------------------------------------$*$*
+
+* write: / xeket-ebeln , 12 xeket-ebelp, 18 p_eindt, 28 p_open_qty.
+ENDFORM.

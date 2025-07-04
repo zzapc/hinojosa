@@ -1,0 +1,275 @@
+FUNCTION zfm_sd_get_fol_cdata.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_T_VBADR_WE) TYPE  SHP_VL10_VBADR_T
+*"  CHANGING
+*"     REFERENCE(C_SHP_VL10_ITEM) TYPE  SHP_VL10_ITEM
+*"----------------------------------------------------------------------
+
+**********************************************************************
+* Parámetros locales
+**********************************************************************
+
+****** STRUCTURES
+
+  DATA: ls_shipment_cdata TYPE zshipment_s_data.
+
+**********************************************************************
+* Validaciones
+**********************************************************************
+
+****** CHECK FOLDING
+
+  CHECK c_shp_vl10_item-vstel(1) EQ '2'.
+
+**********************************************************************
+* Lógica
+**********************************************************************
+
+****** GET DATA
+
+**********************************************************************
+* INI GAPSD021 - Campos Z VL10C Packaging
+**********************************************************************
+
+***** SHP DATA
+
+  CALL FUNCTION 'ZFM_SD_GET_SHP_CDATA'
+    EXPORTING
+      i_vbeln           = c_shp_vl10_item-vbelv
+      i_posnr           = c_shp_vl10_item-posnv
+    IMPORTING
+      e_shipment_s_data = ls_shipment_cdata
+    EXCEPTIONS
+      no_valid_iparams  = 1
+      no_valid_itype    = 2
+      OTHERS            = 3.
+
+  IF ( sy-subrc EQ 0 ).
+    MOVE-CORRESPONDING ls_shipment_cdata TO c_shp_vl10_item.
+  ENDIF.
+
+**********************************************************************
+* FIN GAPSD021 - Campos Z VL10C Packaging
+**********************************************************************
+
+***** PALETS Y DIMENSIONES
+
+  "Obtener info numero pallets y dimensiones
+  SELECT SINGLE cuobj
+    INTO @DATA(lv_cuobj)
+    FROM marc AS t1 INNER JOIN ekko AS t2
+      ON t1~werks EQ t2~reswk
+   WHERE matnr EQ @c_shp_vl10_item-matnr.
+
+  IF sy-subrc = 0.
+
+    SELECT SINGLE tbqty, length, length_uom, width, width_uom, height, height_uom
+      INTO @DATA(wa_idx)
+      FROM yhp_idx_td151
+     WHERE cuobj EQ @lv_cuobj
+       AND shuty EQ 'UNIT'.
+
+    IF sy-subrc = 0.
+      TRY.
+          c_shp_vl10_item-zzcantpale = c_shp_vl10_item-olfmng / wa_idx-tbqty.
+        CATCH cx_root.
+      ENDTRY.
+
+      c_shp_vl10_item-zzlength = wa_idx-length.
+      c_shp_vl10_item-zzlength_uom = wa_idx-length_uom.
+      c_shp_vl10_item-zzwidth = wa_idx-width.
+      c_shp_vl10_item-zzwidth_uom = wa_idx-width_uom.
+      c_shp_vl10_item-zzheight = wa_idx-height.
+      c_shp_vl10_item-zzheight_uom = wa_idx-height_uom.
+
+    ENDIF.
+
+  ENDIF.
+
+***** STOCK DATA
+
+  CASE sy-tcode.
+
+    WHEN 'VL10X'.
+
+*     add jtm 14.11.2022
+      SELECT SINGLE lgnum
+        INTO @DATA(lgnum)
+        FROM t320
+       WHERE werks EQ @c_shp_vl10_item-werks.
+
+
+      IF lgnum IS NOT INITIAL.
+*        Cambio calculo stock disponible. Cliente + sin asignar - picking
+        CALL FUNCTION 'ZSWM_CALCULO_STOCK_DISPONIBLE'
+          EXPORTING
+            lgnum         = lgnum
+            matnr         = c_shp_vl10_item-matnr
+            werks         = c_shp_vl10_item-werks
+          IMPORTING
+            zzlasbt_stock = c_shp_vl10_item-zzlasbt_stock.
+      ELSE.
+
+*     fin de add jtm 14.11.2022
+        IF c_shp_vl10_item-vbelv IS INITIAL.
+
+          SELECT SUM( kalab )
+            INTO @DATA(l_mska)
+            FROM mska
+           WHERE matnr = @c_shp_vl10_item-matnr
+             AND werks = @c_shp_vl10_item-werks.
+
+        ELSE.
+
+          SELECT SUM( kalab )
+            INTO @l_mska
+            FROM mska
+           WHERE matnr = @c_shp_vl10_item-matnr
+             AND vbeln = @c_shp_vl10_item-vbelv
+             AND posnr = @c_shp_vl10_item-posnv
+             AND werks = @c_shp_vl10_item-werks.
+
+        ENDIF.
+
+*     add jtm 14.11.2022 subimos aqui este código
+        IF sy-subrc = 0 AND l_mska IS NOT INITIAL.
+
+          c_shp_vl10_item-zzlasbt_stock = l_mska.
+
+        ELSE.
+
+          SELECT SINGLE *
+            INTO @DATA(l_mard)
+            FROM mard
+           WHERE matnr = @c_shp_vl10_item-matnr
+             AND werks = @c_shp_vl10_item-werks.
+
+          IF sy-subrc = 0.
+            c_shp_vl10_item-zzlasbt_stock = l_mard-labst.
+          ENDIF.
+
+        ENDIF.
+
+      ENDIF. " add jtm 14.11.2022
+*     fin de subir jtm 14.11.2022 codigo
+
+
+      "JCB 21.03.24, 81696 - INDICAR ALMACÉN EXTERNO EN LISTADO DE CARGAS
+      "Stock almacenes 3000, 3001, 3002
+      SELECT SUM( labst )
+        INTO @c_shp_vl10_item-zzlabst_3000
+        FROM mard
+        WHERE matnr = @c_shp_vl10_item-matnr AND
+              werks = @c_shp_vl10_item-werks AND
+              lgort = '3000'.
+      SELECT SUM( labst )
+        INTO @c_shp_vl10_item-zzlabst_3001
+        FROM mard
+        WHERE matnr = @c_shp_vl10_item-matnr AND
+              werks = @c_shp_vl10_item-werks AND
+              lgort = '3001'.
+      SELECT SUM( labst )
+        INTO @c_shp_vl10_item-zzlabst_3002
+        FROM mard
+        WHERE matnr = @c_shp_vl10_item-matnr AND
+              werks = @c_shp_vl10_item-werks AND
+              lgort = '3002'.
+
+
+      "JCB 17.11.22. Nº orden
+      "Ir a EKKN con EBELN = Nº pedido compra & EBELP = Nº Posición y obtener VBELN & VBELP.
+      "Después, ir a EKPO con EBELN = Nº pedido compra & EBELP = Nº Posición y obtener MATNR.
+
+      "Después ir a AUFK con WERKS = CT_POSTAB-VSTEL (dato que aparece en el listado) & KDAUF = EKKN – VBELN & KDPOS = EKKN – VBELP.
+      "La orden es el valor del campo AUFNR. Por supuesto, debemos de tener en cuenta que la orden tenga el estatus correcto.
+      SELECT SINGLE aufk~aufnr
+        INTO @c_shp_vl10_item-zzaufnr
+        FROM ekkn INNER JOIN aufk ON aufk~werks = @c_shp_vl10_item-vstel AND
+                                     aufk~kdauf = ekkn~vbeln       AND
+                                     aufk~kdpos = ekkn~vbelp
+        WHERE ekkn~ebeln = @c_shp_vl10_item-vbelv AND
+              ekkn~ebelp = @c_shp_vl10_item-posnv AND
+              NOT EXISTS ( SELECT * FROM jest WHERE jest~objnr = aufk~objnr  AND
+                                                    jest~inact = @space   AND
+                                                    jest~stat  IN ('I0045', 'I0076') ).    "Cierre técnico, petición de borrado
+      IF c_shp_vl10_item-zzaufnr IS NOT INITIAL.
+        SELECT SINGLE gstrs, gsuzs, gltrs, gluzs, gstrp
+          INTO (@c_shp_vl10_item-zzgstrs, @c_shp_vl10_item-zzgsuzs, @c_shp_vl10_item-zzgltrs, @c_shp_vl10_item-zzgluzs, @c_shp_vl10_item-zzgstrp)
+          FROM afko
+          WHERE aufnr = @c_shp_vl10_item-zzaufnr.
+      ENDIF.
+
+
+    WHEN OTHERS.
+
+      SELECT SINGLE kalab
+        INTO @l_mska
+        FROM mska
+       WHERE matnr = @c_shp_vl10_item-matnr
+         AND vbeln = @c_shp_vl10_item-vbelv
+         AND posnr = @c_shp_vl10_item-posnv
+         AND werks = @c_shp_vl10_item-werks.
+
+*     add jtm 14.11.2022 subimos aqui este código
+      IF sy-subrc = 0 AND l_mska IS NOT INITIAL.
+
+        c_shp_vl10_item-zzlasbt_stock = l_mska.
+
+      ELSE.
+
+        SELECT SINGLE *
+          INTO l_mard
+          FROM mard
+         WHERE matnr = c_shp_vl10_item-matnr
+           AND werks IN ( c_shp_vl10_item-werks, c_shp_vl10_item-reswk ).
+
+        IF sy-subrc = 0.
+          c_shp_vl10_item-zzlasbt_stock = l_mard-labst.
+        ENDIF.
+
+      ENDIF.
+*     fin de subir jtm 14.11.2022 codigo
+
+  ENDCASE.
+
+****  CONVERSION DE STOCK A M2
+
+  CALL FUNCTION 'MD_CONVERT_MATERIAL_UNIT'
+    EXPORTING
+      i_matnr              = c_shp_vl10_item-matnr
+      i_in_me              = c_shp_vl10_item-meins
+      i_out_me             = 'M2'
+      i_menge              = c_shp_vl10_item-labst
+    IMPORTING
+      e_menge              = c_shp_vl10_item-zzlabst_m2
+    EXCEPTIONS
+      error_in_application = 1
+      error                = 2
+      OTHERS               = 3.
+  IF sy-subrc = 0.
+    c_shp_vl10_item-zzm2 = 'M2'.
+  ELSE.
+    CLEAR: c_shp_vl10_item-zzlabst_m2,c_shp_vl10_item-zzm2.
+  ENDIF.
+
+  "JVM - 17/11/2022 Añadir el nombre del cliente, no el del destino
+  SELECT SINGLE name1
+    FROM kna1
+    INTO c_shp_vl10_item-zznom_cli
+    WHERE kunnr EQ ( SELECT kunnr
+                       FROM vbak
+                      WHERE vbeln EQ c_shp_vl10_item-vbelv ).
+  "FJVM - 17/11/2022 Añadir el nombre del cliente, no el del destino
+
+**** DIRECCIÓN
+
+  READ TABLE i_t_vbadr_we INTO DATA(ls_vbadr_we) INDEX 1.
+
+  MOVE ls_vbadr_we-stras TO c_shp_vl10_item-zzstras.
+  MOVE ls_vbadr_we-land1 TO c_shp_vl10_item-zzland1.
+  MOVE ls_vbadr_we-pstlz TO c_shp_vl10_item-zzpstlz.
+  MOVE ls_vbadr_we-ort01 TO c_shp_vl10_item-zzort01.
+
+ENDFUNCTION.

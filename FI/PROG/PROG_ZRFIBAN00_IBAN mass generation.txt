@@ -1,0 +1,268 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRFIBAN00
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT zrfiban00 LINE-SIZE 132.
+
+TABLES: lfbk, knbk, t005.
+
+SELECT-OPTIONS:
+  vendor    FOR lfbk-lifnr,
+  customer  FOR knbk-kunnr,
+  country   FOR lfbk-banks OBLIGATORY.
+PARAMETERS:
+  testrun   LIKE rfpdo1-allgtest DEFAULT 'X'.
+
+DATA:
+  t_lfbk    LIKE lfbk OCCURS 0 WITH HEADER LINE,
+  t_knbk    LIKE knbk OCCURS 0 WITH HEADER LINE,
+  g_type(8) TYPE c.
+DATA: lines TYPE i.
+
+AT SELECTION-SCREEN.
+  PERFORM warning.
+
+TOP-OF-PAGE.
+  CASE g_type.
+    WHEN 'LFBK'.
+      WRITE / 'Vendor  '.
+    WHEN 'KNBK'.
+      WRITE / 'Customer'.
+    WHEN OTHERS.
+      WRITE / g_type.
+  ENDCASE.
+  ULINE.
+
+START-OF-SELECTION.
+  DESCRIBE TABLE country LINES lines.
+  IF lines EQ 0.
+    EXIT.
+  ENDIF.
+
+  SELECT * FROM  lfbk
+           INTO  TABLE t_lfbk
+           WHERE lifnr IN vendor
+           AND   banks IN country.
+  SELECT * FROM  knbk
+           INTO  TABLE t_knbk
+           WHERE kunnr IN customer
+           AND   banks IN country.
+  SORT t_lfbk BY lifnr.
+  SORT t_knbk BY kunnr.
+
+END-OF-SELECTION.
+  LOOP AT t_lfbk.
+    PERFORM iban_update USING t_lfbk-banks
+                              t_lfbk-bankl
+                              t_lfbk-bankn
+                              t_lfbk-bkont
+                              t_lfbk-bkref
+                              'LFBK'
+                              t_lfbk-lifnr.
+  ENDLOOP.
+  NEW-PAGE.
+  LOOP AT t_knbk.
+    PERFORM iban_update USING t_knbk-banks
+                              t_knbk-bankl
+                              t_knbk-bankn
+                              t_knbk-bkont
+                              t_knbk-bkref
+                              'KNBK'
+                              t_knbk-kunnr.
+  ENDLOOP.
+  COMMIT WORK.
+  CALL FUNCTION 'BUFFER_REFRESH_ALL'.
+
+*-------------------------------------------------------------*
+*      Form  warning                                          *
+*-------------------------------------------------------------*
+FORM warning.
+
+  DATA:
+    l_count(5)  TYPE n,
+    l_text(70)  TYPE c,
+    l_answer(1) TYPE c.
+
+  STATICS:
+    s_country LIKE country OCCURS 0 WITH HEADER LINE.
+
+  CHECK sy-batch EQ space.
+  CHECK s_country[] NE country[].
+
+  SELECT COUNT(*) FROM  t005
+                  INTO  l_count
+                  WHERE land1 IN country.
+  IF l_count LE 1.
+    l_text = 'is allowed in the specified country?'.
+  ELSE.
+    l_text = 'You have selected &N bank countries.'.
+    SHIFT l_count LEFT DELETING LEADING '0'.
+    REPLACE '&N' WITH l_count INTO l_text.
+    CONDENSE l_text.
+    CALL FUNCTION 'POPUP_TO_CONFIRM_STEP'
+      EXPORTING
+        defaultoption = 'N'
+        textline1     = l_text
+        textline2     = 'Do you really want to proceed?'
+        titel         = 'Number of Countries'
+      IMPORTING
+        answer        = l_answer.
+    IF l_answer NE 'J'.
+      REFRESH country.
+      EXIT.
+    ENDIF.
+    l_text = 'is allowed in all specified &N countries?'.
+    REPLACE '&N' WITH l_count INTO l_text.
+    CONDENSE l_text.
+  ENDIF.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM_STEP'
+    EXPORTING
+      defaultoption = 'N'
+      textline1     = 'Are you sure that the generation of IBANs'
+      textline2     = l_text
+      titel         = 'Generation of IBAN'
+    IMPORTING
+      answer        = l_answer.
+  IF l_answer NE 'J'.
+    REFRESH country.
+  ENDIF.
+
+  s_country[] = country[].
+
+ENDFORM.                               "warning
+
+
+* -------------------------------------------------------------------*
+*      Form  iban_update                                             *
+* -------------------------------------------------------------------*
+FORM iban_update USING p_banks LIKE lfbk-banks
+                       p_bankl LIKE lfbk-bankl
+                       p_bankn LIKE lfbk-bankn
+                       p_bkont LIKE lfbk-bkont
+                       p_bkref LIKE lfbk-bkref
+                       p_type  TYPE any
+                       p_konto TYPE any.
+
+  DATA:
+    l_bnklz          LIKE bnka-bnklz,
+    l_bankn_long(35) TYPE c,
+    l_bkont          LIKE lfbk-bkont,
+    l_iban           LIKE tiban-iban,
+    l_msgtx(82)      TYPE c,
+    l_tabname        LIKE tiban-tabname,
+    l_tabkey         LIKE tiban-tabkey.
+
+  STATICS:
+    s_counter TYPE i.
+
+  CALL FUNCTION 'READ_IBAN'
+    EXPORTING
+      i_banks = p_banks
+      i_bankl = p_bankl
+      i_bankn = p_bankn
+      i_bkont = p_bkont
+      i_bkref = p_bkref
+    EXCEPTIONS
+      OTHERS  = 4.
+  IF sy-subrc EQ 0.
+    EXIT.
+  ENDIF.
+
+  g_type = p_type.
+  WRITE: / p_konto,
+           p_banks,
+           p_bankl,
+           p_bankn.
+  CALL FUNCTION 'CONVERT_BANK_ACCOUNT_NUMBER'
+    EXPORTING
+      i_banks      = p_banks
+      i_bankk      = p_bankl
+      i_bankn      = p_bankn
+      i_bkont      = p_bkont
+      i_bkref      = p_bkref
+    IMPORTING
+      e_bankn_long = l_bankn_long
+      e_bkont      = l_bkont.
+
+  CALL FUNCTION 'CONVERT_BANK_ACCOUNT_2_IBAN'
+    EXPORTING
+      i_bank_country     = p_banks
+      i_bank_key         = p_bankl
+      i_bank_number      = l_bnklz
+      i_bank_account     = l_bankn_long
+      i_bank_control_key = l_bkont
+    IMPORTING
+      e_iban             = l_iban
+    EXCEPTIONS
+      error_message      = 4
+      OTHERS             = 4.
+
+  IF sy-subrc NE 0.
+    CALL FUNCTION 'K_MESSAGE_TRANSFORM'
+      EXPORTING
+        par_msgid = sy-msgid
+        par_msgno = sy-msgno
+        par_msgty = sy-msgty
+        par_msgv1 = sy-msgv1
+        par_msgv2 = sy-msgv2
+        par_msgv3 = sy-msgv3
+        par_msgv4 = sy-msgv4
+      IMPORTING
+        par_msgtx = l_msgtx
+      EXCEPTIONS
+        OTHERS    = 4.
+    IF sy-subrc NE 0.
+      l_msgtx = 'IBAN could not be generated, country not supported'.
+    ENDIF.
+    WRITE l_msgtx COLOR COL_NEGATIVE.
+    EXIT.
+  ENDIF.
+  IF l_iban IS INITIAL.
+    l_msgtx = 'IBAN could not be generated, country not supported'.
+    WRITE l_msgtx COLOR COL_NEGATIVE.
+    EXIT.
+  ENDIF.
+
+  WRITE: 'IBAN', l_iban.
+
+  IF testrun EQ 'X'.
+    WRITE 'IBAN generated in test mode'.
+    EXIT.
+  ENDIF.
+
+  l_tabname = p_type.
+  l_tabkey  = p_konto.
+  CALL FUNCTION 'MAINTAIN_IBAN_FROM_DATA'
+    EXPORTING
+      i_banks       = p_banks
+      i_bankl       = p_bankl
+      i_bankn       = p_bankn
+      i_bkont       = p_bkont
+      i_iban        = l_iban
+      i_valid_from  = sy-datum
+      i_bkref       = p_bkref
+      i_tabname     = l_tabname
+      i_tabkey      = l_tabkey
+    EXCEPTIONS
+      error_message = 4
+      OTHERS        = 4.
+
+  IF sy-subrc NE 0.
+    WRITE 'IBAN not valid, please contact SAP' COLOR COL_NEGATIVE.
+  ELSE.
+    WRITE 'IBAN inserted'.
+  ENDIF.
+
+  ADD 1 TO s_counter.
+  IF s_counter EQ 100.
+    CLEAR s_counter.
+    COMMIT WORK.
+    CALL FUNCTION 'BUFFER_REFRESH_ALL'.
+  ENDIF.
+
+ENDFORM.                               "iban_update

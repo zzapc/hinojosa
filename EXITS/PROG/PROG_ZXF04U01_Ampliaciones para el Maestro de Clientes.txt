@@ -1,0 +1,544 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZXF04U01
+*&---------------------------------------------------------------------*
+*"----------------------------------------------------------------------
+*"*"Lokale Schnittstelle:
+*"       IMPORTING
+*"             VALUE(I_KNA1) LIKE  KNA1 STRUCTURE  KNA1
+*"             VALUE(I_KNB1) LIKE  KNB1 STRUCTURE  KNB1 OPTIONAL
+*"             VALUE(I_KNVV) LIKE  KNVV STRUCTURE  KNVV OPTIONAL
+*"             VALUE(I_ADDRHANDLE) LIKE  ADDR1_SEL-ADDRHANDLE
+*"                             OPTIONAL
+*"       TABLES
+*"              T_KNAS STRUCTURE  KNAS OPTIONAL
+*"              T_KNAT STRUCTURE  KNAT OPTIONAL
+*"              T_KNB5 STRUCTURE  KNB5 OPTIONAL
+*"              T_KNBK STRUCTURE  KNBK OPTIONAL
+*"              T_KNBW STRUCTURE  KNBW OPTIONAL
+*"              T_KNEX STRUCTURE  KNEX OPTIONAL
+*"              T_KNVA STRUCTURE  KNVA OPTIONAL
+*"              T_KNVD STRUCTURE  KNVD OPTIONAL
+*"              T_KNVI STRUCTURE  KNVI OPTIONAL
+*"              T_KNVK STRUCTURE  KNVK OPTIONAL
+*"              T_KNVL STRUCTURE  KNVL OPTIONAL
+*"              T_KNVP STRUCTURE  KNVP OPTIONAL
+*"              T_KNZA STRUCTURE  KNZA OPTIONAL
+*"----------------------------------------------------------------------
+
+"ini CVP 05.10.2022 12:58  Capturar Campos ZZ del idoc de entrada( ZDEBMAS_A01 ampliacion ZDEBMAS07_A01) ,recoger de memoria para actualizar la KNVV
+"-> ver badi (clase ) ZCL_IM_CUSTOMER_ADD_DATA_B    método   -> IF_EX_CUSTOMER_ADD_DATA_BI~PASS_NON_STANDARD_SEGMENT
+TYPES : BEGIN OF ty_data,
+          counter   TYPE sy-tabix,
+          temp_data TYPE string,
+        END OF ty_data.
+DATA : lt_data_knvv TYPE TABLE OF ty_data,
+       lt_data_knvp TYPE TABLE OF ty_data,
+       key          TYPE indx-srtfd.
+DATA : lr_expimp  TYPE REF TO cl_abap_expimp_db.
+DATA:ls_ze1knvvm TYPE ze1knvvm,
+     ls_ze1knvpm TYPE ze1knvpm.
+FIELD-SYMBOLS : <fs_data> TYPE ty_data.
+
+"importar datos de ventas
+key = 'ZDEBMAS_A01_KNVV'.
+IMPORT lt_data_knvv TO lt_data_knvv FROM DATABASE indx(z1) ID key.
+IF lt_data_knvv[] IS NOT INITIAL.
+  CREATE OBJECT lr_expimp.
+  TRY.
+      CALL METHOD lr_expimp->delete
+        EXPORTING
+          tabname          = 'INDX'
+          client           = sy-mandt
+          area             = 'Z1'
+          id               = key
+          client_specified = abap_true.
+    CATCH cx_sy_client .
+    CATCH cx_sy_generic_key .
+    CATCH cx_sy_incorrect_key .
+  ENDTRY.
+
+  READ TABLE lt_data_knvv INTO DATA(ls_data) INDEX 1.
+  IF sy-subrc = 0.
+    ASSIGN ('(SAPMF02D)KNVV') TO FIELD-SYMBOL(<knvv_aux>).
+    IF <knvv_aux> IS ASSIGNED.
+      ls_ze1knvvm = ls_data-temp_data.
+      MOVE-CORRESPONDING ls_ze1knvvm TO <knvv_aux>.
+    ENDIF.
+  ENDIF.
+ENDIF.
+
+"Importar datos de Interlocutores
+key = 'ZDEBMAS_A01_KNVP'.
+IMPORT lt_data_knvp TO lt_data_knvp FROM DATABASE indx(z2) ID key.
+IF lt_data_knvp[] IS NOT INITIAL.
+  CREATE OBJECT lr_expimp.
+  TRY.
+      CALL METHOD lr_expimp->delete
+        EXPORTING
+          tabname          = 'INDX'
+          client           = sy-mandt
+          area             = 'Z2'
+          id               = key
+          client_specified = abap_true.
+    CATCH cx_sy_client .
+    CATCH cx_sy_generic_key .
+    CATCH cx_sy_incorrect_key .
+  ENDTRY.
+
+  FIELD-SYMBOLS <lt_knvp_aux> TYPE fknvp_tab.
+  DATA ls_knvp_aux TYPE fknvp.
+  ASSIGN ('(SAPMF02D)XKNVP[]') TO <lt_knvp_aux> .
+  IF <lt_knvp_aux> IS ASSIGNED.
+    READ TABLE <lt_knvp_aux> INTO DATA(ls_knvp) INDEX 1.
+
+    LOOP AT lt_data_knvp INTO ls_data.
+      CLEAR :ls_ze1knvpm,ls_knvp_aux.
+      ls_ze1knvpm = ls_data-temp_data.
+      READ TABLE <lt_knvp_aux> WITH KEY parvw = ls_ze1knvpm-parvw TRANSPORTING NO FIELDS.
+      IF sy-subrc <> 0.
+        MOVE-CORRESPONDING ls_ze1knvpm TO ls_knvp_aux.
+        ls_knvp_aux-mandt = sy-mandt.
+        ls_knvp_aux-kunnr = ls_knvp-kunnr.
+        ls_knvp_aux-vkorg = ls_knvp-vkorg.
+        ls_knvp_aux-vtweg = ls_knvp-vtweg.
+        ls_knvp_aux-spart = ls_knvp-spart.
+        ls_knvp_aux-kz    = ls_knvp-kz."'I'.
+        APPEND ls_knvp_aux TO <lt_knvp_aux>.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+ENDIF.
+"Fin CVP 05.10.2022 12:58
+
+
+* EBA 24/04/2014 Hacer que la condición de pago de deudores sea
+* automáticamente la misma que la que tenga asociada su Sociedad Financiera
+* La relación entre dichas tablas la podemos encontrar en T024E para Org.
+* de compra y en la tabla TVKO para Org. de Venta.
+DATA: l_knb1   TYPE          knb1,
+      l_knvv   TYPE          knvv,
+      i_tvko   TYPE TABLE OF tvko WITH HEADER LINE,
+      l_tvko   TYPE          tvko,
+      l_cambio.
+
+FIELD-SYMBOLS: <knb1> TYPE knb1,
+               <knvv> TYPE knvv,
+               <kna1> TYPE kna1.
+DATA: lv_iban TYPE iban.
+
+* GST - 11/01/2016 ->
+* NIF Residente:
+DATA: ls_knas  TYPE knas,
+      knas_aux TYPE knas.
+* GST - 11/01/2016 <-
+
+
+* Si han modificado la vista de sociedad
+IF NOT i_knb1 IS INITIAL.
+* SCT 16.03.2018 Id.46961 Responsable/comisionista obligatorio Cipasi
+  IF i_knb1-bukrs = '4000' AND i_kna1-ktokd = 'ZCLI'.
+    IF i_knb1-busab IS INITIAL.
+      MESSAGE e219(zsd).
+    ENDIF.
+  ENDIF.
+* Verifico si hay un cambio respecto a lo que había en base de datos
+  SELECT SINGLE * FROM knb1
+    INTO l_knb1
+   WHERE kunnr = i_knb1-kunnr
+     AND bukrs = i_knb1-bukrs.
+  IF sy-subrc = 0.
+    IF i_knb1-zterm NE l_knb1-zterm.
+
+* Recupero las organizaciones de ventas asociadas a la sociedad
+      SELECT * FROM tvko
+        INTO TABLE i_tvko
+       WHERE bukrs = i_knb1-bukrs.
+
+* Si había alguna activa cambio el valor e informo
+      IF NOT i_knvv IS INITIAL.
+        l_cambio = 'X'.
+        LOOP AT i_tvko WHERE vkorg = i_knvv-vkorg.
+          IF i_knvv-zterm NE i_knb1-zterm.
+            ASSIGN ('(SAPMF02D)KNVV') TO <knvv>.
+            IF sy-subrc = 0.
+              <knvv>-zterm = i_knb1-zterm.
+              " Se cambia la condición de pago de la org.ventas & a &
+              MESSAGE i020(zsd) WITH i_knvv-vkorg i_knb1-zterm.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+* Del resto de posibles, doy aviso para que la cambien a mano
+      LOOP AT i_tvko WHERE vkorg NE i_knvv-vkorg.
+        SELECT SINGLE * FROM knvv
+          INTO l_knvv
+         WHERE kunnr = i_knb1-kunnr
+           AND vkorg = i_tvko-vkorg.
+        IF l_knvv-zterm NE i_knb1-zterm.
+          "Debe cambiar la cond.pago de la org.ventas & a &
+          MESSAGE i021(zsd) WITH i_knvv-vkorg i_knb1-zterm.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+ENDIF.
+
+* No han modificado datos de sociedad, pero si de area de ventas
+IF NOT i_knvv IS INITIAL AND l_cambio IS INITIAL.
+
+* Busco la sociedad asociada a la org.ventas
+  SELECT SINGLE * FROM tvko
+    INTO l_tvko
+   WHERE vkorg = i_knvv-vkorg.
+  IF sy-subrc = 0.
+    SELECT SINGLE * FROM knb1
+      INTO l_knb1
+     WHERE kunnr = i_knvv-kunnr
+       AND bukrs = l_tvko-bukrs.
+    IF sy-subrc = 0.
+      IF l_tvko-bukrs <> '2000' AND i_knvv-vkorg <> '2001' AND i_knvv-vkorg <> '2000'. "JCB 21.11.22. Condicionar para que en el caso de la sociedad 2000 y org. Ventas 2001 no haga esa validación
+        "77323 - LER - 14.10.2024 Se elimina condicion para area de ventas 2000 y 2001.
+* Si no coincide la condición de pago con la de la sociedad, cambio y aviso
+        IF i_knvv-zterm NE l_knb1-zterm.
+          ASSIGN ('(SAPMF02D)KNVV') TO <knvv>.
+          IF sy-subrc = 0.
+            <knvv>-zterm = l_knb1-zterm.
+            " Se cambia la condición de pago de la org.ventas & a &
+            MESSAGE i020(zsd) WITH i_knvv-vkorg l_knb1-zterm.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDIF.
+
+******************************************************************************
+* EBA 21/07/2014.
+* a) SE TRATA DE CAMBIAR EL CAMPO MULTIEMPRESA (KNA1-GFORM) AL CREARSE EL CLIENTE
+*    EN MÁS DE UNA SOCIEDAD DEL GRUPO.
+* b) SE TRATA DE CAMBIAR EL CAMPO GRUPO DE TOLERANCIA (KNB1-TOGRU = 'COMU') SI
+*    DENTRO DE LA SOCIEDAD RAFAEL HINOJOSA S.A. (Xativa y Pacs) SE CREA
+*    EL MISMO CLIENTE
+DATA: g_knb1 TYPE TABLE OF knb1 WITH HEADER LINE.
+
+IF NOT i_knb1 IS INITIAL.
+  SELECT SINGLE * FROM knb1
+    INTO g_knb1
+   WHERE kunnr = i_knb1-kunnr.
+*     AND bukrs = i_knb1-bukrs.
+ENDIF.
+
+** SOTHIS**
+* SE FILTRA POR GRUPO DE CUENTAS
+DATA: ls_lfa1 TYPE lfa1,
+      ls_t005 TYPE t005,
+      ls_knbk TYPE knbk.
+TABLES: kna1, knb1.
+DATA: ls_fi0001 TYPE ztfi0001.
+DATA: lt_kna1 LIKE kna1 OCCURS 0.
+
+* FILTRAR POR GRUPO DE CUENTAS (se añade el chequeo para clientes potenciales y grupo 80113)
+IF i_kna1-ktokd = 'ZCLI' OR i_kna1-ktokd = 'ZPOT'. "OR i_kna1-ktokd = 'ZGRU'."
+
+* COMPROBAR SI EXISTE ALGUN CLIENTE CON ESE NIF
+  IF NOT i_kna1-stcd1 IS INITIAL.
+    SELECT * FROM kna1
+     UP TO 1 ROWS
+     WHERE kunnr NE i_kna1-kunnr
+       AND stcd1 = i_kna1-stcd1
+       AND ktokd NE 'ZSUB'. "Ticket 85998 Se excluye del chequeo los subcontratistas. 23.10.24"
+*       AND ktokd NE 'ZGRU'.
+      "Ticket 74976 Se excluye del chequeo los clientes del grupo. 16.01.23
+    ENDSELECT.
+
+    IF sy-subrc = 0.
+      " BG Ini 23.10.2023 - Se comenta select y mensaje; se valida si existe en la org.ventas enviada
+*      SELECT * UP TO 1 ROWS
+*      FROM knb1
+*        WHERE kunnr EQ kna1-kunnr.
+*      ENDSELECT.
+*      MESSAGE e107(zfi) WITH i_kna1-stcd1 kna1-kunnr knb1-bukrs.
+
+      SELECT * UP TO 1 ROWS
+       FROM knb1
+         WHERE kunnr EQ kna1-kunnr.
+*           AND bukrs EQ i_knb1-bukrs.
+      ENDSELECT.
+      IF sy-subrc EQ 0.
+        MESSAGE e107(zfi) WITH i_kna1-stcd1 kna1-kunnr knb1-bukrs.
+      ENDIF.
+
+      SELECT * UP TO 1 ROWS
+        INTO @DATA(x_knvv_aux)
+       FROM knvv
+         WHERE kunnr EQ @kna1-kunnr.
+*           AND vkorg EQ @i_knvv-vkorg.
+      ENDSELECT.
+      IF sy-subrc EQ 0.
+        MESSAGE e107(zfi) WITH i_kna1-stcd1 kna1-kunnr x_knvv_aux-vkorg.
+      ENDIF.
+
+      IF i_kna1-name1 IS INITIAL.
+        i_kna1-name1 = kna1-name1.
+      ENDIF.
+      " BG Fin 23.10.2023 - Se comenta mensaje y se valida si existe en la org.ventas enviada
+
+    ELSE.
+      "COMPROBAR IBAN
+      IF i_knb1-zwels = 'G' OR i_knb1-zwels = 'Q' OR
+         i_knb1-zwels = 'B' OR i_knb1-zwels = 'M'.
+        SELECT SINGLE *
+        FROM knb1
+        WHERE kunnr = i_kna1-kunnr.
+        IF sy-subrc <> 0.
+          CLEAR  ls_knbk.
+          READ TABLE t_knbk INTO  ls_knbk
+          INDEX 1.
+          CLEAR lv_iban.
+          GET PARAMETER ID 'ZIB' FIELD lv_iban.
+          FREE MEMORY ID 'ZIB'.
+          IF ( ls_knbk-banks IS INITIAL OR ls_knbk-bankl IS INITIAL OR ls_knbk-bankn IS INITIAL ) AND lv_iban IS INITIAL.
+            MESSAGE e009(zfi) WITH i_knb1-zwels.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      "VALIDACION DEL GRUPO DE TESORERIA DE CLIENTES
+      IF NOT i_knb1 IS INITIAL.
+        IF i_knb1-fdgrv(2) = 'CL' AND i_kna1-ktokd <> 'ZGRU' .
+
+          IF i_knb1-fdgrv <> 'CL-ZCALC'.
+            CLEAR ls_fi0001.
+            SELECT SINGLE * INTO ls_fi0001
+            FROM ztfi0001
+            WHERE zrelacion = 'D'
+            AND zwels = i_knb1-zwels
+            AND fdgrv = i_knb1-fdgrv.
+            IF sy-subrc <> 0.
+              MESSAGE e011(zfi) WITH i_knb1-fdgrv.
+            ELSE.
+              IF ls_fi0001-hbkid <> 'DUMMY'.
+                IF ls_fi0001-hbkid(4) <> i_knb1-hbkid(4).
+                  MESSAGE e011(zfi) WITH i_knb1-fdgrv.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+          ELSE.
+            CLEAR ls_fi0001.
+            SELECT SINGLE * INTO ls_fi0001
+            FROM ztfi0001
+            WHERE zrelacion = 'D'
+            AND zwels = i_knb1-zwels
+            AND fdgrv = i_knb1-fdgrv.
+            IF sy-subrc = 0.
+              i_knb1-fdgrv = ls_fi0001-fdgrv.
+            ENDIF.
+
+          ENDIF.
+        ELSE.
+          IF i_knb1-fdgrv IS INITIAL AND i_kna1-ktokd <> 'ZPOT'.
+            MESSAGE e012(zfi) WITH i_knb1-fdgrv.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ELSEIF i_kna1-land1 = 'ES'.
+    MESSAGE e015(zfi) WITH kna1-kunnr.
+  ENDIF.
+
+  "VERIFICAMOS SI ES NECESARIO EL NIF COMUNITARIO
+  "JCB 14.06.23. 77645.
+  "Se decide mejorar la seguridad del dato implementando las siguientes validaciones:
+  "Si es cliente de la UE <> ES:
+  "NIF comunitario debe estar relleno.
+  "NIF comunitario no puede estar repetido.
+  IF i_kna1-land1 <> 'ES'.
+    CLEAR ls_t005.
+    SELECT SINGLE * INTO ls_t005
+      FROM t005
+      WHERE land1 = i_kna1-land1.
+
+    CLEAR ls_knas.
+    READ TABLE t_knas INTO ls_knas WITH KEY land1 = 'ES'.
+
+    IF ls_t005-xegld = 'X' AND i_kna1-stceg IS INITIAL.
+      MESSAGE e008(zfi) WITH i_kna1-kunnr.
+
+    ELSEIF ls_t005-xegld = 'X'.
+      "NIF de Residentes:
+      SELECT * FROM kna1
+        UP TO 1 ROWS
+        WHERE kunnr NE i_kna1-kunnr
+        AND stceg = i_kna1-stceg.
+      ENDSELECT.
+
+      IF sy-subrc = 0.
+        SELECT * UP TO 1 ROWS
+        FROM knb1
+          WHERE kunnr EQ kna1-kunnr.
+        ENDSELECT.
+
+        MESSAGE e007(zfi) WITH i_kna1-stceg kna1-kunnr knb1-bukrs.
+      ELSE.
+        CLEAR knas_aux.
+        SELECT SINGLE * FROM knas
+          INTO knas_aux
+          WHERE kunnr NE i_kna1-kunnr
+          AND land1 = 'ES'
+          AND stceg = i_kna1-stceg.
+
+        IF sy-subrc = 0.
+          SELECT * UP TO 1 ROWS
+            FROM knb1
+            WHERE kunnr EQ knas_aux-kunnr.
+          ENDSELECT.
+
+          MESSAGE e007(zfi) WITH i_kna1-stceg knas_aux-kunnr knb1-bukrs.
+        ENDIF.
+      ENDIF.
+
+    ELSE.
+      "ini cgijon - 09.03.22 - sat 7000045859 ticket 70944
+      IF i_kna1-kunnr IS NOT INITIAL AND i_kna1-stceg IS NOT INITIAL.
+        SELECT * FROM kna1
+         UP TO 1 ROWS
+         WHERE kunnr NE i_kna1-kunnr AND
+               stceg = i_kna1-stceg.
+        ENDSELECT.
+
+        IF sy-subrc = 0.
+          SELECT * UP TO 1 ROWS
+          FROM knb1
+            WHERE kunnr EQ kna1-kunnr.
+          ENDSELECT.
+
+          MESSAGE e007(zfi) WITH i_kna1-stceg kna1-kunnr knb1-bukrs.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDIF.
+
+*" Inicio BG 30.11.2023 - Si es ZCLI se marca con X los campos de la KNVV
+*IF i_kna1-ktokd = 'ZCLI'.
+*  IF i_knvv-mrnkz IS INITIAL OR i_knvv-bokre IS INITIAL OR i_knvv-prfre IS INITIAL.
+*    ASSIGN ('(SAPMF02D)KNVV') TO <knvv>.
+*    IF sy-subrc = 0.
+*      <knvv>-mrnkz = abap_true.
+*      <knvv>-bokre = abap_true.
+*      <knvv>-prfre = abap_true.
+*    ENDIF.
+*  ENDIF.
+*ENDIF.
+*" Fin BG 30.11.2023
+
+******************************************************************************
+* EBA 18/09/2014.
+* SE TRATA DE VERIFICAR EL CAMPO "GRUPO" KNA1-KONZS QUE NOS PUEDA VENIR
+* DE LOS ERP CONTRA EL CÓDIGO DE CLIENTE QUE TENGA EN SAP.
+IF i_kna1-konzs IS NOT INITIAL AND sy-tcode NS 'XK' AND sy-tcode NS 'MK'. " cvivo - 56810 - Quitamos validación para proveedores
+  SELECT SINGLE kunnr FROM kna1 INTO i_kna1-kunnr
+  WHERE kunnr = i_kna1-konzs.
+  IF sy-subrc <> 0.
+    MESSAGE e014(zfi) WITH i_kna1-konzs.
+  ENDIF.
+ENDIF.
+
+*****************************************************************************
+*VALIDACION GRUPO CUENTAS CLIENTE - CUENTA ASOCIADA.
+*80113 - LER 21.11.23 - 83595 LER 01.08.2024 VALIDACION CTA ZPOT
+*****************************************************************************
+IF i_knb1-akont IS NOT INITIAL.
+  CASE i_kna1-ktokd.
+    WHEN 'ZCLI'.
+      IF i_knb1-akont <> '0004300000'.
+        MESSAGE e049(zfi).
+      ENDIF.
+    WHEN 'ZGRU'.
+      IF i_knb1-akont <> '0004330000'.
+        MESSAGE e049(zfi).
+      ENDIF.
+    WHEN 'ZPOT'.
+      IF i_knb1-akont <> '0004300001'.
+        MESSAGE e053(zfi).
+      ENDIF.
+
+    WHEN OTHERS.
+  ENDCASE.
+ENDIF.
+********83595 LER 01.08.2024 VALIDACION CTA ZPOT CONTROL PASO A S4H****
+" Validación adicional para ZPOT 83595 LER 01.08.2024 VALIDACION CTA ZPOT
+IF i_kna1-ktokd = 'ZPOT'.
+  IF NOT i_knb1-zwels IS INITIAL AND i_knb1-zwels <> 'V'.
+    MESSAGE e052(zfi).
+  ENDIF.
+ENDIF.
+
+"JCB 26.01.24. GAPSD076 - Aviso indicar Zona de Transporte en destinatario
+"Al crear un destinatario de mercancias validar si el campo Zona de Transporte se ha completado y sino debe de aparecer un aviso.
+IF i_kna1-ktokd = 'ZDES' AND i_kna1-lzone IS INITIAL AND i_knvv IS NOT INITIAL.
+  SET CURSOR FIELD 'ADDR1_DATA-TRANSPZONE'.
+  MESSAGE w051(zfi).
+ENDIF.
+
+"JCB 26.01.24. GAPSD086 - Puesto de descarga sea obligatorio al crear destinatario de mercancias
+FIELD-SYMBOLS: <fs_xknva_t> TYPE STANDARD TABLE,
+               <fs_xknva>   TYPE fknva.
+IF i_kna1-ktokd = 'ZDES' AND i_kna1-kunnr IS INITIAL AND t_knva[] IS INITIAL.
+  ASSIGN ('(SAPMF02D)XKNVA[]') TO <fs_xknva_t>.
+  IF sy-subrc = 0 AND <fs_xknva_t> IS INITIAL.
+    APPEND INITIAL LINE TO <fs_xknva_t> ASSIGNING <fs_xknva>.
+    <fs_xknva>-ablad = 'Horario descarga'.
+    <fs_xknva>-knfak = 'ES'.
+    <fs_xknva>-moab1 = <fs_xknva>-diab1 = <fs_xknva>-miab1 = <fs_xknva>-doab1 = <fs_xknva>-frab1 = '080000'.
+    <fs_xknva>-mobi1 = <fs_xknva>-dibi1 = <fs_xknva>-mibi1 = <fs_xknva>-dobi1 = <fs_xknva>-frbi1 = '140000'.
+    <fs_xknva>-moab2 = <fs_xknva>-diab2 = <fs_xknva>-miab2 = <fs_xknva>-doab2 = <fs_xknva>-frab2 = '160000'.
+    <fs_xknva>-mobi2 = <fs_xknva>-dibi2 = <fs_xknva>-mibi2 = <fs_xknva>-dobi2 = <fs_xknva>-frbi2 = '180000'.
+  ENDIF.
+ENDIF.
+
+
+*APC20240606 Verificamos si el cliente tiene el interoculotor backoffice informado
+* Si no es así, lanzamos en fondo el reprot ZRSD0038 para crear ese interlocutor
+IF NOT i_knvv IS INITIAL AND i_kna1-ktokd = 'ZCLI'.
+  IF NOT line_exists( t_knvp[ parvw = 'A1' ] ).
+    SELECT SINGLE kunnr FROM knvv   "Sólo durante la creación del área de ventas
+      INTO i_knvv-kunnr
+     WHERE kunnr = i_knvv-kunnr
+       AND vkorg = i_knvv-vkorg
+       AND vtweg = i_knvv-vtweg
+       AND spart = i_knvv-spart.
+    IF sy-subrc NE 0.
+      IF zcl_ap_parametros=>existe( clave = 'CORE_BODEF' campo = '' valor = i_knvv-vkorg ) . "Sólo ciertas organizaciones de ventas
+        IF zcl_ap_exits=>exit_activa( 'CLIENTE_CREAR_BACKOFFICE' ).
+          DATA: l_backoffice        TYPE lifnr,
+                l_backoffice_nombre TYPE lfa1-name1,
+                l_message           TYPE bapi_msg.
+          TRY.
+              PERFORM get_backoffice IN PROGRAM zrsd0038
+                USING 'A1' i_knvv-ernam i_knvv-vkorg
+              CHANGING l_backoffice l_backoffice_nombre l_message.
+              IF NOT l_backoffice IS INITIAL. "Se ha determinado backoffice genérico
+                FIELD-SYMBOLS: <xknvp> TYPE table,
+                               <knvp>  TYPE fknvp.
+                ASSIGN ('(SAPMF02D)XKNVP[]') TO <xknvp>.
+                IF sy-subrc = 0.
+                  APPEND INITIAL LINE TO <xknvp> ASSIGNING <knvp>.
+                  MOVE-CORRESPONDING i_knvv TO <knvp>.
+                  <knvp>-parvw = 'A1'.
+                  <knvp>-lifnr = l_backoffice.
+                  <knvp>-kz = 'I'.
+                  zcl_ap_exits=>log_st( exit = 'CLIENTE_CREAR_BACKOFFICE'
+                                        clave = i_knvv-kunnr && '-' && i_knvv-vkorg
+                                        p1 = 'Se asignada backoffice' p2 = l_backoffice
+                                        msgty = 'S' ).
+                ENDIF.
+              ENDIF.
+            CATCH cx_root INTO DATA(o_root).
+          ENDTRY.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDIF.

@@ -1,0 +1,266 @@
+
+CLASS zcl_im__deliv_proc_interco DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC .
+
+  PUBLIC SECTION.
+
+    INTERFACES if_badi_interface .
+    INTERFACES if_ex_le_shp_delivery_proc .
+  PROTECTED SECTION.
+  PRIVATE SECTION.
+endclass. "ZCL_IM__DELIV_PROC_INTERCO definition
+class ZCL_IM__DELIV_PROC_INTERCO implementation.
+  method IF_EX_LE_SHP_DELIVERY_PROC~CHANGE_DELIVERY_HEADER.
+  endmethod.
+  METHOD if_ex_le_shp_delivery_proc~change_delivery_item.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~change_fcode_attributes.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~change_field_attributes.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~check_item_deletion.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~delivery_deletion.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~delivery_final_check.
+    DATA: ls_error TYPE finchdel,
+          ls_lips  TYPE lipsvb,
+          ls_likp  TYPE likpvb.
+
+    FIELD-SYMBOLS: <fs_lips> TYPE lipsvb.
+
+    DATA: lv_segcal  TYPE zcod_sc,
+          lv_segcal2 TYPE zcod_sc,
+          lv_index   TYPE i.
+
+    DATA: l_matkl TYPE matkl,
+          l_nsp   TYPE abap_bool VALUE abap_false. "Existe material nonStandard Paper
+
+*   Obtenemos valor segcal informado en cabecera
+    READ TABLE it_xlikp INTO ls_likp INDEX 1.
+    CHECK sy-subrc EQ 0.
+
+*   Controlamos que todos los pedidos ZINT tienen el mismo valor en ZZSEGCAL
+*   Iteramos sobre las posiciones de las entregas para comprobar los pedidos
+    LOOP AT it_xlikp INTO ls_likp WHERE vbtyp NE '7'. " cvivo - Proyecto WM - excluir la validación para entregas entrantes
+      LOOP AT it_xlips ASSIGNING <fs_lips>.
+*     Nos quedamos con el indice
+        lv_index = sy-tabix.
+
+        SELECT SINGLE zzsegcal FROM ekko INTO lv_segcal
+          WHERE ebeln = <fs_lips>-vgbel
+            AND bsart = 'ZINT'.
+        IF sy-subrc NE 0.
+*       SD tambien tiene el campo de calidad en cabecera
+          SELECT SINGLE zzsegcal FROM vbak INTO lv_segcal
+            WHERE vbeln = <fs_lips>-vgbel.
+          IF sy-subrc NE 0.
+            CONTINUE.
+          ENDIF.
+        ENDIF.
+
+        SELECT SINGLE matkl INTO l_matkl FROM mara WHERE matnr = <fs_lips>-matnr.
+        IF sy-subrc EQ 0 AND l_matkl EQ '10199'.
+          l_nsp = abap_true.
+        ENDIF.
+
+*     Controlamos que sea ZINT . NEw - ZINT o que viene de SD
+        IF sy-subrc EQ 0.
+*       Si es la primera pasada guardamos valor para comparar con el resto de pedidos de la entrega
+          IF lv_index = 1.
+            lv_segcal2 = lv_segcal.
+          ENDIF.
+
+          IF l_nsp EQ abap_true AND lv_segcal NE '2'.
+            ls_error-msgid = 'ZMM'.
+            ls_error-msgty = 'E'.
+            ls_error-msgno = 000.
+*          ls_error- = 'La calidad del pedido no es de 2ª'.
+
+            ls_error-msgv1 = 'La calidad no es de 2ª con material NSP'.
+            ls_error-msgv2 = <fs_lips>-matnr.
+            INSERT ls_error INTO TABLE ct_finchdel.
+            EXIT.
+          ENDIF.
+
+*       Si es diferente lanzamos error. Controlamos que si se está creando no compare con cabecera
+          IF ( lv_segcal NE lv_segcal2 ) OR ( ls_likp-zzsegcal NE lv_segcal AND sy-tcode NE 'VL10X').
+            ls_error-msgid = 'ZMM'.
+            ls_error-msgty = 'E'.
+            ls_error-msgno = 145.
+            ls_error-vbeln = <fs_lips>-vbeln.
+            INSERT ls_error INTO TABLE ct_finchdel.
+            EXIT.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+
+    DATA: lv_mtart TYPE mtart.
+
+    DATA: l_objkey           TYPE                   objnum,
+          lt_allocvaluesnum  TYPE STANDARD TABLE OF bapi1003_alloc_values_num,
+          lt_allocvalueschar TYPE STANDARD TABLE OF bapi1003_alloc_values_char,
+          wa_char            TYPE                   bapi1003_alloc_values_char,
+          lt_allocvaluescurr TYPE STANDARD TABLE OF bapi1003_alloc_values_curr,
+          lt_return          TYPE STANDARD TABLE OF bapiret2.
+
+    IF ls_likp-lfart = 'ZLF2' OR ls_likp-lfart = 'ZLF3'.
+
+      LOOP AT it_xlips ASSIGNING <fs_lips> WHERE charg IS NOT INITIAL .
+        SELECT SINGLE mtart FROM mara
+          INTO lv_mtart
+          WHERE matnr = <fs_lips>-matnr.
+
+        IF lv_mtart = 'ZPLP' OR lv_mtart = 'ZPMP'.
+          CLEAR: l_objkey, lt_allocvaluesnum, lt_allocvalueschar, lt_allocvaluescurr, lt_return.
+          REFRESH: lt_allocvaluesnum ,lt_allocvalueschar, lt_allocvaluescurr, lt_return.
+
+          CONCATENATE <fs_lips>-matnr <fs_lips>-charg INTO l_objkey.
+          CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+            EXPORTING
+              objectkey       = l_objkey
+              objecttable     = 'MCH1'
+              classnum        = 'Z_CLIENTE'
+              classtype       = '023'
+            TABLES
+              allocvaluesnum  = lt_allocvaluesnum
+              allocvalueschar = lt_allocvalueschar
+              allocvaluescurr = lt_allocvaluescurr
+              return          = lt_return.
+
+          READ TABLE lt_allocvalueschar INTO wa_char WITH KEY charact = 'Z_CLIENTE'.
+          IF sy-subrc = 0 AND wa_char-value_char <> ls_likp-kunag.
+*           “Cliente en el lote XXXXXXXXX no coincide con solicitante de la entrega”.
+            ls_error-msgid = 'ZSD'.
+            ls_error-msgty = 'E'.
+            ls_error-msgno = 057.
+            ls_error-vbeln = <fs_lips>-vbeln.
+            ls_error-msgv1 = <fs_lips>-charg.
+            INSERT ls_error INTO TABLE  ct_finchdel.
+            EXIT.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~document_number_publish.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~fill_delivery_header.
+
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~fill_delivery_item.
+* ini - cvivo - Proyecto WM - Validar ctd bobina < 5000 kg
+    DATA: max  TYPE brgew_15,
+          min  TYPE brgew_15,
+          log  TYPE shp_badi_error_log,
+          name TYPE char40.
+
+    SELECT SINGLE @abap_true FROM tvlk
+      WHERE vbtyp EQ '7' " entrega entrante
+        AND kappl EQ 'E1' " aplicación: entrega entrante
+        AND lfart EQ @is_likp-lfart
+      INTO @DATA(result).
+
+    IF sy-subrc EQ 0. " sólo aplica a entregas entrantes
+      CONCATENATE 'Z_CTD_EM_BOBINA_' cs_lips-werks INTO name.
+
+      SELECT SINGLE *
+        FROM tvarvc
+        WHERE name EQ @name
+          INTO @DATA(tvarvc).
+
+      MOVE tvarvc-high TO max.
+      MOVE tvarvc-low TO min.
+
+      IF cs_lips-uecha IS INITIAL.
+        IF tvarvc IS NOT INITIAL AND ( cs_lips-mtart EQ 'ZPAP' OR cs_lips-mtart EQ 'ZCAB' OR cs_lips-mtart EQ 'ZPIM' )
+          AND cs_lips-charg IS NOT INITIAL AND ( cs_lips-lfimg > max OR cs_lips-lfimg < min )
+          AND cs_lips-meins EQ 'KG'. "lotes de papel = bobina
+          log-msgty = 'E'.
+          log-msgid = 'ZMM'.
+          log-msgno = '165'.
+          WRITE min TO log-msgv1 LEFT-JUSTIFIED DECIMALS 0.
+          WRITE max TO log-msgv2 LEFT-JUSTIFIED DECIMALS 0.
+          log-vbeln = cs_lips-vbeln.
+          log-posnr = cs_lips-posnr.
+          APPEND log TO ct_log.
+        ENDIF.
+      ELSE. " en partición de lote la cantidad en esta badi va en peso bruto :(
+        IF tvarvc IS NOT INITIAL AND ( cs_lips-mtart EQ 'ZPAP' OR cs_lips-mtart EQ 'ZCAB' OR cs_lips-mtart EQ 'ZPIM' )
+        AND cs_lips-charg IS NOT INITIAL AND ( cs_lips-brgew > max OR cs_lips-brgew < min )
+        AND cs_lips-meins EQ 'KG'. "lotes de papel = bobina
+          log-msgty = 'E'.
+          log-msgid = 'ZMM'.
+          log-msgno = '165'.
+          WRITE min TO log-msgv1 LEFT-JUSTIFIED DECIMALS 0.
+          WRITE max TO log-msgv2 LEFT-JUSTIFIED DECIMALS 0.
+          log-vbeln = cs_lips-vbeln.
+          log-posnr = cs_lips-posnr.
+          APPEND log TO ct_log.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+* fin - cvivo - Proyecto WM - Validar ctd bobina < 5000 kg
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~initialize_delivery.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~item_deletion.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~publish_delivery_item.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~read_delivery.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~save_and_publish_before_output.
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~save_and_publish_document.
+    DATA: lv_anul     TYPE xflag,
+          ls_xlikp    TYPE likpvb,
+          lt_finchdel TYPE finchdel_t,
+          ls_finchdel TYPE finchdel.
+
+    IF sy-tcode = 'VL09'.
+      LOOP AT it_xlikp INTO ls_xlikp.
+        CLEAR lv_anul.
+        CALL FUNCTION 'ZMFMM_CHECK_ANUL_SAL_MCIA'
+          EXPORTING
+            i_vbeln      = ls_xlikp-vbeln
+          IMPORTING
+            e_anul       = lv_anul
+          EXCEPTIONS
+            no_anulacion = 1
+            OTHERS       = 2.
+        IF sy-subrc <> 0.
+* Control de errores:
+          MESSAGE e099(zmm) WITH ls_xlikp-vbeln.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+  ENDMETHOD.
+  METHOD if_ex_le_shp_delivery_proc~save_document_prepare.
+    DATA: ls_lips  TYPE lipsvb.
+
+    FIELD-SYMBOLS: <fs_likp> TYPE likpvb,
+                   <fs_lips> TYPE lipsvb.
+
+*   Leemos cabecera de la entrega
+    READ TABLE ct_xlikp ASSIGNING <fs_likp> INDEX 1.
+
+*   Obtenemos cabecera de la entrega
+    READ TABLE ct_xlips INTO ls_lips INDEX 1.
+    IF sy-subrc EQ 0.
+      SELECT SINGLE zzsegcal FROM ekko INTO <fs_likp>-zzsegcal
+        WHERE ebeln = ls_lips-vgbel
+          AND bsart = 'ZINT'.
+      IF sy-subrc NE 0.
+*       SD tambien tiene el campo de calidad en cabecera
+        SELECT SINGLE zzsegcal FROM vbak INTO <fs_likp>-zzsegcal
+          WHERE vbeln = ls_lips-vgbel.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+endclass. "ZCL_IM__DELIV_PROC_INTERCO definition
+endclass. "ZCL_IM__DELIV_PROC_INTERCO implementation

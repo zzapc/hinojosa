@@ -1,0 +1,171 @@
+FUNCTION zswm_get_shipment_out_ui5 .
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(TCODE) TYPE  TCODE OPTIONAL
+*"     VALUE(UNAME) TYPE  SY-UNAME DEFAULT SY-UNAME
+*"     VALUE(TKNUM) TYPE  TKNUM OPTIONAL
+*"     VALUE(VBELN) TYPE  VBELN OPTIONAL
+*"     VALUE(POSNR) TYPE  POSNR OPTIONAL
+*"  EXPORTING
+*"     VALUE(LT_VTTK) TYPE  VTTK_TAB
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_T
+*"     VALUE(TT_TRANP_OUT) TYPE  ZSWM_GET_TRANSPORTES_UI5_STRTT
+*"     VALUE(TT_HEAD) TYPE  ZSWM_GET_ENTREGAS_HEAD_UI5_STT
+*"     VALUE(TT_ENTRE) TYPE  ZSWM_GET_ENTREGAS_UI5_STR_TT
+*"     VALUE(TT_PICKING) TYPE  ZSWM_UI5_STOCK_AND_PICKING_TT
+*"     VALUE(TT_STOCK) TYPE  ZSWM_UI5_STOCK_AND_PICKING_TT
+*"----------------------------------------------------------------------
+  PERFORM break USING 'ZSWM_GET_SHIPMENT_OUT_UI5'.
+
+  DATA: data_u            TYPE zswm_data_ui5_eeeoo_str,
+        r_param           TYPE zswm_data_ui5_param_str,
+        r_funcionalidades TYPE zswm_data_ui5_func_str.
+
+  DATA: l_active TYPE flag.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = tknum
+    IMPORTING
+      output = tknum.
+
+  CALL FUNCTION 'ZSWM_GET_DATA_USER_UI5'
+    EXPORTING
+      uname      = uname
+      statu      = 'X'
+      no_gen_log = abap_true
+    IMPORTING
+      data_user  = data_u
+*     ERROR      =
+*     TT_LOG     =
+    .
+
+  CALL FUNCTION 'ZSWM_GET_PARAM_UI5'
+    EXPORTING
+      data_user         = data_u
+      tcode             = tcode
+      no_gen_log        = abap_true
+    IMPORTING
+      r_param           = r_param
+      r_funcionalidades = r_funcionalidades
+*     ERROR             =
+*     TT_LOG            =
+    .
+  SELECT * INTO TABLE lt_vttk FROM vttk WHERE tknum EQ tknum.
+  DATA: vbeln_ini TYPE vbeln, posnr_ini TYPE posnr.
+  PERFORM get_transportes_out USING lt_vttk
+                                    data_u
+                                    r_param
+                                    tcode
+                                    vbeln_ini
+                                    posnr_ini
+                             CHANGING tt_tranp_out
+                                      tt_head
+                                      tt_entre.
+  CHECK vbeln IS NOT INITIAL.
+  DELETE tt_head  WHERE vbeln NE vbeln.
+  DELETE tt_entre WHERE vbeln NE vbeln.
+  SELECT * INTO TABLE  @DATA(tt_pick) FROM zswm_ui5_pick WHERE vbeln EQ @vbeln
+*                                                           and posnr eq @posnr
+                                                           AND lvorm NE @abap_true.
+
+  IF posnr IS NOT INITIAL.
+    DELETE tt_entre WHERE posnr NE posnr.
+    DELETE tt_pick  WHERE posnr NE posnr.
+  ENDIF.
+*    and posnr is not INITIAL.
+  DATA tt_lqua TYPE TABLE OF lqua.
+* add jtm 27.06.2022
+  DATA rang_lgtype TYPE bapi1172_lgtyp_range_tab.
+  CALL FUNCTION 'ZSWM_SET_GET_VALUES'
+    EXPORTING
+*      shortname = 'ZSWM_PLANCHA_LGTYP'    " del jtm 20.02.2024
+      shortname = 'ZSWM_PLANCHA_LGTYP_DOS' " add jtm 20.02.2024
+      lgnum     = data_u-lgnum             " add jtm 20.02.2024
+    IMPORTING
+      rr_lgtyp  = rang_lgtype.
+
+* fin de add jtm 27.06.2022
+  LOOP AT tt_entre INTO DATA(rt_entre) WHERE vbeln EQ vbeln.
+*  read TABLE tt_entre into data(rT_entre) with key vbeln = v<beln
+*                                                   posnr = posnr.
+
+    SELECT * INTO TABLE @DATA(tt_lqua_aux) FROM lqua WHERE lgnum EQ @rt_entre-lgnum
+                                                   AND matnr EQ @rt_entre-matnr
+                                                   AND werks EQ @rt_entre-werks
+                                                   AND lgort EQ @rt_entre-lgort
+*                                                   AND sobkz EQ @rt_entre-sobkz
+*         " SMT - INI - 11.11.2022 14:33:28 - comentamos para obtener todo el stock. y filtrar luego
+                                                   AND lgtyp IN @rang_lgtype      " add jtm 27.06.2022
+*                                                  and sonum eq @rt_entre-sonum
+*         " SMT - INI - 11.11.2022 14:33:28 - comentamos para obtener todo el stock. y filtrar luego
+                                                   AND bestq EQ @rt_entre-insmk
+                                                   AND verme >  0.
+*                                                  and lgtyp ne 'MUE'.           " es el picking
+
+    " SMT - INI - 11.11.2022 14:15:07 - Borramos el stock que no cumpla la condición si tenemos el addon cross activo
+
+    CLEAR: l_active.
+    CALL FUNCTION 'ZSWM_ACTIVE_CROSS_SONUM'
+      EXPORTING
+        i_tknum  = tknum    " Nº de transporte
+        i_vbeln  = vbeln    " Número de documento comercial
+        i_posnr  = posnr    " Número de posición del documento comercial
+      IMPORTING
+        e_active = l_active.    " Indicador general
+
+    IF l_active IS INITIAL. "Si no está activo vamos contra pedido
+      DELETE tt_lqua_aux WHERE sobkz NE rt_entre-sobkz AND sonum NE rt_entre-sonum.
+    ENDIF.
+
+    " SMT - FIN - 11.11.2022 14:15:49 - Borramos el stock que no cumpla la condición si tenemos el addon cross activo
+
+
+    IF rt_entre-charg IS NOT INITIAL.
+      DELETE tt_lqua_aux WHERE charg NE rt_entre-charg.
+    ENDIF.
+    IF rt_entre-sobkz EQ 'E'
+    and l_active      ne abap_true. " Add jtm 12.11.2022
+      DELETE tt_lqua_aux WHERE sonum NE rt_entre-sonum.
+    ENDIF.
+    CHECK tt_lqua_aux[] IS NOT INITIAL.
+    APPEND LINES OF tt_lqua_aux TO tt_lqua.
+  ENDLOOP.
+*  select * into TABLE  @data(tt_pick) from ZSWM_UI5_PICK where vbeln eq @vbeln
+*                                                           and posnr eq @posnr
+*                                                           and lvorm ne @abap_true.
+  DATA registro TYPE zswm_ui5_stock_and_picking_scr.
+  LOOP AT tt_pick INTO DATA(rt_pick).
+    CLEAR registro.
+    READ TABLE tt_lqua WITH KEY lenum = rt_pick-nlenr
+                                matnr = rt_pick-matnr
+                                werks = rt_pick-werks
+                                lgort = rt_pick-lgort
+                                sobkz = rt_pick-sobkz
+                                charg = rt_pick-charg
+                                bestq = rt_pick-bestq
+                                sonum = rt_pick-sonum
+                                lgpla = vbeln
+                                lgtyp = 'MUE'   INTO DATA(rt_lqua).
+    CHECK sy-subrc EQ 0.
+    DATA(sw_tabix) = sy-tabix.
+    MOVE-CORRESPONDING rt_lqua TO registro.
+    registro-exidv  = rt_pick-exidv.
+    registro-vhilm  = rt_pick-vhilm.
+    registro-menge  = rt_lqua-verme.
+    APPEND registro TO tt_picking.
+    DELETE tt_lqua INDEX sw_tabix.
+  ENDLOOP.
+  DELETE tt_lqua WHERE lgtyp EQ 'MUE' AND lgpla+0(1) EQ '0'.
+  LOOP AT tt_lqua INTO rt_lqua.
+    CLEAR registro.
+    MOVE-CORRESPONDING rt_lqua TO registro.
+    registro-exidv     = rt_lqua-lenum.
+    registro-menge     = rt_lqua-verme.
+    APPEND registro TO tt_stock.
+  ENDLOOP.
+
+
+ENDFUNCTION.

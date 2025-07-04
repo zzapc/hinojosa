@@ -1,0 +1,339 @@
+
+class YCL_HP_SMD_AIS_STP_S199 definition
+  public
+  inheriting from /VCXI/CL_CKMR_CLSTP
+  final
+  create public .
+
+public section.
+
+  methods CONSTRUCTOR
+    importing
+      !IR_RPSEG type ref to /VCXI/CL_CKMR_RPSEG
+    raising
+      /VCXI/CX_CKX .
+
+  methods EXECUTE
+    redefinition .
+protected section.
+
+  data R_DCO_OUTPUT type ref to YCL_HP_SMD_AIS_DCO .
+  data R_DCO_INPUT type ref to YCL_HP_SMD_AIS_DCO .
+  data R_IDAT_SDOC type ref to YCL_HP_SMD_AIS_IDAT_SDOC .
+
+  methods FILL_SDOC
+    changing
+      !CT_WRKLI type YHP_SMD_AIS_TT_QUOT_WRKLI
+    raising
+      /VCXI/CX_CKX .
+private section.
+endclass. "YCL_HP_SMD_AIS_STP_S199 definition
+class YCL_HP_SMD_AIS_STP_S199 implementation.
+method CONSTRUCTOR.
+
+*** Super Constructor
+  SUPER->CONSTRUCTOR( IR_RPSEG = IR_RPSEG ).
+
+*** Map DCO to Required Input/Output
+  ME->R_RPSEG->MAP_DCO( changing CR_DCO = ME->R_DCO_INPUT ).
+  ME->R_RPSEG->MAP_DCO( changing CR_DCO = ME->R_DCO_OUTPUT ).
+
+endmethod.
+method EXECUTE.
+
+  data: LF_VBELN   type VBELN_VA,
+        LF_OBJEK   type CUOBN,
+        LF_VCSTA   type ZVCXI_XCI_VCSTA,
+        LF_SVCSTAT type /VCXI/VKSR_ELMST,
+        LF_WAIT    type I value 5.
+
+  data: LS_SDOCRS type ZVCXI_XCI_S_SDOCRS.
+
+  data: LT_WRKLI   type YHP_SMD_AIS_TT_QUOT_WRKLI,
+        LT_SVC_MSG type /VCXI/CKXM_TT_MSG.
+
+  data: LR_MSG    type ref to /VCXI/CL_CKXM_MESSAGE,
+        LR_SVC    type ref to   /VCXI/CL_VKSRA_SVC,
+        LR_CX_CKX type ref to /VCXI/CX_CKX.
+
+  field-symbols: <S_WRKLI>     type YHP_SMD_AIS_S_QUOT_WRKLI,
+                 <S_WRKLI_SUB> type YHP_SMD_AIS_S_QUOT_WRKLI.
+
+  try.
+
+***   Fill SD Document Data
+      ME->FILL_SDOC( changing CT_WRKLI = ME->R_DCO_INPUT->T_WRKLI ).
+      create object LR_MSG.
+
+      if ME->R_IDAT_SDOC is bound.
+
+***     Call BAPI
+*        YCL_HP_SMD_AIS_SRV=>F_STATUS = 'S'.
+         "JBL Prevent second Sdoc creation if step is executed twice OPHJVC-636
+          data LT_WRKLI1 type YHP_SMD_AIS_TT_QUOT_WRKLI.
+          data LS_WRKLI type YHP_SMD_AIS_S_QUOT_WRKLI.
+          LT_WRKLI1 = ME->R_DCO_INPUT->T_WRKLI.
+          SORT LT_WRKLI1 BY VBELN_NEW DESCENDING.
+          read table LT_WRKLI1 into LS_WRKLI index 1.
+          LF_VBELN = LS_WRKLI-VBELN_NEW.
+*End of OPHJVC-636
+        ME->R_IDAT_SDOC->CALL_BAPI( exporting IF_TESTRUN           = ABAP_FALSE
+                                              IF_BEHAVE_WHEN_ERROR = 'P'
+                                              IF_VBELN             = LF_VBELN
+                                    importing ER_MSG               = LR_MSG
+                                              EF_VBELN             = LF_VBELN
+                                              ES_SDOCRS            = LS_SDOCRS ).
+*        clear YCL_HP_SMD_AIS_SRV=>F_STATUS.
+        if LF_VBELN is not initial.
+
+***       reprocess SVC to trigger "fill production"
+          loop at ME->R_DCO_INPUT->T_WRKLI assigning <S_WRKLI>.
+            YCL_HP_SVC_SRV_UTIL=>OPEN_EDITABLE_SVC( exporting IF_VBELN = LF_VBELN
+                                                              IF_POSNR = <S_WRKLI>-POSNR
+                                                    importing ER_SVC   = LR_SVC ).
+            try.
+                YCL_HP_SVC_SRV_UTIL=>SAVE_EDITABLE_SVC( IF_VBELN       = LF_VBELN
+                                                        IF_POSNR       = <S_WRKLI>-POSNR
+                                                        IR_SVC         = LR_SVC
+                                                        IF_FORCE_SAVE  = ABAP_TRUE ).
+              catch /VCXI/CX_CKX into LR_CX_CKX. " inconsistent sales docs can not be saved (depends on SAP release, IS-MILL). this causes an exception
+                LR_CX_CKX->F_MSGTY = 'W'.
+                LR_MSG->ADD_MESSAGE_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+            endtry.
+            YCL_HP_SVC_SRV_UTIL=>FREE_EDITABLE_SVC( IR_SVC   = LR_SVC
+                                                    IF_VBELN = LF_VBELN ).
+          endloop.
+
+          do 5 times.
+***         enqueue  (EVVBAKE or EZVCXI_XCI_D200E ??)
+            call function 'ENQUEUE_EVVBAKE'
+              exporting
+                VBELN          = LF_VBELN
+              exceptions
+                FOREIGN_LOCK   = 1
+                SYSTEM_FAILURE = 2
+                others         = 3.
+            if SY-SUBRC <> 0.
+              wait up to LF_WAIT seconds.
+              LF_WAIT = LF_WAIT - 1.
+            else.
+              call function 'DEQUEUE_EVVBAKE'
+                exporting
+                  VBELN = LF_VBELN.
+              exit.
+            endif.
+          enddo.
+
+***       Get Status of SmartVC and LO-VC (lock VC config if needed)
+          try.
+
+              loop at LS_SDOCRS-T_ITEMS into data(LS_ITEMS).
+
+***             Skip Multi quantity positions
+                check LS_ITEMS-MATERIAL ns '_MQ_CNF'.
+
+                clear: LF_SVCSTAT, LT_SVC_MSG.
+                YCL_HP_SVC_SRV_UTIL=>CHECK_SVC_CONFIG( exporting IF_CUOBJ    = LS_ITEMS-CONFIG
+                                                       importing EF_ELMST    = LF_SVCSTAT
+                                                                 ET_MESSAGES = LT_SVC_MSG ).
+
+                check LF_SVCSTAT ne /VCXI/CL_VKSR_SERVICE=>C_ELMST_G.
+
+***             SVC is inconsistent for &1 &2. It will be locked.
+                LR_MSG->ADD_MESSAGE( IF_MSGID = 'YHP_SMD_AIS'
+                                     IF_MSGTY = 'W'
+                                     IF_MSGNO = '004'
+                                     IF_MSGV1 = |{ LF_VBELN alpha = out }|
+                                     IF_MSGV2 = |{ LS_ITEMS-ITM_NUMBER alpha = out }| ).
+
+***             Append all error messages as warning to avoid stopping the process
+                loop at LT_SVC_MSG into data(LS_SVC_MSG).
+                  if LS_SVC_MSG-MSGTY eq 'E'.
+                    LS_SVC_MSG-MSGTY = 'W'.
+                  endif.
+                  append LS_SVC_MSG to LR_MSG->T_MSG.
+                endloop.
+
+                LF_VCSTA = YCL_HP_SVC_SRV_UTIL=>GET_LOVC_STATUS( IF_CUOBJ = LS_ITEMS-CONFIG ).
+
+***             In case of SmartVC inconsistent, and LOVC not locked, then lock it
+                check LF_VCSTA ne YCL_HP_SVC_SRV_UTIL=>C_VCSTA_LOCKED.
+
+                concatenate LF_VBELN LS_ITEMS-ITM_NUMBER
+                       into LF_OBJEK.
+
+                YCL_HP_SVC_SRV_UTIL=>SET_LOVC_STATUS( IF_CUOBJ = LS_ITEMS-CONFIG
+                                                      IF_OBJEK = LF_OBJEK
+                                                      IF_OBTAB = 'VBPS'
+                                                      IF_VCSTA = YCL_HP_SVC_SRV_UTIL=>C_VCSTA_LOCKED ).
+
+              endloop.
+
+            catch /VCXI/CX_CKX into LR_CX_CKX.
+              LR_MSG->ADD_MESSAGE_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+
+          endtry.
+
+***       Update DCO
+          loop at ME->R_DCO_INPUT->T_WRKLI assigning <S_WRKLI>.
+            append initial line to LT_WRKLI assigning <S_WRKLI_SUB>.
+            move-corresponding <S_WRKLI> to <S_WRKLI_SUB>.
+            <S_WRKLI_SUB>-VBELN_NEW = LF_VBELN.
+          endloop.
+          ME->R_DCO_OUTPUT->SET_WRKLI( IT_WRKLI = LT_WRKLI ).
+
+        endif.
+
+      endif.
+
+***   Check Result
+      loop at LR_MSG->T_MSG into data(LS_MSG)
+        where MSGTY eq 'E' or MSGTY eq 'A' or MSGTY eq 'X'.
+        exit.
+      endloop.
+
+      if LS_MSG is not initial.
+***     Set Status to Error
+        /VCXI/CX_CKX=>RAISE_CKX_WITH_MESSAGE( IF_MSGID = LS_MSG-MSGID
+                                              IF_MSGNO = LS_MSG-MSGNO
+                                              IF_MSGTY = LS_MSG-MSGTY
+                                              IF_MSGV1 = LS_MSG-MSGV1
+                                              IF_MSGV2 = LS_MSG-MSGV2
+                                              IF_MSGV3 = LS_MSG-MSGV3
+                                              IF_MSGV4 = LS_MSG-MSGV4 ).
+      endif.
+
+***   Set Status to Complete
+      ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_COMPLETED ).
+
+***   Merge VCXI-Messages
+      try.
+          if LR_MSG is bound.
+            ME->R_RPSEG->R_MSG->MERGE( changing CR_MESSAGE = LR_MSG ).
+          endif.
+        catch /VCXI/CX_CKX.                             "#EC NO_HANDLER
+      endtry.
+
+    catch /VCXI/CX_CKX into LR_CX_CKX.
+
+***   Set Status to Error
+      ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_ERROR ).
+
+***   Add Message to Message Log
+      ME->R_RPSEG->R_MSG->ADD_MESSAGE_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+
+***   Merge VCXI-Messages
+      try.
+          if LR_MSG is bound.
+            ME->R_RPSEG->R_MSG->MERGE( changing CR_MESSAGE = LR_MSG ).
+          endif.
+        catch /VCXI/CX_CKX.                             "#EC NO_HANDLER
+      endtry.
+
+  endtry.
+
+*** Perform Save and Commit
+  ME->R_RPSEG->SAVE_AND_COMMIT( ).
+
+endmethod.
+method FILL_SDOC.
+
+  data: LF_NIDAT_SVC type ZVCXI_XCI_NIDAT,
+        LF_POSNR     type POSNR_VA.
+
+  data: LS_SDOCIN type ZVCXI_XCI_S_SDOCIN.
+
+  data: LR_IDAT_SDOC type ref to YCL_HP_SMD_AIS_IDAT_SDOC,
+        LR_CX_CKX    type ref to /VCXI/CX_CKX,
+        LR_MSG       type ref to /VCXI/CL_CKXM_MESSAGE.
+
+  field-symbols: <S_WRKLI> type YHP_SMD_AIS_S_QUOT_WRKLI.
+
+  try.
+
+      create object LR_MSG.
+
+      loop at CT_WRKLI assigning <S_WRKLI>.
+
+        if SY-TABIX eq 1.
+
+***       Create IDAT SD Document
+          LR_IDAT_SDOC = YCL_HP_SMD_AIS_IDAT_SDOC=>CREATE( IF_AUART = <S_WRKLI>-AUART
+                                                           IF_VKORG = <S_WRKLI>-VKORG
+                                                           IF_VTWEG = <S_WRKLI>-VTWEG
+                                                           IF_SPART = <S_WRKLI>-SPART ).
+          LR_IDAT_SDOC->SET_DATES( IF_PRSDT = <S_WRKLI>-PRSDT
+                                   IF_BNDDT = <S_WRKLI>-BNDDT ).
+
+
+        endif.
+
+        if <S_WRKLI>-R_IDAT_SVC is initial.
+          raise exception type /VCXI/CX_CKX.
+        endif.
+
+***     Get current GUID (Temporary one)
+        LF_NIDAT_SVC = <S_WRKLI>-R_IDAT_SVC->/VCXI/IF_CKX_OBJECT~GET_GUID( ).
+
+        check LR_IDAT_SDOC is bound.
+
+***     Set Partner
+        LR_IDAT_SDOC->SET_SDOCPA( IF_PARVW = 'AG'
+                                  IF_KUNNR = <S_WRKLI>-KUNAG ).
+        if <S_WRKLI>-KUNWE is not initial.
+          LR_IDAT_SDOC->SET_SDOCPA( IF_PARVW = 'WE'
+                                    IF_KUNNR = <S_WRKLI>-KUNWE ).
+        endif.
+
+***     Set Info
+        clear LS_SDOCIN.
+        move <S_WRKLI>-GROUPING to LS_SDOCIN-BSTKD.
+
+        LR_IDAT_SDOC->SET_SDOCIN( IS_SDOCIN = LS_SDOCIN ).
+
+***     Set Items
+        LF_POSNR = <S_WRKLI>-POSNR.
+        LR_IDAT_SDOC->SET_SDOCIT( IF_POSNR     = LF_POSNR
+                                  IF_MATNR     = <S_WRKLI>-RMATN
+                                  IF_WERKS     = <S_WRKLI>-WERKS
+                                  IF_KWMENG    = <S_WRKLI>-KWMENG
+                                  IF_VRKME     = 'ST'
+                                  IF_BSTKD     = <S_WRKLI>-LEGMA
+                                  IF_LGORT    = <s_wrkli>-lgort
+                                  IF_NIDAT_SVC = LF_NIDAT_SVC ).
+
+        move LF_POSNR to <S_WRKLI>-POSNR_NEW.
+
+***     Set Conditions
+        if <S_WRKLI>-PR00 is not initial.
+          LR_IDAT_SDOC->SET_COND( IF_POSNR = LF_POSNR
+                                  IF_KSCHL = 'ZPRC'
+                                  IF_KBETR = <S_WRKLI>-PR00
+                                  IF_KONWA = <S_WRKLI>-WAERK ).
+        endif.
+        if <S_WRKLI>-ZR01 is not initial.
+          LR_IDAT_SDOC->SET_COND( IF_POSNR = LF_POSNR
+                                  IF_KSCHL = 'ZR01'
+                                  IF_KBETR = <S_WRKLI>-ZR01
+                                  IF_KONWA = <S_WRKLI>-WAERK ).
+        endif.
+
+      endloop.
+
+      ME->R_IDAT_SDOC = LR_IDAT_SDOC.
+
+***   Merge resulting Messages
+      ME->R_RPSEG->R_MSG->MERGE( changing CR_MESSAGE = LR_MSG ).
+
+***----------------------------------------------------------------------------
+    catch /VCXI/CX_CKX into LR_CX_CKX.
+
+***   Set Status to Error
+      ME->R_RPSEG->SET_SRPSG( IF_SRPSG = /VCXI/CL_CKMR_RPSEG=>C_SRPSG_ERROR ).
+
+***   Add Message to Message Log
+      ME->R_RPSEG->R_MSG->ADD_MESSAGE_BY_CX_CKX( IR_CX_CKX = LR_CX_CKX ).
+
+  endtry.
+
+endmethod.

@@ -1,0 +1,202 @@
+
+class YCL_HP_PP_STATUS_CHANGE_LOG definition
+  public
+  create public .
+
+public section.
+
+  types:
+    YTT_AUFNR type standard table of AUFNR .
+
+  class-methods GET_PROD_ORD
+    importing
+      !IF_TOOL_MATNR type MATNR
+    exporting
+      !ET_AUFNR type YTT_AUFNR .
+  class-methods STATUS_CHANGE_LOG
+    importing
+      !IF_TOSTA type YRF_TPR_TOSTA optional
+      !IF_MSTAE type MSTAE optional
+      !IF_MMSTA type MMSTA optional
+      !IF_TOOL_MATNR type MATNR
+      !IF_TOOL_WERKS type WERKS_D .
+  class-methods AT_MATERIAL_SAVE_CHECK
+    importing
+      !IS_WMARA type MARA
+      !IS_WMARC type MARC .
+protected section.
+private section.
+endclass. "YCL_HP_PP_STATUS_CHANGE_LOG definition
+class YCL_HP_PP_STATUS_CHANGE_LOG implementation.
+method AT_MATERIAL_SAVE_CHECK.
+
+  data: LF_MSTAE_OLD type MSTAE,
+        LF_MMSTA_OLD type MMSTA.
+
+*** Log Change of Material Status
+  select single MSTAE
+    into LF_MSTAE_OLD
+    from MARA
+    where MATNR eq IS_WMARA-MATNR.
+  select single MMSTA
+    into LF_MMSTA_OLD
+    from MARC
+    where MATNR eq IS_WMARC-MATNR
+      and WERKS eq IS_WMARC-WERKS.
+  if LF_MSTAE_OLD ne IS_WMARA-MSTAE or
+     LF_MMSTA_OLD ne IS_WMARC-MMSTA.
+    YCL_HP_PP_STATUS_CHANGE_LOG=>STATUS_CHANGE_LOG( exporting IF_TOOL_MATNR = IS_WMARA-MATNR
+                                                              IF_TOOL_WERKS = IS_WMARC-WERKS
+                                                              IF_MSTAE      = IS_WMARA-MSTAE
+                                                              IF_MMSTA      = IS_WMARC-MMSTA ).
+  endif.
+
+endmethod.
+method GET_PROD_ORD.
+
+  data: LF_MTART type MTART,
+        LF_TTYPE type C,
+        LF_OBJ   type CUIB_OBJKEY,
+        LF_MATNR type MATNR.
+  data: LT_CUOBJ type standard table of CUOBJ,
+        LT_OBJ   type standard table of CUIB_OBJKEY,
+        LT_MATNR type standard table of MATNR.
+
+  clear ET_AUFNR.
+*** Tool type
+  select single MTART
+    into LF_MTART
+    from MARA
+    where MATNR eq IF_TOOL_MATNR.
+  case LF_MTART.
+    when 'ZTRO'.
+      LF_TTYPE = 'D'. " Die Cutting Tool
+    when 'ZCLI'.
+      LF_TTYPE = 'P'. " Printing Tool
+    when others.
+      return.
+  endcase.
+
+*** Get Usages
+  case LF_TTYPE.
+    when 'D'.
+      select CUOBJ
+        into table LT_CUOBJ
+        from YHP_IDX_TD100
+        where DCUTT eq IF_TOOL_MATNR.
+    when 'P'.
+      select CUOBJ
+        into table LT_CUOBJ
+        from YHP_IDX_TD130
+        where PRTON eq IF_TOOL_MATNR.
+  endcase.
+
+*** Get produced materials
+  check LT_CUOBJ is not initial.
+  select OBJECT_KEY
+    into table LT_OBJ
+    from YHP_IDX_TD010
+    for all entries in LT_CUOBJ
+    where CUOBJ eq LT_CUOBJ-TABLE_LINE
+      and OBJECT_TYPE eq 'MARC'.
+  loop at LT_OBJ into LF_MATNR.
+    append LF_MATNR to LT_MATNR.
+  endloop.
+
+*** Find production orders
+  check LT_MATNR is not initial.
+  select distinct AUFNR
+    into table ET_AUFNR
+    from AFKO
+    for all entries in LT_MATNR
+    where PLNBEZ eq LT_MATNR-TABLE_LINE.
+
+endmethod.
+method STATUS_CHANGE_LOG.
+
+  data: LF_AUFNR      type AUFNR.
+  data: LS_PP_TD010   type YHP_PP_TD010,
+        LS_PP_TD010_C type YHP_PP_TD010,
+        LS_TPR_TD100  type YRF_TPR_TD100.
+  data: LT_PP_TD010   type standard table of YHP_PP_TD010,
+        LT_AUFNR      type YTT_AUFNR.
+
+*** fill common data
+  LS_PP_TD010_C-GUID = CL_SYSTEM_UUID=>IF_SYSTEM_UUID_STATIC~CREATE_UUID_C22( ).
+  LS_PP_TD010_C-CHAAT_DATE = SY-DATUM.
+  LS_PP_TD010_C-CHAAT_TIME = SY-UZEIT.
+  LS_PP_TD010_C-TOOL_MATNR = IF_TOOL_MATNR.
+*** MARA data
+  select single MTART MSTAE
+    into ( LS_PP_TD010_C-TOOL_MTART, LS_PP_TD010_C-TOOL_MSTAE )
+    from MARA
+    where MATNR eq IF_TOOL_MATNR.
+  if IF_MSTAE is not initial.
+    LS_PP_TD010_C-TOOL_MSTAE = IF_MSTAE.
+  endif.
+  select single MTSTB
+    into LS_PP_TD010_C-TOOL_MSTAE_DESCR
+    from T141T
+    where SPRAS eq 'EN'
+      and MMSTA eq LS_PP_TD010_C-TOOL_MSTAE.
+
+*** Get Production orders
+  GET_PROD_ORD( exporting IF_TOOL_MATNR = IF_TOOL_MATNR
+                importing ET_AUFNR      = LT_AUFNR ).
+  loop at LT_AUFNR into LF_AUFNR.
+    LS_PP_TD010 = LS_PP_TD010_C.
+    LS_PP_TD010-AUFNR = LF_AUFNR.
+    select single PLNBEZ WERKS STAT
+      into ( LS_PP_TD010-MATNR, LS_PP_TD010-WERKS, LS_PP_TD010-ESTAT )
+      from AUFK
+      inner join AFKO
+        on AFKO~AUFNR eq AUFK~AUFNR
+      inner join JEST
+        on AUFK~OBJNR eq JEST~OBJNR
+      where AUFK~AUFNR eq LS_PP_TD010-AUFNR
+        and STAT   eq 'I0001' " ABIE Abiertos = Created
+        and INACT  eq SPACE.
+    check SY-SUBRC eq 0.
+
+*** tool status
+    if LS_PP_TD010-WERKS eq IF_TOOL_WERKS and
+       IF_TOSTA is not initial.
+      LS_PP_TD010-TOSTA = IF_TOSTA.
+    else.
+      clear LS_TPR_TD100.
+      YCL_RF_TPM_TOOL=>GET_TD100( exporting IF_MATNR = IF_TOOL_MATNR
+                                            IF_WERKS = LS_PP_TD010-WERKS
+                                  importing ES_TD100 = LS_TPR_TD100 ).
+      LS_PP_TD010-TOSTA = LS_TPR_TD100-TOSTA.
+    endif.
+    select single TXT30
+      into LS_PP_TD010-TOSTA_DESCR
+      from TJ30T
+      where STSMA eq 'YTOOL'
+        and SPRAS eq 'EN'
+        and TXT04 eq LS_PP_TD010-TOSTA.
+*** plant specific status
+    if LS_PP_TD010-WERKS eq IF_TOOL_WERKS and
+       IF_MMSTA is not initial.
+      LS_PP_TD010-TOOL_MMSTA = IF_MMSTA.
+    else.
+      select single MMSTA
+        into LS_PP_TD010-TOOL_MMSTA
+        from MARC
+        where MATNR eq IF_TOOL_MATNR
+          and WERKS eq LS_PP_TD010-WERKS.
+    endif.
+    select single MTSTB
+      into LS_PP_TD010-TOOL_MMSTA_DESCR
+      from T141T
+      where SPRAS eq 'EN'
+        and MMSTA eq LS_PP_TD010-TOOL_MMSTA.
+
+    append LS_PP_TD010 to LT_PP_TD010.
+  endloop.
+
+*** Write to DB
+  check LT_PP_TD010 is not initial.
+  modify YHP_PP_TD010 from table LT_PP_TD010.
+
+endmethod.

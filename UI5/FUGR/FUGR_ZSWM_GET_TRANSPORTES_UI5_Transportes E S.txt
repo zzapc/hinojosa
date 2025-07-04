@@ -1,0 +1,210 @@
+FUNCTION zswm_get_transportes_ui5.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(TCODE) TYPE  TCODE
+*"     VALUE(UNAME) TYPE  SY-UNAME DEFAULT SY-UNAME
+*"     VALUE(FECHA) TYPE  SY-DATUM OPTIONAL
+*"     VALUE(TKNUM) TYPE  VTTK-TKNUM OPTIONAL
+*"  EXPORTING
+*"     VALUE(LT_VTTK) TYPE  VTTK_TAB
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_T
+*"     VALUE(TT_TRANP_OUT) TYPE  ZSWM_GET_TRANSPORTES_UI5_STRTT
+*"     VALUE(TT_HEAD) TYPE  ZSWM_GET_ENTREGAS_HEAD_UI5_STT
+*"     VALUE(TT_ENTRE) TYPE  ZSWM_GET_ENTREGAS_UI5_STR_TT
+*"  TABLES
+*"      GT_SELECT_LIST STRUCTURE  ZSWM_TKNUM_SELECT_LIST OPTIONAL
+*"----------------------------------------------------------------------
+  PERFORM break USING 'ZSWM_GET_TRANSPORTES_UI5'.
+
+  DATA: data_u            TYPE zswm_data_ui5_eeeoo_str,
+        r_param           TYPE zswm_data_ui5_param_str,
+        r_funcionalidades TYPE zswm_data_ui5_func_str.
+  CLEAR: gt_select_list[], tt_tranp_out[].
+
+
+  DATA tl_tknum_rg LIKE RANGE OF tknum.
+  IF tknum IS NOT INITIAL.
+    tl_tknum_rg = VALUE #( ( sign = 'I' option = 'EQ' low = tknum ) ).
+  ENDIF.
+
+  CALL FUNCTION 'ZSWM_GET_DATA_USER_UI5'
+    EXPORTING
+      uname      = uname
+      statu      = 'X'
+      no_gen_log = abap_true
+    IMPORTING
+      data_user  = data_u
+*     ERROR      =
+*     TT_LOG     =
+    .
+
+  CALL FUNCTION 'ZSWM_GET_PARAM_UI5'
+    EXPORTING
+      data_user         = data_u
+      tcode             = tcode
+      no_gen_log        = abap_true
+    IMPORTING
+      r_param           = r_param
+      r_funcionalidades = r_funcionalidades
+*     ERROR             =
+*     TT_LOG            =
+    .
+  CASE tcode.
+    WHEN 'ZWM_RF_UI5_ENT_001'. " entradas plancha grupo
+*   Sacamos todas las entregas entrantes (SPED) sin contabilizar
+      DATA:
+            t_entregas LIKE r_entregas OCCURS 0 WITH HEADER LINE.
+      CLEAR t_entregas[].
+      PERFORM get_entregas TABLES t_entregas USING data_u r_param '7' lt_vttk.
+      DELETE lt_vttk WHERE tknum NOT IN tl_tknum_rg.
+
+
+
+    WHEN 'ZWM_RF_UI5_EXP_001'. " expediciones
+      PERFORM get_entregas TABLES t_entregas USING data_u r_param 'J' lt_vttk.
+      DELETE lt_vttk WHERE tknum NOT IN tl_tknum_rg.
+
+*      SORT t_entregas BY tknum vbeln.
+*      DELETE ADJACENT DUPLICATES FROM t_entregas COMPARING tknum vbeln.
+      DATA: vbeln TYPE vbeln,
+            posnr TYPE posnr.
+      PERFORM get_transportes_out USING lt_vttk data_u r_param tcode vbeln posnr CHANGING tt_tranp_out tt_head tt_entre.
+*     add jtm 22.11.2022
+      LOOP AT tt_tranp_out INTO DATA(rt_transp_out) WHERE status NE '00'.
+        DATA(sw_tabix) = sy-tabix.
+        SELECT SINGLE inicio INTO @DATA(inicio_carga) FROM zswm_ui5_tknum WHERE tknum EQ @rt_transp_out-tknum.
+        CHECK sy-subrc     NE 0.
+*          AND inicio_carga NE abap_true.
+
+        rt_transp_out-status = '00'.
+        SELECT SINGLE ddtext INTO rt_transp_out-status_txt FROM dd07t WHERE domname    EQ 'ZSWM_PICK_STATUS'
+                                                            AND domvalue_l EQ rt_transp_out-status
+                                                            AND ddlanguage EQ sy-langu.
+
+        MODIFY tt_tranp_out FROM rt_transp_out INDEX sw_tabix.
+      ENDLOOP.
+*     fin de add jtm 22.11.2022
+    WHEN 'ZWM_RF_UI5_ENT_002'
+      OR 'ZWM_RF_UI5_ENT_003'
+      OR 'ZWM_RF_UI5_ENT_006' "Entradas subcontratación Pedidos
+      OR 'ZWM_RF_UI5_ENT_007'. "Entradas CM
+      EXIT..
+      RANGES: r_add02 FOR vttk-add02.
+      CLEAR: r_add02[], r_add02.
+      DATA: add02 TYPE vttk-add02.
+*     ----------------------------------------------------*
+*     Transportes de entrada
+*     ----------------------------------------------------*
+      CASE tcode.
+        WHEN 'ZWM_RF_UI5_ENT_002'. " SRETI
+          add02 = 'ZWM_RF_004'.
+
+        WHEN 'ZWM_RF_UI5_ENT_003'  " CRETI
+          OR 'ZWM_RF_UI5_ENT_006' "Entradas subcontratación Pedidos
+          OR 'ZWM_RF_UI5_ENT_007'. "Entradas CM
+
+          add02 = 'ZWM_RF_009'.
+      ENDCASE.
+
+      SELECT * INTO TABLE lt_vttk
+               FROM vttk
+               WHERE tknum IN tl_tknum_rg  AND
+                     tplst = r_param-tplst AND
+                     shtyp = r_param-shtyp AND
+                     abfer = r_param-abfer AND  " de entrada
+                     sdabw = r_param-sdabw AND " Solo materia prima
+                     stdis = space AND
+                     stlad = space AND  "sin fin de carga
+                   ( add02 = space OR
+                     add02 = add02 ). " entrada plancha
+*     ----------------------------------------------------*
+*     Transportes de entrada para devolución de cliente
+*     ----------------------------------------------------*
+*     RE: HINOJOSA TRANSPORTE DEVOLUCION en el mail de este asunto se definión que las devoluciones estarán previamente realizados los
+*     siguientes documentos
+*       - Pedido venta devolución
+*       - Entrega
+*       - Transporte de salida
+*       - La entrega y el transporte estarán vinculados
+
+      DATA t_entregas_devo LIKE r_entregas OCCURS 0 WITH HEADER LINE.
+      CLEAR t_entregas_devo[].
+      LOOP AT data_u-tt320 INTO DATA(rt_t320).
+        SELECT likp~lgnum likp~vbeln likp~vbtyp vbuk~wbstk lips~werks lips~lgort lips~mtart  APPENDING CORRESPONDING FIELDS OF TABLE t_entregas_devo
+        FROM likp INNER JOIN lips
+        ON lips~vbeln = likp~vbeln
+                        INNER JOIN vbuk
+        ON vbuk~vbeln = likp~vbeln
+        WHERE likp~vstel EQ r_param-vstel
+          AND lips~werks EQ rt_t320-werks
+          AND lips~lgort EQ rt_t320-lgort
+          AND mtart      IN r_param-rr_mtart
+          AND likp~vbtyp EQ 'T'                  " entregas entrantes
+          AND wbstk      NE 'C'.                 " no contabilziadas
+      ENDLOOP.
+      SORT t_entregas_devo. DELETE ADJACENT DUPLICATES FROM t_entregas_devo.
+      LOOP AT t_entregas_devo.
+        SELECT * INTO TABLE @DATA(tt_vttp) FROM vttp WHERE vbeln EQ @t_entregas_devo-vbeln AND
+                                                           tknum IN @tl_tknum_rg.
+        CHECK sy-subrc EQ 0.
+        LOOP AT tt_vttp INTO DATA(rt_vttp).
+
+          SELECT * APPENDING TABLE lt_vttk FROM vttk WHERE tknum EQ rt_vttp-tknum
+                                                       AND abfer EQ '1'
+                                                       AND stdis EQ space
+                                                       AND stlad EQ space.
+        ENDLOOP.
+      ENDLOOP.
+
+*    WHEN 'ZWM_RF_UI5_ENT_005'. "Entradas subcontratación OF
+*      EXIT.
+  ENDCASE.
+* ----------------------------------------------------*
+* Fin de GET TRANSPORTES DEVOLUCION
+* ----------------------------------------------------*
+  SORT lt_vttk BY dplbg uplbg tknum ASCENDING.
+  LOOP AT lt_vttk INTO DATA(ls_vttk).
+    gt_select_list-cod = 'TR'.
+
+    gt_select_list-obj_number = ls_vttk-tknum.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = ls_vttk-tknum
+      IMPORTING
+        output = ls_vttk-tknum.
+    gt_select_list-obj_numberc = ls_vttk-tknum.
+    DATA name1 LIKE lfa1-name1.
+    IF ls_vttk-tdlnr IS NOT INITIAL.
+      SELECT SINGLE name1 INTO name1 FROM lfa1 WHERE lifnr EQ ls_vttk-tdlnr.
+      MOVE name1 TO gt_select_list-obj_numberc_alt.
+    ELSE.
+      CLEAR name1.
+    ENDIF.
+    CONCATENATE  ls_vttk-text4 '-'                          " Nombre de proveedor
+                 text-015 ls_vttk-text1 '-'                " tlf de conductor
+                 ls_vttk-signi                             " matricula
+                 INTO gt_select_list-obj_number_alt SEPARATED BY space.
+
+    gt_select_list-zzpeso_alb = ls_vttk-zzpeso_alb.
+    gt_select_list-dtmeg = ls_vttk-dtmeg.
+    gt_select_list-tknum = ls_vttk-tknum.
+
+    gt_select_list-tcode = tcode.
+    APPEND gt_select_list.
+  ENDLOOP.
+
+  CHECK gt_select_list[] IS INITIAL.
+  MOVE abap_true TO error.
+*     No existen transportes pendientes para: &
+  SELECT SINGLE ttext INTO @DATA(ttext) FROM tstct WHERE tcode EQ @tcode
+                                                     AND sprsl EQ @sy-langu.
+  IF sy-subrc NE 0.
+    SELECT SINGLE ttext INTO ttext FROM tstct WHERE tcode EQ tcode.
+  ENDIF.
+  PERFORM mensaje USING 'E' 'ZSWM_UI5' '023' ttext space space space CHANGING tt_log[].
+
+
+
+ENDFUNCTION.

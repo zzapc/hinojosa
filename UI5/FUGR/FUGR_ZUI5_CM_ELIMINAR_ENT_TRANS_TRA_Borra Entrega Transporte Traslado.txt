@@ -1,0 +1,176 @@
+FUNCTION zui5_cm_eliminar_ent_trans_tra.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_TRANSPORTE) TYPE  TKNUM
+*"     VALUE(I_ENTREGA) TYPE  VBELN_VL
+*"     VALUE(I_ALMACEN_MONTAJE) TYPE  LGORT_D OPTIONAL
+*"  EXPORTING
+*"     VALUE(O_BORRADO) TYPE  FLAG
+*"     VALUE(O_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+*Únicamente será posible SI TODOS los pedidos de entregas incluidas en el transporte tienen Status PENDIENTE de facturar.
+*Esta funcionalidad, supondría ejecutar los siguientes subprocesos:
+*#  Eliminar status del transporte.
+*#  Anular salida de mercancías de todas las entregas incluidas en el transporte.
+*#  Desasignar las entregas del transporte.
+*#  Borrar las entregas que estaban incluidas en el transporte.
+*#  Marcar para borrado pedidos de entregas que estaban incluidas en el transporte.
+*#  Borrar transporte.
+  DATA: borrar_transporte TYPE flag,
+        lt_return         TYPE bapiret2_t.
+
+  DATA: headerdata       LIKE  bapishipmentheader,
+        headerdataaction LIKE  bapishipmentheaderaction,
+        itemdata         TYPE TABLE OF bapishipmentitem,
+        itemdataaction   TYPE TABLE OF bapishipmentitemaction,
+        t_mesg           TYPE TABLE OF mesg,
+        header_data      LIKE  bapiobdlvhdrchg,
+        header_control   LIKE  bapiobdlvhdrctrlchg,
+        order_header_inx TYPE  bapisdh1x,
+        order_item_in    TYPE TABLE OF  bapisditm,
+        order_item_inx   TYPE TABLE OF bapisditmx.
+
+  PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '044' 'ZUI5_CM_ELIMINAR_ENT_TRANS_TRA' '' '' ''CHANGING o_return.
+
+  SELECT a~vbeln, b~vbtyp, c~wbstk
+    FROM vttp AS a
+    INNER JOIN likp AS b ON b~vbeln = a~vbeln
+    INNER JOIN vbuk AS c ON c~vbeln = b~vbeln
+    INTO TABLE @DATA(lt_entregas)
+    WHERE tknum = @i_transporte
+    AND b~vbeln = @i_entrega.
+  IF sy-subrc = 0.
+    "Recuperamos los pedidos asociados para marcarlos como borrado
+    SELECT DISTINCT a~vgbel, a~vgpos, a~vbeln, a~posnr,  b~fkstk, b~abstk, b~gbstk
+      FROM lips AS a
+      LEFT JOIN vbuk AS b ON b~vbeln = a~vbeln
+      INTO TABLE @DATA(lt_pedidos)
+      WHERE a~vbeln = @i_entrega
+*      AND fkstk = 'A'
+      .
+    IF sy-subrc = 0.
+      SORT lt_pedidos BY vgbel vgpos vbeln posnr .
+      DELETE ADJACENT DUPLICATES FROM lt_pedidos COMPARING vgbel vgpos vbeln posnr.
+
+      "Recuperamos estados de la Entrega Entrante GBSTK = 'A' o GBSTK = 'C'
+      SELECT DISTINCT b~vbeln, a~ebeln, a~ebelp,  c~gbstk
+        FROM  ekbe AS a
+        INNER JOIN vbfa AS b ON b~vbelv = a~belnr AND b~vbtyp_n = '7' " AND b~posnv = a~ebelp
+        INNER JOIN vbuk AS c ON c~vbeln = b~vbeln
+        INTO TABLE @DATA(lt_entrega_entrante)
+        FOR ALL ENTRIES IN @lt_pedidos
+        WHERE a~ebeln = @lt_pedidos-vgbel
+        AND a~bewtp = 'L'.
+      IF sy-subrc = 0.
+        SORT lt_entrega_entrante BY vbeln.
+        DELETE ADJACENT DUPLICATES FROM lt_entrega_entrante COMPARING vbeln.
+        "Borrar entrega entrante generada (bapi_inb_delivery_change)
+        LOOP AT lt_entrega_entrante INTO DATA(ls_entrega_entrante).
+          PERFORM borrar_entrega_entrante USING ls_entrega_entrante-vbeln CHANGING lt_return.
+
+          APPEND LINES OF lt_return TO o_return.
+        ENDLOOP.
+      ENDIF.
+      READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+      IF sy-subrc NE 0.
+
+        "Anular salida de mercancías de todas las entregas incluidas en el transporte.
+        LOOP AT lt_entregas INTO DATA(ls_entrega).
+          CLEAR: lt_return.
+          IF ls_entrega-wbstk = 'C'.
+            PERFORM anular_salida_mercancias USING ls_entrega-vbeln
+                                                   ls_entrega-vbtyp
+                                             CHANGING lt_return.
+          ELSE.
+            PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '040' ls_entrega-vbeln '' '' ''CHANGING o_return.
+          ENDIF.
+          APPEND LINES OF lt_return TO o_return.
+        ENDLOOP.
+
+        READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+        IF sy-subrc NE 0.
+          "Eliminar status del transporte.????
+          PERFORM borrar_status_trans  USING    i_transporte
+                                   CHANGING lt_return.
+          APPEND LINES OF lt_return TO o_return.
+
+          "Desasignar las entregas del transporte.
+          APPEND INITIAL LINE TO o_return ASSIGNING FIELD-SYMBOL(<ls_return>).
+          <ls_return>-type = 'S'.
+          <ls_return>-id = 'ZUI5_CM'.
+          <ls_return>-number = '011'.
+          <ls_return>-message_v1 = |{ i_transporte ALPHA = OUT }|.
+
+          PERFORM borrar_asig_ent_trans USING i_entrega i_transporte CHANGING lt_return.
+          APPEND LINES OF lt_return TO o_return.
+
+          READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+          IF sy-subrc NE 0.
+            "Borramos HU de la entrega
+            PERFORM mensajes_pasos USING 'ZUI5_CM' 'I' '054' i_entrega  '' '' ''CHANGING o_return.
+            CLEAR: lt_return.
+            CALL FUNCTION 'ZUI5_CM_DELETE_HU_ENTREGA'
+              DESTINATION 'NONE'
+              EXPORTING
+                i_vbeln  = i_entrega
+              IMPORTING
+                e_return = lt_return.
+            APPEND LINES OF lt_return TO o_return.
+          ENDIF.
+
+          READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+          IF sy-subrc NE 0.
+            "Borrar entrega
+            PERFORM borrar_entrega USING i_entrega
+                                   CHANGING lt_return.
+
+            APPEND LINES OF lt_return TO o_return.
+          ENDIF.
+
+
+          READ TABLE o_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+          IF sy-subrc NE 0.
+*          "Marcar para borrado pedidos de entregas que estaban incluidas en el transporte.Motivo de rechazo por determinar
+            IF lt_pedidos IS NOT INITIAL.
+*
+              LOOP AT lt_pedidos INTO DATA(ls_pedido) WHERE vgbel IS NOT INITIAL.
+                DATA(lv_pedido) = ls_pedido-vgbel.
+                AT END OF vgbel.
+
+                  PERFORM borrar_pedido_po USING lv_pedido '00000' CHANGING lt_return.
+                  APPEND LINES OF lt_return TO o_return.
+
+                ENDAT.
+              ENDLOOP.
+            ENDIF.
+*
+          ENDIF.
+        ELSE.
+          APPEND INITIAL LINE TO o_return ASSIGNING <ls_return>.
+          <ls_return>-type = 'E'.
+          <ls_return>-id = 'ZUI5_CM'.
+          <ls_return>-number = '008'.
+          <ls_return>-message_v1 = |{ i_transporte ALPHA = OUT }|.
+        ENDIF.
+      ELSE.
+        APPEND INITIAL LINE TO o_return ASSIGNING <ls_return>.
+        <ls_return>-type = 'E'.
+        <ls_return>-id = 'ZUI5_CM'.
+        <ls_return>-number = '013'.
+        <ls_return>-message_v1 = |{ i_transporte ALPHA = OUT }|.
+      ENDIF.
+    ENDIF.
+
+  ELSE. "no existen entregas y podemos borrar el transporte
+    APPEND INITIAL LINE TO o_return ASSIGNING <ls_return>.
+    <ls_return>-type = 'E'.
+    <ls_return>-id = 'ZUI5_CM'.
+    <ls_return>-number = '012'.
+    <ls_return>-message_v1 = |{ i_entrega ALPHA = OUT }|.
+    <ls_return>-message_v2 = |{ i_transporte ALPHA = OUT }|.
+  ENDIF.
+
+  PERFORM guardar_log_traslado USING i_entrega  o_return.
+
+ENDFUNCTION.

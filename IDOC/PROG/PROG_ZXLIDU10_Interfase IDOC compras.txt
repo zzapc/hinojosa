@@ -1,0 +1,511 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZXLIDU10
+*&---------------------------------------------------------------------*
+*"----------------------------------------------------------------------
+*"*"Globale Schnittstelle:
+*"       IMPORTING
+*"             VALUE(I_IDOC_CONTROL) LIKE  EDIDC STRUCTURE  EDIDC
+*"             VALUE(X_XALLR) LIKE  RLREO-XFELD
+*"             VALUE(X_XALLP) LIKE  RLREO-XFELD
+*"             VALUE(X_TCODE) LIKE  SY-TCODE
+*"             VALUE(X_IMKPF) LIKE  IMKPF STRUCTURE  IMKPF
+*"       EXPORTING
+*"             VALUE(X_XALLR) LIKE  RLREO-XFELD
+*"             VALUE(X_XALLP) LIKE  RLREO-XFELD
+*"             VALUE(X_TCODE) LIKE  SY-TCODE
+*"             VALUE(X_IMKPF) LIKE  IMKPF STRUCTURE  IMKPF
+*"       TABLES
+*"              T_IMSEG STRUCTURE  IMSEG
+*"              T_IDOC_DATA STRUCTURE  EDIDD
+*"----------------------------------------------------------------------
+
+DATA: ls_imseg    TYPE imseg,
+      lv_ctd      TYPE mb_erfmg, "i,
+      lv_resto    TYPE mb_erfmg,
+      lv_meins    TYPE meins,
+      lv_xchpf    TYPE xchpf,
+      lv_clabs    TYPE labst,
+      lv_index    LIKE sy-tabix,
+      lv_error_um TYPE xfeld,
+      lv_charg    TYPE charg_d,
+      lv_matnr    TYPE matnr,
+      lv_verpr    TYPE verpr,
+      lv_peinh    TYPE peinh,
+      st1         TYPE string,
+      st2         TYPE string,
+      lv_error(1).
+DATA lv_sndpor TYPE edi_sndpor.
+
+DATA: ls_ztmm0024 TYPE ztmm0024.
+
+DATA: ls_data    TYPE edidd,
+      ls_e1mbxyh TYPE e1mbxyh,
+      lv_menge_r TYPE menge_d,
+      lv_menge_s TYPE menge_d.
+
+DATA: r_excepcion TYPE RANGE OF rvari_val_255 WITH HEADER LINE.
+DATA: r_rango TYPE RANGE OF bwart WITH HEADER LINE.
+DATA: r_matnr TYPE RANGE OF matnr WITH HEADER LINE.
+
+FIELD-SYMBOLS: <imseg> TYPE imseg.
+
+CONSTANTS lc_werks TYPE werks_d VALUE '4000'.
+
+IF syst-sysid = 'HED' OR syst-sysid = 'HEQ'.
+  lv_sndpor = 'HPDCLNT001'.
+ELSEIF syst-sysid = 'HEP'.
+  lv_sndpor = 'HPPCLNT001'.
+ENDIF.
+
+*ORC cambio por nuevas sociedades
+
+*IF i_idoc_control-sndpor = lv_sndpor AND ( i_idoc_control-mescod = 'R20' OR i_idoc_control-mescod = 'R30'
+*                                             OR i_idoc_control-mescod = 'A00' OR i_idoc_control-mescod = 'A01' OR i_idoc_control-mescod = 'A10' ).
+
+IF i_idoc_control-sndpor = lv_sndpor AND  i_idoc_control-mescod <> ''.
+
+  " cvivo - 64548 - Errores iDOC, gestión en masa y error material preimpreso de Navision
+  DATA(l_werks) = t_imseg[ 1 ]-werks.
+
+  SELECT SINGLE @abap_true FROM tvarvc
+    INTO @DATA(alfa)
+    WHERE name EQ 'ZMM_EXIT_CONVERT_ALFANUM'
+      AND low EQ @l_werks.
+
+  IF sy-subrc EQ 0.
+    LOOP AT t_imseg ASSIGNING FIELD-SYMBOL(<data>) WHERE matnr CP '0*P*'. " si comienza por ceros y tiene una P es preimpreso, verificamos y cambiamos en ese caso
+      DATA(l_zpim) = <data>-matnr.
+      SPLIT l_zpim AT 'P' INTO st1 st2.
+
+      l_zpim = |P{ st2 }|. " cogemos los dígitos a partir de la P
+
+      SELECT SINGLE @abap_true FROM mara
+        INTO @DATA(exists)
+        WHERE matnr EQ @l_zpim.
+
+      IF sy-subrc EQ 0.
+        <data>-matnr = l_zpim.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  CLEAR ls_imseg.
+  LOOP AT t_imseg INTO ls_imseg WHERE ( bwart <> '561' AND bwart <> '961' ).
+    lv_index = sy-tabix.
+
+    " cvivo 65837 - Si tiene lote, verificamos si el material es el mismo, de lo contrario manda SAP
+    SELECT SINGLE @abap_true FROM tvarvc
+      WHERE name EQ 'ZMM_IDOC_EM_SOLO_LOTE'
+        AND low EQ @ls_imseg-werks
+      INTO @DATA(manda_lote).
+
+    IF ls_imseg-charg IS NOT INITIAL AND sy-subrc EQ 0.
+      SELECT SINGLE * FROM mchb
+        WHERE werks EQ @ls_imseg-werks
+          AND charg EQ @ls_imseg-charg
+        INTO @DATA(mchb).
+
+      IF sy-subrc EQ 0.
+        ls_imseg-matnr = mchb-matnr.
+      ENDIF.
+    ENDIF.
+
+    CLEAR: lv_xchpf, lv_clabs, lv_meins.
+    SELECT SINGLE meins xchpf INTO (lv_meins, lv_xchpf)
+    FROM mara
+    WHERE matnr = ls_imseg-matnr.
+
+    IF sy-subrc NE 0 AND ls_imseg-charg IS NOT INITIAL." cvivo 65221
+      SELECT SINGLE mchb~matnr mara~meins mara~xchpf FROM mchb
+        INNER JOIN mara
+        ON mchb~matnr EQ mara~matnr
+      INTO (ls_imseg-matnr, lv_meins, lv_xchpf)
+      WHERE mchb~charg EQ ls_imseg-charg
+      AND mchb~werks EQ ls_imseg-werks.
+    ENDIF.
+
+    IF lv_xchpf IS INITIAL.
+
+      IF ls_imseg-werks = lc_werks. " SI ES CIPASI
+        CLEAR: ls_data.
+        READ TABLE t_idoc_data INTO ls_data
+        WITH KEY segnam = 'E1MBXYH'.
+        IF sy-subrc = 0.
+          ls_e1mbxyh = ls_data-sdata.
+
+          CLEAR: lv_menge_r, lv_menge_s.
+
+          SELECT SUM( menge ) INTO lv_menge_r
+          FROM mseg
+          INNER JOIN mkpf ON mseg~mblnr = mkpf~mblnr
+                          AND   mseg~mjahr = mkpf~mjahr
+          WHERE mseg~werks = lc_werks
+          AND mseg~matnr = ls_imseg-matnr
+          AND mseg~shkzg = 'S'
+          AND mkpf~budat > ls_e1mbxyh-budat .
+
+
+          SELECT SUM( menge ) INTO lv_menge_s
+          FROM mseg
+          INNER JOIN mkpf ON mseg~mblnr = mkpf~mblnr
+                          AND   mseg~mjahr = mkpf~mjahr
+          WHERE mseg~werks = lc_werks
+          AND mseg~matnr = ls_imseg-matnr
+          AND mseg~shkzg = 'H'
+          AND mkpf~budat > ls_e1mbxyh-budat.
+
+
+* mirar stock del material en el almacen
+          SELECT SINGLE labst INTO lv_clabs
+          FROM mard
+          WHERE werks = ls_imseg-werks
+          AND lgort = ls_imseg-lgort
+          AND matnr = ls_imseg-matnr.
+
+          lv_clabs = lv_clabs + lv_menge_s - lv_menge_r.
+
+        ENDIF.
+
+
+      ELSE. " EL RESTO CONFORME ESTABA FUNCIONANDO
+
+* mirar stock del material en el almacen
+        SELECT SINGLE labst INTO lv_clabs
+        FROM mard
+        WHERE werks = ls_imseg-werks
+        AND lgort = ls_imseg-lgort
+        AND matnr = ls_imseg-matnr.
+
+      ENDIF.
+
+
+      IF ls_imseg-erfme <> lv_meins.
+
+* convertir a UM del material
+        CALL FUNCTION 'MATERIAL_UNIT_CONVERSION'
+          EXPORTING
+            input                = ls_imseg-erfmg
+            matnr                = ls_imseg-matnr
+            meinh                = ls_imseg-erfme
+            meins                = lv_meins
+          IMPORTING
+            output               = lv_ctd
+          EXCEPTIONS
+            conversion_not_found = 1
+            input_invalid        = 2
+            material_not_found   = 3
+            meinh_not_found      = 4
+            meins_missing        = 5
+            no_meinh             = 6
+            output_invalid       = 7
+            overflow             = 8
+            OTHERS               = 9.
+
+        IF sy-subrc = 0.
+          CLEAR lv_error_um.
+        ELSE.
+          lv_error_um = 'X'.
+        ENDIF.
+
+      ELSE.
+        lv_ctd = ls_imseg-erfmg.
+      ENDIF.
+
+      IF lv_error_um IS INITIAL.
+
+        IF lv_ctd > lv_clabs.
+          ls_imseg-bwart = '992'.
+          ls_imseg-erfmg =  lv_ctd - lv_clabs.
+*      ls_imseg-ERFMG = lv_resto.
+          ls_imseg-erfme = lv_meins.
+          MODIFY t_imseg FROM ls_imseg INDEX lv_index.
+
+        ELSEIF lv_ctd < lv_clabs.
+          ls_imseg-erfmg =  lv_clabs - lv_ctd.
+*      ls_imseg-ERFMG = lv_resto.
+          ls_imseg-bwart = '991'.
+          ls_imseg-erfme = lv_meins.
+          MODIFY t_imseg FROM ls_imseg INDEX lv_index.
+
+        ELSEIF lv_ctd = lv_clabs.
+*        ls_imseg-erfmg =  0.
+*      ls_imseg-ERFMG = lv_resto.
+          ls_imseg-bwart = 'ZZZ'.
+          ls_imseg-erfme = lv_meins.
+          IF lv_ctd = 0 AND lv_clabs = 0. "esto se hace para todas las lineas de la foto de Stock sin movimiento a 0, se queden como procesado
+            ls_imseg-erfmg = 1.
+          ENDIF.
+          MODIFY t_imseg FROM ls_imseg INDEX lv_index.
+        ENDIF.
+      ELSE.
+        ls_imseg-bwart = 'YYY'.
+*          ls_imseg-erfme = lv_meins.
+        MODIFY t_imseg FROM ls_imseg INDEX lv_index.
+      ENDIF.
+
+
+    ELSEIF lv_xchpf = 'X'.
+
+      IF ls_imseg-werks = lc_werks. " SI ES CIPASI
+        CLEAR: ls_data.
+        READ TABLE t_idoc_data INTO ls_data
+        WITH KEY segnam = 'E1MBXYH'.
+        IF sy-subrc = 0.
+          ls_e1mbxyh = ls_data-sdata.
+
+          CLEAR: lv_menge_r, lv_menge_s.
+
+          SELECT SUM( menge ) INTO lv_menge_r
+          FROM mseg
+          INNER JOIN mkpf ON mseg~mblnr = mkpf~mblnr
+                          AND   mseg~mjahr = mkpf~mjahr
+          WHERE mseg~werks = lc_werks
+          AND mseg~matnr = ls_imseg-matnr
+            AND mseg~charg = ls_imseg-charg
+            AND mseg~shkzg = 'S'
+          AND mkpf~budat > ls_e1mbxyh-budat .
+
+
+          SELECT SUM( menge ) INTO lv_menge_s
+          FROM mseg
+          INNER JOIN mkpf ON mseg~mblnr = mkpf~mblnr
+                          AND   mseg~mjahr = mkpf~mjahr
+          WHERE mseg~werks = lc_werks
+          AND mseg~matnr = ls_imseg-matnr
+          AND mseg~charg = ls_imseg-charg
+            AND mseg~shkzg = 'H'
+          AND mkpf~budat > ls_e1mbxyh-budat .
+
+
+* mirar el stock por lote en el almacen
+          SELECT SINGLE clabs INTO lv_clabs
+          FROM mchb
+          WHERE werks = ls_imseg-werks
+          AND lgort = ls_imseg-lgort
+          AND matnr = ls_imseg-matnr
+          AND charg = ls_imseg-charg.
+
+
+          lv_clabs = lv_clabs + lv_menge_s - lv_menge_r.
+
+        ENDIF.
+
+
+      ELSE. " EL RESTO CONFORME ESTABA FUNCIONANDO
+
+* mirar el stock por lote en el almacen
+        SELECT SINGLE clabs INTO lv_clabs
+        FROM mchb
+        WHERE werks = ls_imseg-werks
+        AND lgort = ls_imseg-lgort
+        AND matnr = ls_imseg-matnr
+        AND charg = ls_imseg-charg.
+
+      ENDIF.
+
+      IF ls_imseg-erfme <> lv_meins.
+
+* convertir a UM del material
+        CALL FUNCTION 'MATERIAL_UNIT_CONVERSION'
+          EXPORTING
+            input                = ls_imseg-erfmg
+            matnr                = ls_imseg-matnr
+            meinh                = ls_imseg-erfme
+            meins                = lv_meins
+          IMPORTING
+            output               = lv_ctd
+          EXCEPTIONS
+            conversion_not_found = 1
+            input_invalid        = 2
+            material_not_found   = 3
+            meinh_not_found      = 4
+            meins_missing        = 5
+            no_meinh             = 6
+            output_invalid       = 7
+            overflow             = 8
+            OTHERS               = 9.
+
+        IF sy-subrc = 0.
+          CLEAR lv_error_um.
+        ELSE.
+          lv_error_um = 'X'.
+        ENDIF.
+      ELSE.
+        lv_ctd = ls_imseg-erfmg.
+      ENDIF.
+
+      IF lv_error_um IS INITIAL.
+        IF lv_ctd > lv_clabs.
+          ls_imseg-bwart = '992'.
+          ls_imseg-erfmg =  lv_ctd - lv_clabs.
+          ls_imseg-erfme = lv_meins.
+          MODIFY t_imseg FROM ls_imseg INDEX lv_index.
+
+        ELSEIF lv_ctd < lv_clabs.
+
+          ls_imseg-bwart = '991'.
+          ls_imseg-erfmg =  lv_clabs - lv_ctd.
+          ls_imseg-erfme = lv_meins.
+          MODIFY t_imseg FROM ls_imseg INDEX lv_index.
+
+        ELSEIF lv_ctd = lv_clabs.
+*        ls_imseg-erfmg =  0.
+*      ls_imseg-ERFMG = lv_resto.
+          ls_imseg-bwart = 'ZZZ'.
+          ls_imseg-erfme = lv_meins.
+
+          IF lv_ctd = 0 AND lv_clabs = 0. "esto se hace para todas las lineas de la foto de Stock sin movimiento a 0, se queden como procesado
+            ls_imseg-erfmg = 1.
+          ENDIF.
+
+          MODIFY t_imseg FROM ls_imseg INDEX lv_index.
+        ENDIF.
+      ELSE.
+        ls_imseg-bwart = 'YYY'.
+*          ls_imseg-erfme = lv_meins.
+        MODIFY t_imseg FROM ls_imseg INDEX lv_index.
+      ENDIF.
+    ENDIF.
+
+* ini 06.02.2018 - cvivo - 46358 Verificación cuadre stocks AS400/SAP foto global
+    CLEAR ls_ztmm0024.
+    ls_ztmm0024-datum = sy-datum.
+    ls_ztmm0024-uzeit = sy-uzeit.
+    ls_ztmm0024-werks = ls_imseg-werks.
+    ls_ztmm0024-lgort = ls_imseg-lgort.
+    ls_ztmm0024-matnr = ls_imseg-matnr.
+    ls_ztmm0024-charg = ls_imseg-charg.
+    ls_ztmm0024-erp_erfmg = lv_ctd.
+    ls_ztmm0024-sap_erfmg = lv_clabs.
+    ls_ztmm0024-meins = lv_meins.
+    ls_ztmm0024-docnum = i_idoc_control-docnum.
+    ls_ztmm0024-bwart = ls_imseg-bwart.
+    MODIFY ztmm0024 FROM ls_ztmm0024.
+* fin 06.02.2018 - cvivo - 46358 Verificación cuadre stocks AS400/SAP foto global
+  ENDLOOP.
+
+* ini 01.06.2018 - cvivo - 48268 Valoración de reprocesado
+  SELECT SINGLE @abap_true FROM tvarvc    " cvivo - 64548 - Errores iDOC, gestión en masa
+  INTO @DATA(skip)
+        WHERE name EQ 'ZMM_SKIP_EXIT_ZXLIDU10_REPROC'
+        AND low EQ @l_werks.
+
+  IF sy-subrc NE 0.
+    SELECT * FROM tvarvc
+      WHERE name EQ 'ZEXCEP_LOTE_REPROC'
+      INTO @DATA(tvarvc).
+      r_excepcion-sign = tvarvc-sign.
+      r_excepcion-option = tvarvc-opti.
+      r_excepcion-low = tvarvc-low.
+      r_excepcion-high = tvarvc-high.
+      APPEND r_excepcion.
+    ENDSELECT.
+
+    LOOP AT t_imseg ASSIGNING <imseg> WHERE bwart EQ '961'.
+      CLEAR: lv_charg, lv_clabs, lv_error, lv_meins, lv_matnr.
+
+      MOVE <imseg>-sgtxt TO lv_charg.
+
+* mirar el stock por lote en el almacen
+      SELECT SINGLE matnr clabs INTO (lv_matnr, lv_clabs)
+        FROM mchb
+        WHERE werks = <imseg>-werks
+        AND charg = lv_charg.
+
+      IF sy-subrc EQ 0.
+        SELECT SINGLE meins FROM mara
+          INTO lv_meins
+          WHERE matnr EQ lv_matnr.
+
+        IF sy-subrc EQ 0 AND lv_meins EQ <imseg>-erfme.
+          SELECT SINGLE verpr peinh INTO (lv_verpr, lv_peinh)
+            FROM mbew
+            WHERE matnr EQ lv_matnr
+              AND bwkey EQ <imseg>-werks
+              AND vprsv EQ 'V'.
+
+          IF sy-subrc EQ 0 AND lv_verpr GT 0.
+            CLEAR <imseg>-exbwr.
+            <imseg>-exbwr = ( lv_verpr * <imseg>-erfmg ) / lv_peinh.
+            CLEAR lv_verpr.
+
+            IF <imseg>-exbwr LE 0.
+              lv_error = 'X'.
+            ENDIF.
+          ELSE.
+            lv_error = 'X'.
+          ENDIF.
+        ELSE.
+          lv_error = 'X'.
+        ENDIF.
+      ELSEIF lv_charg IN r_excepcion. " se dan por buenos los de SICE fuera de inventario, valoramos con el material actual
+        SELECT SINGLE meins FROM mara
+          INTO lv_meins
+          WHERE matnr EQ <imseg>-matnr.
+
+        IF sy-subrc EQ 0 AND lv_meins EQ <imseg>-erfme.
+          SELECT SINGLE verpr peinh INTO (lv_verpr, lv_peinh)
+            FROM mbew
+            WHERE matnr EQ <imseg>-matnr
+              AND bwkey EQ <imseg>-werks
+              AND vprsv EQ 'V'.
+
+          IF sy-subrc EQ 0 AND lv_verpr GT 0.
+            CLEAR <imseg>-exbwr.
+            <imseg>-exbwr = ( lv_verpr * <imseg>-erfmg ) / lv_peinh.
+            CLEAR lv_verpr.
+
+            IF <imseg>-exbwr LE 0.
+              lv_error = 'X'.
+            ENDIF.
+          ELSE.
+            lv_error = 'X'.
+          ENDIF.
+        ELSE.
+          lv_error = 'X'.
+        ENDIF.
+      ELSE.
+        lv_error = 'X'.
+      ENDIF.
+
+      IF lv_error IS NOT INITIAL.
+        <imseg>-bwart = 'WWW'. " para recuperar el error en la otra EXIT
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+* fin 01.06.2018 - cvivo - 48268 Valoración de reprocesado
+
+  " cvivo - 62286 - Crear material auto.si falla iDOC (ahorrar tiempo)
+  SELECT * FROM tvarvc
+  WHERE name EQ 'ZMM_IDOC_MOV_MAT_AUTO'
+  INTO @tvarvc.
+    r_rango-sign = tvarvc-sign.
+    r_rango-option = tvarvc-opti.
+    r_rango-low = tvarvc-low.
+    r_rango-high = tvarvc-high.
+    APPEND r_rango.
+  ENDSELECT.
+
+  LOOP AT t_imseg ASSIGNING <imseg> WHERE bwart IN r_rango.
+    SELECT SINGLE @abap_true FROM mard
+      WHERE matnr EQ @<imseg>-matnr
+        AND werks EQ @<imseg>-werks
+        AND lgort EQ @<imseg>-lgort
+      INTO @DATA(check).
+
+    IF sy-subrc NE 0. " no existe el mat en el mínimo nivel: almacén
+      r_matnr-sign = 'I'.
+      r_matnr-option = 'EQ'.
+      r_matnr-low = <imseg>-matnr.
+      APPEND r_matnr.
+    ENDIF.
+  ENDLOOP.
+
+  IF r_matnr[] IS NOT INITIAL.
+    SUBMIT zrmm0022 WITH s_matnr IN r_matnr " creación sin código material
+                    WITH p_matnr EQ abap_true
+                    WITH p_werks EQ <imseg>-werks
+                    WITH p_fondo EQ abap_true
+                    AND RETURN.
+  ENDIF.
+ENDIF.

@@ -1,0 +1,388 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZSEIS_PATRON_ALV_PAI
+*&---------------------------------------------------------------------*
+
+
+*&---------------------------------------------------------------------*
+*&      Module  pai_1  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE pai_1 INPUT.
+  PERFORM f_pai_1.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Module  pai_1  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE pai_1_exit_command INPUT.
+  PERFORM f_pai_1_exit_command.
+ENDMODULE.
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_PAI_1
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_pai_1 .
+
+  DATA: vl_answer        TYPE c,
+        vl_titlebar      TYPE string,
+        vl_text_question TYPE string,
+        vl_error         TYPE xfeld,
+        vl_msg_error     TYPE text255.
+  DATA vl_refresh TYPE xfeld VALUE space.
+
+  IF sy-datar = 'X'.
+    vg_datos_modificados_cab = vg_datos_modificados = 'X'.
+  ELSE.
+    LOOP AT tg_config_subscreen ASSIGNING FIELD-SYMBOL(<fs_config_subscreen>) WHERE event_receiver IS BOUND.
+      <fs_config_subscreen>-alv->check_changed_data( IMPORTING e_valid = DATA(vl_valid) CHANGING c_refresh = vl_refresh ).
+      IF <fs_config_subscreen>-event_receiver->datos_modificados = 'X'.
+        vg_datos_modificados = 'X'.
+        EXIT.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+
+
+  PERFORM f_user_command_pre IN PROGRAM (sy-cprog) IF FOUND USING sy-dynnr okcode vl_error.
+  CHECK vl_error = space.
+
+  "Recogemos los datos de la dynpro abierta actualmente
+  READ TABLE it_def_prog INTO wa_def_prog WITH KEY dynpro = sy-dynnr.
+
+  CASE okcode.
+    WHEN 'VOLVER' OR 'ATRAS'.
+      IF vg_datos_modificados = 'X'.
+        "Mensaje de advertencia si hay datos modificados
+        MESSAGE s916(zseis) INTO vl_titlebar.
+        MESSAGE s917(zseis) INTO vl_text_question.
+        CALL FUNCTION 'POPUP_TO_CONFIRM'
+          EXPORTING
+            titlebar              = vl_titlebar
+            text_question         = vl_text_question
+            default_button        = '1'
+            display_cancel_button = 'X'
+          IMPORTING
+            answer                = vl_answer
+          EXCEPTIONS
+            text_not_found        = 1
+            OTHERS                = 2.
+        IF vl_answer = '1'.
+          PERFORM f_save_data_patron USING space CHANGING vl_error.
+          IF vl_error = space.
+            COMMIT WORK AND WAIT.
+            SET SCREEN 0.
+          ELSE.
+            ROLLBACK WORK.
+          ENDIF.
+
+        ELSEIF vl_answer = '2' OR vl_answer IS INITIAL.
+          ROLLBACK WORK.
+          LEAVE TO SCREEN 0.
+        ENDIF.
+
+      ELSE.
+        LEAVE TO SCREEN 0.
+      ENDIF.
+
+
+    WHEN 'SAVE'.
+      IF vg_solo_consulta = 'X' OR vg_cabecera_borrada = 'X'.
+        MESSAGE 'Sólo consulta. No se puede modificar' TYPE 'I'.
+        RETURN.
+      ENDIF.
+
+      LOOP AT tg_config_subscreen ASSIGNING <fs_config_subscreen> WHERE event_receiver IS BOUND.
+        IF <fs_config_subscreen>-event_receiver->errores IS NOT INITIAL.
+          MESSAGE 'Hay datos con errores' TYPE 'I' DISPLAY LIKE 'E'.
+          RETURN.
+        ENDIF.
+      ENDLOOP.
+
+      IF vg_datos_modificados = space.
+        MESSAGE 'No hay datos modificados' TYPE 'I'.
+        RETURN.
+      ENDIF.
+
+      PERFORM f_save_data_patron USING space CHANGING vl_error.
+
+
+    WHEN 'MODO'.
+      CHECK vg_cabecera_borrada = space.
+
+      LOOP AT tg_config_subscreen ASSIGNING <fs_config_subscreen> WHERE alv IS BOUND AND editable = 'X'.
+        IF vg_solo_consulta = 'X'.
+*          PERFORM f_ejecutar_objeto_bloqueo USING sy-dynnr 'ENQUEUE' CHANGING it_alv.
+*          <fs_config_subscreen>-alv->set_ready_for_input( ).
+
+        ELSE.
+          IF vg_datos_modificados = 'X'.
+            MESSAGE 'Existen datos cambiados. Actualice antes procesar' TYPE 'I'.
+            RETURN.
+          ENDIF.
+*          PERFORM f_ejecutar_objeto_bloqueo USING sy-dynnr 'DEQUEUE' CHANGING it_alv.
+*          <fs_config_subscreen>-alv->set_ready_for_input( 0 ).
+        ENDIF.
+
+        PERFORM f_set_estilos_alv USING <fs_config_subscreen>-dynpro CHANGING <fs_config_subscreen>-tabla.
+        <fs_config_subscreen>-alv->refresh_table_display( is_stable = vg_stable ).
+      ENDLOOP.
+
+      IF vg_solo_consulta = 'X'.
+        vg_solo_consulta = space.
+        PERFORM f_ejecutar_objeto_bloqueo USING vg_ventana_inicial 'ENQUEUE' CHANGING it_alv.
+      ELSE.
+        vg_solo_consulta = 'X'.
+        PERFORM f_ejecutar_objeto_bloqueo USING vg_ventana_inicial 'DEQUEUE' CHANGING it_alv.
+      ENDIF.
+
+
+
+    WHEN vg_boton_alv_datos_gestion.
+      READ TABLE tg_config_edit ASSIGNING FIELD-SYMBOL(<fs_config_edit>)
+        WITH KEY dynpro = sy-dynnr.
+      IF sy-subrc = 0 AND <fs_config_edit>-nombre_workarea IS NOT INITIAL.
+        ASSIGN (<fs_config_edit>-nombre_workarea) TO FIELD-SYMBOL(<fs_workarea>).
+        IF sy-subrc = 0.
+          CALL FUNCTION 'Z_SEIS_MOSTRAR_DATOS_GESTION'
+            EXPORTING
+              wp_data = <fs_workarea>.
+        ENDIF.
+      ENDIF.
+
+    WHEN 'BORRADO'.
+      DATA vl_ok TYPE xfeld VALUE 'X'.
+
+      IF vg_alta_cabecera <> space. CLEAR vl_ok. ENDIF.
+      IF vl_ok = 'X'.
+        READ TABLE tg_config_edit ASSIGNING <fs_config_edit> WITH KEY dynpro = sy-dynnr.
+        IF sy-subrc <> 0. CLEAR vl_ok. ENDIF.
+      ENDIF.
+
+      IF vl_ok = 'X' AND <fs_config_edit>-borrado_logico = 'X'            AND
+                         <fs_config_edit>-nombre_workarea IS NOT INITIAL  AND
+                         <fs_config_edit>-nombre_tabla IS NOT INITIAL.
+        READ TABLE it_alv_pk TRANSPORTING NO FIELDS WITH KEY dynpro = sy-dynnr.
+
+
+        ASSIGN (<fs_config_edit>-nombre_workarea) TO <fs_workarea>.
+        IF sy-subrc <> 0. CLEAR vl_ok. ENDIF.
+
+        IF vl_ok = 'X'.
+          ASSIGN COMPONENT <fs_config_edit>-campo_borrado_logico OF STRUCTURE <fs_workarea> TO FIELD-SYMBOL(<fs_campo_borrado>).
+          IF sy-subrc <> 0. CLEAR vl_ok. ENDIF.
+        ENDIF.
+
+        IF vl_ok = 'X'.
+          DATA(vl_borrar) = SWITCH #( <fs_campo_borrado> WHEN 'X' THEN space ELSE 'X' ).
+          DATA wl_alv TYPE st_lin_alv.
+
+          IF vl_borrar = 'X'.
+            DATA(vl_accion) = 'D'.
+            PERFORM f_delete_bd_pre IN PROGRAM (sy-repid) IF FOUND
+              TABLES it_alv
+              USING  sy-dynnr 0 wl_alv vl_error vl_msg_error.
+          ELSE.
+            vl_accion = 'A'.
+            PERFORM f_activar_bd_pre IN PROGRAM (sy-repid) IF FOUND
+              TABLES it_alv
+              USING  sy-dynnr 0 wl_alv vl_error vl_msg_error.
+          ENDIF.
+
+          IF vl_error = space.
+            PERFORM f_validar_bd IN PROGRAM (sy-repid) IF FOUND
+              TABLES it_alv
+              USING  vl_accion sy-dynnr 0 wl_alv vl_error vl_msg_error .
+          ENDIF.
+
+          IF vl_error = 'X'.
+            CLEAR vl_ok.
+            MESSAGE vl_msg_error TYPE 'I' DISPLAY LIKE 'E'.
+          ENDIF.
+        ENDIF.
+
+        DATA vl_texto TYPE text40.
+        IF vl_ok = 'X'.
+          IF vg_datos_modificados = 'X'.
+            vl_texto = 'Hay cambios pendientes, si continua, los perderá. ¿Desea continuar?'.
+          ELSEIF vl_borrar = space.
+            vl_texto = '¿Desea activar el registro?'.
+          ELSEIF vl_borrar = 'X'.
+            vl_texto = '¿Desea marcar para borrado el registro?'.
+          ENDIF.
+          CALL FUNCTION 'POPUP_TO_CONFIRM'
+            EXPORTING
+              text_question  = vl_texto
+            IMPORTING
+              answer         = vl_answer
+            EXCEPTIONS
+              text_not_found = 1
+              OTHERS         = 2.
+          CHECK vl_answer = '1'.
+
+          vg_datos_modificados_cab = 'X'.
+          <fs_campo_borrado> = vl_borrar.
+
+          IF vl_error <> 'X'.
+*            "Dynamic Native SQL
+*            DATA(vl_update) = |UPDATE { <fs_config_edit>-nombre_tabla }|.
+*            DATA(vl_set)    = |SET { <fs_config_edit>-campo_borrado_logico } = '{ vl_borrar }'|.
+*            DATA: tl_where TYPE TABLE OF string.
+*            DATA: vl_where TYPE string.
+*
+*            LOOP AT it_alv_pk ASSIGNING FIELD-SYMBOL(<fs_alv_pk>) WHERE dynpro = sy-dynnr.
+*              ASSIGN COMPONENT <fs_alv_pk>-campo_pk OF STRUCTURE <fs_workarea> TO FIELD-SYMBOL(<fs_campo_pk>).
+*              CHECK sy-subrc = 0.
+*
+*              IF vl_where IS INITIAL.
+*                vl_where = |WHERE { <fs_alv_pk>-campo_pk } = '{ <fs_campo_pk> }'|.
+*              ELSE.
+*                vl_where = |{ vl_where } AND { <fs_alv_pk>-campo_pk } = '{ <fs_campo_pk> }'|.
+*              ENDIF.
+*            ENDLOOP.
+*
+*            TRY.
+*                DATA(vl_sql) = |{ vl_update } { vl_set } { vl_where } |.
+*                NEW cl_sql_statement( )->execute_update( vl_sql ).
+*              CATCH cx_sql_exception INTO DATA(rl_sql_exception).
+*                ROLLBACK WORK.
+*                MESSAGE rl_sql_exception->get_text( ) TYPE 'I' DISPLAY LIKE 'E'.
+*                RETURN.
+*            ENDTRY.
+
+
+            DATA: vl_data_bd            TYPE REF TO data.
+            FIELD-SYMBOLS: <fs_data_bd> TYPE any.
+
+            CHECK <fs_config_edit>-nombre_tabla IS NOT INITIAL.
+            CREATE DATA vl_data_bd TYPE (<fs_config_edit>-nombre_tabla).
+            ASSIGN vl_data_bd->* TO <fs_data_bd>.
+
+            IF sy-subrc = 0.
+              MOVE-CORRESPONDING <fs_workarea> TO <fs_data_bd>.
+              IF <fs_config_edit>-borrado_logico = 'X'.
+                UPDATE (<fs_config_edit>-nombre_tabla) FROM <fs_data_bd>.
+              ELSE.
+                DELETE (<fs_config_edit>-nombre_tabla) FROM <fs_data_bd>.
+              ENDIF.
+            ENDIF.
+            IF sy-subrc = 0.
+              COMMIT WORK AND WAIT.
+              IF vl_borrar = space.
+                vl_texto = 'Registro activado correctamente'.
+              ELSEIF vl_borrar = 'X'.
+                vl_texto = 'Registro borrado correctamente'.
+              ENDIF.
+              MESSAGE vl_texto TYPE 'S'.
+
+              LEAVE TO SCREEN  0.
+            ELSE.
+              vl_msg_error = 'Error al borrar cabecera'.
+              ROLLBACK WORK.
+              MESSAGE vl_texto TYPE 'I' DISPLAY LIKE 'E'.
+            ENDIF.
+
+          ENDIF.
+        ENDIF.
+      ENDIF.
+  ENDCASE.
+
+
+
+
+
+  "Llamada a la función del usuario que controla las acciones
+  "No se realiza el f_user_command si hemos cancelado.
+  IF vl_answer <> 'A'.
+    PERFORM f_user_command IN PROGRAM (sy-cprog) IF FOUND USING sy-dynnr okcode.
+  ENDIF.
+
+
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_PAI_1
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_pai_1_exit_command.
+
+
+  IF sy-datar = 'X'.
+    vg_datos_modificados_cab = vg_datos_modificados = 'X'.
+  ELSE.
+    LOOP AT tg_config_subscreen ASSIGNING FIELD-SYMBOL(<fs_config_subscreen>) WHERE event_receiver IS BOUND.
+      <fs_config_subscreen>-alv->check_changed_data( IMPORTING e_valid = DATA(vl_valid)  ).
+      IF <fs_config_subscreen>-event_receiver->datos_modificados = 'X'.
+        vg_datos_modificados = 'X'.
+        EXIT.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+
+  DATA: vl_answer        TYPE c,
+        vl_titlebar      TYPE string,
+        vl_text_question TYPE string.
+
+  "Recogemos los datos de la dynpro abierta actualmente
+  READ TABLE it_def_prog INTO wa_def_prog WITH KEY dynpro = sy-dynnr.
+
+  CASE okcode.
+    WHEN 'CANCELAR'.
+      DATA vl_salir TYPE xfeld.
+
+      IF vg_datos_modificados = 'X'.
+        "Mensaje de advertencia si hay datos modificados
+        MESSAGE s916(zseis) INTO vl_titlebar.
+        MESSAGE s917(zseis) INTO vl_text_question.
+        CALL FUNCTION 'POPUP_TO_CONFIRM'
+          EXPORTING
+            titlebar              = 'Salir'
+            text_question         = 'Hay datos modificados. ¿Desea salir de todas formas?'
+            default_button        = '2'
+            display_cancel_button = space
+          IMPORTING
+            answer                = vl_answer
+          EXCEPTIONS
+            text_not_found        = 1
+            OTHERS                = 2.
+
+        IF vl_answer = '1'.
+          vl_salir = 'X'.
+        ENDIF.
+      ELSE.
+        vl_salir = 'X'.
+      ENDIF.
+
+      IF vl_salir IS NOT INITIAL.
+*        IF vg_solo_consulta IS INITIAL.
+*          DATA vl_subrc TYPE sy-subrc.
+*          PERFORM f_desbloquear_entidad CHANGING vl_subrc.
+*        ENDIF.
+        LEAVE TO SCREEN 0.
+      ENDIF.
+  ENDCASE.
+
+  "Llamada a la función del usuario que controla las acciones
+  "No se realiza el f_user_command si hemos cancelado.
+  IF vl_answer <> 'A'.
+    PERFORM f_exit_command IN PROGRAM (sy-cprog) IF FOUND USING sy-dynnr okcode.
+  ENDIF.
+ENDFORM.

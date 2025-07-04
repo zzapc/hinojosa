@@ -1,0 +1,624 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRWMCONS0003
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+**&---------------------------------------------------------------------*
+REPORT zrwmcons0003_old.
+
+
+**************************
+* Tipos de datos
+**************************
+
+TYPES: BEGIN OF st_cinumbers,
+         aufnr            TYPE   zsppt_cinumbers-aufnr,
+         vornr            TYPE   zsppt_cinumbers-vornr,
+         ci_number        TYPE   zsppt_cinumbers-ci_number,
+         cant_step        TYPE   zsppt_cinumbers-cant_step,
+         rsnum            TYPE   zsppt_cinumbers-rsnum,
+         rspos            TYPE   zsppt_cinumbers-rspos,
+         bwart            TYPE   resb-bwart,
+         stepcontribution TYPE   zsppt_cinumbers-stepcontribution,
+         porc_cantidad    TYPE p DECIMALS 6,
+         cantidad_consumo TYPE   ekpo-menge,
+         meins            TYPE   ekpo-meins,
+       END OF st_cinumbers.
+
+**************************
+* Variables globales
+**************************
+DATA: vg_test TYPE xfeld.
+DATA: tg_consumos_pp        TYPE zwm_t_consumos_pp.
+DATA: rg_alv TYPE REF TO cl_salv_table.
+*DATA vg_stock TYPE text40.
+
+**************************
+* Pantalla de selección
+**************************
+PARAMETERS: p_lgnum TYPE lagp-lgnum DEFAULT '201' OBLIGATORY.
+PARAMETERS: p_lgtyp TYPE lagp-lgtyp DEFAULT '100' NO-DISPLAY.
+PARAMETERS: p_lgpla TYPE lagp-lgpla OBLIGATORY.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-t02.
+PARAMETERS: p_cinum   TYPE zwm_intf_omp_sap-cinumber OBLIGATORY.
+PARAMETERS: p_lenum   TYPE lqua-lenum OBLIGATORY.
+SELECTION-SCREEN COMMENT /33(30) vg_stock.
+PARAMETERS: p_diam    TYPE bstmg.
+SELECTION-SCREEN END OF BLOCK b2.
+
+
+
+*AT SELECTION-SCREEN ON p_lenum.
+AT SELECTION-SCREEN.
+  CLEAR vg_stock.
+  IF p_lgnum IS NOT INITIAL AND p_lenum IS NOT INITIAL.
+    SELECT *
+      INTO TABLE @DATA(tl_lqua)
+      FROM lqua
+      UP TO 1 ROWS
+      WHERE lgnum = @p_lgnum  AND
+            lenum = @p_lenum
+      ORDER BY verme DESCENDING, gesme DESCENDING.
+    IF sy-subrc = 0.
+      DATA(wl_lqua) = tl_lqua[ 1 ].
+    ELSE.
+      MESSAGE 'No se ha encontrado unidad de almacén' TYPE 'E'.
+    ENDIF.
+
+*    IF p_diam IS INITIAL.
+    DATA: vl_diam     TYPE bstmg,
+          vl_diam_str TYPE text40.
+
+    zcl_wm_nt_generic=>conv_mat_diametro(
+      EXPORTING iv_matnr          = wl_lqua-matnr
+                iv_qty            = wl_lqua-verme
+                iv_meins          = wl_lqua-meins
+                iv_dest_meins     = zcl_wm_nt_generic=>gc_meins_dia
+                iv_werks          = wl_lqua-werks
+      RECEIVING rv_qty = vl_diam
+      EXCEPTIONS um_no_valid       = 1
+                 missing_constants = 2
+                 missing_matnr     = 3
+                 no_base_calc      = 4
+                 OTHERS            = 5 ).
+
+    WRITE vl_diam TO vl_diam_str. CONDENSE vl_diam_str.
+    vg_stock = |Diámetro bobina: { vl_diam_str } cm|.
+  ENDIF.
+
+
+
+
+
+START-OF-SELECTION.
+  PERFORM f_start_of_selection.
+
+END-OF-SELECTION.
+  PERFORM f_end_of_selection.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_START_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_start_of_selection.
+  SELECT SINGLE werks, lgort, lgnum
+    INTO @DATA(wl_t320)
+    FROM t320
+    WHERE lgnum = @p_lgnum.
+  IF sy-subrc <> 0.
+    MESSAGE 'Almacén WM incorrecto' TYPE 'E'.
+  ENDIF.
+
+
+  DATA(rl_consumos) = NEW zcl_zui5_wm_consumos_dpc_imp( ).
+  DATA rl_exc TYPE REF TO /iwbep/cx_mgw_busi_exception.
+
+  TRY .
+      DATA(wl_estacion) = rl_consumos->estaciones_getdetail( vp_werks = wl_t320-werks
+                                                             vp_lgpla = p_lgpla ).
+
+    CATCH /iwbep/cx_mgw_busi_exception INTO rl_exc.
+      MESSAGE rl_exc->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+  "Buscamos los CI Numbers
+  SELECT  *
+    INTO TABLE @DATA(tl_intf_omp_sap)
+    FROM zwm_intf_omp_sap
+    WHERE lgnum    = @p_lgnum AND
+          cinumber = @p_cinum.
+*          inactivo = @space.
+
+  IF sy-subrc <> 0.
+    SELECT  *
+      INTO TABLE @tl_intf_omp_sap
+      FROM zwm_intf_omp_sap
+      WHERE lgnum = @p_lgnum AND
+            benum = @p_cinum.
+  ENDIF.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'No se ha encontrado el CI Number' TYPE 'E'.
+  ENDIF.
+
+  DATA: tl_cinumbers TYPE TABLE OF st_cinumbers,
+        wl_cinumbers LIKE LINE OF tl_cinumbers.
+
+  LOOP AT tl_intf_omp_sap ASSIGNING FIELD-SYMBOL(<fs_intf_omp_sap>).
+    CLEAR wl_cinumbers.
+    wl_cinumbers-ci_number = <fs_intf_omp_sap>-benum.
+    wl_cinumbers-meins     = zcl_wm_nt_generic=>gc_meins_kg.
+
+    IF <fs_intf_omp_sap>-upper_orderid IS NOT INITIAL.
+      wl_cinumbers-aufnr            = <fs_intf_omp_sap>-upper_orderid.
+      wl_cinumbers-stepcontribution = <fs_intf_omp_sap>-stepcontribution_upper.
+      wl_cinumbers-cant_step        = wl_cinumbers-stepcontribution.
+      APPEND wl_cinumbers TO tl_cinumbers.
+    ENDIF.
+    IF <fs_intf_omp_sap>-lower_orderid IS NOT INITIAL.
+      wl_cinumbers-aufnr            = <fs_intf_omp_sap>-lower_orderid.
+      wl_cinumbers-stepcontribution = <fs_intf_omp_sap>-stepcontribution_lower.
+      wl_cinumbers-cant_step        = wl_cinumbers-stepcontribution.
+      APPEND wl_cinumbers TO tl_cinumbers.
+    ENDIF.
+  ENDLOOP.
+
+
+
+  "Totalizamos los cant_step para sacar el porcentaje de contribución
+  DATA vl_cantidad_total TYPE ekpo-menge.
+  LOOP AT tl_cinumbers ASSIGNING FIELD-SYMBOL(<fs_cinumbers>).
+    ADD <fs_cinumbers>-cant_step TO vl_cantidad_total.
+  ENDLOOP.
+
+
+  "Buscamos las reservas de las ordenes/ci numbers identificadas
+  DATA tl_xloek_rg TYPE RANGE OF resb-xloek.
+  IF tl_cinumbers IS NOT INITIAL.
+*      IF vp_inactivos = space.
+*        tl_xloek_rg = VALUE #( ( sign = 'I' option = 'EQ' low = space ) ).
+*      ENDIF.
+
+    SELECT resb~rsnum, resb~rspos, resb~rsart, resb~matnr, resb~aufnr, resb~werks,
+           resb~bdmng, resb~meins, resb~enmng, resb~sortf, resb~bwart, resb~vornr,
+           mara~zzgramaje, mara~zzancho, mara~zzlargo, mara~mtart, t023t~wgbez60
+      INTO TABLE @DATA(tl_resb)
+      FROM resb INNER JOIN ( mara LEFT OUTER JOIN t023t ON t023t~spras = @sy-langu AND
+                                                           t023t~matkl = mara~matkl )
+                ON mara~matnr = resb~matnr
+      FOR ALL ENTRIES IN @tl_cinumbers
+      WHERE resb~aufnr = @tl_cinumbers-aufnr AND
+            resb~xloek IN @tl_xloek_rg.
+  ENDIF.
+
+  "Buscamos la bobina en el cuanto
+  SELECT *
+    INTO TABLE @DATA(tl_lqua)
+    FROM lqua
+    UP TO 1 ROWS
+    WHERE lgnum = @p_lgnum  AND
+          lenum = @p_lenum
+    ORDER BY verme DESCENDING, gesme DESCENDING.
+  IF sy-subrc = 0.
+    DATA(wl_lqua) = tl_lqua[ 1 ].
+  ELSE.
+    MESSAGE 'No se ha encontrado unidad de almacén' TYPE 'E'.
+  ENDIF.
+*  IF wl_lqua-verme = 0.
+*    wl_lqua-verme = wl_lqua-gesme.
+*  ENDIF.
+
+  "Obtener cantidad actual EN KG
+  DATA(vl_cantidad_actual) = zcl_wm_nt_generic=>conv_matnr( iv_matnr      = wl_lqua-matnr
+                                                            iv_meins_dest = zcl_wm_nt_generic=>gc_meins_kg
+                                                            iv_meins_orig = wl_lqua-meins
+                                                            iv_qty        = wl_lqua-verme ).
+
+
+  "Obtener cantidad restante EN KG
+  DATA(vl_cantidad_restante) = p_diam.
+
+  IF vl_cantidad_restante > 0.
+    zcl_wm_nt_generic=>conv_mat_diametro(
+      EXPORTING iv_matnr          = wl_lqua-matnr
+                iv_qty            = vl_cantidad_restante
+                iv_meins          = zcl_wm_nt_generic=>gc_meins_dia
+                iv_dest_meins     = zcl_wm_nt_generic=>gc_meins_kg
+                iv_werks          = wl_t320-werks
+      RECEIVING rv_qty = vl_cantidad_restante
+      EXCEPTIONS um_no_valid       = 1
+                 missing_constants = 2
+                 missing_matnr     = 3
+                 no_base_calc      = 4
+                 OTHERS            = 5 ).
+  ENDIF.
+
+
+
+  IF vl_cantidad_actual = 0.
+    MESSAGE 'No hay stock en la bobina' TYPE 'E'.
+  ELSEIF vl_cantidad_actual < vl_cantidad_restante.
+    MESSAGE 'No hay suficiente stock en la bobina para la cantidad indicada' TYPE 'E'.
+  ENDIF.
+
+  DATA(vl_cantidad_consumo) = vl_cantidad_actual - vl_cantidad_restante.
+  "No debería pasar, pero si si por cualquier casual la cantidad de consumo es mayor que la actual, cogemos la actual
+  IF vl_cantidad_consumo > vl_cantidad_actual.
+    vl_cantidad_consumo = vl_cantidad_actual.
+  ENDIF.
+
+
+  "Recorremos los CINUMBERS/Ordenes para completar con los datos de consumo
+  DATA: vl_cantidad_consumo_aux TYPE ekpo-menge.
+
+  LOOP AT tl_cinumbers ASSIGNING <fs_cinumbers>.
+    READ TABLE tl_resb ASSIGNING FIELD-SYMBOL(<fs_resb>) WITH KEY aufnr = <fs_cinumbers>-aufnr
+                                                                  sortf = p_lgpla.
+    CHECK sy-subrc = 0.
+    <fs_cinumbers>-rsnum = <fs_resb>-rsnum.
+    <fs_cinumbers>-rspos = <fs_resb>-rspos.
+    <fs_cinumbers>-vornr = <fs_resb>-vornr.
+    <fs_cinumbers>-bwart = <fs_resb>-bwart.
+
+    IF vl_cantidad_total <> 0.
+      <fs_cinumbers>-porc_cantidad = <fs_cinumbers>-cant_step / vl_cantidad_total.
+    ENDIF.
+
+    <fs_cinumbers>-cantidad_consumo = vl_cantidad_consumo * <fs_cinumbers>-porc_cantidad.
+    CALL FUNCTION 'ROUND'
+      EXPORTING
+        input         = <fs_cinumbers>-cantidad_consumo
+        sign          = '-' "Redondeo hacia abajo
+      IMPORTING
+        output        = <fs_cinumbers>-cantidad_consumo
+      EXCEPTIONS
+        input_invalid = 1
+        overflow      = 2
+        type_invalid  = 3
+        OTHERS        = 4.
+    ADD <fs_cinumbers>-cantidad_consumo TO vl_cantidad_consumo_aux.
+  ENDLOOP.
+
+  "El último consumo se lleva la diferencia
+  IF <fs_cinumbers> IS ASSIGNED AND vl_cantidad_consumo <> vl_cantidad_consumo_aux.
+    <fs_cinumbers>-cantidad_consumo = <fs_cinumbers>-cantidad_consumo + ( vl_cantidad_consumo - vl_cantidad_consumo_aux ).
+  ENDIF.
+
+
+  DATA: wl_return	            TYPE bapiret2,
+        tl_link_conf_goodsmov	TYPE bapi_link_conf_goodsmov_tt,
+        tl_goodsmovements	    TYPE bapi2017_gm_item_create_t,
+        tl_timetickets        TYPE bapi_pp_timeticket_tt.
+
+
+  DATA vl_index TYPE i.
+  LOOP AT tl_cinumbers ASSIGNING <fs_cinumbers> WHERE cantidad_consumo > 0.
+    APPEND INITIAL LINE TO tl_timetickets ASSIGNING FIELD-SYMBOL(<fs_timetickets>).
+    <fs_timetickets>-orderid          = <fs_cinumbers>-aufnr.
+    <fs_timetickets>-operation        = <fs_cinumbers>-vornr.
+
+    <fs_timetickets>-postg_date       = sy-datlo.
+    <fs_timetickets>-conf_text        = ''.
+    <fs_timetickets>-exec_start_date  = sy-datlo.
+    <fs_timetickets>-exec_start_time  = sy-timlo.
+    <fs_timetickets>-exec_fin_date    = sy-datlo.
+    <fs_timetickets>-exec_fin_time    = sy-timlo.
+    <fs_timetickets>-ex_created_by    = sy-uname.
+
+
+    APPEND INITIAL LINE TO tl_goodsmovements ASSIGNING FIELD-SYMBOL(<fs_goodsmovements>).
+    <fs_goodsmovements>-move_type   = <fs_cinumbers>-bwart.
+    <fs_goodsmovements>-entry_qnt   = <fs_cinumbers>-cantidad_consumo.
+    <fs_goodsmovements>-entry_uom   = <fs_cinumbers>-meins.
+    <fs_goodsmovements>-material    = wl_lqua-matnr.
+    <fs_goodsmovements>-plant       = wl_lqua-werks.
+    <fs_goodsmovements>-stge_loc    = wl_lqua-lgort.
+    <fs_goodsmovements>-batch       = wl_lqua-charg.
+    <fs_goodsmovements>-stge_type   = '100'.
+    <fs_goodsmovements>-stge_bin    = p_lgpla.
+
+    ADD 1 TO vl_index.
+    APPEND INITIAL LINE TO tl_link_conf_goodsmov ASSIGNING FIELD-SYMBOL(<fs_link_conf_goodsmov>).
+    <fs_link_conf_goodsmov>-index_confirm   = vl_index.
+    <fs_link_conf_goodsmov>-index_goodsmov  = vl_index.
+
+
+    APPEND INITIAL LINE TO tg_consumos_pp ASSIGNING FIELD-SYMBOL(<fs_zwm_consumos_pp>).
+    <fs_zwm_consumos_pp>-werks          = <fs_goodsmovements>-plant.
+    <fs_zwm_consumos_pp>-contador2      = <fs_link_conf_goodsmov>-index_goodsmov.
+    <fs_zwm_consumos_pp>-dats           = <fs_timetickets>-exec_start_date.
+    <fs_zwm_consumos_pp>-tims           = <fs_timetickets>-exec_start_time.
+    <fs_zwm_consumos_pp>-id_bob_ecm     = <fs_timetickets>-orderid && <fs_timetickets>-operation.
+    <fs_zwm_consumos_pp>-ci_number      = <fs_cinumbers>-ci_number.
+    <fs_zwm_consumos_pp>-lenum          = p_lenum.
+    <fs_zwm_consumos_pp>-aufnr          = <fs_cinumbers>-aufnr.
+    <fs_zwm_consumos_pp>-lgpla          = <fs_goodsmovements>-stge_bin.
+    <fs_zwm_consumos_pp>-matnr          = <fs_goodsmovements>-material.
+    <fs_zwm_consumos_pp>-charg          = <fs_goodsmovements>-batch.
+    <fs_zwm_consumos_pp>-restante       = vl_cantidad_restante.
+    <fs_zwm_consumos_pp>-meins          = <fs_cinumbers>-meins.
+    <fs_zwm_consumos_pp>-consumo        = <fs_goodsmovements>-entry_qnt.
+    <fs_zwm_consumos_pp>-meins_consumo  = <fs_goodsmovements>-entry_uom.
+    <fs_zwm_consumos_pp>-cla_manual     = 'X'.
+    <fs_zwm_consumos_pp>-ernam          = sy-uname.
+    <fs_zwm_consumos_pp>-erdat          = sy-datum.
+    <fs_zwm_consumos_pp>-erzet          = sy-uzeit.
+  ENDLOOP.
+
+  IF tl_goodsmovements IS INITIAL.
+    MESSAGE 'No se han podido determinar consumos' TYPE 'E'.
+  ENDIF.
+
+
+  "Verificamos bloqueos
+  DATA: vl_garg TYPE seqg3-garg,
+        tl_enq  TYPE TABLE OF seqg3.
+
+  CONCATENATE sy-mandt wl_lqua-matnr wl_lqua-werks INTO vl_garg RESPECTING BLANKS.
+
+  DO 5 TIMES.
+    CALL FUNCTION 'ENQUEUE_READ'
+      EXPORTING
+        gclient = sy-mandt
+        gname   = 'MARC'
+        garg    = vl_garg
+        guname  = sy-uname
+      TABLES
+        enq     = tl_enq.
+
+    IF tl_enq IS NOT INITIAL.
+      WAIT UP TO 1 SECONDS.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDDO.
+
+
+
+  "Ahora sí que hacemos los consumos
+  DATA(vl_testrun) = vg_test.
+  DATA: tl_detail_return      TYPE TABLE OF bapi_coru_return,
+        tl_return             TYPE bapiret2_t,
+        wl_return_prodordconf TYPE bapiret1,
+        vl_post_wrong_entries TYPE bapi_coru_param-ins_err VALUE '0'.
+
+
+  TRY .
+      CALL FUNCTION 'BAPI_PRODORDCONF_CREATE_TT'
+        EXPORTING
+          post_wrong_entries = vl_post_wrong_entries
+          testrun            = vl_testrun
+        IMPORTING
+          return             = wl_return_prodordconf
+        TABLES
+          timetickets        = tl_timetickets
+          goodsmovements     = tl_goodsmovements
+          link_conf_goodsmov = tl_link_conf_goodsmov
+          detail_return      = tl_detail_return
+        EXCEPTIONS
+          error_message      = 1.
+      IF sy-subrc = 1.
+        zcl_seis_odata_utils=>lanzar_excepcion( ).
+      ENDIF.
+
+      MOVE-CORRESPONDING tl_detail_return TO tl_return.
+      zcl_seis_odata_utils=>lanzar_excepcion( bapiret2_t = tl_return ).
+    CATCH /iwbep/cx_mgw_busi_exception INTO rl_exc.
+      MESSAGE rl_exc->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+  IF vl_testrun = space.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+    WAIT UP TO 2 SECONDS.
+
+
+    SELECT MAX( contador )
+      INTO @DATA(vl_contador)
+      FROM zwm_consumos_pp
+      WHERE werks = @wl_t320-werks.
+    ADD 1 TO vl_contador.
+
+    LOOP AT tg_consumos_pp ASSIGNING <fs_zwm_consumos_pp>.
+      <fs_zwm_consumos_pp>-contador = vl_contador.
+      READ TABLE tl_detail_return ASSIGNING FIELD-SYMBOL(<fs_detail_return>) WITH KEY row = <fs_zwm_consumos_pp>-contador2.
+      IF sy-subrc = 0.
+        <fs_zwm_consumos_pp>-texto = <fs_detail_return>-message.
+        <fs_zwm_consumos_pp>-rueck = <fs_detail_return>-conf_no.
+        <fs_zwm_consumos_pp>-rmzhl = <fs_detail_return>-conf_cnt.
+      ENDIF.
+    ENDLOOP.
+
+
+    "Buscamos los movimientos de mercancías de la notificación
+    IF tg_consumos_pp IS NOT INITIAL.
+      SELECT rueck, rmzhl, wablnr, weblnr, myear
+        INTO TABLE @DATA(tl_afru)
+        FROM afru
+        FOR ALL ENTRIES IN @tg_consumos_pp
+        WHERE rueck = @tg_consumos_pp-rueck AND
+              rmzhl = @tg_consumos_pp-rmzhl.
+
+      SELECT rueck, rmzhl, mblnr, mjahr, mblpo
+        INTO TABLE @DATA(tl_afwi)
+        FROM afwi
+        FOR ALL ENTRIES IN @tg_consumos_pp
+        WHERE rueck = @tg_consumos_pp-rueck AND
+              rmzhl = @tg_consumos_pp-rmzhl.
+    ENDIF.
+
+    LOOP AT tg_consumos_pp ASSIGNING <fs_zwm_consumos_pp>.
+      READ TABLE tl_afru ASSIGNING FIELD-SYMBOL(<fs_afru>) WITH KEY rueck = <fs_zwm_consumos_pp>-rueck
+                                                                    rmzhl = <fs_zwm_consumos_pp>-rmzhl.
+      IF sy-subrc = 0.
+        <fs_zwm_consumos_pp>-mblnr = <fs_afru>-wablnr.
+        <fs_zwm_consumos_pp>-mjahr = <fs_afru>-myear.
+      ENDIF.
+
+      IF <fs_zwm_consumos_pp>-mblnr IS INITIAL.
+        READ TABLE tl_afwi ASSIGNING FIELD-SYMBOL(<fs_afwi>) WITH KEY rueck = <fs_zwm_consumos_pp>-rueck
+                                                                      rmzhl = <fs_zwm_consumos_pp>-rmzhl.
+        IF sy-subrc = 0.
+          <fs_zwm_consumos_pp>-mblnr = <fs_afwi>-mblnr.
+          <fs_zwm_consumos_pp>-mjahr = <fs_afwi>-mjahr.
+        ENDIF.
+      ENDIF.
+
+      IF <fs_zwm_consumos_pp>-mblnr IS INITIAL.
+        <fs_zwm_consumos_pp>-texto = 'Consumo realizado, pero no se ha podido determinar doc. material'.
+        CONTINUE.
+      ENDIF.
+    ENDLOOP.
+
+
+
+    IF tg_consumos_pp IS NOT INITIAL.
+      SELECT ltbp~lgnum, ltbp~tbnum, ltbp~tbpos, ltbp~meins, ltbp~menge, ltbp~charg,
+             ltbk~nltyp, ltbk~nlpla, ltbp~tanum
+        INTO TABLE @DATA(tl_ltbp)
+        FROM ltbk INNER JOIN ltbp ON ltbp~lgnum = ltbk~lgnum AND
+                                     ltbp~tbnum = ltbk~tbnum
+        FOR ALL ENTRIES IN @tg_consumos_pp
+        WHERE ltbk~lgnum = @p_lgnum AND
+              ltbk~mblnr = @tg_consumos_pp-mblnr AND
+              ltbk~mjahr = @tg_consumos_pp-mjahr AND
+              ltbk~mblnr <> @space               AND
+              ltbk~mblnr <> '0000000000'.
+    ENDIF.
+
+
+
+    "Aquí lo que necesito es que hagamos la consulta…Si la NT asociada a la posición del
+    "documento de material está completada (ltbp tiene la OT informada)…no hace falta crear OT.
+
+
+    "Además, he probado y falla la creación e la OT con 1 documentos de material con dos posiciones.
+    "Esto ocurre porque cada posición genera su NT y en el código solo apuntamos a una y el trite lo estamos rellenando para los dos.
+    "Es decir, hay que llamar a crear OF una vez por cada posición de documento de material si se cumple lo definido en este punto (No existe OT ya)
+
+    DATA tl_trite TYPE l03b_trite_t.
+    LOOP AT tl_ltbp ASSIGNING FIELD-SYMBOL(<fs_ltbp>).
+      IF <fs_ltbp>-tanum IS INITIAL.
+        CLEAR tl_trite.
+        APPEND INITIAL LINE TO tl_trite ASSIGNING FIELD-SYMBOL(<fs_trite>).
+        <fs_trite>-tbpos = <fs_ltbp>-tbpos.
+        <fs_trite>-altme = <fs_ltbp>-meins.
+        <fs_trite>-anfme = <fs_ltbp>-menge.
+        <fs_trite>-charg = <fs_ltbp>-charg.
+        <fs_trite>-nltyp = <fs_ltbp>-nltyp.
+        <fs_trite>-nlpla = <fs_ltbp>-nlpla.
+
+        <fs_trite>-vlpla = wl_lqua-lgpla.
+        <fs_trite>-vltyp = wl_lqua-lgtyp.
+        <fs_trite>-letyp = wl_lqua-letyp.
+
+        TRY .
+            DATA(rl_utils_wm) = NEW zcl_utils_wm( i_werks = wl_t320-werks
+                                                  i_lgort = wl_t320-lgort ).
+            DATA(vl_tanum) = rl_utils_wm->create_to_4_tr( i_tbnum   = <fs_ltbp>-tbnum
+                                                          i_t_trite = tl_trite
+                                                          i_commit  = 'X' ).
+          CATCH zcx_wm_exception INTO DATA(rl_wm_exc).
+            DATA(vl_msg) = rl_wm_exc->get_text( ).
+          CATCH zcx_mm_exception INTO DATA(rl_mm_exc).
+            vl_msg = rl_mm_exc->get_text( ).
+        ENDTRY.
+
+      ELSE.
+        vl_tanum = <fs_ltbp>-tanum.
+      ENDIF.
+    ENDLOOP.
+
+
+    LOOP AT tg_consumos_pp ASSIGNING <fs_zwm_consumos_pp> WHERE mblnr IS NOT INITIAL.
+      <fs_zwm_consumos_pp>-tanum = vl_tanum.
+      IF <fs_zwm_consumos_pp>-tanum IS INITIAL.
+        <fs_zwm_consumos_pp>-texto = 'Consumo realizado, pero no se ha realizada la OT'.
+        CONTINUE.
+      ENDIF.
+    ENDLOOP.
+
+
+
+    "Actualizamos tablaS Z de bobinas
+    MODIFY zwm_consumos_pp  FROM TABLE tg_consumos_pp.
+**    MODIFY zwm_ecm_bobine   FROM wl_bobina.
+
+
+*
+*    " cvivo - Lanzamos la impresión aquí, 1 etiqueta por consumo
+*    IF vl_cantidad_restante > 0.
+*      DATA tl_selection_table TYPE TABLE OF rsparamsl_255.
+*      EXPORT lv_vengo_inter_consumo = abap_true         TO MEMORY ID 'VENGO_CONSUMO' .
+*      EXPORT lv_cod_maq_portabo     = wl_estacion-lgpla TO MEMORY ID 'MAQUINA'.
+*
+*      " create label for remaining
+*      tl_selection_table = VALUE #( ( selname = 'P_LGNUM' kind = 'P' sign = 'I' option = 'EQ' low = p_lgnum )
+*                                    ( selname = 'S_LENUM' kind = 'S' sign = 'I' option = 'EQ' low = p_lenum ) ).
+*      SUBMIT zimpresion_ua WITH SELECTION-TABLE tl_selection_table AND RETURN.
+*      FREE MEMORY ID: 'VENGO_CONSUMO', 'MAQUINA'.
+*    ENDIF.
+
+  ENDIF.
+ENDFORM.
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_END_OF_SELECTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_end_of_selection.
+  PERFORM f_mostrar_alv.
+
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  F_MOSTRAR_ALV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_mostrar_alv .
+  IF tg_consumos_pp IS INITIAL.
+    MESSAGE 'No se han encontrado datos' TYPE 'S' DISPLAY LIKE 'W'.
+    RETURN.
+  ENDIF.
+
+  TRY.
+      cl_salv_table=>factory( IMPORTING r_salv_table = rg_alv
+                              CHANGING  t_table      = tg_consumos_pp ).
+    CATCH cx_salv_msg INTO DATA(rl_exc).
+      MESSAGE rl_exc->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+
+  DATA(wl_key) = VALUE salv_s_layout_key( report = sy-repid ).
+  rg_alv->get_layout( )->set_key( wl_key ).
+  rg_alv->get_layout( )->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  rg_alv->get_layout( )->set_default( abap_true ).
+  rg_alv->get_functions( )->set_all( 'X' ).
+  DATA(rl_columns) = rg_alv->get_columns( ).
+  DATA: rl_column  TYPE REF TO cl_salv_column_table.
+  rl_columns->set_optimize( ).
+
+  rg_alv->display( ).
+ENDFORM.

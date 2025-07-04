@@ -1,0 +1,2086 @@
+*&---------------------------------------------------------------------*
+*& Report  SD_SDOC_PRINT01
+*&---------------------------------------------------------------------*
+*& Print Program for Sales Documents
+*&---------------------------------------------------------------------*
+REPORT zrsd_print_pedido MESSAGE-ID vd_pdf.
+
+TABLES:
+  nast,
+  tnapr,
+  toa_dara,
+  vbdka,                                          "#EC NEEDED sapscript
+  komk,                                           "#EC NEEDED sapscript
+  tvko.                                           "#EC NEEDED sapscript
+
+TYPE-POOLS:
+  szadr.
+
+DATA:
+  BEGIN OF gs_nast.
+    INCLUDE STRUCTURE nast.
+  DATA:
+    email_addr TYPE ad_smtpadr,
+  END OF gs_nast.
+
+DATA:
+  gr_badi_print              TYPE REF TO badi_sd_sls_print01,
+
+  gt_komv                    TYPE TABLE OF komv,
+  gt_vedpa                   TYPE TABLE OF vedpa,
+  gt_item_cancellation_dates TYPE vedpn_t,
+  gt_vbtyp_fix_values        TYPE TABLE OF dd07v,
+  gt_add_msg                 TYPE balmi_t,
+
+  gs_interface               TYPE sdoc_s_prt_interface,
+  gs_komk                    TYPE komk,
+
+  gv_screen_display          TYPE char1,
+  gv_price_print_mode        TYPE char1,
+  gv_language                TYPE sylangu,
+  gv_scenario                TYPE c,
+  gv_dummy                   TYPE char1.                    "#EC NEEDED
+
+FIELD-SYMBOLS:
+  <gs_vbdka>      TYPE vbdka,
+  <gv_returncode> TYPE sysubrc.
+
+CONSTANTS:
+  gc_pr_kappl  TYPE char1 VALUE 'V',
+  gc_true      TYPE char1 VALUE 'X',
+  gc_false     TYPE char1 VALUE space,
+  gc_english   TYPE char1 VALUE 'E',
+  gc_pdf       TYPE char1 VALUE '2',
+  gc_equal     TYPE char2 VALUE 'EQ',
+  gc_include   TYPE char1 VALUE 'I',
+  gc_cash_sale TYPE char1 VALUE 'C',
+  gc_max_brtwr TYPE brtwr VALUE '999999999.99',
+  BEGIN OF gc_nacha,
+    printer       TYPE na_nacha VALUE 1,
+    fax           TYPE na_nacha VALUE 2,
+    external_send TYPE na_nacha VALUE 5,
+  END OF gc_nacha,
+  BEGIN OF gc_device,
+    printer    TYPE output_device VALUE 'P',
+    fax        TYPE output_device VALUE 'F',
+    email      TYPE output_device VALUE 'E',
+    web_dynpro TYPE output_device VALUE 'W',
+  END OF gc_device.
+
+INCLUDE:
+  rvdirekt.
+
+* >>>>> BUNDLING <<<<< *************************************************
+INCLUDE check_bundling_print.
+* >>>>> BUNDLING <<<<< *************************************************
+
+*---------------------------------------------------------------------*
+*       FORM ENTRY                                                    *
+*---------------------------------------------------------------------*
+FORM entry                                                  "#EC CALLED
+     USING cv_returncode  TYPE sysubrc
+           uv_screen      TYPE char1.
+
+
+  TRY.
+*     Get BAdI handle
+      GET BADI gr_badi_print
+        FILTERS
+          filter_order = tnapr-sform.
+    CATCH cx_badi_not_implemented.
+*     This should not occur due to fallback class but to be save...
+      CLEAR gr_badi_print.
+    CATCH cx_badi_multiply_implemented.
+*     Several implementations exist for the filter 'form name'.
+*     This appears to be very unlikely but to be save...
+      CLEAR gr_badi_print.
+  ENDTRY.
+
+* Assign RC
+  ASSIGN cv_returncode TO <gv_returncode>.
+
+* Refresh global data
+  PERFORM initialize_data.
+
+* Set data and start processing
+  gv_screen_display = uv_screen.
+  gs_nast           = nast.
+  PERFORM processing.
+
+ENDFORM.                    "entry
+
+*---------------------------------------------------------------------*
+*       FORM ENTRY_CASH_SALE                                          *
+*---------------------------------------------------------------------*
+FORM entry_cash_sale                                        "#EC CALLED
+     USING cv_returncode TYPE sysubrc
+           uv_screen     TYPE char1.
+
+  TRY.
+*     Get BAdI handle
+      GET BADI gr_badi_print
+        FILTERS
+          filter_order = tnapr-sform.
+    CATCH cx_badi_not_implemented.
+*     This should not occur due to fallback class but to be save...
+      CLEAR gr_badi_print.
+    CATCH cx_badi_multiply_implemented.
+*     Several implementations exist for the filter 'form name'.
+*     This appears to be very unlikely but to be save...
+      CLEAR gr_badi_print.
+  ENDTRY.
+
+* Assign RC
+  ASSIGN cv_returncode TO <gv_returncode>.
+
+* Refresh global data
+  PERFORM initialize_data.
+
+* Set data and start processing
+  gv_screen_display = uv_screen.
+  gs_nast           = nast.
+  gv_scenario       = gc_cash_sale.
+  PERFORM processing.
+
+ENDFORM.                    "entry_cash_sale
+
+*&---------------------------------------------------------------------*
+*&      Form  processing
+*&---------------------------------------------------------------------*
+FORM processing.
+
+* Retrieve the data
+  PERFORM get_data.
+  CHECK <gv_returncode> IS INITIAL.
+
+* Print, fax, send data
+  PERFORM print_data.
+  CHECK <gv_returncode> IS INITIAL.
+
+  IF cl_ops_switch_check=>sd_sfws_sc4( ) EQ abap_true.
+*   Export additional messages into ABAP memory (even if empty)
+    SORT gt_add_msg
+         BY msgty msgid msgno msgv1 msgv2 msgv3 msgv4.
+    DELETE ADJACENT DUPLICATES
+           FROM gt_add_msg COMPARING
+           msgty msgid msgno msgv1 msgv2 msgv3 msgv4.
+    EXPORT lt_add_msg = gt_add_msg TO MEMORY ID 'PDF_ADD_MSG'.
+    CLEAR gt_add_msg.
+  ENDIF.
+
+ENDFORM.                    " processing
+
+*&---------------------------------------------------------------------*
+*&      Form  get_data
+*&---------------------------------------------------------------------*
+FORM get_data.
+
+  DATA:
+    lt_vbdpa TYPE vbdpa_t,
+    lt_vedka TYPE TABLE OF vedka,
+    lt_mess  TYPE TABLE OF vbfs,
+
+    ls_comwa TYPE vbco3,
+
+    ls_mess  TYPE vbfs.
+
+  FIELD-SYMBOLS:
+    <ls_item_detail> TYPE sdoc_s_prt_item_detail.
+
+* Init pricing on demand
+  CALL FUNCTION 'RV_PRICE_PRINT_GET_MODE'
+    IMPORTING
+      e_print_mode = gv_price_print_mode.
+  IF gv_price_print_mode EQ chara.
+    CALL FUNCTION 'RV_PRICE_PRINT_REFRESH'
+      TABLES
+        tkomv = gt_komv.
+  ENDIF.
+
+* Set data and call print view
+  ls_comwa-mandt = sy-mandt.
+  ls_comwa-spras = gs_nast-spras.
+  ls_comwa-vbeln = gs_nast-objky.
+  ls_comwa-kunde = gs_nast-parnr.
+  ls_comwa-parvw = gs_nast-parvw.
+  CALL FUNCTION 'RV_DOCUMENT_PRINT_VIEW'
+    EXPORTING
+      comwa                       = ls_comwa
+    IMPORTING
+      kopf                        = gs_interface-head_detail-vbdka
+    TABLES
+      pos                         = lt_vbdpa
+      mess                        = lt_mess
+    EXCEPTIONS
+      fehler_bei_datenbeschaffung = 1.
+  IF sy-subrc NE 0.
+*   Error whilst data retrieval
+    <gv_returncode> = sy-subrc.
+    PERFORM protocol_update.
+  ENDIF.
+* In create mode if the sales document has no external number and it
+* does not contain any item, yet, the above module undesired returns
+* an item w/ initial POSNR and we have to get rid of it...
+  DELETE lt_vbdpa WHERE posnr EQ posnr_low.
+* Adopt messages into log
+  LOOP AT lt_mess INTO ls_mess.
+    MESSAGE ID ls_mess-msgid TYPE ls_mess-msgty NUMBER ls_mess-msgno
+         WITH ls_mess-msgv1 ls_mess-msgv2 ls_mess-msgv3 ls_mess-msgv4
+         INTO gv_dummy.
+    PERFORM protocol_update.
+  ENDLOOP.
+  CHECK <gv_returncode> IS INITIAL.
+
+* Assign a global pointer to the VBDKA
+  ASSIGN gs_interface-head_detail-vbdka TO <gs_vbdka>.
+
+* Set default language
+  gv_language = gs_nast-spras.
+
+* Set Country for display conversions e.g. WRITE TO
+  SET COUNTRY <gs_vbdka>-land1.
+
+* Fetch servicecontract-data and notice-data for head and position.
+  CALL FUNCTION 'SD_VEDA_GET_PRINT_DATA'
+    EXPORTING
+      i_document_number = <gs_vbdka>-vbeln
+      i_language        = gv_language
+      i_posnr_low       = posnr_low
+    TABLES
+      print_data_pos    = gt_vedpa
+      print_data_head   = lt_vedka
+      print_notice_pos  = gt_item_cancellation_dates
+      print_notice_head = gs_interface-head_detail-cancellation_dates.
+
+* Validity dates of service contracts
+  READ TABLE lt_vedka INTO gs_interface-head_detail-vedka INDEX 1.
+
+* Cancellation dates of service contracts
+  IF NOT gs_interface-head_detail-cancellation_dates IS INITIAL.
+*   Set up control
+    gs_interface-head_detail-ex_cancellation_dates = gc_true.
+  ENDIF.
+
+* Get the item details
+  PERFORM get_item_details   USING lt_vbdpa.
+  CHECK <gv_returncode> IS INITIAL.
+
+* Get the header details
+  PERFORM get_head_details.
+  CHECK <gv_returncode> IS INITIAL.
+
+*ENHANCEMENT-POINT EHP603_SD_SDOC_PRINT01_01 SPOTS ES_SD_SDOC_PRINT01.
+
+ENDFORM.                    " get_data
+
+*&---------------------------------------------------------------------*
+*&      Form  protocol_update
+*&---------------------------------------------------------------------*
+FORM protocol_update.
+
+  CHECK gv_screen_display = gc_false.
+  CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+    EXPORTING
+      msg_arbgb = sy-msgid
+      msg_nr    = sy-msgno
+      msg_ty    = sy-msgty
+      msg_v1    = sy-msgv1
+      msg_v2    = sy-msgv2
+      msg_v3    = sy-msgv3
+      msg_v4    = sy-msgv4
+    EXCEPTIONS
+      OTHERS    = 0.
+
+ENDFORM.                    " protocol_update
+
+*&---------------------------------------------------------------------*
+*&      Form  print_data
+*&---------------------------------------------------------------------*
+FORM print_data.
+
+  DATA:
+    ls_outputparams TYPE sfpoutputparams,
+    ls_docparams    TYPE sfpdocparams,
+    ls_pdf_file     TYPE fpformoutput,
+    ls_pdf_file_2   TYPE fpformoutput, "CGIJON - 03.06.22 - SAT 7000047491 - TICKET 71417  - ANEXOS PED
+
+    lv_fm_name      TYPE rs38l_fnam,
+    lv_fm_name_2    TYPE rs38l_fnam, "CGIJON - 03.06.22 - SAT 7000047491 - TICKET 71417  - ANEXOS PED
+    lv_device       TYPE output_device,
+    lv_failed       TYPE boole_d.
+
+* The form must be of type PDF
+  IF tnapr-formtype NE gc_pdf.
+    <gv_returncode>  = 1.
+    MESSAGE e005 WITH <gs_vbdka>-vbeln
+                      tnapr-sform
+                 INTO gv_dummy.
+    PERFORM protocol_update.
+    RETURN.
+  ENDIF.
+
+  IF gs_nast-kschl = 'ZBA3'.
+    DO 10 TIMES.
+      SELECT SINGLE zzfconfs FROM vbap INTO @DATA(lv_f) WHERE vbeln = @<gs_vbdka>-vbeln AND zzfconfs = '00000000' AND bedae <> 'KSV'.
+      IF sy-subrc = 0.
+        WAIT UP TO 1 SECONDS.
+      ELSE.
+        EXIT.
+      ENDIF.
+    ENDDO.
+  ENDIF.
+
+* Get output parameters
+  PERFORM get_output_params CHANGING ls_outputparams
+                                     ls_docparams
+                                     lv_device.
+  CHECK <gv_returncode> IS INITIAL.
+
+  IF cl_ops_switch_check=>sd_sfws_sc1( ) IS NOT INITIAL.
+* >>>>> BUNDLING <<<<< *************************************************
+* Check for bundling
+* Import parameter from memory
+    DATA:  bundling TYPE char1.
+    CLEAR: bundling.
+    IMPORT bundling FROM MEMORY ID 'BUNDLING'.
+    IF sy-subrc NE 0 OR bundling NE 'X' OR
+       nast-nacha NE '1'.
+      CLEAR: bundling.
+*   Open the spool job
+      CALL FUNCTION 'FP_JOB_OPEN'
+        CHANGING
+          ie_outputparams = ls_outputparams
+        EXCEPTIONS
+          cancel          = 1
+          usage_error     = 2
+          system_error    = 3
+          internal_error  = 4
+          OTHERS          = 5.
+      IF sy-subrc <> 0.
+        <gv_returncode> = sy-subrc.
+        PERFORM protocol_update.
+        RETURN.
+      ENDIF.
+    ENDIF.
+* >>>>> BUNDLING <<<<< *************************************************
+  ELSE.
+* Open the spool job
+    CALL FUNCTION 'FP_JOB_OPEN'
+      CHANGING
+        ie_outputparams = ls_outputparams
+      EXCEPTIONS
+        cancel          = 1
+        usage_error     = 2
+        system_error    = 3
+        internal_error  = 4
+        OTHERS          = 5.
+    IF sy-subrc <> 0.
+*   Error with spool job
+      <gv_returncode> = sy-subrc.
+      PERFORM protocol_update.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+
+
+* Get the name of the generated function module
+  TRY.
+      CALL FUNCTION 'FP_FUNCTION_MODULE_NAME'
+        EXPORTING
+          i_name     = tnapr-sform
+        IMPORTING
+          e_funcname = lv_fm_name.
+
+    CATCH cx_fp_api_repository
+          cx_fp_api_usage
+          cx_fp_api_internal.
+*     Function generation did fail
+      <gv_returncode> = 99.
+      MESSAGE e000 WITH <gs_vbdka>-vbeln
+                   INTO gv_dummy.
+      PERFORM protocol_update.
+      RETURN.
+  ENDTRY.
+
+  "INI CGIJON - 03.06.22 - SAT 7000047491 - TICKET 71417  - ANEXOS PED
+  break developer.
+  IF gs_interface-head_detail-vbdka-vkorg = '4000'.
+    TRY.
+        CALL FUNCTION 'FP_FUNCTION_MODULE_NAME'
+          EXPORTING
+            i_name     = 'ZESSDF_ANEXO_PEDIDO'
+          IMPORTING
+            e_funcname = lv_fm_name_2.
+
+      CATCH cx_fp_api_repository
+            cx_fp_api_usage
+            cx_fp_api_internal.
+*     Function generation did fail
+        <gv_returncode> = 99.
+        MESSAGE e000 WITH <gs_vbdka>-vbeln
+                     INTO gv_dummy.
+        PERFORM protocol_update.
+        RETURN.
+    ENDTRY.
+
+  ENDIF.
+  "FIN CGIJON - 03.06.22 - SAT 7000047491 - TICKET 71417  - ANEXOS PED
+
+
+  IF gr_badi_print IS BOUND.
+*   Call BAdI for printing
+    CALL BADI gr_badi_print->print_data
+      EXPORTING
+        iv_fm_name    = lv_fm_name
+        is_interface  = gs_interface
+        is_docparams  = ls_docparams
+        is_nast       = nast
+      IMPORTING
+        es_formoutput = ls_pdf_file
+      EXCEPTIONS
+        error         = 1.
+  ELSE.
+*   No BAdI handle: Directly call the function module generated
+*   from according PDF form
+    CALL FUNCTION lv_fm_name
+      EXPORTING
+        /1bcdwb/docparams  = ls_docparams
+        sls_prt_com        = gs_interface
+      IMPORTING
+        /1bcdwb/formoutput = ls_pdf_file
+      EXCEPTIONS
+        usage_error        = 1
+        system_error       = 2
+        internal_error     = 3
+        OTHERS             = 4.
+  ENDIF.
+  IF NOT sy-subrc IS INITIAL.
+*   Printing failed
+    <gv_returncode> = sy-subrc.
+    PERFORM protocol_update.
+    MESSAGE e000 WITH <gs_vbdka>-vbeln
+                 INTO gv_dummy.
+    PERFORM protocol_update.
+*   Do not directly return but only after closing the spool job
+    lv_failed = abap_true.
+  ENDIF.
+
+  "INI CGIJON - 03.06.22 - SAT 7000047491 - TICKET 71417  - ANEXOS PED
+  break developer.
+  IF gs_interface-head_detail-vbdka-vkorg = '4000'.
+    CALL FUNCTION lv_fm_name_2
+      EXPORTING
+        /1bcdwb/docparams  = ls_docparams
+        sls_prt_com        = gs_interface
+      IMPORTING
+        /1bcdwb/formoutput = ls_pdf_file
+      EXCEPTIONS
+        usage_error        = 1
+        system_error       = 2
+        internal_error     = 3
+        OTHERS             = 4.
+    "FIN CGIJON - 03.06.22 - SAT 7000047491 - TICKET 71417  - ANEXOS PED
+
+    IF cl_ops_switch_check=>sd_sfws_sc1( ) IS NOT INITIAL.
+* >>>>> BUNDLING <<<<< *************************************************
+      IF bundling NE 'X'.
+*   Close the spool job
+        CALL FUNCTION 'FP_JOB_CLOSE'
+          EXCEPTIONS
+            usage_error    = 1
+            system_error   = 2
+            internal_error = 3
+            OTHERS         = 4.
+        IF sy-subrc <> 0.
+          <gv_returncode> = sy-subrc.
+          MESSAGE e000 WITH <gs_vbdka>-vbeln
+                       INTO gv_dummy.
+          PERFORM protocol_update.
+          RETURN.
+        ENDIF.
+      ENDIF.
+* >>>>> BUNDLING <<<<< *************************************************
+    ELSE.
+* Close the spool job
+      CALL FUNCTION 'FP_JOB_CLOSE'
+        EXCEPTIONS
+          usage_error    = 1
+          system_error   = 2
+          internal_error = 3
+          OTHERS         = 4.
+      IF sy-subrc <> 0.
+*   Error with spool job
+        <gv_returncode> = sy-subrc.
+        MESSAGE e000 WITH <gs_vbdka>-vbeln
+                     INTO gv_dummy.
+        PERFORM protocol_update.
+        RETURN.
+      ENDIF.
+    ENDIF.
+
+    IF NOT lv_failed IS INITIAL.
+*   Now, leave processing if printing did fail
+      RETURN.
+    ENDIF.
+
+    "INI CGIJON - 03.06.22 - SAT 7000047491 - TICKET 71417  - ANEXOS PED
+*   FP_GET_PDF_TABLE-> to merge multiple generated files into a single pdf.
+    DATA:lt_data            TYPE STANDARD TABLE OF tabl1024, "RAWSTRING
+         lo_pdf_merger      TYPE REF TO cl_rspo_pdf_merge,
+         lt_pdf_table       TYPE tfpcontent,
+         lv_merged_document TYPE xstring,
+         lv_len             TYPE i,
+         lv_rc              TYPE i VALUE 0.
+
+*&&-- Merging different PDF files into one
+    CREATE OBJECT lo_pdf_merger.
+
+    CALL FUNCTION 'FP_GET_PDF_TABLE'
+      IMPORTING
+        e_pdf_table = lt_pdf_table.
+
+* add documents to attribute table of pdf merger
+    LOOP AT lt_pdf_table INTO DATA(lwa_form).
+      lo_pdf_merger->add_document( lwa_form ).
+    ENDLOOP.
+
+    lo_pdf_merger->merge_documents( IMPORTING merged_document = lv_merged_document
+                                              rc = lv_rc ).
+    CALL FUNCTION 'SCMS_XSTRING_TO_BINARY'
+      EXPORTING
+        buffer        = lv_merged_document
+      IMPORTING
+        output_length = lv_len
+      TABLES
+        binary_tab    = lt_data.
+
+    DATA:lv_file      TYPE string,
+         lv_path      TYPE string,
+         lv_file_name TYPE string.
+
+    CALL METHOD cl_gui_frontend_services=>file_save_dialog
+      EXPORTING
+        window_title              = 'Save Form'    "You can pass any value as per your choice
+        default_extension         = '.pdf'
+        default_file_name         = 'Pedido.pdf'
+        prompt_on_overwrite       = 'X'
+      CHANGING
+        filename                  = lv_file_name
+        path                      = lv_path
+        fullpath                  = lv_file
+      EXCEPTIONS
+        cntl_error                = 1
+        error_no_gui              = 2
+        not_supported_by_gui      = 3
+        invalid_default_file_name = 4
+        OTHERS                    = 5.
+    IF sy-subrc <> 0.
+*     Implement suitable error handling here
+    ENDIF.
+
+    CALL METHOD cl_gui_frontend_services=>gui_download
+      EXPORTING
+        bin_filesize            = lv_len
+        filename                = lv_file
+        filetype                = 'BIN'
+      CHANGING
+        data_tab                = lt_data
+      EXCEPTIONS
+        file_write_error        = 1
+        no_batch                = 2
+        gui_refuse_filetransfer = 3
+        invalid_type            = 4
+        no_authority            = 5
+        unknown_error           = 6
+        header_not_allowed      = 7
+        separator_not_allowed   = 8
+        filesize_not_allowed    = 9
+        header_too_long         = 10
+        dp_error_create         = 11
+        dp_error_send           = 12
+        dp_error_write          = 13
+        unknown_dp_error        = 14
+        access_denied           = 15
+        dp_out_of_memory        = 16
+        disk_full               = 17
+        dp_timeout              = 18
+        file_not_found          = 19
+        dataprovider_exception  = 20
+        control_flush_error     = 21
+        not_supported_by_gui    = 22
+        error_no_gui            = 23
+        OTHERS                  = 24.
+    IF sy-subrc IS NOT INITIAL.
+    ENDIF.
+
+    CALL METHOD cl_gui_frontend_services=>execute
+      EXPORTING
+        document               = lv_file
+        synchronous            = 'X'
+      EXCEPTIONS
+        cntl_error             = 1
+        error_no_gui           = 2
+        bad_parameter          = 3
+        file_not_found         = 4
+        path_not_found         = 5
+        file_extension_unknown = 6
+        error_execute_failed   = 7
+        synchronous_failed     = 8
+        not_supported_by_gui   = 9
+        OTHERS                 = 10.
+    IF sy-subrc IS NOT INITIAL.
+    ENDIF.
+    CLEAR:lv_file,lv_len,lv_path,lv_file_name,lt_data.
+  ELSE.
+    IF cl_ops_switch_check=>sd_sfws_sc1( ) IS NOT INITIAL.
+* >>>>> BUNDLING <<<<< *************************************************
+      IF bundling NE 'X'.
+*   Close the spool job
+        CALL FUNCTION 'FP_JOB_CLOSE'
+          EXCEPTIONS
+            usage_error    = 1
+            system_error   = 2
+            internal_error = 3
+            OTHERS         = 4.
+        IF sy-subrc <> 0.
+          <gv_returncode> = sy-subrc.
+          MESSAGE e000 WITH <gs_vbdka>-vbeln
+                       INTO gv_dummy.
+          PERFORM protocol_update.
+          RETURN.
+        ENDIF.
+      ENDIF.
+* >>>>> BUNDLING <<<<< *************************************************
+    ELSE.
+* Close the spool job
+      CALL FUNCTION 'FP_JOB_CLOSE'
+        EXCEPTIONS
+          usage_error    = 1
+          system_error   = 2
+          internal_error = 3
+          OTHERS         = 4.
+      IF sy-subrc <> 0.
+*   Error with spool job
+        <gv_returncode> = sy-subrc.
+        MESSAGE e000 WITH <gs_vbdka>-vbeln
+                     INTO gv_dummy.
+        PERFORM protocol_update.
+        RETURN.
+      ENDIF.
+    ENDIF.
+
+    IF NOT lv_failed IS INITIAL.
+*   Now, leave processing if printing did fail
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+  "FIN CGIJON - 03.06.22 - SAT 7000047491 - TICKET 71417  - ANEXOS PED
+
+
+
+
+
+
+* Post processing
+  CASE lv_device.
+    WHEN gc_device-fax
+      OR gc_device-email.
+      PERFORM send_data USING lv_device
+                              ls_pdf_file.
+      IF ls_outputparams-arcmode <> '1'.
+        CALL FUNCTION 'ARCHIV_CREATE_OUTGOINGDOC_MULT'
+          EXPORTING
+            documentclass            = 'PDF'
+            document                 = ls_pdf_file-pdf
+          TABLES
+            arc_i_tab                = ls_docparams-daratab
+          EXCEPTIONS
+            error_archiv             = 1
+            error_communicationtable = 2
+            error_connectiontable    = 3
+            error_kernel             = 4
+            error_parameter          = 5
+            error_format             = 6
+            OTHERS                   = 7.
+        IF sy-subrc <> 0.
+          MESSAGE ID sy-msgid TYPE 'E' NUMBER sy-msgno
+                  WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4
+                  RAISING system_error.
+        ENDIF.
+      ENDIF.
+    WHEN gc_device-web_dynpro.
+      EXPORT lv_pdf_file = ls_pdf_file-pdf TO MEMORY ID 'PDF_FILE'.
+  ENDCASE.
+  CHECK <gv_returncode> IS INITIAL.
+
+ENDFORM.                    " print_data
+
+*&---------------------------------------------------------------------*
+*&      Form  get_item_details
+*&---------------------------------------------------------------------*
+FORM get_item_details
+     USING ut_vbdpa       TYPE vbdpa_t.
+
+  DATA:
+    lt_sub_items   TYPE vbdpau_t,
+
+    ls_dd07v       TYPE dd07v,
+    ls_text        TYPE tline,
+    ls_item_detail TYPE sdoc_s_prt_item_detail.
+
+  FIELD-SYMBOLS:
+    <ls_vbdpa>            TYPE vbdpa,
+    <ls_last_item_detail> TYPE sdoc_s_prt_item_detail,
+    <ls_item_detail>      TYPE sdoc_s_prt_item_detail.
+
+* Get domain fix values of VBTYP
+  CALL FUNCTION 'DD_DOMVALUES_GET'
+    EXPORTING
+      domname        = 'VBTYP'
+      text           = gc_true
+      langu          = gv_language
+    TABLES
+      dd07v_tab      = gt_vbtyp_fix_values
+    EXCEPTIONS
+      wrong_textflag = 1
+      OTHERS         = 2.
+  IF sy-subrc <> 0.
+*   Domain fixed values not existing in target language...!?
+    <gv_returncode> = sy-subrc.
+    MESSAGE e000 WITH <gs_vbdka>-vbeln
+                 INTO gv_dummy.
+    PERFORM protocol_update.
+    RETURN.
+  ENDIF.
+
+* Get Sub items
+  PERFORM get_sub_items USING    ut_vbdpa
+                        CHANGING lt_sub_items.
+  CHECK <gv_returncode> IS INITIAL.
+
+  LOOP AT ut_vbdpa ASSIGNING <ls_vbdpa>
+                   WHERE dragr EQ space. "Not print rejected item
+*   Init item
+    CLEAR ls_item_detail.
+*   Assign schedule lines to the main item
+    IF <ls_vbdpa>-posnr_neu EQ space.
+      IF NOT <ls_last_item_detail> IS ASSIGNED
+        OR <ls_last_item_detail>-vbdpa-posnr NE <ls_vbdpa>-posnr.
+        READ TABLE gs_interface-item_detail
+             ASSIGNING <ls_last_item_detail>
+             WITH KEY vbdpa-posnr = <ls_vbdpa>-posnr
+             BINARY SEARCH.
+        IF sy-subrc <> 0.
+*         Item does not exist
+          <gv_returncode> = sy-subrc.
+          MESSAGE e000 WITH <gs_vbdka>-vbeln
+                       INTO gv_dummy.
+          PERFORM protocol_update.
+          RETURN.
+        ENDIF.
+      ENDIF.
+      APPEND <ls_vbdpa> TO <ls_last_item_detail>-schedule_lines.
+*     Set up control
+      <ls_last_item_detail>-ex_schedule_lines = gc_true.
+      CONTINUE.
+    ENDIF.
+*   Fill the VBDPA structure
+    ls_item_detail-vbdpa = <ls_vbdpa>.
+*   Clear Predecessor document if equal to header predecessor
+    IF ls_item_detail-vbdpa-vbtyp_vang EQ <gs_vbdka>-vbtyp_vang AND
+       ls_item_detail-vbdpa-vbeln_vang EQ <gs_vbdka>-vbeln_vang.
+      CLEAR: ls_item_detail-vbdpa-vbeln_vang,
+             ls_item_detail-vbdpa-vbtyp_vang.
+    ENDIF.
+*   Clear LFDAT
+    IF ls_item_detail-vbdpa-etenr_da EQ gc_true
+      OR <gs_vbdka>-lfdat EQ
+         ls_item_detail-vbdpa-lfdat.
+      CLEAR ls_item_detail-vbdpa-lfdat.
+    ENDIF.
+*   Get the type text of the predecessor document
+    IF NOT ls_item_detail-vbdpa-vbtyp_vang IS INITIAL.
+      READ TABLE gt_vbtyp_fix_values  INTO ls_dd07v
+                WITH KEY domvalue_l = ls_item_detail-vbdpa-vbtyp_vang.
+
+      IF sy-subrc IS INITIAL.
+        ls_item_detail-vbtyp_vang_text = ls_dd07v-ddtext.
+      ENDIF.
+    ENDIF.
+*   Validity dates of service contracts
+    READ TABLE gt_vedpa INTO ls_item_detail-vedpa INDEX 1.
+*   Get the item prices
+    PERFORM get_item_prices CHANGING ls_item_detail.
+    IF <gv_returncode> <> 0.
+      RETURN.
+    ENDIF.
+*   Get the item billing schedules
+    PERFORM get_item_billing_schedules CHANGING ls_item_detail.
+    IF <gv_returncode> <> 0.
+      RETURN.
+    ENDIF.
+*   Get configurations
+    PERFORM get_item_characteristics CHANGING ls_item_detail.
+    IF <gv_returncode> <> 0.
+      RETURN.
+    ENDIF.
+*   Get serials
+    PERFORM get_item_serials CHANGING ls_item_detail.
+    IF <gv_returncode> <> 0.
+      RETURN.
+    ENDIF.
+*   Get correction text
+    PERFORM get_item_correction_text CHANGING ls_item_detail.
+    IF <gv_returncode> <> 0.
+      RETURN.
+    ENDIF.
+    IF gr_badi_print IS BOUND.
+*     Call BAdI concerning item details
+      CALL BADI gr_badi_print->get_item_details
+        EXPORTING
+          is_vbdka       = <gs_vbdka>
+          is_nast        = nast
+          iv_language    = gv_language
+        CHANGING
+          cs_item_detail = ls_item_detail.
+    ENDIF.
+    APPEND ls_item_detail TO gs_interface-item_detail
+                          ASSIGNING <ls_last_item_detail>.
+  ENDLOOP.
+
+* Assign the sub items to their master items
+  SORT lt_sub_items BY posnr.
+  PERFORM assign_sub_items USING lt_sub_items
+                           CHANGING gs_interface-item_detail.
+  CHECK <gv_returncode> IS INITIAL.
+
+* Assign the cancellation dates to the items
+  PERFORM assign_cancel_dates CHANGING gs_interface-item_detail.
+  CHECK <gv_returncode> IS INITIAL.
+
+ENDFORM.                    " get_item_details
+
+*&---------------------------------------------------------------------*
+*&      Form  get_item_prices
+*&---------------------------------------------------------------------*
+FORM get_item_prices
+     CHANGING cs_item_detail TYPE sdoc_s_prt_item_detail.
+
+  DATA:
+    ls_komp  TYPE komp,
+    ls_komvd TYPE komvd,
+
+    lv_lines TYPE i.
+
+* Fill the communication structure
+  IF gs_komk-knumv NE <gs_vbdka>-knumv OR
+     gs_komk-knumv IS INITIAL.
+    CLEAR gs_komk.
+    gs_komk-mandt     = sy-mandt.
+    gs_komk-kalsm     = <gs_vbdka>-kalsm.
+    gs_komk-kappl     = gc_pr_kappl.
+    gs_komk-waerk     = <gs_vbdka>-waerk.
+    gs_komk-knumv     = <gs_vbdka>-knumv.
+    gs_komk-knuma     = <gs_vbdka>-knuma.
+    gs_komk-vbtyp     = <gs_vbdka>-vbtyp.
+    gs_komk-land1     = <gs_vbdka>-land1.
+    gs_komk-vkorg     = <gs_vbdka>-vkorg.
+    gs_komk-vtweg     = <gs_vbdka>-vtweg.
+    gs_komk-spart     = <gs_vbdka>-spart.
+    gs_komk-bukrs     = <gs_vbdka>-bukrs_vf.
+    gs_komk-hwaer     = <gs_vbdka>-waers.
+    gs_komk-prsdt     = <gs_vbdka>-erdat.
+    gs_komk-kurst     = <gs_vbdka>-kurst.
+    gs_komk-kurrf     = <gs_vbdka>-kurrf.
+    gs_komk-kurrf_dat = <gs_vbdka>-kurrf_dat.
+  ENDIF.
+  ls_komp-kposn     = cs_item_detail-vbdpa-posnr.
+  ls_komp-kursk     = cs_item_detail-vbdpa-kursk.
+  ls_komp-kursk_dat = cs_item_detail-vbdpa-kursk_dat.
+  IF <gs_vbdka>-vbtyp CA 'HKNOT6'.
+    IF cs_item_detail-vbdpa-shkzg CA ' A'.
+      ls_komp-shkzg = gc_true.
+    ENDIF.
+  ELSE.
+    IF cs_item_detail-vbdpa-shkzg CA 'BX'.
+      ls_komp-shkzg = gc_true.
+    ENDIF.
+  ENDIF.
+
+  IF gr_badi_print IS BOUND.
+*   Call BAdI for preparation of item pricing
+    CALL BADI gr_badi_print->prepare_item_prices
+      EXPORTING
+        is_vbdka       = <gs_vbdka>
+        iv_language    = gv_language
+        is_item_detail = cs_item_detail
+        is_nast        = nast
+      CHANGING
+        cs_komp        = ls_komp
+        cs_komk        = gs_komk.
+  ENDIF.
+
+* Get the item prices
+  IF gv_price_print_mode EQ chara.
+    CALL FUNCTION 'RV_PRICE_PRINT_ITEM'
+      EXPORTING
+        comm_head_i = gs_komk
+        comm_item_i = ls_komp
+        language    = gv_language
+      IMPORTING
+        comm_head_e = gs_komk
+        comm_item_e = ls_komp
+      TABLES
+        tkomv       = gt_komv
+        tkomvd      = cs_item_detail-conditions.
+  ELSE.
+    CALL FUNCTION 'RV_PRICE_PRINT_ITEM_BUFFER'
+      EXPORTING
+        comm_head_i = gs_komk
+        comm_item_i = ls_komp
+        language    = gv_language
+      IMPORTING
+        comm_head_e = gs_komk
+        comm_item_e = ls_komp
+      TABLES
+        tkomv       = gt_komv
+        tkomvd      = cs_item_detail-conditions.
+  ENDIF.
+
+  IF NOT cs_item_detail-conditions IS INITIAL.
+*   The conditions have always one initial line
+    DESCRIBE TABLE cs_item_detail-conditions LINES lv_lines.
+    IF lv_lines EQ 1.
+      READ TABLE cs_item_detail-conditions INTO ls_komvd
+                                           INDEX 1.
+      IF NOT ls_komvd IS INITIAL.
+*       Set up control
+        cs_item_detail-ex_conditions = gc_true.
+      ENDIF.
+    ELSE.
+*     Set up control
+      cs_item_detail-ex_conditions = gc_true.
+    ENDIF.
+  ENDIF.
+
+* Fill the tax code
+  CALL FUNCTION 'SD_TAX_CODE_MAINTAIN'
+    EXPORTING
+      key_knumv           = gs_komk-knumv
+      key_kposn           = ls_komp-kposn
+      i_application       = ' '
+      i_pricing_procedure = gs_komk-kalsm
+    TABLES
+      xkomv               = gt_komv.
+
+ENDFORM.                    " get_item_prices
+
+*&---------------------------------------------------------------------*
+*&      Form  get_head_details
+*&---------------------------------------------------------------------*
+FORM get_head_details.
+
+* Get Sales Org detail
+  PERFORM get_head_tvko.
+  CHECK <gv_returncode> IS INITIAL.
+
+* Get header prices
+  PERFORM get_head_prices.
+  CHECK <gv_returncode> IS INITIAL.
+
+* Get dynamic texts
+  PERFORM get_head_text.
+  CHECK <gv_returncode> IS INITIAL.
+
+* Get sending country
+  PERFORM get_head_sending_country.
+  CHECK <gv_returncode> IS INITIAL.
+
+* Check repeat printout
+  PERFORM get_head_repeat_flag.
+  CHECK <gv_returncode> IS INITIAL.
+
+  IF gr_badi_print IS BOUND.
+*   Call BAdI concerning head details
+    CALL BADI gr_badi_print->get_head_details
+      EXPORTING
+        iv_language  = gv_language
+        is_nast      = nast
+      CHANGING
+        cs_interface = gs_interface.
+  ENDIF.
+
+ENDFORM.                    " get_head_details
+
+*&---------------------------------------------------------------------*
+*&      Form  get_head_repeat_flag
+*&---------------------------------------------------------------------*
+FORM get_head_repeat_flag.
+
+  DATA:
+    lv_nast TYPE nast.
+
+* Get message
+  SELECT SINGLE * INTO lv_nast FROM nast
+                                WHERE kappl = gs_nast-kappl "#EC *
+                                AND   objky = gs_nast-objky
+                                AND   kschl = gs_nast-kschl
+                                AND   spras = gv_language
+                                AND   parnr = gs_nast-parnr
+                                AND   parvw = gs_nast-parvw
+                                AND   nacha BETWEEN '1' AND '4'
+                                AND   vstat = '1'.
+  IF sy-subrc IS INITIAL.
+    gs_interface-head_detail-repeat = gc_true.
+  ENDIF.
+
+ENDFORM.                    " get_head_repeat_flag
+
+*&---------------------------------------------------------------------*
+*&      Form  get_head_sending_country
+*&---------------------------------------------------------------------*
+FORM get_head_sending_country.
+
+  DATA:
+    ls_address TYPE sdpartner_address.
+
+* Check country is still outstanding
+  CHECK <gs_vbdka>-sland IS INITIAL.
+* Retrieve from address
+  CALL FUNCTION 'SD_ADDRESS_GET'
+    EXPORTING
+      fif_address_number      = gs_interface-head_detail-tvko-adrnr
+      fif_address_type        = char1
+    IMPORTING
+      fes_sdpartner_address   = ls_address
+    EXCEPTIONS
+      address_not_found       = 1
+      address_type_not_exists = 2
+      no_person_number        = 3
+      OTHERS                  = 4.
+  IF sy-subrc IS INITIAL.
+*   Use country detected
+    <gs_vbdka>-sland = ls_address-country.
+  ELSE.
+*   No country detected
+    <gv_returncode> = sy-subrc.
+    MESSAGE e004 WITH <gs_vbdka>-vbeln
+                      gs_interface-head_detail-tvko-vkorg
+                 INTO gv_dummy.
+    PERFORM protocol_update.
+    RETURN.
+  ENDIF.
+
+ENDFORM.                    " get_head_sending_country
+
+*&---------------------------------------------------------------------*
+*&      Form  get_item_billing_schedules
+*&---------------------------------------------------------------------*
+FORM get_item_billing_schedules
+     CHANGING cs_item_detail TYPE sdoc_s_prt_item_detail.
+
+  DATA:
+    ls_bill_plan             TYPE fpltdr.
+
+* Check we deal with a billing plan at all
+  CHECK NOT cs_item_detail-vbdpa-fplnr IS INITIAL.
+* Get billing plan data
+  CALL FUNCTION 'BILLING_SCHED_PRINTVIEW_READ'
+    EXPORTING
+      i_fplnr    = cs_item_detail-vbdpa-fplnr
+      i_language = gv_language
+      i_vbeln    = <gs_vbdka>-vbeln
+    TABLES
+      zfpltdr    = cs_item_detail-bill_plan.
+  IF NOT cs_item_detail-bill_plan IS INITIAL.
+*   Transfer billing plan data
+    READ TABLE cs_item_detail-bill_plan INTO ls_bill_plan
+                                        INDEX 1.
+    IF NOT ls_bill_plan-perio IS INITIAL.
+      cs_item_detail-bill_plan_periodic = ls_bill_plan.
+      CLEAR cs_item_detail-bill_plan.
+    ELSE.
+      SORT cs_item_detail-bill_plan BY fkdat.
+*     Set up control
+      cs_item_detail-ex_bill_plan = gc_true.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " get_item_billing_schedules
+
+*&---------------------------------------------------------------------*
+*&      Form  get_sub_items
+*&---------------------------------------------------------------------*
+FORM get_sub_items
+  USING    ut_vbdpa     TYPE vbdpa_t
+  CHANGING ct_sub_items TYPE vbdpau_t.
+
+  DATA:
+    ls_sub_item         TYPE vbdpau.
+
+  FIELD-SYMBOLS:
+    <ls_vbdpa>          TYPE vbdpa.
+
+  LOOP AT ut_vbdpa ASSIGNING <ls_vbdpa>.
+    IF <ls_vbdpa>-uepos IS INITIAL           OR
+       <ls_vbdpa>-uepos NE ls_sub_item-posnr.
+*     Append work area to table ct_sub_items
+      IF ls_sub_item-uposv > 0.
+        APPEND ls_sub_item TO ct_sub_items.
+        CLEAR ls_sub_item.
+      ENDIF.
+*     Start filling new work area
+      ls_sub_item-posnr = <ls_vbdpa>-posnr.
+      IF NOT <ls_vbdpa>-uepos IS INITIAL           AND
+             <ls_vbdpa>-uepos NE ls_sub_item-posnr.
+        ls_sub_item-posnr = <ls_vbdpa>-uepos.
+        ls_sub_item-uepvw = <ls_vbdpa>-uepvw.
+        ls_sub_item-uposv = <ls_vbdpa>-posnr.
+      ENDIF.
+    ELSE.
+      IF ls_sub_item-uposv IS INITIAL          OR
+         ls_sub_item-uposv GT <ls_vbdpa>-posnr.
+        ls_sub_item-uposv = <ls_vbdpa>-posnr.
+      ENDIF.
+      IF ls_sub_item-uposb LT <ls_vbdpa>-posnr AND
+         ls_sub_item-uposv LT <ls_vbdpa>-posnr.
+        ls_sub_item-uposb = <ls_vbdpa>-posnr.
+      ENDIF.
+      ls_sub_item-uepvw = <ls_vbdpa>-uepvw.    "UPOS usage
+    ENDIF.
+  ENDLOOP.
+  IF ls_sub_item-uposv > 0.
+    APPEND ls_sub_item TO ct_sub_items.
+  ENDIF.
+  SORT ct_sub_items.
+
+  LOOP AT ct_sub_items INTO ls_sub_item.
+    LOOP AT ut_vbdpa ASSIGNING <ls_vbdpa> WHERE posnr EQ ls_sub_item-uposv AND
+                                                dragr EQ 'X'.
+      DELETE TABLE ct_sub_items FROM ls_sub_item.
+    ENDLOOP.
+  ENDLOOP.
+
+
+ENDFORM.                    " get_sub_items
+
+*&---------------------------------------------------------------------*
+*&      Form  assign_sub_items
+*&---------------------------------------------------------------------*
+FORM assign_sub_items
+     USING    ut_sub_items   TYPE vbdpau_t
+     CHANGING ct_item_detail TYPE sdoc_t_prt_item_detail.
+
+  DATA:
+    ls_sub_item              TYPE vbdpau.
+
+  FIELD-SYMBOLS:
+    <ls_item_detail>         TYPE sdoc_s_prt_item_detail.
+
+* Treat subordinated items
+  LOOP AT ut_sub_items INTO ls_sub_item.
+    IF NOT <ls_item_detail>             IS ASSIGNED          OR
+           <ls_item_detail>-vbdpa-posnr NE ls_sub_item-posnr.
+      READ TABLE ct_item_detail ASSIGNING <ls_item_detail>
+                                WITH KEY vbdpa-posnr = ls_sub_item-posnr
+                                BINARY SEARCH.
+      IF sy-subrc <> 0.
+*        <gv_returncode> = sy-subrc.
+*        message e000 with <gs_vbdka>-vbeln
+*                     into gv_dummy.
+*        perform protocol_update.
+*        return.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+    APPEND ls_sub_item TO <ls_item_detail>-sub_items.
+*   Set up control
+    <ls_item_detail>-ex_sub_items = gc_true.
+  ENDLOOP.
+
+ENDFORM.                    " assign_sub_items
+
+*&---------------------------------------------------------------------*
+*&      Form  get_head_text
+*&---------------------------------------------------------------------*
+FORM get_head_text.
+
+  DATA:
+    ls_dd07v         TYPE dd07v.
+
+  CONSTANTS:
+    lc_vbtyp_invoice TYPE vbtyp VALUE 'M'.
+
+* VBDKA-VBTYP
+  IF gv_scenario EQ gc_cash_sale.
+    READ TABLE gt_vbtyp_fix_values
+         INTO ls_dd07v
+         WITH KEY domvalue_l = lc_vbtyp_invoice.
+  ELSE.
+    READ TABLE gt_vbtyp_fix_values
+         INTO ls_dd07v
+         WITH KEY domvalue_l = <gs_vbdka>-vbtyp.
+  ENDIF.
+
+  IF sy-subrc IS INITIAL.
+    gs_interface-head_detail-vbtyp_text = ls_dd07v-ddtext.
+  ENDIF.
+
+* VBDKA-VBTYP_VANG
+  IF NOT <gs_vbdka>-vbeln_vang IS INITIAL.
+    READ TABLE gt_vbtyp_fix_values
+         INTO ls_dd07v
+         WITH KEY domvalue_l = <gs_vbdka>-vbtyp_vang.
+    IF sy-subrc IS INITIAL.
+      gs_interface-head_detail-vbtyp_vang_text = ls_dd07v-ddtext.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " get_head_text
+
+*&---------------------------------------------------------------------*
+*&      Form  get_item_characteristics
+*&---------------------------------------------------------------------*
+FORM get_item_characteristics
+     CHANGING cs_item_detail TYPE sdoc_s_prt_item_detail.
+
+  DATA:
+    lt_conf TYPE TABLE OF conf_out,
+    lt_cabn TYPE TABLE OF cabn,
+
+    ls_conf TYPE conf_out,
+    ls_cabn TYPE cabn.
+
+  RANGES:
+    lr_cabn FOR ls_cabn-atinn.
+
+* Check appropriate config exists
+  CHECK NOT cs_item_detail-vbdpa-cuobj IS INITIAL AND
+            cs_item_detail-vbdpa-attyp NE var_typ.
+* Get config data
+  CALL FUNCTION 'VC_I_GET_CONFIGURATION'
+    EXPORTING
+      instance      = cs_item_detail-vbdpa-cuobj
+      language      = gv_language
+      print_sales   = gc_true
+    TABLES
+      configuration = lt_conf
+    EXCEPTIONS
+      OTHERS        = 4.
+  IF sy-subrc <> 0.
+*   Error whilst config data retrieval
+    <gv_returncode> = sy-subrc.
+    MESSAGE e001 WITH <gs_vbdka>-vbeln
+                 INTO gv_dummy.
+    PERFORM protocol_update.
+    RETURN.
+  ENDIF.
+  IF NOT lt_conf IS INITIAL.
+*   Transfer config data
+    LOOP AT lt_conf INTO ls_conf.
+      lr_cabn-option = gc_equal.
+      lr_cabn-sign   = gc_include.
+      lr_cabn-low    = ls_conf-atinn.
+      COLLECT lr_cabn.
+    ENDLOOP.
+*   Get config characteristics
+    CALL FUNCTION 'CLSE_SELECT_CABN'
+      TABLES
+        in_cabn        = lr_cabn
+        t_cabn         = lt_cabn
+      EXCEPTIONS
+        no_entry_found = 1
+        OTHERS         = 2.
+    IF sy-subrc <> 0.
+*     Error whilst config characteristic retrieval
+      <gv_returncode> = sy-subrc.
+      MESSAGE e001 WITH <gs_vbdka>-vbeln
+                   INTO gv_dummy.
+      PERFORM protocol_update.
+      RETURN.
+    ENDIF.
+*   Transfer config characteristics
+    SORT lt_cabn BY atinn.
+    LOOP AT lt_conf INTO ls_conf.
+      READ TABLE lt_cabn
+           INTO ls_cabn
+           WITH KEY atinn = ls_conf-atinn
+           BINARY SEARCH.
+      IF sy-subrc        NE 0             OR
+         ( ls_cabn-attab EQ 'SDCOM' AND
+           ls_cabn-atfel EQ 'VKOND'     ) OR
+         ls_cabn-attab   EQ 'VCSD_UPDATE'.
+        DELETE lt_conf.
+      ENDIF.
+    ENDLOOP.
+    cs_item_detail-configuration = lt_conf.
+    IF NOT cs_item_detail-configuration IS INITIAL.
+*     Set up control
+      cs_item_detail-ex_configuration = gc_true.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " get_item_characteristics
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_head_PRICES
+*&---------------------------------------------------------------------*
+FORM get_head_prices.
+
+  DATA:
+    ls_balmi TYPE balmi.
+
+  IF gr_badi_print IS BOUND.
+*   Call BAdI for preparation of head pricing
+    CALL BADI gr_badi_print->prepare_head_prices
+      EXPORTING
+        is_interface = gs_interface
+        iv_language  = gv_language
+        is_nast      = nast
+      CHANGING
+        cs_komk      = gs_komk.
+  ENDIF.
+
+* Get the head prices
+  IF gv_price_print_mode EQ chara.
+    CALL FUNCTION 'RV_PRICE_PRINT_HEAD'
+      EXPORTING
+        comm_head_i = gs_komk
+        language    = gv_language
+      IMPORTING
+        comm_head_e = gs_komk
+      TABLES
+        tkomv       = gt_komv
+        tkomvd      = gs_interface-head_detail-conditions.
+  ELSE.
+    CALL FUNCTION 'RV_PRICE_PRINT_HEAD_BUFFER'
+      EXPORTING
+        comm_head_i = gs_komk
+        language    = gv_language
+      IMPORTING
+        comm_head_e = gs_komk
+      TABLES
+        tkomv       = gt_komv
+        tkomvd      = gs_interface-head_detail-conditions.
+  ENDIF.
+
+* Fill gross value
+  gs_interface-head_detail-doc_currency = gs_komk-waerk.
+  IF gs_komk-fkwrt GT gc_max_brtwr.
+    gs_interface-head_detail-gross_value = gc_max_brtwr.
+    IF cl_ops_switch_check=>sd_sfws_sc4( ) EQ abap_true.
+*     Expose additional message
+      MESSAGE i013(vd_pdf)
+              WITH gc_max_brtwr gs_komk-fkwrt
+              INTO gv_dummy.
+      MOVE-CORRESPONDING sy TO ls_balmi.
+      INSERT ls_balmi INTO TABLE gt_add_msg.
+    ENDIF.
+
+  ELSE.
+    gs_interface-head_detail-gross_value = gs_komk-fkwrt.
+  ENDIF.
+
+ENDFORM.                    " GET_head_PRICES
+
+*&---------------------------------------------------------------------*
+*&      Form  assign_cancel_dates
+*&---------------------------------------------------------------------*
+FORM assign_cancel_dates
+     CHANGING ct_item_detail TYPE sdoc_t_prt_item_detail.
+
+  DATA:
+    ls_item_cancel_dates     TYPE vedpn.
+
+  FIELD-SYMBOLS:
+    <ls_item_detail>         TYPE sdoc_s_prt_item_detail.
+
+* Treat cancellatrion of dates
+  SORT gt_item_cancellation_dates BY vposn.
+  LOOP AT gt_item_cancellation_dates INTO ls_item_cancel_dates.
+    IF NOT <ls_item_detail>            IS ASSIGNED                   OR
+          <ls_item_detail>-vbdpa-posnr NE ls_item_cancel_dates-vposn.
+      READ TABLE ct_item_detail
+           ASSIGNING <ls_item_detail>
+           WITH KEY vbdpa-posnr = ls_item_cancel_dates-vposn
+           BINARY SEARCH.
+      IF sy-subrc <> 0.
+        <gv_returncode> = sy-subrc.
+        MESSAGE e000 WITH <gs_vbdka>-vbeln
+                     INTO gv_dummy.
+        PERFORM protocol_update.
+        RETURN.
+      ENDIF.
+    ENDIF.
+    APPEND ls_item_cancel_dates TO <ls_item_detail>-cancellation_dates.
+*   Set up control
+    <ls_item_detail>-ex_cancellation_dates = gc_true.
+  ENDLOOP.
+
+ENDFORM.                    " assign_cancel_dates
+
+*&---------------------------------------------------------------------*
+*&      Form  get_item_serials
+*&---------------------------------------------------------------------*
+FORM get_item_serials
+     CHANGING cs_item_detail TYPE sdoc_s_prt_item_detail.
+
+  DATA:
+    lt_sernos   TYPE TABLE OF rserob,
+    lt_serials  TYPE TABLE OF riserls,
+
+    ls_key_data TYPE rserob,
+    ls_sernos   TYPE rserob,
+    ls_serials  TYPE riserls.
+
+* Set key data
+  ls_key_data-taser   = 'SER02'.
+  ls_key_data-sdaufnr = <gs_vbdka>-vbeln.
+  ls_key_data-posnr   = cs_item_detail-vbdpa-posnr.
+  IF     ls_key_data-sdaufnr IS INITIAL AND
+     NOT ls_key_data-posnr   IS INITIAL.
+*   Whilst creation the doc number might be initial: Use temp placeholder
+    ls_key_data-sdaufnr = char$.
+  ENDIF.
+
+* Read the serialnumbers of the position.
+  CALL FUNCTION 'GET_SERNOS_OF_DOCUMENT'
+    EXPORTING
+      key_data            = ls_key_data
+    TABLES
+      sernos              = lt_sernos
+    EXCEPTIONS
+      key_parameter_error = 1
+      no_supported_access = 2
+      no_data_found       = 3
+      OTHERS              = 4.
+  IF sy-subrc NE 0 AND
+     sy-subrc NE 3.
+*   Error occurred
+*    <gv_returncode> = sy-subrc.
+*    MESSAGE e002 WITH <gs_vbdka>-vbeln
+*                 INTO gv_dummy.
+    PERFORM protocol_update.
+*    RETURN.
+  ENDIF.
+* Check any data has been retrieved
+  CHECK sy-subrc EQ 0.
+* Transfer serialnumbers
+  LOOP AT lt_sernos INTO ls_sernos.
+    ls_serials-vbeln = ls_sernos-sdaufnr.
+    ls_serials-posnr = ls_sernos-posnr.
+    ls_serials-sernr = ls_sernos-sernr.
+    APPEND ls_serials TO lt_serials.
+  ENDLOOP.
+* Process the stringtable for Printing.
+  CALL FUNCTION 'PROCESS_SERIALS_FOR_PRINT'
+    EXPORTING
+      i_boundary_left             = '(_'
+      i_boundary_right            = '_)'
+      i_sep_char_strings          = ',_'
+      i_sep_char_interval         = '_-_'
+      i_use_interval              = 'X'
+      i_boundary_method           = 'C'
+      i_line_length               = 70
+      i_no_zero                   = 'X'
+      i_alphabet                  = sy-abcde
+      i_digits                    = '0123456789'
+      i_special_chars             = '-'
+      i_with_second_digit         = ' '
+    TABLES
+      serials                     = lt_serials
+      serials_print               = cs_item_detail-serials
+    EXCEPTIONS
+      boundary_missing            = 01
+      interval_separation_missing = 02
+      length_to_small             = 03
+      internal_error              = 04
+      wrong_method                = 05
+      wrong_serial                = 06
+      two_equal_serials           = 07
+      serial_with_wrong_char      = 08
+      serial_separation_missing   = 09.
+  IF sy-subrc NE 0.
+    <gv_returncode> = sy-subrc.
+    MESSAGE e002 WITH <gs_vbdka>-vbeln
+                 INTO gv_dummy.
+    PERFORM protocol_update.
+    RETURN.
+  ENDIF.
+
+  IF NOT cs_item_detail-serials IS INITIAL.
+*   Set up control
+    cs_item_detail-ex_serials = gc_true.
+  ENDIF.
+
+ENDFORM.                    " get_item_serials
+
+*&---------------------------------------------------------------------*
+*&      Form  get_head_tvko
+*&---------------------------------------------------------------------*
+FORM get_head_tvko.
+
+* Get TVKO
+  CALL FUNCTION 'TVKO_SINGLE_READ'
+    EXPORTING
+      vkorg     = <gs_vbdka>-vkorg
+    IMPORTING
+      wtvko     = gs_interface-head_detail-tvko
+    EXCEPTIONS
+      not_found = 1
+      OTHERS    = 2.
+  IF sy-subrc <> 0.
+    <gv_returncode> = sy-subrc.
+    MESSAGE e003 WITH <gs_vbdka>-vbeln
+                      <gs_vbdka>-vkorg
+                 INTO gv_dummy.
+    PERFORM protocol_update.
+    RETURN.
+  ENDIF.
+
+ENDFORM.                    " get_head_tvko
+
+*&---------------------------------------------------------------------*
+*&      Form  get_item_correction_text
+*&---------------------------------------------------------------------*
+FORM get_item_correction_text
+     CHANGING cs_item_detail TYPE sdoc_s_prt_item_detail.
+
+  DATA:
+    ls_vbtyp_desc LIKE LINE OF gt_vbtyp_fix_values,
+    ls_tline      TYPE tline.
+
+* Check correction text is necessary
+  CHECK <gs_vbdka>-vbklt EQ vbklt_rech_korr.
+
+  IF <gs_vbdka>-vbtyp = vbtyp_ganf.
+*   Credit memo
+    IF cs_item_detail-vbdpa-shkzg = gc_true.
+*     Credit memo request
+      READ TABLE gt_vbtyp_fix_values
+           INTO ls_vbtyp_desc
+           WITH KEY domvalue_l = vbtyp_ganf.
+      cs_item_detail-correction_text = ls_vbtyp_desc-ddtext.
+    ELSE.
+*     Debit memo request
+      READ TABLE gt_vbtyp_fix_values
+           INTO ls_vbtyp_desc
+           WITH KEY domvalue_l = vbtyp_lanf.
+      cs_item_detail-correction_text = ls_vbtyp_desc-ddtext.
+    ENDIF.
+  ELSEIF <gs_vbdka>-vbtyp = vbtyp_lanf.
+*   Debit memo
+    IF cs_item_detail-vbdpa-shkzg = gc_false.
+*     Debit memo request
+      READ TABLE gt_vbtyp_fix_values
+           INTO ls_vbtyp_desc
+           WITH KEY domvalue_l = vbtyp_lanf.
+      cs_item_detail-correction_text = ls_vbtyp_desc-ddtext.
+    ELSE.
+*     Credit memo request
+      READ TABLE gt_vbtyp_fix_values
+           INTO ls_vbtyp_desc
+           WITH KEY domvalue_l = vbtyp_ganf.
+      cs_item_detail-correction_text = ls_vbtyp_desc-ddtext.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " get_item_correction_text
+
+*&---------------------------------------------------------------------*
+*&      Form  send_data
+*&---------------------------------------------------------------------*
+FORM send_data
+     USING uv_device   TYPE output_device
+           us_pdf_file TYPE fpformoutput.
+
+  DATA:
+    lt_mail_text    TYPE bcsy_text,
+    lt_adsmtp       TYPE TABLE OF adsmtp,
+    lt_adfax        TYPE TABLE OF adfax,
+
+    ls_adsmtp       TYPE adsmtp,
+    ls_adfax        TYPE adfax,
+    ls_address      TYPE sdprt_addr_s,
+
+    lv_date(14)     TYPE c,
+    lv_mail_subject TYPE so_obj_des,
+    lv_send_to_all  TYPE os_boolean,
+    lv_vbeln        TYPE vbeln.
+
+  CHECK gv_screen_display NE gc_true.
+
+* Construct the subject text
+  IF nast-tdcovtitle IS INITIAL.
+    WRITE <gs_vbdka>-audat TO lv_date.
+    WRITE <gs_vbdka>-vbeln TO lv_vbeln NO-ZERO.
+    CONCATENATE gs_interface-head_detail-vbtyp_text
+                lv_vbeln
+                lv_date
+           INTO lv_mail_subject
+           SEPARATED BY space.
+  ELSE.
+    lv_mail_subject = nast-tdcovtitle.
+  ENDIF.
+
+  DATA tl_address LIKE TABLE OF ls_address.
+
+  CASE uv_device.
+    WHEN gc_device-email.
+*     Get the e-mail-text
+      PERFORM get_mail_body CHANGING lt_mail_text.
+      CHECK <gv_returncode> IS INITIAL.
+
+
+      "Email de:
+      SELECT SINGLE *
+        INTO @DATA(wl_zssdt057_sol)
+        FROM zssdt057_sol
+        WHERE kschl = @gs_nast-kschl                          AND
+              vkorg = @gs_interface-head_detail-vbdka-vkorg.
+      IF sy-subrc = 0.
+        ls_address-sender_email_addr = wl_zssdt057_sol-email.
+      ENDIF.
+
+      IF ls_address-sender_email_addr IS INITIAL.
+*     Get the e-mail address of the sender from sales org. or
+*     user's e-mail as fallback
+        CALL FUNCTION 'ADDR_COMM_GET'
+          EXPORTING
+            address_number    = gs_interface-head_detail-tvko-adrnr
+            language          = gv_language
+            table_type        = 'ADSMTP'
+          TABLES
+            comm_table        = lt_adsmtp
+          EXCEPTIONS
+            parameter_error   = 1
+            address_not_exist = 2
+            internal_error    = 3
+            OTHERS            = 4.
+        IF sy-subrc <> 0.
+          <gv_returncode> = sy-subrc.
+          PERFORM protocol_update.
+          RETURN.
+        ENDIF.
+*     Transfer e-mail address
+        READ TABLE lt_adsmtp INTO ls_adsmtp
+             WITH KEY flgdefault = gc_true.
+        IF sy-subrc IS INITIAL.
+          ls_address-sender_email_addr = ls_adsmtp-smtp_addr.
+        ENDIF.
+      ENDIF.
+
+
+
+*     Get the e-mail address of the recipient
+      "JCB 13.08.24. GAPSD065 - Añadir tabla Z para añadir mails de envio de la confirmacion de pedido por destinatario de mercancias
+
+      "Solicitante
+      DATA(vl_kunag) = gs_interface-head_detail-vbdka-kunnr.
+
+      "Destinatario
+      SELECT SINGLE kunnr
+        INTO @DATA(vl_kunnr)
+        FROM vbpa
+        WHERE vbeln = @gs_interface-head_detail-vbdka-vbeln AND
+              posnr = '000000'                              AND
+              parvw = 'WE'.
+
+
+      SELECT *
+        INTO TABLE @DATA(tl_zssdt065_aux)
+        FROM zssdt065
+        WHERE kschl = @gs_nast-kschl                          AND
+              vkorg = @gs_interface-head_detail-vbdka-vkorg   AND
+              ( kunnr = @vl_kunnr OR kunag = @vl_kunag ).
+
+      DATA: tl_zssdt065 LIKE tl_zssdt065_aux.
+      LOOP AT tl_zssdt065_aux ASSIGNING FIELD-SYMBOL(<fs_zssdt065_aux>) WHERE kunag = vl_kunag AND kunnr = vl_kunnr.
+        APPEND <fs_zssdt065_aux> TO tl_zssdt065.
+      ENDLOOP.
+
+      IF tl_zssdt065 IS INITIAL.
+        LOOP AT tl_zssdt065_aux ASSIGNING <fs_zssdt065_aux> WHERE kunag IS INITIAL AND kunnr = vl_kunnr.
+          APPEND <fs_zssdt065_aux> TO tl_zssdt065.
+        ENDLOOP.
+      ENDIF.
+
+      IF tl_zssdt065 IS INITIAL.
+        LOOP AT tl_zssdt065_aux ASSIGNING <fs_zssdt065_aux> WHERE kunag = vl_kunag AND kunnr IS INITIAL.
+          APPEND <fs_zssdt065_aux> TO tl_zssdt065.
+        ENDLOOP.
+      ENDIF.
+
+
+      LOOP AT tl_zssdt065 ASSIGNING FIELD-SYMBOL(<fs_zssdt065>).
+        ls_address-recip_email_addr = <fs_zssdt065>-email.
+        APPEND ls_address TO tl_address.
+      ENDLOOP.
+
+*      IF tl_address IS INITIAL.
+*        ls_address-recip_email_addr = gs_nast-email_addr.
+*        APPEND ls_address TO tl_address.
+*      ENDIF.
+
+
+    WHEN gc_device-fax.
+*     Get the e-mail address of the recipient
+      ls_address-recip_fax_country = gs_nast-tland.
+      ls_address-recip_fax_number  = gs_nast-telfx(30).
+*     Get the fax address of the sender from sales org. or
+*     user's e-mail as fallback
+      CALL FUNCTION 'ADDR_COMM_GET'
+        EXPORTING
+          address_number    = gs_interface-head_detail-tvko-adrnr
+          language          = gv_language
+          table_type        = 'ADFAX'
+        TABLES
+          comm_table        = lt_adfax
+        EXCEPTIONS
+          parameter_error   = 1
+          address_not_exist = 2
+          internal_error    = 3
+          OTHERS            = 4.
+      IF sy-subrc <> 0.
+        <gv_returncode> = sy-subrc.
+        PERFORM protocol_update.
+        RETURN.
+      ENDIF.
+*     Transfer e-mail address
+      READ TABLE lt_adfax INTO ls_adfax
+           WITH KEY flgdefault = gc_true.
+
+      IF sy-subrc IS INITIAL.
+        ls_address-sender_fax_country = ls_adfax-country.
+        ls_address-sender_fax_number  = ls_adfax-fax_number.
+      ENDIF.
+
+      APPEND ls_address TO tl_address.
+  ENDCASE.
+
+
+
+
+* Send PDF data
+  LOOP AT tl_address INTO ls_address.
+    CALL FUNCTION 'SD_PDF_SEND_DATA'
+      EXPORTING
+        iv_device        = uv_device
+        iv_email_subject = lv_mail_subject
+        it_email_text    = lt_mail_text
+        is_main_data     = us_pdf_file
+        iv_language      = gv_language
+        is_address       = ls_address
+      IMPORTING
+        ev_send_to_all   = lv_send_to_all
+      EXCEPTIONS
+        exc_document     = 1
+        exc_send_request = 2
+        exc_address      = 3
+        OTHERS           = 4.
+    IF sy-subrc <> 0.
+*   Sending did fail
+      MESSAGE e000 WITH <gs_vbdka>-vbeln
+                   INTO gv_dummy.
+      PERFORM protocol_update.
+      <gv_returncode> = 99.
+      RETURN.
+    ENDIF.
+  ENDLOOP.
+
+  IF lv_send_to_all = gc_true.
+*   Write success message into log
+    MESSAGE i022(so)
+            INTO gv_dummy.
+    PERFORM protocol_update.
+  ELSE.
+*   Write fail message into log
+    MESSAGE i023(so)
+            WITH <gs_vbdka>-vbeln
+            INTO gv_dummy.
+    PERFORM protocol_update.
+  ENDIF.
+
+ENDFORM.                    " send_data
+
+*&---------------------------------------------------------------------*
+*&      Form  get_mail_body
+*&---------------------------------------------------------------------*
+FORM get_mail_body
+     CHANGING ct_mail_text TYPE bcsy_text.
+
+  DATA:
+    lt_lines   TYPE TABLE OF tline,
+    lt_otfdata TYPE TABLE OF itcoo,
+
+    ls_options TYPE itcpo.
+
+* Checkl a form does exist at all
+  CHECK NOT tnapr-fonam IS INITIAL.
+* Set data
+  ls_options-tdgetotf = gc_true.
+  ls_options-tddest   = gs_nast-ldest.
+  ls_options-tdprogram = tnapr-pgnam.
+  vbdka               = <gs_vbdka>.
+  komk                = gs_komk.
+  tvko                = gs_interface-head_detail-tvko.
+* Open form
+  CALL FUNCTION 'OPEN_FORM'
+    EXPORTING
+      dialog                      = ' '
+      form                        = tnapr-fonam
+      language                    = gv_language
+      options                     = ls_options
+    EXCEPTIONS
+      canceled                    = 1
+      device                      = 2
+      form                        = 3
+      options                     = 4
+      unclosed                    = 5
+      mail_options                = 6
+      archive_error               = 7
+      invalid_fax_number          = 8
+      more_params_needed_in_batch = 9
+      spool_error                 = 10
+      codepage                    = 11
+      OTHERS                      = 12.
+  IF sy-subrc <> 0.
+    <gv_returncode> = sy-subrc.
+    PERFORM protocol_update.
+    RETURN.
+  ENDIF.
+* Write form
+  CALL FUNCTION 'WRITE_FORM'
+    EXPORTING
+      element                  = 'MAIL_BODY'
+    EXCEPTIONS
+      element                  = 1
+      function                 = 2
+      type                     = 3
+      unopened                 = 4
+      unstarted                = 5
+      window                   = 6
+      bad_pageformat_for_print = 7
+      spool_error              = 8
+      codepage                 = 9
+      OTHERS                   = 10.
+  IF sy-subrc <> 0.
+    <gv_returncode> = sy-subrc.
+    PERFORM protocol_update.
+    RETURN.
+  ENDIF.
+* Close form
+  CALL FUNCTION 'CLOSE_FORM'
+    TABLES
+      otfdata                  = lt_otfdata
+    EXCEPTIONS
+      unopened                 = 1
+      bad_pageformat_for_print = 2
+      send_error               = 3
+      spool_error              = 4
+      codepage                 = 5
+      OTHERS                   = 6.
+  IF sy-subrc <> 0.
+    <gv_returncode> = sy-subrc.
+    PERFORM protocol_update.
+    RETURN.
+  ENDIF.
+* Convert form data
+  CALL FUNCTION 'CONVERT_OTF'
+    TABLES
+      otf                   = lt_otfdata
+      lines                 = lt_lines
+    EXCEPTIONS
+      err_max_linewidth     = 1
+      err_format            = 2
+      err_conv_not_possible = 3
+      err_bad_otf           = 4
+      OTHERS                = 5.
+  IF sy-subrc <> 0.
+    <gv_returncode> = sy-subrc.
+    PERFORM protocol_update.
+    RETURN.
+  ENDIF.
+  CALL FUNCTION 'CONVERT_ITF_TO_STREAM_TEXT'
+    EXPORTING
+      language    = gv_language
+    TABLES
+      itf_text    = lt_lines
+      text_stream = ct_mail_text.
+
+ENDFORM.                    " get_mail_body
+
+*&---------------------------------------------------------------------*
+*&      Form  get_output_params
+*&---------------------------------------------------------------------*
+FORM get_output_params
+     CHANGING cs_outputparams  TYPE sfpoutputparams
+              cs_docparams     TYPE sfpdocparams
+              cv_device        TYPE output_device.
+
+  DATA:
+    ls_comm_values       TYPE szadr_comm_values,
+    lv_comm_type         TYPE ad_comm,
+    lv_otf_memory_switch TYPE c.
+
+
+  CASE gs_nast-nacha.
+    WHEN gc_nacha-external_send.
+*     Send
+      IF NOT gs_nast-tcode IS INITIAL.
+        CALL FUNCTION 'ADDR_GET_NEXT_COMM_TYPE'
+          EXPORTING
+            strategy           = gs_nast-tcode
+            address_type       = <gs_vbdka>-address_type
+            address_number     = <gs_vbdka>-adrnr
+            person_number      = <gs_vbdka>-adrnp
+          IMPORTING
+            comm_type          = lv_comm_type
+            comm_values        = ls_comm_values
+          EXCEPTIONS
+            address_not_exist  = 1
+            person_not_exist   = 2
+            no_comm_type_found = 3
+            internal_error     = 4
+            parameter_error    = 5
+            OTHERS             = 6.
+        IF sy-subrc <> 0.
+          <gv_returncode> = sy-subrc.
+          PERFORM protocol_update.
+          RETURN.
+        ENDIF.
+*       Proccess communication type
+        CASE lv_comm_type.
+          WHEN 'INT'.  "e-mail
+            cs_outputparams-getpdf = gc_true.
+            cv_device              = gc_device-email.
+            gs_nast-email_addr     = ls_comm_values-adsmtp-smtp_addr.
+          WHEN 'FAX'.
+            cs_outputparams-getpdf = gc_true.
+            cv_device              = gc_device-fax.
+            gs_nast-telfx          = ls_comm_values-adfax-fax_number.
+            gs_nast-tland          = ls_comm_values-adfax-country.
+          WHEN 'LET'.   "Printer
+            cv_device              = gc_device-printer.
+        ENDCASE.
+      ELSE.
+        cv_device                  = gc_device-printer.
+      ENDIF.
+
+      "JCB 22.10.24. Si el envio es externo, voy a poner que es email.
+      "Las direcciones las buscaré de la tabla Z
+      IF lv_comm_type <> 'INT'.
+        cs_outputparams-getpdf = gc_true.
+        cv_device              = gc_device-email.
+        gs_nast-email_addr     = ls_comm_values-adsmtp-smtp_addr.
+      ENDIF.
+
+
+    WHEN gc_nacha-printer.
+*     Print
+      cv_device                    = gc_device-printer.
+    WHEN gc_nacha-fax.
+*     Fax
+      cs_outputparams-getpdf       = gc_true.
+      cv_device                    = gc_device-fax.
+  ENDCASE.
+
+* The original document should be printed only once
+  IF NOT gv_screen_display               IS INITIAL  AND
+         gs_interface-head_detail-repeat EQ gc_false.
+*    cs_outputparams-noprint   = gc_true.
+    cs_outputparams-nopributt = gc_true.
+    cs_outputparams-noarchive = gc_true.
+  ENDIF.
+* Set up screen display
+  IF gv_screen_display     = 'X'.
+    cs_outputparams-preview = gc_true.
+    cs_outputparams-getpdf  = gc_false.
+  ELSEIF gv_screen_display = 'W'. "Web dynpro
+    cs_outputparams-getpdf  = gc_true.
+    cv_device               = gc_device-web_dynpro.
+  ENDIF.
+* Set basic data
+  cs_outputparams-nodialog  = gc_true.
+  cs_outputparams-dest      = gs_nast-ldest.
+  cs_outputparams-copies    = gs_nast-anzal.
+  cs_outputparams-dataset   = gs_nast-dsnam.
+  cs_outputparams-suffix1   = gs_nast-dsuf1.
+  cs_outputparams-suffix2   = gs_nast-dsuf2.
+  cs_outputparams-cover     = gs_nast-tdocover.
+  cs_outputparams-covtitle  = gs_nast-tdcovtitle.
+  cs_outputparams-authority = gs_nast-tdautority.
+  cs_outputparams-receiver  = gs_nast-tdreceiver.
+  cs_outputparams-division  = gs_nast-tddivision.
+  cs_outputparams-arcmode   = gs_nast-tdarmod.
+  cs_outputparams-reqimm    = gs_nast-dimme.
+  cs_outputparams-reqdel    = gs_nast-delet.
+  cs_outputparams-senddate  = gs_nast-vsdat.
+  cs_outputparams-sendtime  = gs_nast-vsura.
+
+* INI CGIJON - 03.06.22 - SAT 7000047491 - TICKET 71417  - ANEXOS PED
+  break developer.
+  IF gs_interface-head_detail-vbdka-vkorg = '4000'.
+    cs_outputparams-assemble  = 'X'.
+    cs_outputparams-bumode   = 'M'. "This is Bundle Mode
+    cs_outputparams-getpdf      = 'M'. "This should be set to M, compare to regular value X being
+    cs_outputparams-nodialog = gc_true.
+    cs_outputparams-preview  =  gc_false.
+    cs_outputparams-reqnew   = gc_true.
+  ENDIF.
+* FIN CGIJON - 03.06.22 - SAT 7000047491 - TICKET 71417  - ANEXOS PED
+
+
+* Print Preview for CRM Web UI, printing button always active
+  IF cl_ops_switch_check=>sd_sfws_sc3( ) EQ abap_true.
+    CALL FUNCTION 'GET_OTF_MEMORY_SWITCH'
+      IMPORTING
+        ev_otf_memory_switch = lv_otf_memory_switch.
+    IF lv_otf_memory_switch EQ abap_true.
+*      cs_outputparams-noprint   = gc_false.
+    ENDIF.
+  ENDIF.
+
+* Set language and default language
+  cs_docparams-langu     = gv_language.
+  cs_docparams-replangu1 = <gs_vbdka>-spras_vko.
+  cs_docparams-replangu2 = gc_english.
+  cs_docparams-country   = <gs_vbdka>-land1.
+
+
+* Archiving
+  APPEND toa_dara TO cs_docparams-daratab.
+
+ENDFORM.                    " get_output_params
+
+*&---------------------------------------------------------------------*
+*&      Form  initialize_data
+*&---------------------------------------------------------------------*
+FORM initialize_data.
+
+  CLEAR:
+    gt_vedpa,
+    gt_vbtyp_fix_values,
+    gt_item_cancellation_dates,
+    gt_komv,
+
+    gs_interface,
+    gs_komk,
+    gs_nast,
+
+    gv_screen_display,
+    gv_price_print_mode,
+    gv_language,
+    gv_scenario,
+    gv_dummy,
+
+    <gv_returncode>.
+
+  IF gr_badi_print IS BOUND.
+*   Call BAdI concerning initialization
+    CALL BADI gr_badi_print->initialize_data.
+  ENDIF.
+
+ENDFORM.                    " initialize_data

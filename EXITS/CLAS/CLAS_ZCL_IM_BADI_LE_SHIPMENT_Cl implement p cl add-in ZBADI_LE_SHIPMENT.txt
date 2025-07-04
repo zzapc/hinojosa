@@ -1,0 +1,204 @@
+
+CLASS zcl_im_badi_le_shipment DEFINITION
+  PUBLIC FINAL
+  CREATE PUBLIC.
+
+  PUBLIC SECTION.
+    INTERFACES if_ex_badi_le_shipment.
+
+
+endclass. "ZCL_IM_BADI_LE_SHIPMENT definition
+class ZCL_IM_BADI_LE_SHIPMENT implementation.
+  METHOD if_ex_badi_le_shipment~at_save.
+    DATA ls_vttk TYPE vttkvb.
+    DATA: ls_vttk_new_out TYPE vttkvb,
+          change          TYPE flag.
+    DATA: ex_object_cx_root TYPE REF TO cx_root,
+          ex_text           TYPE string,
+          ex_text_long      TYPE string.
+
+    READ TABLE im_shipments_at_save-new_vttk INDEX 1 INTO ls_vttk. " cvivo - Proyecto CB WM - 15.03.2019
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+
+*     add jtm 02.06.2022 rellenar peso max permitido
+    IF ls_vttk-allowed_twgt IS INITIAL.
+      READ TABLE cha_shipments_at_save-new_vttk INDEX 1 INTO ls_vttk_new_out.
+      IF sy-subrc = 0.
+
+        TRY.
+            CALL FUNCTION 'ZSWM_MODIFICAR_PESO_MAX_TRANSP'
+              EXPORTING
+                vttk_in  = ls_vttk
+              CHANGING
+                vttk_out = ls_vttk_new_out
+                change   = change.
+
+          CATCH cx_root INTO ex_object_cx_root.
+            ex_text = ex_object_cx_root->get_text( ).
+            ex_text_long = ex_object_cx_root->get_longtext( ).
+        ENDTRY.
+        IF change = abap_true.
+          MODIFY cha_shipments_at_save-new_vttk FROM ls_vttk_new_out INDEX 1.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+*     fin de add jtm 02.06.2022 fin de rellenar peso max permitido
+    SELECT SINGLE @abap_true FROM tvarvc
+      WHERE name = 'ZWM_CLASE_TRANSPORTE'
+        AND low  = @ls_vttk-shtyp
+      INTO @DATA(result).
+
+    IF sy-subrc = 0.
+      IF NOT ls_vttk-text2 CO '0123456789 '.
+        MESSAGE 'Campo "Peso entrada" debe contener sólo números' TYPE 'E'.
+      ELSEIF NOT ls_vttk-text3 CO '0123456789 '.
+        MESSAGE 'Campo "Peso salida" debe contener sólo números' TYPE 'E'.
+      ENDIF.
+    ENDIF.
+
+    " ASC >>> 06.02.24 Desmarcar flag relevante para gastos de transporte
+    IF ls_vttk-shtyp = 'Z007'.
+      SELECT SINGLE lifnr, addrnumber, sort1, zzsigni " ASC 06.03.24 Nos piden que el bloqueo relevante para gastos dependa del campo zzsigni
+        FROM lfa1
+        INNER JOIN adrc ON lfa1~adrnr = adrc~addrnumber
+        WHERE lifnr = @ls_vttk-tdlnr
+      INTO @DATA(ls_gastos).
+*        IF sy-subrc = 0 AND ls_gastos-sort1 EQ abap_false.
+      IF sy-subrc = 0 AND ls_gastos-zzsigni IS INITIAL.
+        CLEAR ls_vttk-frkrl.
+        MODIFY cha_shipments_at_save-new_vttk FROM ls_vttk INDEX 1.
+      ENDIF.
+    ENDIF.
+    " ASC <<< 06.02.24 Desmarcar flag relevante para gastos de transporte
+
+*Forzar interlocutor emisor de factura asociada a transportista
+    IF zcl_ap_exits=>exit_activa( 'VTXX_EMISOR_FACTURA' ).
+
+      IF NOT ls_vttk-tdlnr IS INITIAL.
+* Verificamos si el transportista tiene emisor de factura
+        SELECT lifn2 FROM wyt3
+          INTO @DATA(l_emisor_factura)
+          UP TO 1 ROWS
+         WHERE lifnr = @ls_vttk-tdlnr
+           AND parvw = 'RS'
+          ORDER BY PRIMARY KEY.
+        ENDSELECT.
+
+        READ TABLE im_shipments_at_save-old_vttk INDEX 1 INTO DATA(ls_vttk_old).
+        IF ls_vttk-tdlnr <> ls_vttk_old-tdlnr AND NOT ls_vttk_old-tdlnr IS INITIAL.
+          SELECT lifn2 FROM wyt3
+            INTO @DATA(l_emisor_factura_anterior)
+          UP TO 1 ROWS
+           WHERE lifnr = @ls_vttk_old-tdlnr
+             AND parvw = 'RS'
+          ORDER BY PRIMARY KEY.
+          ENDSELECT.
+          IF l_emisor_factura_anterior = l_emisor_factura.
+            CLEAR l_emisor_factura_anterior.
+          ENDIF.
+        ENDIF.
+
+        IF NOT l_emisor_factura IS INITIAL.
+* Verificamos si está el intercutor.
+          LOOP AT cha_shipments_at_save-new_vbpa TRANSPORTING NO FIELDS WHERE     parvw  = 'RS'
+                                                                              AND lifnr  = l_emisor_factura
+                                                                              AND updkz <> 'D'.
+            EXIT.
+          ENDLOOP.
+          IF sy-subrc = 0.
+* Si si existe, vemos si hubiera otro asociado a un intercutor previo para borrarlo.
+            IF NOT l_emisor_factura_anterior IS INITIAL.
+              ASSIGN cha_shipments_at_save-new_vbpa[ parvw = 'RS'
+                                                     lifnr = l_emisor_factura_anterior ] TO FIELD-SYMBOL(<vbpa>).
+              IF sy-subrc = 0.
+                <vbpa>-updkz = 'D'.
+              ENDIF.
+            ENDIF.
+          ELSE.
+* Si existe otro destinatario de factura lo cambio
+            LOOP AT cha_shipments_at_save-new_vbpa ASSIGNING <vbpa> WHERE     parvw  = 'RS'
+                                                                          AND updkz <> 'D'.
+              SELECT SINGLE lifnr land1 adrnr stcd1 stceg FROM lfa1
+                INTO CORRESPONDING FIELDS OF <vbpa>
+               WHERE lifnr = l_emisor_factura.
+              IF <vbpa>-updkz IS INITIAL.
+                <vbpa>-updkz = 'U'.
+              ENDIF.
+              EXIT.
+            ENDLOOP.
+* Si no, lo añado
+            IF sy-subrc <> 0.
+              READ TABLE cha_shipments_at_save-new_vbpa INTO DATA(l_vbpa) INDEX 1.
+              IF sy-subrc = 0.
+                l_vbpa-parvw = 'RS'.
+                SELECT SINGLE lifnr land1 adrnr stcd1 stceg FROM lfa1
+                  INTO CORRESPONDING FIELDS OF l_vbpa
+                 WHERE lifnr = l_emisor_factura.
+                IF l_vbpa-updkz IS INITIAL OR l_vbpa-updkz = 'D'.
+                  l_vbpa-updkz = 'U'.
+                ENDIF.
+                APPEND l_vbpa TO cha_shipments_at_save-new_vbpa.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+* Si el nuevo transportista no tiene destino de factura, pero el anterior existía lo borramos
+        ELSEIF NOT l_emisor_factura_anterior IS INITIAL.
+          ASSIGN cha_shipments_at_save-new_vbpa[ parvw = 'RS'
+                                                 lifnr = l_emisor_factura_anterior ] TO <vbpa>.
+          IF sy-subrc = 0.
+            <vbpa>-updkz = 'D'.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+*Traemos los datos por defecto del proveedor, si los tiene
+    IF zcl_ap_exits=>exit_activa( 'VTXX_TRAER_DATOS_TRANSPORTISTA' ).
+      LOOP AT cha_shipments_at_save-new_vttk ASSIGNING FIELD-SYMBOL(<new_vttk>) WHERE NOT tdlnr IS INITIAL.
+        SELECT SINGLE name1, stcd1, stceg, zzsigni, zzremolque, zzadd_info FROM lfa1
+          INTO (@DATA(l_conductor), @DATA(l_dni), @DATA(l_nif_comunitario), @DATA(l_matricula), @DATA(l_remolque), @DATA(l_tipo_camion))
+         WHERE lifnr = @ls_vttk-tdlnr.
+        IF sy-subrc = 0.
+          IF NOT l_matricula IS INITIAL.
+            IF l_matricula NE <new_vttk>-zzmatricula.
+              <new_vttk>-zzmatricula = l_matricula.
+            ENDIF.
+            IF l_matricula NE <new_vttk>-signi.
+              <new_vttk>-signi = l_matricula.
+            ENDIF.
+          ENDIF.
+          IF NOT l_remolque IS INITIAL.
+            IF l_remolque NE <new_vttk>-zzremolque.
+              <new_vttk>-zzremolque = l_remolque.
+            ENDIF.
+            IF l_matricula NE <new_vttk>-tpbez.
+              <new_vttk>-tpbez = l_remolque.
+            ENDIF.
+          ENDIF.
+          IF NOT l_tipo_camion IS INITIAL AND l_tipo_camion NE <new_vttk>-add04.
+            <new_vttk>-add04 = l_tipo_camion.
+          ENDIF.
+
+          IF NOT l_tipo_camion IS INITIAL.
+            IF NOT l_conductor IS INITIAL AND l_conductor NE <new_vttk>-zzconductor.
+              <new_vttk>-zzconductor = l_conductor.
+            ENDIF.
+            IF l_dni IS INITIAL AND NOT l_nif_comunitario IS INITIAL.
+              l_dni = l_nif_comunitario.
+            ENDIF.
+            IF NOT l_dni IS INITIAL AND l_dni NE <new_vttk>-zzdni.
+              <new_vttk>-zzdni = l_dni.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDMETHOD.
+  METHOD if_ex_badi_le_shipment~before_update.
+  ENDMETHOD.
+  METHOD if_ex_badi_le_shipment~in_update.
+  ENDMETHOD.
+endclass. "ZCL_IM_BADI_LE_SHIPMENT definition
+endclass. "ZCL_IM_BADI_LE_SHIPMENT implementation

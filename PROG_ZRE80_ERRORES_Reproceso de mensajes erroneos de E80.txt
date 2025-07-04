@@ -1,0 +1,390 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRE80_ERRORES
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+REPORT zre80_errores.
+
+TYPES: BEGIN OF ty_zte80_messages,
+         id_mensaje      TYPE ze80_id_mensaje,
+         estado          TYPE ze80_estado,
+         centro          TYPE werks_d,
+         fecha_env       TYPE date,
+         hora_env        TYPE time,
+         tipo_mensaje    TYPE ze80_tipo_mensaje,
+         numero_de_dcmnt TYPE ze80_numero_de_dcmnt,
+         reason_code     TYPE ze80_reason_code,
+         reason_text     TYPE ze80_reason_text,
+         fecha_err       TYPE date,
+         hora_err        TYPE time,
+         fecha_rep       TYPE date,
+         hora_rep        TYPE time,
+         icon_estado     TYPE string,
+       END OF ty_zte80_messages.
+
+DATA: lo_alv             TYPE REF TO cl_salv_table,
+      gt_alv             TYPE TABLE OF ty_zte80_messages,
+      lex_message        TYPE REF TO cx_salv_msg,
+      lo_layout_settings TYPE REF TO cl_salv_layout,
+      lo_layout_key      TYPE        salv_s_layout_key,
+      lo_functions       TYPE REF TO cl_salv_functions_list,
+      lo_columns         TYPE REF TO cl_salv_columns_table,
+      lo_column          TYPE REF TO cl_salv_column,
+      lex_not_found      TYPE REF TO cx_salv_not_found,
+      lr_functions       TYPE REF TO cl_salv_functions_list,
+      l_text             TYPE string,
+      l_icon             TYPE string,
+      gc_true            TYPE boolean,
+      lv_answer          TYPE c,
+      lt_selected_row    TYPE salv_t_row,
+      ls_selected_row    LIKE LINE OF lt_selected_row,
+      lv_lines           TYPE string,
+      ls_datos           LIKE LINE OF gt_alv,
+      l_msg              TYPE string,
+      lo_events          TYPE REF TO cl_salv_events_table,
+      o_selections       TYPE REF TO cl_salv_selections,
+      lt_parameters      TYPE ustyp_t_parameters,
+      ls_parameters      LIKE LINE OF lt_parameters,
+      lv_charg           TYPE charg_d,
+      lv_vbeln_prep      TYPE vbeln_vl,
+      lv_vbeln_exp       TYPE vbeln_vl.
+
+TABLES mara.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+
+SELECTION-SCREEN SKIP.
+
+PARAMETERS: pa_cntro TYPE werks_d OBLIGATORY,
+            pa_msjid TYPE ze80_id_mensaje.
+
+SELECT-OPTIONS: so_fecha FOR mara-ersda DEFAULT sy-datum,
+                so_hora  FOR sy-uzeit   DEFAULT '000000' TO '235959'.
+
+SELECTION-SCREEN SKIP.
+
+SELECTION-SCREEN END OF BLOCK b1.
+
+FORM icono_alv.
+
+  LOOP AT gt_alv ASSIGNING FIELD-SYMBOL(<fs_icon>).
+    CASE <fs_icon>-estado.
+
+      WHEN '0'.
+        <fs_icon>-icon_estado = icon_green_light.
+
+      WHEN '1'.
+        <fs_icon>-icon_estado = icon_red_light.
+
+      WHEN '2'.
+        <fs_icon>-icon_estado = icon_yellow_light.
+    ENDCASE.
+
+  ENDLOOP.
+
+ENDFORM.
+
+FORM recuperar_datos.
+
+  IF pa_msjid IS INITIAL.
+    SELECT * FROM zte80_messages INTO CORRESPONDING FIELDS OF TABLE gt_alv WHERE centro = pa_cntro AND fecha_env IN so_fecha AND hora_env IN so_hora.
+  ELSE.
+    SELECT * FROM zte80_messages INTO CORRESPONDING FIELDS OF TABLE gt_alv WHERE centro = pa_cntro AND fecha_env IN so_fecha AND hora_env IN so_hora AND id_mensaje = pa_msjid.
+  ENDIF.
+
+  SORT gt_alv BY id_mensaje.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       CLASS class_handle_events DEFINITION
+*---------------------------------------------------------------------*
+CLASS class_handle_events DEFINITION.
+  PUBLIC SECTION.
+    METHODS:
+      on_user_command
+                  FOR EVENT added_function OF cl_salv_events
+        IMPORTING e_salv_function.
+
+ENDCLASS.
+
+*---------------------------------------------------------------------*
+*       CLASS lcl_handle_events IMPLEMENTATION
+*---------------------------------------------------------------------*
+CLASS class_handle_events IMPLEMENTATION.
+
+  METHOD on_user_command.
+
+    CASE e_salv_function.
+      WHEN 'REPROCESAR'.
+
+        lt_selected_row = lo_alv->get_selections( )->get_selected_rows( ).
+
+        LOOP AT lt_selected_row INTO ls_selected_row. "Comprobar que todos los mensajes seleccionados sean erróneos
+
+          READ TABLE gt_alv INTO ls_datos INDEX ls_selected_row.
+
+          IF ls_datos-estado NE '1'.
+
+            MESSAGE 'Seleccionar únicamente mensajes erróneos' TYPE 'I'.
+            RETURN.
+
+          ENDIF.
+
+        ENDLOOP.
+
+        DESCRIBE TABLE lt_selected_row LINES lv_lines.
+
+        IF lv_lines EQ 0. "No se han seleccionado lineas
+          MESSAGE 'Seleccionar únicamente mensajes erróneos' TYPE 'I'.
+          RETURN.
+
+        ELSE.
+          CONCATENATE 'Se reprocesarán' lv_lines 'mensajes' INTO l_msg SEPARATED BY space.
+          CALL FUNCTION 'POPUP_TO_CONFIRM'
+            EXPORTING
+              titlebar              = 'Mensaje de confirmación'
+              text_question         = l_msg
+              text_button_1         = 'Aceptar'
+              icon_button_1         = 'ICON_CHECKED'
+              text_button_2         = 'Cancelar'
+              icon_button_2         = 'ICON_CANCEL'
+              default_button        = '2'
+              display_cancel_button = ''
+              start_column          = 25
+              start_row             = 10
+            IMPORTING
+              answer                = lv_answer
+            EXCEPTIONS
+              text_not_found        = 1
+              OTHERS                = 2.
+
+          IF sy-subrc <> 0.
+* Implement suitable error handling here
+          ENDIF.
+
+          IF lv_answer = 1. "Botón aceptar
+
+            LOOP AT lt_selected_row INTO ls_selected_row.
+
+              READ TABLE gt_alv INTO ls_datos INDEX ls_selected_row.
+
+              IF ls_datos IS NOT INITIAL.
+
+                IF ls_datos-estado = '1'.
+
+                  IF ls_datos-tipo_mensaje = 'SU_DATA'.
+
+                    lv_charg = ls_datos-numero_de_dcmnt.
+
+                    CALL FUNCTION 'Z_E80_ENVIO_STOCK_BOBINA'
+                      EXPORTING
+                        i_werks          = ls_datos-centro
+                        i_charg          = lv_charg
+*                       I_OBJEK          =
+                        i_idmsg          = ls_datos-id_mensaje
+                        i_par_origen     = '0'
+                      EXCEPTIONS
+                        lote_inexistente = 1
+                        OTHERS           = 2.
+
+
+                  ELSEIF ls_datos-tipo_mensaje = 'SHP_INS'.
+
+                    lv_vbeln_prep = ls_datos-numero_de_dcmnt.
+
+                    DATA: lv_vbeln_prep00 TYPE vbeln.
+
+                    UNPACK lv_vbeln_prep TO lv_vbeln_prep00.
+
+                    CALL FUNCTION 'Z_E80_ENVIO_ENTREGAS_PREPA'
+                      EXPORTING
+                        i_vbeln = lv_vbeln_prep00
+                        i_werks = ls_datos-centro
+                        i_idmsg = ls_datos-id_mensaje.
+
+
+                  ELSEIF ls_datos-tipo_mensaje = 'SHP_CTRL'.
+
+                    lv_vbeln_exp = ls_datos-numero_de_dcmnt.
+
+                    CALL FUNCTION 'Z_E80_ENVIO_ENTREGAS_EXPEDIDAS'
+                      EXPORTING
+                        i_vbeln = lv_vbeln_exp
+                        i_werks = ls_datos-centro
+                        i_idmsg = ls_datos-id_mensaje.
+
+                  ENDIF.
+
+                ELSE. "Si se seleccionan mensajes que no son de error
+
+                  MESSAGE 'Seleccionar únicamente mensajes erróneos' TYPE 'I'.
+
+                ENDIF.
+              ENDIF.
+            ENDLOOP.
+          ELSE.
+            RETURN. "Botón cancelar
+          ENDIF.
+        ENDIF.
+
+        PERFORM recuperar_datos.
+
+        PERFORM icono_alv.
+
+        lo_alv->refresh( refresh_mode = if_salv_c_refresh=>full ).
+
+    ENDCASE.
+  ENDMETHOD.
+
+ENDCLASS.
+
+INITIALIZATION.
+
+  CALL FUNCTION 'SUSR_USER_PARAMETERS_GET' "Recuperamos el centro del usuario
+    EXPORTING
+      user_name       = sy-uname
+*     WITH_TEXT       =
+    TABLES
+      user_parameters = lt_parameters
+* EXCEPTIONS
+*     USER_NAME_NOT_EXIST       = 1
+*     OTHERS          = 2
+    .
+  IF sy-subrc <> 0.
+* Implement suitable error handling here
+  ENDIF.
+
+  READ TABLE lt_parameters WITH KEY parid = 'WRK' INTO ls_parameters.
+  IF sy-subrc = 0.
+    pa_cntro = ls_parameters-parva.
+  ELSE.
+    pa_cntro = '3000'.
+  ENDIF.
+
+START-OF-SELECTION.
+
+  DATA: go_events_sup TYPE REF TO class_handle_events.
+
+  PERFORM recuperar_datos.
+
+  PERFORM icono_alv.
+
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = lo_alv
+        CHANGING
+          t_table      =  gt_alv ).
+
+      lo_alv->set_screen_status( pfstatus = 'SALV_STANDARD'
+                                          report = sy-repid
+                                          set_functions = lo_alv->c_functions_all ).
+
+    CATCH cx_salv_msg INTO lex_message.
+
+  ENDTRY.
+
+
+  o_selections = lo_alv->get_selections( ).
+  o_selections->set_selection_mode( cl_salv_selections=>multiple ).
+
+  lr_functions = lo_alv->get_functions( ).
+  lr_functions->set_default( gc_true ).
+
+  " Set the ALV Layouts
+  "-----------------------------------------------------------"
+  lo_layout_settings   = lo_alv->get_layout( ).
+  lo_layout_key-report = sy-repid.
+  lo_layout_settings->set_key( lo_layout_key ).
+  lo_layout_settings->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  lo_layout_settings->set_default( abap_true ).
+
+  " set the ALV Toolbars
+  "-----------------------------------------------------------"
+  lo_functions = lo_alv->get_functions( ).
+  lo_alv->get_functions( )->set_all( if_salv_c_bool_sap=>true ).
+
+  " Optimize ALV Columns size
+  "-----------------------------------------------------------"
+  lo_columns = lo_alv->get_columns( ).
+  lo_columns->set_optimize( 'X' ).
+
+  TRY.
+      lo_column = lo_columns->get_column( 'FECHA_ENV' ).
+      lo_column->set_short_text( 'FechaEnv' ).
+      lo_column->set_medium_text( 'Fecha Envío' ).
+      lo_column->set_long_text( 'Fecha Envío' ).
+    CATCH cx_salv_not_found INTO lex_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'HORA_ENV' ).
+      lo_column->set_short_text( 'HoraEnv' ).
+      lo_column->set_medium_text( 'Hora Envío' ).
+      lo_column->set_long_text( 'Hora Envío' ).
+    CATCH cx_salv_not_found INTO lex_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'FECHA_ERR' ).
+      lo_column->set_short_text( 'FechaErr' ).
+      lo_column->set_medium_text( 'Fecha Error' ).
+      lo_column->set_long_text( 'Fecha Error' ).
+    CATCH cx_salv_not_found INTO lex_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'HORA_ERR' ).
+      lo_column->set_short_text( 'HoraErr' ).
+      lo_column->set_medium_text( 'Hora Error' ).
+      lo_column->set_long_text( 'Hora Error' ).
+    CATCH cx_salv_not_found INTO lex_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'FECHA_REP' ).
+      lo_column->set_short_text( 'FechaRep' ).
+      lo_column->set_medium_text( 'Fecha Repro' ).
+      lo_column->set_long_text( 'Fecha Reprocesado' ).
+    CATCH cx_salv_not_found INTO lex_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_column = lo_columns->get_column( 'HORA_REP' ).
+      lo_column->set_short_text( 'HoraRep' ).
+      lo_column->set_medium_text( 'Hora Repro' ).
+      lo_column->set_long_text( 'Hora Reprocesado' ).
+    CATCH cx_salv_not_found INTO lex_not_found.
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( columnname = 'ESTADO' ).
+      lo_column->set_short_text( value  = 'Estado' ).
+      lo_column->set_medium_text( value  = 'Estado' ).
+      lo_column->set_long_text( value  = 'Estado' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( columnname = 'ICON_ESTADO' ).
+      lo_column->set_short_text( value  = 'Estado' ).
+      lo_column->set_medium_text( value  = 'Estado' ).
+      lo_column->set_long_text( value  = 'Estado' ).
+    CATCH cx_salv_not_found .
+  ENDTRY.
+
+  TRY.
+
+    CATCH cx_salv_not_found.
+
+  ENDTRY.
+
+  CREATE OBJECT go_events_sup.
+  lo_events = lo_alv->get_event( ).
+  SET HANDLER go_events_sup->on_user_command FOR lo_events.
+
+  lo_alv->display( ).

@@ -1,0 +1,632 @@
+*----------------------------------------------------------------------*
+***INCLUDE ZRPP0058_F01.
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  OBTENER_DATOS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM obtener_datos .
+
+  TYPES: BEGIN OF ty_tab_kg_dec,
+           matnr      TYPE matnr,
+           kg_reales  TYPE menge_d,
+           coste_real TYPE netwr,
+           porc_real  TYPE zporc_mat_rec,
+         END OF ty_tab_kg_dec.
+  DATA: lt_kg_dec TYPE STANDARD TABLE OF ty_tab_kg_dec.
+  TYPES: BEGIN OF ty_equ,
+           matnr       TYPE matnr,
+           matnr_equiv TYPE matnr,
+         END OF ty_equ.
+  DATA: l_tot_kg        TYPE menge_d,
+        l_tot_por       TYPE netwr,
+        l_total_kg_teor TYPE menge_d,
+        ls_cellcolor    TYPE lvc_s_scol,
+        l_ult_matnr     TYPE matnr.
+
+* Anyo y mes actual.
+  DATA: l_any_pres TYPE mjahr,
+        l_mes_pres TYPE bumon.
+
+  CLEAR: l_tot_kg, l_tot_por.
+
+  l_any_pres = sy-datum(4).
+  l_mes_pres = sy-datum+4(2).
+
+  DATA(l_fecha_rango) = s_fec[ 1 ].
+
+* Obtención de lotes.
+  SELECT z41~matnr ,  z41~kg_reales , z41~ind_lote_consum ,z41~pmv "AS kg_reales
+    FROM ztpp0041 AS z41
+    INNER JOIN ztpp0040 AS z40 ON z40~id_receta = z41~id_receta
+    INTO TABLE @DATA(lt_041)
+    WHERE z41~werks        =   @p_werks     AND
+          z41~id_receta    IN  @s_rec AND
+          z40~zcalidad     =   @p_cali AND
+*          z40~zcalidad     IN  @s_cal AND
+          z41~fecha_fabr   IN  @s_fec AND
+          z41~ind_sin_etiq IN ( ' ' , '0' , '1' ). " para no tener en cuenta los ficticios consumidos mediante "lotes sin etiqueta"
+
+  CHECK lt_041 IS NOT INITIAL.
+
+  CALL METHOD zclpp_consumo_recetas_mp=>obtener_lista_mat_teorica
+    EXPORTING
+      i_werks      = p_werks
+      i_calidad    = p_cali
+    IMPORTING
+      ot_lista_mat = DATA(lt_lista_mat).
+
+* Cargar registros con materiales de la lista teórica.
+  LOOP AT lt_lista_mat INTO DATA(ls_lista).
+
+    APPEND INITIAL LINE TO lt_kg_dec ASSIGNING FIELD-SYMBOL(<fs_kg_dec>).
+    <fs_kg_dec>-matnr        = ls_lista-idnrk.
+
+    APPEND INITIAL LINE TO gt_datos ASSIGNING FIELD-SYMBOL(<fs_datos_alv>).
+    <fs_datos_alv>-matnr        = ls_lista-idnrk.
+    <fs_datos_alv>-maktx      = zcl_utils_hpap_pp=>get_descr_material( <fs_datos_alv>-matnr ).
+    <fs_datos_alv>-porc_teor    = ls_lista-porc.
+
+  ENDLOOP.
+
+
+* Acumular kg reales y coste.
+  CLEAR l_tot_kg.
+  LOOP AT lt_041 INTO DATA(ls_041).
+
+    l_tot_kg = l_tot_kg + ls_041-kg_reales.
+
+    ASSIGN lt_kg_dec[ matnr = ls_041-matnr ] TO <fs_kg_dec>.
+    IF sy-subrc <> 0.
+      APPEND INITIAL LINE TO lt_kg_dec ASSIGNING <fs_kg_dec>.
+      <fs_kg_dec>-matnr     = ls_041-matnr.
+      <fs_kg_dec>-kg_reales = ls_041-kg_reales.
+
+      IF ls_041-ind_lote_consum = ' '. " Si no está consumido, obtener PMV
+        CALL METHOD zclpp_consumo_recetas_mp=>obtener_precio_medio_variable
+          EXPORTING
+            i_werks            = p_werks
+            i_matnr            = ls_041-matnr
+            i_kg_reales        = ls_041-kg_reales
+            i_any              = l_any_pres
+            i_mes              = l_mes_pres
+          IMPORTING
+            o_precio_medio_var = DATA(l_pmv).
+        <fs_kg_dec>-coste_real  = <fs_datos_alv>-coste_real + l_pmv.
+      ELSE.
+        <fs_kg_dec>-coste_real  = <fs_datos_alv>-coste_real + ls_041-pmv.
+      ENDIF.
+
+    ELSE.
+      <fs_kg_dec>-kg_reales   = <fs_kg_dec>-kg_reales  + ls_041-kg_reales.
+      <fs_kg_dec>-coste_real  = <fs_kg_dec>-coste_real + ls_041-pmv.
+    ENDIF.
+
+  ENDLOOP.
+
+*
+  LOOP AT lt_kg_dec INTO DATA(ls_kg_dec).
+
+    ASSIGN gt_datos[ matnr = ls_kg_dec-matnr ] TO <fs_datos_alv>.
+    IF sy-subrc <> 0.
+
+      APPEND INITIAL LINE TO gt_datos ASSIGNING <fs_datos_alv>.
+      <fs_datos_alv>-matnr        = ls_kg_dec-matnr.
+      <fs_datos_alv>-maktx        = zcl_utils_hpap_pp=>get_descr_material( ls_kg_dec-matnr ).
+      <fs_datos_alv>-kg_reales    = ls_kg_dec-kg_reales.
+      <fs_datos_alv>-coste_real   = ls_kg_dec-coste_real.
+
+    ELSE.
+
+      <fs_datos_alv>-kg_reales  = <fs_datos_alv>-kg_reales + ls_kg_dec-kg_reales.
+      <fs_datos_alv>-coste_real = <fs_datos_alv>-coste_real + ls_kg_dec-coste_real.
+
+    ENDIF.
+    <fs_datos_alv>-kg_teor   = ( <fs_datos_alv>-porc_teor * l_tot_kg ) / 100.
+    <fs_datos_alv>-porc_real = ( <fs_datos_alv>-kg_reales * 100 ) / l_tot_kg.
+    l_total_kg_teor          = l_total_kg_teor + <fs_datos_alv>-kg_teor.
+
+    IF <fs_datos_alv>-kg_teor > 0.
+      l_ult_matnr = <fs_datos_alv>-matnr.
+    ENDIF.
+    IF <fs_datos_alv>-porc_real > 0.
+      l_tot_por = l_tot_por + <fs_datos_alv>-porc_real.
+    ENDIF.
+
+
+    DATA: l_menge TYPE menge_d.
+    l_menge = <fs_datos_alv>-kg_teor.
+    CALL METHOD zclpp_consumo_recetas_mp=>obtener_precio_medio_variable
+      EXPORTING
+        i_werks            = p_werks
+        i_matnr            = <fs_datos_alv>-matnr
+        i_kg_reales        = l_menge
+        i_any              = l_any_pres
+        i_mes              = l_mes_pres
+      IMPORTING
+*       o_importe_pmv      = <fs_datos_alv>-importe_pmv
+        o_precio_medio_var = l_pmv.
+    <fs_datos_alv>-coste_teor  = l_pmv.
+
+    <fs_datos_alv>-importe_pmv = ( 1000 * <fs_datos_alv>-coste_real ) / <fs_datos_alv>-kg_reales.
+
+  ENDLOOP.
+
+*  data: l_kg_enteros type n.
+*  DATA: l_total_kg_ent TYPE p DECIMALS 0.
+*  data: l_kg_text type c.
+*  data: l_kg_text_ent type c.
+*  data: l_kg_text_dec type c.
+*
+*  l_kg_text = l_total_kg_teor.
+*  SPLIT l_kg_text  AT '.' INTO l_kg_text_ent l_kg_text_dec.
+*  l_total_kg_teor =  l_kg_text_ent.
+
+*  l_total_kg_ent = l_tot_kg.
+  IF l_total_kg_teor <> l_tot_kg.
+    ASSIGN gt_datos[ matnr = l_ult_matnr ] TO <fs_datos_alv>.
+    <fs_datos_alv>-kg_teor = <fs_datos_alv>-kg_teor - ( l_total_kg_teor - l_tot_kg ).
+  ENDIF.
+
+  IF l_tot_por > 100.
+    ASSIGN gt_datos[ matnr = l_ult_matnr ] TO <fs_datos_alv>.
+    <fs_datos_alv>-porc_real = <fs_datos_alv>-porc_real - ( l_tot_por - 100 ).
+  ELSEIF l_tot_por < 100.
+    ASSIGN gt_datos[ matnr = l_ult_matnr ] TO <fs_datos_alv>.
+    <fs_datos_alv>-porc_real = <fs_datos_alv>-porc_real + ( 100 - l_tot_por ).
+  ENDIF.
+
+* *Último loop para obtener coste teórico y calcular la desviación.
+  LOOP AT gt_datos ASSIGNING <fs_datos_alv>.
+    IF <fs_datos_alv>-importe_pmv = 0.
+
+      l_menge = <fs_datos_alv>-kg_teor.
+      CALL METHOD zclpp_consumo_recetas_mp=>obtener_precio_medio_variable
+        EXPORTING
+          i_werks            = p_werks
+          i_matnr            = <fs_datos_alv>-matnr
+          i_kg_reales        = l_menge
+          i_any              = sy-datum(4)
+          i_mes              = sy-datum+4(2)
+        IMPORTING
+          o_precio_medio_var = <fs_datos_alv>-coste_teor
+          o_importe_pmv      = <fs_datos_alv>-importe_pmv.
+
+    ELSE.
+
+      <fs_datos_alv>-coste_teor   = ( <fs_datos_alv>-importe_pmv * <fs_datos_alv>-kg_teor ) / 1000.
+
+    ENDIF.
+
+    <fs_datos_alv>-desv_coste  = <fs_datos_alv>-coste_teor - <fs_datos_alv>-coste_real.
+
+  ENDLOOP.
+
+
+  PERFORM colorear_alv.
+
+ENDFORM.
+
+
+FORM colorear_alv.
+
+* Colorear desviación (Verde/Rojo)
+  DATA: ls_cellcolor TYPE lvc_s_scol.
+  LOOP AT gt_datos ASSIGNING FIELD-SYMBOL(<fs_datos_alv>).
+
+    CLEAR ls_cellcolor.
+
+    IF <fs_datos_alv>-desv_coste > 0.
+      ls_cellcolor-fname = 'DESV_COSTE'.
+      ls_cellcolor-color-col = '5' . "Rojo
+      ls_cellcolor-color-int = 0.
+      ls_cellcolor-color-inv = 0.
+      APPEND ls_cellcolor TO <fs_datos_alv>-t_color.
+
+    ELSEIF <fs_datos_alv>-desv_coste < 0.
+
+      ls_cellcolor-fname = 'DESV_COSTE'.
+      ls_cellcolor-color-col = '6'. "Verde
+      ls_cellcolor-color-int = 0.
+      ls_cellcolor-color-inv = 0.
+      APPEND ls_cellcolor TO <fs_datos_alv>-t_color.
+
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.
+
+
+FORM mostrar_datos.
+
+
+  gs_dyn_100-werks      = p_werks.
+  gs_dyn_100-zcalidad   = p_cali.
+  gs_dyn_100-fec_ini    = s_fec[ 1 ]-low.
+  gs_dyn_100-fec_fin    = s_fec[ 1 ]-high.
+
+  IF s_rec[] IS NOT INITIAL.
+    gs_dyn_100-rec_ini    = s_rec[ 1 ]-low.
+    gs_dyn_100-rec_fin    = s_rec[ 1 ]-high.
+
+  ENDIF.
+
+  IF gs_dyn_100-container IS NOT BOUND.
+
+    CREATE OBJECT gs_dyn_100-container
+      EXPORTING
+        container_name              = 'GS_DYN_100-CONTAINER'
+      EXCEPTIONS
+        cntl_error                  = 1
+        cntl_system_error           = 2
+        create_error                = 3
+        lifetime_error              = 4
+        lifetime_dynpro_dynpro_link = 5
+        OTHERS                      = 6.
+
+*    TRY.
+    cl_salv_table=>factory(
+      EXPORTING
+        r_container    = gs_dyn_100-container
+        container_name = 'GS_DYN_100-CONTAINER'
+      IMPORTING
+        r_salv_table = gs_dyn_100-alv
+      CHANGING
+        t_table      = gt_datos ).
+
+    PERFORM tunning_alv.
+
+    gs_dyn_100-alv->display( ).
+
+  ENDIF.
+
+ENDFORM.
+
+FORM tunning_alv.
+
+  DATA: lr_functions TYPE REF TO cl_salv_functions_list,
+        lo_column2   TYPE REF TO cl_salv_column_table,
+
+        lo_column    TYPE REF TO cl_salv_column,
+        lo_columns   TYPE REF TO cl_salv_columns_table.
+
+  DATA(gr_layout) = gs_dyn_100-alv->get_layout( ).
+  key-report = sy-repid.
+  gr_layout->set_key( key ).
+  gr_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  gr_layout->set_default( abap_true ).
+
+  IF p_lay06 IS NOT INITIAL.
+    gr_layout->set_initial_layout( p_lay06 ).
+  ENDIF.
+
+  lo_columns = gs_dyn_100-alv->get_columns( ).
+  lo_columns->set_optimize( 'X' ).
+
+  TRY.
+      lo_columns->set_color_column( 'T_COLOR' ).
+    CATCH cx_salv_data_error.                           "#EC NO_HANDLER
+
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'MATNR' ).
+      lo_column->set_short_text( 'Material.' ).
+      lo_column->set_medium_text( 'Material' ).
+      lo_column->set_long_text( 'Material' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'MAKTX' ).
+      lo_column->set_short_text( 'Desc. Mat.' ).
+      lo_column->set_medium_text( 'Desc. Material' ).
+      lo_column->set_long_text( 'Desc. Material' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'PORC_TEOR' ).
+      lo_column->set_short_text( '% Teórico' ).
+      lo_column->set_medium_text( '% Teórico' ).
+      lo_column->set_long_text( '% Teórico' ).
+      lo_column->set_decimals( '0' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'KG_TEOR' ).
+      lo_column->set_short_text( 'Kg.teórico' ).
+      lo_column->set_medium_text( 'Kg.teóricos' ).
+      lo_column->set_long_text( 'Kg.teóricos' ).
+      lo_column->set_decimals( '0' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'COSTE_TEOR' ).
+      lo_column->set_short_text( 'Coste teo.' ).
+      lo_column->set_medium_text( 'Coste teórico' ).
+      lo_column->set_long_text( 'Coste teórico' ).
+*      lo_column->set_decimals( '0' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'PORC_REAL' ).
+      lo_column->set_short_text( '% real' ).
+      lo_column->set_medium_text( '% real' ).
+      lo_column->set_long_text( '% real' ).
+      lo_column->set_decimals( '0' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'KG_REALES' ).
+      lo_column->set_short_text( 'Kg. real' ).
+      lo_column->set_medium_text( 'Kg. reales' ).
+      lo_column->set_long_text( 'Kg. reales' ).
+      lo_column->set_decimals( '0' ).
+    CATCH cx_root .
+  ENDTRY.
+
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'COSTE_REAL' ).
+      lo_column->set_short_text( 'Coste real' ).
+      lo_column->set_medium_text( 'Coste real' ).
+      lo_column->set_long_text( 'Coste real' ).
+      lo_column->set_decimals( '0' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'IMPORTE_PMV' ).
+      lo_column->set_short_text( 'Imp. PMV' ).
+      lo_column->set_medium_text( 'Importe PMV' ).
+      lo_column->set_long_text( 'Importe PMV' ).
+      lo_column->set_decimals( '0' ).
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+      lo_column ?= lo_columns->get_column( 'DESV_COSTE' ).
+      lo_column->set_short_text( 'Desv.coste' ).
+      lo_column->set_medium_text( 'Desviación coste' ).
+      lo_column->set_decimals( '0' ).
+      lo_column->set_long_text( 'Desviación coste' ).
+      lo_column->set_decimals( '0' ).
+
+    CATCH cx_root .
+  ENDTRY.
+
+  DATA: lr_functions2 TYPE REF TO cl_salv_functions_list,
+        l_text        TYPE string.
+
+
+**... §3.1 activate ALV generic Functions
+  lr_functions = gs_dyn_100-alv->get_functions( ).
+  lr_functions->set_all( 'X' ).
+
+  CALL METHOD lr_functions->set_graphics
+    EXPORTING
+      value = ' '.
+
+  CALL METHOD lr_functions->set_print
+    EXPORTING
+      value = ' '.
+
+  CALL METHOD lr_functions->set_detail
+    EXPORTING
+      value = ' '.
+
+  CALL METHOD lr_functions->set_find_more
+    EXPORTING
+      value = ' '.
+
+*-- Selection
+  DATA:   lo_cols_tab TYPE REF TO cl_salv_columns_table.
+
+  lo_cols_tab = gs_dyn_100-alv->get_columns( ).
+  lo_cols_tab->set_optimize( ).
+  TRY.
+      lo_cols_tab->set_color_column( 'COLOR' ).
+
+    CATCH cx_salv_data_error.                           "#EC NO_HANDLER
+  ENDTRY.
+
+
+  gs_dyn_100-alv->display( ).
+
+
+
+ENDFORM.
+
+
+FORM buscar_variante  CHANGING p_vari TYPE disvariant-variant.
+
+  DATA: ls_variant TYPE disvariant,
+        l_exit     TYPE char1.
+
+  ls_variant-report = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant = ls_variant
+      i_save     = 'A'
+*     it_default_fieldcat =
+    IMPORTING
+      e_exit     = l_exit
+      es_variant = ls_variant
+    EXCEPTIONS
+      not_found  = 2.
+  IF sy-subrc = 2.
+    MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSE.
+    IF l_exit EQ space.
+      p_vari = ls_variant-variant.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " BUSCAR_VARIANTE
+
+FORM buscar_calidades  CHANGING p_calidad TYPE ztpp0040-zcalidad.
+
+  DATA: ls_variant TYPE disvariant,
+        lt_return  TYPE STANDARD TABLE OF ddshretval,
+        l_exit     TYPE char1.
+
+
+  SELECT  descrip , zcalidad
+    INTO TABLE @DATA(lt_calidades)
+    FROM ztpp0035
+    WHERE werks = @p_werks AND
+          lvorm = ' '.
+
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      retfield        = 'ZZCALIDAD'    " Name of field in VALUE_TAB
+      value_org       = 'S'        " Value return: C: cell by cell, S: structured
+    TABLES
+      value_tab       = lt_calidades  " Table of values: entries cell by cell
+      return_tab      = lt_return  " Return the selected value
+    EXCEPTIONS
+      parameter_error = 1          " Incorrect parameter
+      no_values_found = 2          " No values found
+      OTHERS          = 3.
+
+  IF sy-subrc NE 0.
+    RETURN.
+  ENDIF.
+
+  READ TABLE lt_return INTO DATA(ls_return) INDEX 1.
+  p_calidad = ls_return-fieldval.
+ENDFORM.                    " BUSCAR_VARIANTE
+
+FORM popup_recetas.
+
+  DATA: lr_functions TYPE REF TO cl_salv_functions_list.
+
+  DATA: go_alv     TYPE REF TO cl_salv_table,
+        lo_columns TYPE REF TO cl_salv_columns_table,
+        lo_column  TYPE REF TO cl_salv_column_table.
+  DATA: lr_display   TYPE REF TO cl_salv_display_settings.
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = go_alv
+        CHANGING
+          t_table      = gt_alv_rec[] ).
+
+    CATCH cx_salv_msg.
+  ENDTRY.
+
+  lo_columns = go_alv->get_columns( ).
+  lo_columns->set_optimize( 'X' ).
+
+*  DATA(gr_layout) = go_alv->get_layout( ).
+*  key2-report = sy-repid.
+*  gr_layout->set_key( key2 ).
+*  gr_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+*  gr_layout->set_default( abap_true ).
+
+
+
+  gr_events_pop = go_alv->get_event( ).
+  CREATE OBJECT event_handler_pop.
+  SET HANDLER event_handler_pop->on_link_click FOR gr_events_pop.
+
+  lr_functions = go_alv->get_functions( ).
+  lr_functions->set_all( 'X' ).
+
+  CALL METHOD lr_functions->set_print
+    EXPORTING
+      value = ' '.
+
+  CALL METHOD lr_functions->set_detail
+    EXPORTING
+      value = ' '.
+
+
+
+  lr_display = go_alv->get_display_settings( ).
+  lr_display->set_list_header( 'Recetas incorporadas' ).
+
+
+  TRY.
+
+      lo_column ?= lo_columns->get_column( 'ID_RECETA' ).
+      lo_column->set_cell_type( if_salv_c_cell_type=>hotspot ).
+
+    CATCH cx_root .
+  ENDTRY.
+
+
+  TRY.
+
+      lo_column ?= lo_columns->get_column( 'DIAS' ).
+      lo_column->set_short_text( 'Días.' ).
+      lo_column->set_medium_text( 'Días' ).
+      lo_column->set_long_text( 'Días' ).
+
+    CATCH cx_root .
+  ENDTRY.
+
+  TRY.
+
+      lo_column ?= lo_columns->get_column( 'DAT_INI' ).
+      lo_column->set_short_text( 'F.inicial' ).
+      lo_column->set_medium_text( 'F.inicial' ).
+      lo_column->set_long_text( 'F.inicial' ).
+
+    CATCH cx_root .
+  ENDTRY.
+  TRY.
+
+      lo_column ?= lo_columns->get_column( 'DAT_FIN' ).
+      lo_column->set_short_text( 'F.final' ).
+      lo_column->set_medium_text( 'F.final' ).
+      lo_column->set_long_text( 'F.final' ).
+
+    CATCH cx_root .
+  ENDTRY.
+
+
+  TRY.
+
+      lo_column ?= lo_columns->get_column( 'HOR_INI' ).
+      lo_column->set_short_text( 'H.inicial' ).
+      lo_column->set_medium_text( 'H.inicial' ).
+      lo_column->set_long_text( 'H.inicial' ).
+
+    CATCH cx_root .
+  ENDTRY.
+  TRY.
+
+      lo_column ?= lo_columns->get_column( 'HOR_FIN' ).
+      lo_column->set_short_text( 'H.final' ).
+      lo_column->set_medium_text( 'H.final' ).
+      lo_column->set_long_text( 'H.final' ).
+
+    CATCH cx_root .
+  ENDTRY.
+
+
+  IF go_alv IS BOUND.
+    go_alv->set_screen_popup(
+      start_column = 35
+      end_column  = 165
+      start_line  = 10
+      end_line    = 19 ).
+
+    go_alv->display( ).
+
+  ENDIF.
+
+ENDFORM.

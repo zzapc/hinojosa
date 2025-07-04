@@ -1,0 +1,127 @@
+*----------------------------------------------------------------------*
+*   INCLUDE ZDYN_MD_SUPPLIER_BANK2                                 *
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  md_get_sup_bank_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_GT_SUP_BANK_TMP  text
+*      -->P_GT_SUP_BANK  text
+*      -->P_UPTOROWS  text
+*      <--P_LB_EXIT_LOOP  text
+*----------------------------------------------------------------------*
+FORM md_get_sup_bank_data
+  TABLES gt_sup_bank_tmp    STRUCTURE gs_sup_bank_tmp
+         gt_sup_bank        STRUCTURE gs_sup_bank
+  USING    uptorows
+  CHANGING cb_exit_loop.
+
+  DATA:
+    lc_bank_key TYPE lfbk-bankl,
+    li_lines    TYPE i,
+    lt_vat      TYPE TABLE OF /cockpit/vmde_s,
+    lst_vat     TYPE /cockpit/vmde_s.
+
+* Copy Supplier bank data to target table (EMEIC1301)
+  SELECT *
+         FROM /cockpit/vmde_sb
+         INTO TABLE gt_sup_bank_tmp
+         UP TO uptorows ROWS
+         WHERE lifnr IN lifnr
+           AND land1 IN land1
+           AND ktokk IN ktokk
+           AND bukrs IN bukrs
+           AND lifnr >   gs_sup_bank_last_row-lifnr
+         ORDER BY lifnr banks bankl bankn bukrs.
+  IF sy-subrc NE 0.
+    cb_exit_loop = 'X'.
+    EXIT.
+  ENDIF.
+
+* Find last lifnr - new selection must start from saved lifnr
+  DESCRIBE TABLE gt_sup_bank_tmp LINES li_lines.
+  READ TABLE gt_sup_bank_tmp INTO gs_sup_bank_last_row INDEX li_lines.
+
+* We need to process all entries of last lifnr in one batch.
+* Select above can skip some of them.
+  SELECT *
+        FROM /cockpit/vmde_sb
+        APPENDING TABLE gt_sup_bank_tmp
+        WHERE lifnr = gs_sup_bank_last_row-lifnr
+          AND land1 IN land1
+          AND ktokk IN ktokk
+          AND bukrs IN bukrs
+        ORDER BY lifnr banks bankl bankn bukrs.
+
+  SORT gt_sup_bank_tmp BY lifnr banks bankl bankn bukrs.
+  DELETE ADJACENT DUPLICATES FROM gt_sup_bank_tmp
+         COMPARING lifnr banks bankl bankn bukrs.
+  SORT gt_sup_bank_tmp BY banks.
+  CLEAR:
+    gc_land1,
+    gc_landx.
+
+*-- Get VAT info
+  IF p_supcca EQ abap_true.
+    SELECT *
+           FROM /cockpit/vmde_s
+           INTO TABLE lt_vat FOR ALL ENTRIES IN gt_sup_bank_tmp
+           WHERE lifnr EQ gt_sup_bank_tmp-lifnr
+           AND   land1 EQ gt_sup_bank_tmp-land1
+           AND   ktokk EQ gt_sup_bank_tmp-ktokk
+           AND   intca EQ gt_sup_bank_tmp-intca
+           AND   bukrs EQ gt_sup_bank_tmp-bukrs.
+  ENDIF.
+
+
+* Copy Supplier Bank data to target table (EMEIC 1301)
+  LOOP AT gt_sup_bank_tmp INTO gs_sup_bank_tmp.
+    CLEAR:
+      gs_sup_bank,
+      lc_bank_key.
+
+*   see EBY8346-828 for more explainations EMEIC1337
+    IF gc_land1 NE gs_sup_bank_tmp-banks.
+      gc_land1 = gs_sup_bank_tmp-banks.
+      SELECT SINGLE landx FROM t005t
+                          INTO gc_landx
+                         WHERE land1 EQ gs_sup_bank_tmp-banks AND
+                               spras EQ sy-langu.
+      IF sy-subrc NE 0.
+        SELECT SINGLE landx FROM t005t
+                            INTO gc_landx
+                           WHERE land1 EQ gs_sup_bank_tmp-banks AND
+                                 spras EQ 'E'.
+        IF sy-subrc NE 0.
+          gc_landx = space. " no translation found
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    MOVE-CORRESPONDING gs_sup_bank_tmp TO gs_sup_bank.
+    gs_sup_bank-landx = gc_landx.
+
+*   Get bank details
+    lc_bank_key = gs_sup_bank_tmp-bankl.
+    IF gs_sup_bank_tmp-bnkey = 2.
+      lc_bank_key = gs_sup_bank_tmp-bankn.
+      gs_sup_bank-bankl = gs_sup_bank_tmp-bankn.
+    ENDIF.
+    SELECT SINGLE banka FROM bnka INTO gs_sup_bank-banka
+      WHERE banks = gs_sup_bank_tmp-banks AND bankl = lc_bank_key.
+
+*   add VAT info when needed
+    IF p_supcca EQ abap_true.
+      CLEAR lst_vat.
+      READ TABLE lt_vat INTO lst_vat WITH KEY lifnr = gs_sup_bank-lifnr.
+      IF lst_vat-stceg IS NOT INITIAL.
+        gs_sup_bank-stceg = lst_vat-stceg.
+      ELSE.
+        gs_sup_bank-stceg = con_no_vat.
+      ENDIF.
+    ENDIF.
+    APPEND gs_sup_bank TO gt_sup_bank.
+  ENDLOOP.
+ENDFORM.                    " md_get_sup_bank_data

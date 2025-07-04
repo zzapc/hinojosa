@@ -1,0 +1,434 @@
+
+class ZCL_SI_CONSU_M2S_INB definition
+  public
+  create public .
+
+public section.
+
+  interfaces ZII_SI_CONSU_M2S_INB .
+protected section.
+private section.
+endclass. "ZCL_SI_CONSU_M2S_INB definition
+class ZCL_SI_CONSU_M2S_INB implementation.
+  METHOD zii_si_consu_m2s_inb~si_consu_m2s_inb.
+*------------------------------------------------------------------------------------------
+*  En SAP recibimos de MES los consumos de materias primas (no recorte)
+
+*  Para aquellos materiales cuyo consumo real gestione MES, hay que
+*  modificar las notificaciones SAP de consumo teórico a consumo real.
+
+* •  Operación A, alta de consumo.
+*     Se realizará un consumo del material contra la orden de fabricación
+*     (movimiento 261) por la cantidad informada.
+
+*•  Operación B, baja de consumo.
+*     Se realizará un consumo del material contra la orden de fabricación
+*    (movimiento 262) por la cantidad informada.
+
+* •	Operación E, entrada por regularización de inventario.
+*     En este caso, los campos orden de fabricación, número de fabricación e ID rollo MES vendrán en blanco.
+*     El material, el almacén y la cantidad vendrán informados. La cantidad será el incremento de inventario por recuento.
+*     Se realizará una entrada (movimiento 202) del material contra el centro de coste = 30003407 por la cantidad y en
+*     el almacén informado. La cuenta contable se debe determinar automáticamente.
+
+*•  Operación S, salida por regularización de inventario.
+*     En este caso, los campos orden de fabricación, número de fabricación e ID rollo MES vendrán en blanco.
+*     El material, el almacén y la cantidad vendrán informados. La cantidad será el decremento de inventario por recuento.
+*     Se realizará una salida (movimiento 201) del material contra el centro de coste = 30003407 por la cantidad y en el
+*    almacén informado. La cuenta contable se debe determinar automáticamente.
+
+
+*------------------------------------------------------------------------------------------
+
+*   declaración de variables
+    DATA: wa_row   TYPE zdt_consu_l.
+
+    DATA: lv_materialdocument TYPE  bapi2017_gm_head_ret-mat_doc,
+          lv_matdocumentyear  TYPE bapi2017_gm_head_ret-doc_year,
+
+          wa_goodsmvt_header  TYPE bapi2017_gm_head_01,
+
+          t_goodsmvt_item     TYPE TABLE OF bapi2017_gm_item_create,
+          wa_goodsmvt_item    TYPE bapi2017_gm_item_create,
+
+          t_return            TYPE TABLE OF bapiret2,
+          wa_return           TYPE bapiret2.
+
+
+    DATA: i_string      TYPE  char30,
+          ld_e_float    TYPE f,
+          ld_e_dec      TYPE string,
+          ld_e_decimals TYPE i.
+
+    DATA: lv_extnumber TYPE balnrext.
+
+    DATA: lv_cant TYPE labst.
+
+*   variables envio mail.
+    DATA: lv_mail TYPE xfeld.
+
+    DATA: lt_addr        TYPE bcsy_smtpa,
+          lo_send_email  TYPE REF TO cl_bcs,
+          lo_document    TYPE REF TO cl_document_bcs,
+          lo_recipient   TYPE REF TO if_recipient_bcs,
+          lv_sent_to_all TYPE os_boolean,
+          lo_sender      TYPE REF TO cl_cam_address_bcs,
+          lv_sender      TYPE adr6-smtp_addr,
+          lv_subject     TYPE so_obj_des,
+          lt_message     TYPE soli_tab,
+          ls_message     TYPE soli.
+
+*------------------------------------------------------------------------------------------
+
+    DATA(o_log) = NEW zcl_ap_log( object = 'MES_CONSU'
+                                  report = 'ZCL_SI_CONSU_M2S_INB'
+                                  clave  = zcl_ap_proxy=>GET_MSGGUID( ) ).
+
+*  recuperamos los CECOS de los centros (tabla ZTCENTROS_MES)
+    SELECT * FROM ztmes_centros
+      INTO TABLE @DATA(t_ceco).
+
+*   recuperamos los destinatios del mail en caso de que la interface genere errores.
+    SELECT * FROM ztmes_mail
+      INTO TABLE @DATA(t_mail)
+      WHERE interface = 'MP'.
+
+    LOOP AT input-mt_consu-row INTO wa_row.
+      o_log->log(  msgty    = 'I'
+                   message  = 'Inicio proceso'
+                   msgv1    = wa_row-centro
+                   msgv2    = wa_row-almacen
+                   msgv3    = wa_row-cod_mat
+                   msgv4    = wa_row-lote ).
+
+      CLEAR: lv_mail.
+
+      CHECK wa_row-cantidad_cons IS NOT INITIAL OR wa_row-cantidad_cons = '0' OR wa_row-cantidad_cons(1) <> '-'.
+
+      CLEAR: lv_materialdocument, lv_matdocumentyear, t_goodsmvt_item, t_return.
+      REFRESH: t_goodsmvt_item, t_return.
+
+      wa_goodsmvt_header-pstng_date = sy-datum.
+      wa_goodsmvt_header-doc_date = sy-datum.
+
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wa_row-cod_mat
+        IMPORTING
+          output = wa_goodsmvt_item-material.
+
+
+*     Chequeamos el tipo de material y grupo de artículos
+      SELECT SINGLE mtart, matkl FROM mara
+        INTO @DATA(wa_mara)
+        WHERE matnr = @wa_goodsmvt_item-material.
+
+      CASE wa_row-operacion.
+        WHEN 'A' OR 'B'.
+          SELECT SINGLE * FROM ztmes_consumos
+              INTO @DATA(wa_ztconsumos)
+              WHERE werks = @wa_row-centro AND
+                    mtart = @wa_mara-mtart AND
+                    matkl = @wa_mara-matkl.
+
+        WHEN 'E' OR 'S' OR 'R'.
+          SELECT SINGLE * FROM ztmes_matprima
+            INTO @DATA(wa_ztlote_matprima)
+            WHERE werks = @wa_row-centro AND
+                  mtart = @wa_mara-mtart AND
+                  matkl = @wa_mara-matkl.
+      ENDCASE.
+
+      IF sy-subrc = 0.
+
+        wa_goodsmvt_item-stge_loc = wa_row-almacen.
+        wa_goodsmvt_item-plant = wa_row-centro.
+
+        i_string = wa_row-cantidad_cons.
+        REPLACE '.' IN i_string WITH ','.
+
+        CALL FUNCTION 'C14DG_CHAR_NUMBER_CONVERSION'
+          EXPORTING
+            i_string                   = i_string
+          IMPORTING
+            e_float                    = ld_e_float
+            e_dec                      = ld_e_dec
+            e_decimals                 = ld_e_decimals
+          EXCEPTIONS
+            wrong_characters           = 1
+            first_character_wrong      = 2
+            arithmetic_sign            = 3
+            multiple_decimal_separator = 4
+            thousandsep_in_decimal     = 5
+            thousand_separator         = 6
+            number_too_big             = 7
+            OTHERS                     = 8.
+        IF sy-subrc <> 0.
+*         Implement suitable error handling here
+        ELSE.
+          MOVE ld_e_dec TO wa_goodsmvt_item-entry_qnt.
+        ENDIF.
+
+        wa_goodsmvt_item-entry_uom = wa_row-umb.
+        wa_goodsmvt_item-batch = wa_row-lote.
+        wa_goodsmvt_item-item_text = wa_row-id_rollo_mes.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wa_row-ord_fab
+          IMPORTING
+            output = wa_goodsmvt_item-orderid.
+
+*      SELECT SINGLE rsnum rspos FROM resb
+*        INTO (wa_goodsmvt_item-reserv_no, wa_goodsmvt_item-res_item)
+*        WHERE aufnr = wa_goodsmvt_item-orderid.
+
+
+        READ TABLE t_ceco INTO DATA(wa_ceco) WITH KEY werks = wa_row-centro
+                                                      operacion = wa_row-operacion.
+        CASE wa_row-operacion.
+          WHEN 'A'. "alta de consumo.
+            wa_goodsmvt_item-move_type = '261'.
+            wa_goodsmvt_header-header_txt = 'Consumo MES'.
+
+          WHEN 'B'. "baja de consumo.
+            wa_goodsmvt_item-move_type = '262'.
+            wa_goodsmvt_header-header_txt = 'Consumo MES'.
+
+          WHEN 'E'. "entrada por regularización de inventario
+            wa_goodsmvt_item-move_type = '202'.
+            wa_goodsmvt_header-header_txt = 'Regularización MES'.
+*           wa_goodsmvt_item-GL_ACCOUNT = '7XXXX'.
+            wa_goodsmvt_item-costcenter = wa_ceco-costcenter. "'30003407'.
+*           wa_goodsmvt_item-MVT_IND = 'F'.
+
+          WHEN 'S'. ", salida por regularización de inventario
+            wa_goodsmvt_item-move_type = '201'.
+            wa_goodsmvt_header-header_txt = 'Regularización MES'.
+*           wa_goodsmvt_item-GL_ACCOUNT = '6XXXX'.
+            wa_goodsmvt_item-costcenter = wa_ceco-costcenter. "'30003407'.
+*           wa_goodsmvt_item-MVT_IND = 'F'.
+
+          WHEN 'R'. "regularización de inventario
+*           Obtenemos el stock
+            SELECT SINGLE * FROM mard
+              INTO @DATA(wa_mard)
+              WHERE matnr = @wa_goodsmvt_item-material AND
+                    werks = @wa_row-centro AND
+                    lgort = @wa_row-almacen.
+
+            lv_cant = wa_goodsmvt_item-entry_qnt - wa_mard-labst.
+
+*           calculamos la diferencia entre la cantidad MES y la cantidad actual SAP
+            IF lv_cant > 0.
+              wa_goodsmvt_item-move_type = '202'.
+            ELSEIF lv_cant < 0.
+              wa_goodsmvt_item-move_type = '201'.
+            ELSE.
+              EXIT.
+            ENDIF.
+
+            wa_goodsmvt_item-entry_qnt = abs( lv_cant ).
+            wa_goodsmvt_header-header_txt = 'Regularización MES'.
+            wa_goodsmvt_item-costcenter = wa_ceco-costcenter.
+        ENDCASE.
+
+        APPEND wa_goodsmvt_item TO t_goodsmvt_item.
+
+        CHECK wa_goodsmvt_item-move_type IS NOT INITIAL.
+
+        CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+          EXPORTING
+            goodsmvt_header  = wa_goodsmvt_header
+            goodsmvt_code    = '03'
+*           TESTRUN          = ' '
+*           GOODSMVT_REF_EWM =
+          IMPORTING
+*           GOODSMVT_HEADRET =
+            materialdocument = lv_materialdocument
+            matdocumentyear  = lv_matdocumentyear
+          TABLES
+            goodsmvt_item    = t_goodsmvt_item
+*           GOODSMVT_SERIALNUMBER         =
+            return           = t_return
+*           GOODSMVT_SERV_PART_DATA       =
+*           EXTENSIONIN      =
+          .
+
+        LOOP AT t_return ASSIGNING FIELD-SYMBOL(<msg>).
+          IF <msg>-message IS INITIAL.
+            MESSAGE ID <msg>-id TYPE 'S' NUMBER <msg>-number
+                    WITH <msg>-message_v1 <msg>-message_v2 <msg>-message_v3 <msg>-message_v4
+                    INTO <msg>-message.
+          ENDIF.
+          o_log->log( msgid    = <msg>-id
+                     msgty    = <msg>-type
+                     msgno    = <msg>-number
+                     message  = <msg>-message
+                     msgv1    = wa_row-centro
+                     msgv2    = wa_row-almacen
+                     msgv3    = wa_row-cod_mat
+                     msgv4    = wa_row-lote ).
+        ENDLOOP.
+        IF sy-subrc NE 0.
+          o_log->log(  msgty    = 'I'
+                       message  = 'Fin proceso'
+                       msgv1    = wa_row-centro
+                       msgv2    = wa_row-almacen
+                       msgv3    = wa_row-cod_mat
+                       msgv4    = wa_row-lote ).
+        ENDIF.
+
+        READ TABLE t_return INTO wa_return WITH KEY type = 'E'.
+        IF sy-subrc = 0.
+          lv_mail = 'X'.
+
+          CLEAR lv_extnumber.
+          CONCATENATE 'Centro' wa_row-centro 'Material' wa_row-cod_mat 'Operacion' wa_row-operacion INTO lv_extnumber
+            SEPARATED BY space.
+
+          CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+            EXPORTING
+              objeto    = 'ZSAP_MES'
+              subobjeto = 'ZCONSUMOS'
+              mensajes  = t_return[]
+              extnumber = lv_extnumber.
+
+
+        ELSE.
+          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+            EXPORTING
+              wait = 'X'.
+        ENDIF.
+      ELSE.
+        lv_mail = 'X'.
+
+        CASE wa_row-operacion.
+          WHEN 'A' OR 'B'.
+            wa_return-type = 'E'.
+            wa_return-id = 'ZPP'.
+            wa_return-number = '361'.
+            wa_return-message_v1 = wa_mara-mtart.
+            wa_return-message_v2 = wa_mara-matkl.
+            wa_return-message_v3 ='ZTMES_CONSUMOS'.
+            APPEND wa_return TO t_return .
+
+
+          WHEN 'E' OR 'S' OR 'R'.
+            wa_return-type = 'E'.
+            wa_return-id = 'ZPP'.
+            wa_return-number = '361'.
+            wa_return-message_v1 = wa_mara-mtart.
+            wa_return-message_v2 = wa_mara-matkl.
+            wa_return-message_v3 ='ZTMES_MATPRIMA'.
+            APPEND wa_return TO t_return .
+        ENDCASE.
+
+        CALL FUNCTION 'ZMFPP_GUARDAR_LOG'
+          EXPORTING
+            objeto    = 'ZSAP_MES'
+            subobjeto = 'ZCONSUMOS'
+            mensajes  = t_return[]
+            extnumber = lv_extnumber.
+      ENDIF.
+
+
+
+      IF lv_mail = 'X'.
+
+        READ TABLE t_mail INTO DATA(ls_mails) WITH KEY werks = wa_row-centro.
+        IF sy-subrc = 0.
+
+          IF ls_mails-mail_1 NE space.
+            APPEND ls_mails-mail_1 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_2 NE space.
+            APPEND ls_mails-mail_2 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_3 NE space.
+            APPEND ls_mails-mail_3 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_4 NE space.
+            APPEND ls_mails-mail_4 TO lt_addr.
+          ENDIF.
+          IF ls_mails-mail_5 NE space.
+            APPEND ls_mails-mail_5 TO lt_addr.
+          ENDIF.
+
+*         Inicialización de la clase
+          lo_send_email = cl_bcs=>create_persistent( ).
+
+
+*         cuerpo del mail
+          CLEAR: lt_message.
+          REFRESH: lt_message.
+          CONCATENATE 'Se ha producido un error en la interface MES – SAP (MP) a las' sy-uzeit 'del' sy-datum
+            INTO ls_message SEPARATED BY space.
+          APPEND ls_message TO lt_message.
+
+*APC20241120 Añadimos más información del log del proceso
+          IF NOT  lv_extnumber IS INITIAL. "Esta variable tiene datos de centro y material
+            ls_message =  lv_extnumber.
+            APPEND ls_message TO lt_message.
+          ENDIF.
+
+          LOOP AT t_return ASSIGNING FIELD-SYMBOL(<ret>). "Y eso es la salida de la BAPI
+            IF <ret>-message IS INITIAL.
+              MESSAGE ID <ret>-id TYPE 'S' NUMBER <ret>-number WITH <ret>-message_v1 <ret>-message_v2 <ret>-message_v3 <ret>-message_v4 INTO <ret>-message.
+            ENDIF.
+            ls_message =  <ret>-message.
+            APPEND ls_message TO lt_message.
+          ENDLOOP.
+
+
+*         Crear documento
+          lv_subject = 'Error integración MES – SAP (MP)'.
+
+          lo_document =  cl_document_bcs=>create_document( i_type    =  'HTM'
+                                                           i_subject =  lv_subject
+                                                           i_text    =  lt_message ).
+*         Enviar documento al email
+          lo_send_email->set_document( lo_document ).
+
+*         Añadir remitente
+*          SELECT SINGLE * FROM usr21
+*            INTO @DATA(wa_usr21)
+*            WHERE bname = @sy-uname.
+*
+*          IF sy-subrc = 0.
+*            SELECT SINGLE smtp_addr FROM adr6
+*              INTO  lv_sender
+*              WHERE addrnumber = wa_usr21-addrnumber AND
+*              persnumber = wa_usr21-persnumber.
+*          ENDIF.
+          lv_sender = 'sap@hinojosa.es'.
+
+          lo_sender = cl_cam_address_bcs=>create_internet_address( lv_sender  ).
+          lo_send_email->set_sender( i_sender = lo_sender ).
+
+*         Añadir destinatarios al email
+          DATA l_emails TYPE string.
+          LOOP AT lt_addr ASSIGNING FIELD-SYMBOL(<fs_addr>).
+            lo_recipient = cl_cam_address_bcs=>create_internet_address( <fs_addr> ).
+            lo_send_email->add_recipient( i_recipient = lo_recipient ).
+            __add_lista l_emails <fs_addr>.
+          ENDLOOP.
+
+
+*         Enviar email
+          TRY.
+              lv_sent_to_all = lo_send_email->send( i_with_error_screen = 'X' ).
+            CATCH cx_send_req_bcs .
+          ENDTRY.
+          o_log->log( p1 = 'Se ha enviado mail a ' p2 = l_emails msgty = 'I' ).
+          COMMIT WORK.
+        ELSE.
+          o_log->log( p1 = 'No se envian errores por mail porque no se encuentran destinatarios' msgty = 'E' ).
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+  ENDMETHOD.
+endclass. "ZCL_SI_CONSU_M2S_INB definition
+endclass. "ZCL_SI_CONSU_M2S_INB implementation

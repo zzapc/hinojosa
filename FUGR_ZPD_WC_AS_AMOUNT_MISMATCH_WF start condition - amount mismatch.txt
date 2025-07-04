@@ -1,0 +1,351 @@
+FUNCTION zpd_wc_as_amount_mismatch.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(IS_HEADER) LIKE  /COCKPIT/SHDR_IF STRUCTURE
+*"        /COCKPIT/SHDR_IF
+*"     REFERENCE(IC_PROCESS) TYPE  /COCKPIT/DPROCESS_TYPE
+*"     REFERENCE(IC_WEBCYCLE_ID) LIKE  /COCKPIT/SWC_WEBCYCLE-WC_ID
+*"  EXPORTING
+*"     REFERENCE(EB_START_WF) TYPE  BOOLE-BOOLE
+*"  TABLES
+*"      IT_ITEM STRUCTURE  /COCKPIT/SITEM_IF
+*"      IT_ACCOUNT STRUCTURE  /COCKPIT/SACCT_IF
+*"      IT_TAX STRUCTURE  /COCKPIT/STAX_IF
+*"      ET_MESSAGES STRUCTURE  BAPIRET2 OPTIONAL
+*"  EXCEPTIONS
+*"      ERROR_OCCURED
+*"----------------------------------------------------------------------
+  INCLUDE: /cockpit/constants.
+  DATA:
+    ls_header         LIKE /cockpit/thdr,
+    lt_item           LIKE TABLE OF /cockpit/titem WITH HEADER LINE,
+    lt_item_po        LIKE bapiekpo OCCURS 0 WITH HEADER LINE,
+    lt_po_hist_ttl    LIKE bapiekbes OCCURS 0 WITH HEADER LINE,
+    ls_item           LIKE /cockpit/titem,
+*        lt_item_merged       LIKE /cockpit/titem OCCURS 0 WITH HEADER LINE,
+    lt_accas          LIKE /cockpit/taccas OCCURS 0,
+    lt_accas_merged   LIKE /cockpit/taccas OCCURS 0,
+    lt_tax_merged     LIKE /cockpit/ttax OCCURS 0,
+    li_subrc          LIKE sy-subrc,
+    lb_merged         LIKE boole-boole,
+*        lt_messages          LIKE bapiret2 OCCURS 0,
+*        lp_unit_price        LIKE bapiekpo-net_price,
+    lp_local_amount   LIKE /cockpit/thdr-net_amount,
+    ls_header_po      LIKE bapiekkol,
+    lc_po_number      LIKE bapiekpo-po_number,
+    lc_msg_type       LIKE bapiret2-type,
+    lt_return         LIKE bapireturn OCCURS 0 WITH HEADER LINE,
+    lb_lebre          LIKE ekpo-webre,
+    ls_ekpo           LIKE ekpo,
+    ls_mrm_amck       LIKE mrm_amck,
+    lc_t001_waers     LIKE t001-waers,
+    lt_msgprot        TYPE mrm_tab_errprot,
+*   for SAP standard exit
+    ls_rbkpv          TYPE mrm_rbkpv,
+    ls_drseg          TYPE mmcr_drseg,
+    ls_history_buffer LIKE /cockpit/titem,
+    lv_bsart          LIKE ekko-bsart.
+
+  FIELD-SYMBOLS: <date> TYPE budat.
+
+* Only do this for MM documents
+  CHECK is_header-fi_mm_flg EQ con_type_mm.
+
+
+IF is_header-status     EQ 01 OR
+    is_header-status     EQ 02.
+
+* Map tables
+  CALL FUNCTION '/COCKPIT/MAP_EXTERN_TO_INTERN'
+    EXPORTING
+      i_str_header_if = is_header
+    IMPORTING
+      e_str_header    = ls_header
+    TABLES
+      i_tab_item_if   = it_item
+      e_tab_item      = lt_item.
+
+* Determine the corresponding po item
+  LOOP AT lt_item WHERE NOT po_item   IS INITIAL
+                    AND NOT po_number IS INITIAL.
+
+
+    CLEAR ls_mrm_amck.
+*   Get details of this purchase order
+    IF lt_item-po_number NE lc_po_number.
+      lc_po_number = lt_item-po_number.
+      CALL FUNCTION '/COCKPIT/BAPI_PO_GETDETAIL'
+        EXPORTING
+          purchaseorder          = lc_po_number
+          items                  = con_true
+          history                = con_true
+        IMPORTING
+          po_header              = ls_header_po
+        TABLES
+          po_items               = lt_item_po
+          po_item_history_totals = lt_po_hist_ttl
+          return                 = lt_return
+          et_messages            = et_messages
+        EXCEPTIONS
+          error_or_abort         = 1
+          OTHERS                 = 2.
+      IF sy-subrc NE 0.
+
+*        eb_start_wf = con_true.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+*   Different currencies in order and invoice
+    IF ls_header_po-currency NE is_header-currency.
+      IF ls_header_po-ex_rate_fx = con_true.
+        CONTINUE.
+      ELSE.
+        SELECT SINGLE waers FROM t001 INTO lc_t001_waers
+                      WHERE bukrs = is_header-comp_code.
+        IF lc_t001_waers = is_header-currency.
+          ls_mrm_amck-waers = ls_header_po-currency.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+*   Check if PO item exists
+    READ TABLE lt_item_po WITH KEY po_item = lt_item-po_item.
+    IF sy-subrc NE 0.
+      eb_start_wf = con_true.
+      EXIT.
+    ENDIF.
+
+*   for service PO item check Srv based IV
+    IF lt_item_po-item_cat EQ '9'.
+      PERFORM get_flag_lebre IN PROGRAM /cockpit/saplcheck
+                             USING lt_item_po
+                             CHANGING lb_lebre.
+    ENDIF.
+*   Different units
+*   (units can be different if limit PO or service PO with GR based IV)
+    IF lt_item_po-unit NE lt_item-po_unit AND
+       NOT ( lt_item_po-item_cat   EQ '1' OR
+             lt_item_po-item_cat   EQ '9' ).
+
+      CONTINUE.
+    ENDIF.
+
+*     Read PO history totals
+    CLEAR lt_po_hist_ttl.
+    READ TABLE lt_po_hist_ttl
+         WITH KEY po_item   = lt_item-po_item
+                  serial_no = '00'.
+
+    ls_item = lt_item.
+
+
+*     Fill check structure
+    PERFORM mrm_amck_qack_fill IN PROGRAM /cockpit/saplcheck
+                               TABLES   lt_item
+                                        et_messages
+                               USING    ls_header
+                                        ls_item
+                                        lt_item_po
+                                        lt_po_hist_ttl
+                                        lc_msg_type
+                               CHANGING ls_mrm_amck
+                                        ls_history_buffer.
+    IF ls_mrm_amck IS INITIAL.
+      eb_start_wf = con_true.
+      EXIT.
+    ENDIF.
+* for services with Srv.-based IV
+    IF lt_item_po-item_cat  EQ '9'
+       AND lb_lebre EQ con_true.
+      ls_mrm_amck-noquantity = con_false.
+    ENDIF.
+
+* check not invoice and bsmng = 0.
+    IF is_header-invoice_ind EQ con_true
+       AND ls_mrm_amck-noquantity EQ con_false
+       AND ls_mrm_amck-bsmng IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+*     Overflow?
+    IF ls_mrm_amck-bpmng EQ '9999999999.999'.
+
+      eb_start_wf = con_true.
+
+      EXIT.
+    ENDIF.
+
+*     INV not in PO currency
+    IF ls_header_po-currency NE is_header-currency
+        AND lt_item-cond_type IS INITIAL.
+      ASSIGN COMPONENT 'WWERT' OF STRUCTURE ls_mrm_amck TO <date>.
+      IF sy-subrc <> 0.
+        ASSIGN COMPONENT 'BUDAT' OF STRUCTURE ls_mrm_amck TO <date>.
+      ENDIF.
+      IF is_header-currency = lc_t001_waers.
+        lp_local_amount = ls_mrm_amck-netwr.
+        CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+          EXPORTING
+            date             = <date>
+            foreign_amount   = lp_local_amount
+            foreign_currency = ls_header_po-currency
+            local_currency   = is_header-currency
+          IMPORTING
+            local_amount     = ls_mrm_amck-netwr
+          EXCEPTIONS
+            error_message    = 1
+            OTHERS           = 1.
+        CHECK sy-subrc = 0.
+        IF ls_mrm_amck-wewwr = ls_mrm_amck-wrbtr
+          AND ls_mrm_amck-wewwr > 0.
+          lp_local_amount = ls_mrm_amck-wewwr.
+          CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+            EXPORTING
+              date             = <date>
+              foreign_amount   = lp_local_amount
+              foreign_currency = ls_header_po-currency
+              local_currency   = is_header-currency
+            IMPORTING
+              local_amount     = ls_mrm_amck-wewwr
+            EXCEPTIONS
+              error_message    = 1
+              OTHERS           = 1.
+          CHECK sy-subrc = 0.
+        ENDIF.
+      ELSE.
+*       INV <> PO and <> T001-WAERS
+        lp_local_amount = ls_mrm_amck-netwr.
+        CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+          EXPORTING
+            date             = <date>
+            foreign_amount   = lp_local_amount
+            foreign_currency = ls_header_po-currency
+            local_currency   = lc_t001_waers
+          IMPORTING
+            local_amount     = ls_mrm_amck-netwr
+          EXCEPTIONS
+            error_message    = 1
+            OTHERS           = 1.
+        CHECK sy-subrc = 0.
+        IF ls_mrm_amck-wewwr = ls_mrm_amck-wrbtr
+           AND ls_mrm_amck-wewwr > 0.
+          lp_local_amount = ls_mrm_amck-wewwr.
+          CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+            EXPORTING
+              date             = <date>
+              foreign_amount   = lp_local_amount
+              foreign_currency = ls_header_po-currency
+              local_currency   = lc_t001_waers
+            IMPORTING
+              local_amount     = ls_mrm_amck-wewwr
+            EXCEPTIONS
+              error_message    = 1
+              OTHERS           = 1.
+          CHECK sy-subrc = 0.
+        ENDIF.
+
+        lp_local_amount = ls_mrm_amck-netwr.
+        CALL FUNCTION 'CONVERT_TO_FOREIGN_CURRENCY'
+          EXPORTING
+            date             = <date>
+            foreign_currency = is_header-currency
+            local_amount     = lp_local_amount
+            local_currency   = lc_t001_waers
+            rate             = is_header-kursf
+          IMPORTING
+            foreign_amount   = ls_mrm_amck-netwr
+          EXCEPTIONS
+            error_message    = 1
+            OTHERS           = 1.
+
+        CHECK sy-subrc = 0.
+        IF ls_mrm_amck-wewwr > 0.
+          lp_local_amount = ls_mrm_amck-wewwr.
+          CALL FUNCTION 'CONVERT_TO_FOREIGN_CURRENCY'
+            EXPORTING
+              date             = <date>
+              foreign_currency = is_header-currency
+              local_amount     = lp_local_amount
+              local_currency   = lc_t001_waers
+            IMPORTING
+              foreign_amount   = ls_mrm_amck-wewwr
+            EXCEPTIONS
+              error_message    = 1
+              OTHERS           = 1.
+          CHECK sy-subrc = 0.
+        ENDIF.
+      ENDIF.
+      IF lt_item_po-gr_basediv = con_true
+           AND lt_item_po-item_cat EQ '9'.
+        ls_mrm_amck-wenwr = ls_mrm_amck-netwr.
+      ENDIF.
+    ENDIF.
+
+*     SAP price check
+*     first call SAP standard exit
+    ls_rbkpv-lifnr = ls_header_po-vendor.
+    ls_drseg-lifnr = ls_rbkpv-lifnr.
+    ls_drseg-ebeln = lt_item_po-po_number.
+    ls_drseg-ebelp = lt_item_po-po_item.
+    ls_drseg-mwskz = ls_item-tax_code.
+    ls_drseg-txjcd = ls_item-taxjurcode.
+    ls_drseg-matnr = lt_item_po-material.
+    ls_drseg-matkl = lt_item_po-mat_grp.
+    ls_drseg-werks = lt_item_po-plant.
+
+    IF ls_item-retpo EQ con_true.
+      ls_mrm_amck-retpo = con_true.
+    ENDIF.
+
+    MOVE-CORRESPONDING: ls_mrm_amck TO ls_rbkpv,
+                        ls_mrm_amck TO ls_drseg.
+
+    CALL FUNCTION 'EXIT_SAPLMR1M_001'
+      EXPORTING
+        i_rbkpv  = ls_rbkpv
+        i_ydrseg = ls_drseg
+      EXCEPTIONS
+        OTHERS   = 2.
+
+    IF sy-subrc = 0.
+      MOVE-CORRESPONDING: ls_rbkpv TO ls_mrm_amck,
+                          ls_drseg TO ls_mrm_amck.
+    ENDIF.
+
+    CALL FUNCTION 'MRM_AMOUNT_CHECK'
+      EXPORTING
+        i_mrm_amck    = ls_mrm_amck
+      TABLES
+        t_errprot     = lt_msgprot
+      EXCEPTIONS
+        error_message = 1
+        OTHERS        = 2.
+    IF sy-subrc NE 0.
+      eb_start_wf = con_true.
+      EXIT.
+    ENDIF.
+
+  ENDLOOP.
+
+**********************************TIPOS DE PEDIDO*******
+   LOOP AT lt_item WHERE NOT po_item   IS INITIAL
+                    AND NOT po_number IS INITIAL.
+
+   IF sy-tabix = 1.
+     SELECT SINGLE bsart FROM ekko
+      INTO lv_bsart WHERE
+      ebeln EQ lt_item-po_number .
+      IF lv_bsart <> 'ZPE2'.
+        eb_start_wf = con_false.
+      ENDIF.
+      EXIT.
+   ENDIF.
+**********************************
+  ENDLOOP.
+
+  ELSE. "STATUS 1 o 2
+    eb_start_wf = con_false.
+  ENDIF.
+ENDFUNCTION.

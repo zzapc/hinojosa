@@ -1,0 +1,225 @@
+FUNCTION zswm_post_id_delivery.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(TCODE) TYPE  TCODE OPTIONAL
+*"     VALUE(UNAME) TYPE  SY-UNAME DEFAULT SY-UNAME
+*"     VALUE(VBELN) TYPE  VBELN
+*"     VALUE(OPERARIO) TYPE  ZLNUM_OPER
+*"     VALUE(TKNUM) TYPE  TKNUM OPTIONAL
+*"     VALUE(CERRAR_TRANSPORTE) TYPE  FLAG OPTIONAL
+*"     VALUE(NO_CERRAR_TRANSPORTE) TYPE  FLAG OPTIONAL
+*"     VALUE(NUM_BULTOS) TYPE  I OPTIONAL
+*"     VALUE(NO_GEN_LOG) TYPE  FLAG OPTIONAL
+*"  EXPORTING
+*"     VALUE(ERROR) TYPE  FLAG
+*"     VALUE(TT_LOG) TYPE  BAPIRET2_TT
+*"----------------------------------------------------------------------
+  PERFORM break USING 'ZSWM_POST_ID_DELIVERY'.
+
+  REFRESH tt_log_global.
+*  DATA:
+*    header_data    LIKE  bapiibdlvhdrcon,
+*    header_control LIKE  bapiibdlvhdrctrlcon,
+*    delivery       LIKE  bapiibdlvhdrcon-deliv_numb.
+*    t_return       LIKE bapiret2 OCCURS 0 WITH HEADER LINE
+
+  vbeln = |{ vbeln  ALPHA = IN }|.
+* Intentamos contabilizar entrega &
+  PERFORM mensaje USING 'I' 'ZSWM_UI5' '052'  vbeln space space space CHANGING tt_log_global[].
+
+  SELECT * INTO TABLE @DATA(tt_vekp) FROM vekp WHERE vpobjkey EQ @vbeln
+                                                 AND status   NE '0060'.
+  SELECT SINGLE lgnum INTO @DATA(lgnum) FROM likp WHERE vbeln EQ @vbeln.
+  DESCRIBE TABLE tt_vekp LINES DATA(n_bultos_entrega).
+  IF n_bultos_entrega > num_bultos.
+*    Nº de bul. leídos & menor que expedidos &. Hablar con & (Imposible CONTA)
+    DATA: n_bultos_5_c(5),
+          n_bultos_e_c(5).
+    WRITE n_bultos_entrega TO n_bultos_e_c LEFT-JUSTIFIED.
+    WRITE num_bultos       TO n_bultos_5_c LEFT-JUSTIFIED.
+    SELECT SINGLE lifnr INTO @DATA(lifnr) FROM likp WHERE vbeln EQ @vbeln.
+    SELECT SINGLE name1 INTO @DATA(name1) FROM lfa1 WHERE lifnr EQ @lifnr.
+    PERFORM mensaje USING 'E' 'ZSWM_UI5' '050'  n_bultos_5_c n_bultos_e_c name1 space CHANGING tt_log_global[].
+    MOVE abap_true TO error.
+    APPEND LINES OF tt_log TO tt_log_global.
+  ELSE.
+    DATA  sw_cerrar_transporte.
+    CLEAR sw_cerrar_transporte.
+*   ----------------------------------------------*
+*   Tema de cerrar el transporte
+*   ----------------------------------------------*
+*   A) El transporte viene informado y se quiere cerrar
+    IF  tknum IS NOT INITIAL
+    AND cerrar_transporte EQ abap_true.
+*     La variable tknum_po es la lectura de la otra llamada al mismo MF
+*     Si es igual, significa que se dio error y se quiere cerrar a pesar de ello
+      IF tknum_po EQ tknum.
+        MOVE abap_true TO sw_cerrar_transporte.
+      ELSE.
+*       Miramos que entregas tiene más el transporte y vemos el nº de ellas sin contabilizar
+        SELECT * INTO TABLE @DATA(tt_vttp) FROM vttp WHERE tknum EQ @tknum.
+        DATA n_entregas_sin_contabilizar TYPE i.
+        n_entregas_sin_contabilizar = 0.
+        LOOP AT tt_vttp INTO DATA(rt_vttp).
+*         Son entregas de salida
+          DATA vbeln_ent TYPE vbeln.
+          SELECT vbeln INTO vbeln_ent  UP TO 1 ROWS FROM vbfa WHERE vbelv EQ rt_vttp-vbeln
+                                                            AND vbtyp_n EQ '7'
+                                                            AND vbtyp_v EQ 'J'.
+          ENDSELECT.
+          CHECK vbeln_ent NE vbeln.
+          SELECT SINGLE wbstk INTO @DATA(wbstk) FROM vbuk WHERE vbeln EQ @vbeln_ent.
+          CHECK wbstk NE 'C'.
+          ADD 1 TO n_entregas_sin_contabilizar.
+        ENDLOOP.
+        IF n_entregas_sin_contabilizar > 0.
+          MOVE abap_true TO error.
+*         Transporte & con albaranes sin recepcionar. ¿Quiere cerrar el transporte?
+          PERFORM mensaje USING 'E' 'ZSWM_UI5' '051' tknum space space space CHANGING tt_log_global[].
+          tknum_po = tknum.
+          APPEND LINES OF tt_log TO tt_log_global.
+        ELSE.
+          MOVE abap_true TO sw_cerrar_transporte.
+        ENDIF.
+      ENDIF.
+*   B) EE que viene de un STO y es la única ==> cerramos transporte
+    ELSEIF tknum IS NOT INITIAL
+       AND no_cerrar_transporte NE abap_true.
+      SELECT * INTO TABLE tt_vttp FROM vttp WHERE tknum EQ tknum.
+      DELETE tt_vttp WHERE vbeln EQ vbeln.
+      DESCRIBE TABLE tt_vttp LINES DATA(n_entregas).
+      IF n_entregas <= 0. MOVE abap_true TO sw_cerrar_transporte. ENDIF.
+    ENDIF.
+    IF sw_cerrar_transporte EQ abap_true.
+*      Contabilizaremos entrega & y cerraremos transporte &
+      PERFORM mensaje USING 'I' 'ZSWM_UI5' '053' vbeln tknum space space CHANGING tt_log_global[].
+    ENDIF.
+    IF error NE abap_true.
+*     cambiar jtm 12.03.2022 con la contabilización mediante BAPI BAPI_INB_DELIVERY_CONFIRM_DEC se marcan para borrado las HUS
+*     con lo que anula el tema de WM con la user-exit para heredar nº de HUS ZXLTOU13
+      clear_bi.
+*      dynpro 'SAPMV50A' '4104'.
+*      campo  'LIKP-VBELN' vbeln.
+*      boton  '=WABU_T'.
+      SELECT SINGLE vbtyp INTO @DATA(vbtyp) FROM likp WHERE vbeln EQ @vbeln.
+      CASE vbtyp.
+        WHEN '7'.
+          dynpro 'SAPMV50A' '4104'.
+          campo  'LIKP-VBELN' vbeln.
+          boton  '=WABU_T'.
+
+          call_bi 'VL32N' 'N'.
+        WHEN OTHERS.
+          dynpro 'SAPMV50A' '4004'.
+          campo  'LIKP-VBELN' vbeln.
+          boton  '=WABU_T'.
+
+          call_bi 'VL02N' 'N'.
+      ENDCASE.
+      LOOP AT t_bapiret2 WHERE type EQ  'E'
+                            OR type EQ  'A'.
+      ENDLOOP.
+*      header_data-deliv_numb     =
+*      header_control-deliv_numb  =
+*      delivery                   = vbeln.
+*      header_control-post_gi_flg = abap_true.
+*      CALL FUNCTION 'BAPI_INB_DELIVERY_CONFIRM_DEC'
+*        EXPORTING
+*          header_data    = header_data
+*          header_control = header_control
+*          delivery       = delivery
+**         TECHN_CONTROL  =
+**         HEADER_CONTROL_SPL         =
+*        TABLES
+**         HEADER_PARTNER =
+**         HEADER_PARTNER_ADDR        =
+**         HEADER_DEADLINES           =
+**         ITEM_DATA      =
+**         ITEM_CONTROL   =
+**         ITEM_SERIAL_NO =
+**         HANDLING_UNIT_HEADER       =
+**         HANDLING_UNIT_ITEM         =
+**         HANDLING_UNIT_SERNO        =
+**         EXTENSION1     =
+**         EXTENSION2     =
+*          return         = t_return
+**         TOKENREFERENCE =
+**         ITEM_DATA_SPL  =
+*        .
+*      LOOP AT t_return WHERE type EQ 'E'
+*                         OR  type EQ 'A'.
+*
+*      ENDLOOP.
+      IF sy-subrc EQ 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+*       IMPORTING
+*         RETURN        =
+          .
+        LOOP AT t_bapiret2.
+          PERFORM mensaje USING t_bapiret2-type t_bapiret2-id t_bapiret2-number t_bapiret2-message_v1 t_bapiret2-message_v2 t_bapiret2-message_v3 t_bapiret2-message_v4 CHANGING tt_log_global[].
+        ENDLOOP.
+*        APPEND lines of t_return TO tT_log_global.
+        MOVE abap_true TO error.
+      ELSE.
+*       --------------------------------------------------------------------*
+*       add jtm 21.03.2023 JTM AMPLWM002 Ubicar entradas RF
+        CALL FUNCTION 'ZSWM_UI5_UBICAR_ENTRADA'
+          EXPORTING
+            lgnum = lgnum
+            vbeln = vbeln
+*           QRFC  = 'X'
+*           COMMIT        = ''
+*         IMPORTING
+*           ERROR =
+*           TT_LOG        =
+          .
+*       fin de add jtm 21.03.2023 JTM AMPLWM002 Ubicar entradas RF
+*       --------------------------------------------------------------------*
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+*       Contabilizado documento &.
+        PERFORM mensaje USING 'I' 'ZSWM_UI5' '034' vbeln space space space CHANGING tt_log_global[].
+        IF sw_cerrar_transporte EQ abap_true.
+*          PERFORM close_shipment USING tknum ' ' CHANGING tt_log_global error.
+          CALL FUNCTION 'ZSWM_UPDATE_SHIPMENT_STATUS'
+            EXPORTING
+              i_tknum = tknum
+              i_paso  = 7 "4. Status de Fin de transporte
+*             I_LGNUM =
+            IMPORTING
+              error   = error
+              tt_log  = tt_log.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  tt_log[] = tt_log_global[].
+  CHECK no_gen_log NE abap_true.
+  DATA fval TYPE bdc_fval.
+  WRITE num_bultos TO fval LEFT-JUSTIFIED.
+  CALL METHOD zcl_ui5_log=>save_log
+    EXPORTING
+      mf                = 'ZSWM_POST_ID_DELIVERY'
+*     uname             = SY-UNAME
+*     statu             = 'X'
+      tcode             = tcode
+      vbeln             = vbeln
+      tknum             = tknum
+      lgnum             = lgnum
+      operario          = operario
+      cerrar_transporte = cerrar_transporte
+      fieldname         = 'NUM_BULTOS'
+      fval              = fval
+*     reg_parametros    =
+*     reg_funcionalidades =
+*     tt_pedidos        =
+*     tt_picking        =
+      tt_log            = tt_log
+      error             = error
+      commit            = 'X'.
+
+
+ENDFUNCTION.

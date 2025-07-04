@@ -1,0 +1,382 @@
+*&---------------------------------------------------------------------*
+*&  Include           ZRPP0027_CLASS
+*&---------------------------------------------------------------------*
+
+
+************************************************
+* dynpro 300
+************************************************
+
+CLASS lcl_toolbar_event_receiver DEFINITION.
+
+  PUBLIC SECTION.
+*   Define an event handler method to react to fired function codes
+*     of the toolbar.                   .
+    METHODS: on_function_selected
+                FOR EVENT function_selected OF cl_gui_toolbar
+      IMPORTING fcode.
+
+    METHODS handle_node_double_click
+                FOR EVENT node_double_click OF cl_gui_alv_tree
+      IMPORTING node_key sender.
+ENDCLASS.
+
+
+
+CLASS lcl_toolbar_event_receiver IMPLEMENTATION.
+
+  METHOD on_function_selected.
+    DATA: lt_selected_nodes TYPE lvc_t_nkey,
+          l_selected_node   TYPE lvc_nkey,
+          l_rc              TYPE c,
+          l_sy_sub          TYPE syst_subrc,
+          l_user_bloqueo    TYPE char12.
+
+    DATA: wa_nodo_sel TYPE zepp0027_cuerpo.
+
+    DATA: lv_error TYPE xfeld.
+
+    CASE fcode.
+      WHEN 'DELETE'.
+*       obtenemos el nodo seleccionado
+        CALL METHOD g_alv_tree->get_selected_nodes
+          CHANGING
+            ct_selected_nodes = lt_selected_nodes.
+
+        CALL METHOD cl_gui_cfw=>flush.
+
+*       obtenemos el contenido del nodo seleccionado
+        READ TABLE lt_selected_nodes INTO l_selected_node INDEX 1.
+        IF sy-subrc EQ 0.
+          CALL METHOD g_alv_tree->get_outtab_line
+            EXPORTING
+              i_node_key    = l_selected_node
+            IMPORTING
+              e_outtab_line = wa_nodo_sel.
+
+          IF wa_nodo_sel-aufnr IS INITIAL.
+            MESSAGE i000(0k) WITH text-030. "Seleccione un lote.
+          ELSE.
+
+* Chequeo de bloqueo del lote rollo - CMS - 05-05-2020
+            PERFORM check_bloqueos_rollo  CHANGING l_sy_sub
+                                                      l_user_bloqueo.
+            CHECK l_sy_sub = 0.
+*            IF l_sy_sub <> 0.
+*              MESSAGE e353(zpp) DISPLAY LIKE 'I' WITH gv_lote l_user_bloqueo. "Atención! Lote & bloqueado. Notificar más tarde.
+*              EXIT.
+*            ENDIF.
+*
+            CALL FUNCTION 'POPUP_TO_CONFIRM_STEP'
+              EXPORTING
+                defaultoption  = '2'
+                textline1      = text-018 "¿Realmente desea borrar el lote seleccionado?'(902)
+*               textline2      = 'this node and all its subnodes?'(903)
+                titel          = text-019 "'Confirmación'(904)
+                cancel_display = ' '
+              IMPORTING
+                answer         = l_rc.
+            IF l_rc EQ 'J'.
+              PERFORM eliminar_notificaciones USING wa_nodo_sel
+                                              CHANGING lv_error.
+
+              wa_nodo_sel-matnr = |{ wa_nodo_sel-matnr ALPHA = IN }|.
+
+            IF wa_nodo_sel-tipo = 'R' OR wa_nodo_sel-tipo = ' '.
+              DELETE FROM ztpp0076 WHERE charg = wa_nodo_sel-charg AND matnr = wa_nodo_sel-matnr AND aufnr = wa_nodo_sel-aufnr.
+
+            ELSEIF wa_nodo_sel-tipo = 'P'.
+              DELETE FROM ztpp0076 WHERE charg = wa_nodo_sel-charg AND matnr = '000000000002001764' AND aufnr = wa_nodo_sel-aufnr.
+
+            ENDIF.
+
+              IF lv_error IS INITIAL.
+                CALL METHOD g_alv_tree->delete_subtree
+                  EXPORTING
+                    i_node_key = l_selected_node.
+
+*                 update frontend
+                CALL METHOD g_alv_tree->frontend_update.
+              ELSE.
+                PERFORM mostrar_log.
+
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ELSE.
+          MESSAGE i000(0k) WITH text-030. "Seleccione un lote.
+        ENDIF.
+
+        CALL FUNCTION 'DEQUEUE_ALL'
+*   EXPORTING
+*     _SYNCHRON       = ' '
+          .
+
+      WHEN 'REIMPRIMIR'.
+*       obtenemos el nodo seleccionado
+        CALL METHOD g_alv_tree->get_selected_nodes
+          CHANGING
+            ct_selected_nodes = lt_selected_nodes.
+
+        CALL METHOD cl_gui_cfw=>flush.
+
+*       obtenemos el contenido del nodo seleccionado
+        READ TABLE lt_selected_nodes INTO l_selected_node INDEX 1.
+        IF sy-subrc EQ 0.
+          CALL METHOD g_alv_tree->get_outtab_line
+            EXPORTING
+              i_node_key    = l_selected_node
+            IMPORTING
+              e_outtab_line = wa_nodo_sel.
+
+          IF wa_nodo_sel-aufnr IS INITIAL.
+            MESSAGE i000(0k) WITH text-030. "Seleccione un lote.
+          ELSE.
+*            READ TABLE gt_cuerpo INTO wa_nodo_sel INDEX l_selected_node.
+*            IF sy-subrc = 0.
+*             imprimimos la etiqueta
+            CASE wa_nodo_sel-bwart.
+              WHEN '101'.
+                PERFORM reimprimir_etiq_bobina USING wa_nodo_sel.
+
+              WHEN  '531'.
+                PERFORM imprimir_etiq_pulper_btn_reimp USING wa_nodo_sel.
+
+            ENDCASE.
+*            ENDIF.
+          ENDIF.
+        ELSE.
+          MESSAGE i000(0k) WITH text-030. "Seleccione un lote.
+        ENDIF.
+      WHEN 'REIMPOBS'.
+        CALL METHOD g_alv_tree->get_selected_nodes
+          CHANGING
+            ct_selected_nodes = lt_selected_nodes.
+
+        CALL METHOD cl_gui_cfw=>flush.
+
+*       obtenemos el contenido del nodo seleccionado
+        READ TABLE lt_selected_nodes INTO l_selected_node INDEX 1.
+        IF sy-subrc EQ 0.
+          CALL METHOD g_alv_tree->get_outtab_line
+            EXPORTING
+              i_node_key    = l_selected_node
+            IMPORTING
+              e_outtab_line = wa_nodo_sel.
+
+          IF wa_nodo_sel-aufnr IS INITIAL.
+            MESSAGE i000(0k) WITH text-030. "Seleccione un lote.
+          ELSE.
+* Obtenemos el material del lote, para luego antes de la impresión validar si es cabo o no.
+            SELECT SINGLE matnr
+              INTO g_matnr_etiq
+              FROM mchb
+              WHERE charg = wa_nodo_sel-charg AND
+                    werks = gv_werks.
+* Obtenemos aufnr, matnr, lote para reimpresión de bobina
+              gv_aufnr_bob = wa_nodo_sel-aufnr.
+              gv_matnr_bob = wa_nodo_sel-matnr.
+              gv_lote_bob  = wa_nodo_sel-charg.
+
+* Obtenemos el cliente
+            SELECT SINGLE zzkunnr1
+              INTO g_kunnr_etiq
+              FROM aufk
+              WHERE aufnr = wa_nodo_sel-aufnr.
+* Si es cabo error, sino procesamos etiqueta laboratorio
+            IF zcl_utils_hpap_pp=>es_cabo( i_matnr = g_matnr_etiq
+                                           i_kunnr = g_kunnr_etiq ) = 'X'.
+              MESSAGE i334(zpp) DISPLAY LIKE 'E'. "No se permite imprimir etiqueta de muestra para cabo.
+            ELSE.
+              IF wa_nodo_sel-tipo = 'R'. " Reimpresión de un reproceso, marcamos flag
+                PERFORM reimprimir_etiq_obs_lab USING wa_nodo_sel
+                                                      'X'.  "Bobina a reprocesar
+              ELSEIF wa_nodo_sel-tipo <> 'P'.
+                PERFORM reimprimir_etiq_obs_lab USING wa_nodo_sel
+                                                      ' '.  "Bobina a reprocesar
+              ELSE.
+                MESSAGE e335(zpp). "No se permite imprimir etiqueta de muestra para bobina pulper.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+      WHEN 'DEFBOBINA'.
+*       obtenemos el nodo seleccionado
+        CALL METHOD g_alv_tree->get_selected_nodes
+          CHANGING
+            ct_selected_nodes = lt_selected_nodes.
+
+        CALL METHOD cl_gui_cfw=>flush.
+
+*       obtenemos el contenido del nodo seleccionado
+        READ TABLE lt_selected_nodes INTO l_selected_node INDEX 1.
+        IF sy-subrc EQ 0.
+          CALL METHOD g_alv_tree->get_outtab_line
+            EXPORTING
+              i_node_key    = l_selected_node
+            IMPORTING
+              e_outtab_line = wa_nodo_sel.
+
+          IF wa_nodo_sel-aufnr IS INITIAL.
+            MESSAGE i000(0k) WITH text-030. "Seleccione un lote.
+          ELSE.
+
+            wa_nodo_sel-matnr = |{ wa_nodo_sel-matnr ALPHA = IN }|.
+
+            "Se recuperan los datos del lote seleccionado y se pasan a la pantalla de defectos de bobina
+
+            CLEAR gs_ztpp0076.
+
+            SELECT SINGLE *
+              FROM ztpp0076
+              INTO gs_ztpp0076
+              WHERE aufnr = wa_nodo_sel-aufnr AND
+                    matnr = wa_nodo_sel-matnr AND
+                    charg = wa_nodo_sel-charg.
+
+              gv_aufnr_bob                = wa_nodo_sel-aufnr.
+              gv_matnr_bob                = wa_nodo_sel-matnr.
+              gv_lote_bob                 = wa_nodo_sel-charg.
+
+            IF sy-subrc = 0.
+              gv_modification = 'X'.
+
+              " Si bobina es de reproceso
+              IF wa_nodo_sel-tipo = 'R'.
+                CLEAR gs_dyn601.
+                "Recuperamos orden material y loto de bobina para pantalla defectos bobina
+
+                gs_dyn601-todo_ancho        = gs_ztpp0076-zpos_a.
+                gs_dyn601-sin_etiqueta      = gs_ztpp0076-zpos_s.
+                gs_dyn601-centro            = gs_ztpp0076-zpos_c.
+                gs_dyn601-lado_etiqueta     = gs_ztpp0076-zpos_e.
+                gs_dyn601-diametro          = gs_ztpp0076-zpos_d.
+                gs_dyn601-distancia_s       = gs_ztpp0076-zdist_s.
+                gs_dyn601-distancia_e       = gs_ztpp0076-zdist_e.
+                gs_dyn601-distancia_d       = gs_ztpp0076-zdist_d.
+                gs_dyn601-defecto_alta      = gs_ztpp0076-motivo_rep.
+                gs_dyn601-defecto_mod       = gs_ztpp0076-motivo_rep.
+                gs_dyn601-container_obs_601 = gs_ztpp0076-zobs_bobina.
+
+                CALL SCREEN 0601.
+
+                " Si bobina es buena, pulper o cabo
+              ELSE.
+                CLEAR gs_dyn602.
+
+                gs_dyn602-container_obs_602 = gs_ztpp0076-zobs_bobina.
+                gv_tipo_bob = wa_nodo_sel-tipo.
+
+                CALL SCREEN 0602.
+              ENDIF.
+            ELSE.
+              CLEAR gs_dyn602.
+
+              gv_modification = ' '.
+              gv_tipo_bob = wa_nodo_sel-tipo.
+
+              CALL SCREEN 0602.
+            ENDIF.
+
+
+
+
+
+
+          ENDIF.
+        ENDIF.
+
+    ENDCASE.
+  ENDMETHOD.
+
+
+  METHOD handle_node_double_click.
+
+    DATA: lt_selected_nodes TYPE lvc_t_nkey,
+          l_selected_node   TYPE lvc_nkey,
+          l_rc              TYPE c.
+
+    DATA: wa_nodo_sel TYPE zepp0027_cuerpo.
+
+
+*       obtenemos el nodo seleccionado
+    CALL METHOD g_alv_tree->get_selected_nodes
+      CHANGING
+        ct_selected_nodes = lt_selected_nodes.
+
+    CALL METHOD cl_gui_cfw=>flush.
+
+*   obtenemos el contenido del nodo seleccionado
+    READ TABLE lt_selected_nodes INTO l_selected_node INDEX 1.
+    IF sy-subrc EQ 0.
+      CALL METHOD g_alv_tree->get_outtab_line
+        EXPORTING
+          i_node_key    = l_selected_node
+        IMPORTING
+          e_outtab_line = wa_nodo_sel.
+
+      IF wa_nodo_sel-aufnr IS INITIAL.
+        READ TABLE gt_header  INTO wa_header WITH KEY nkey = l_selected_node.
+
+        gv_orden_300_int = wa_header-aufnr.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = wa_header-aufnr
+          IMPORTING
+            output = gv_orden_300.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = wa_header-plnbez
+          IMPORTING
+            output = gv_matnr_300.
+
+*        gv_orden_300 = wa_header-aufnr.
+*        gv_matnr_300 = wa_header-plnbez.
+        gv_maktx_300 = wa_header-maktx.
+
+*        CONCATENATE wa_header-zebeln1 wa_header-zebelp1 INTO gv_pedpos_300 SEPARATED BY '/'.
+*        gv_ped_300 = wa_header-zebeln1.
+*        gv_pos_300 = wa_header-zebelp1.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = wa_header-zebeln1
+          IMPORTING
+            output = gv_ped_300.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = wa_header-zebelp1
+          IMPORTING
+            output = gv_pos_300.
+
+        CONCATENATE gv_ped_300 gv_pos_300 INTO gv_pedpos_300 SEPARATED BY '/'.
+
+
+        gv_kunnr_300 = wa_header-zkunnr1.
+*       gv_cli_name_300 = wa_header-name1.
+        CONCATENATE wa_header-zkunnr1 wa_header-name1 INTO gv_cli_name_300 SEPARATED BY '-'.
+
+        LEAVE TO SCREEN '0300'.
+
+      ELSE.
+        CLEAR: gv_orden_300, gv_orden_300_int, gv_matnr_300, gv_maktx_300, gv_pedpos_300,
+               gv_ped_300, gv_pos_300, gv_kunnr_300, gv_cli_name_300.
+
+        MESSAGE i000(0k) WITH text-017. "'Please select a node.'(900).
+      ENDIF.
+    ELSE.
+      CLEAR: gv_orden_300, gv_orden_300_int, gv_matnr_300, gv_maktx_300, gv_pedpos_300,
+             gv_ped_300, gv_pos_300, gv_kunnr_300, gv_cli_name_300.
+
+      MESSAGE i000(0k) WITH text-017. "'Please select a node.'(900).
+    ENDIF.
+
+  ENDMETHOD.
+
+
+
+ENDCLASS.

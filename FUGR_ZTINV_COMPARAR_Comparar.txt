@@ -1,0 +1,172 @@
+FUNCTION ztinv_comparar.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(LT_FICH) TYPE  ZTINV0001_PI
+*"     REFERENCE(DOCUM) TYPE  ZTINV_CI-DOCUM
+*"  EXPORTING
+*"     REFERENCE(VERSION) TYPE  ZTINV_CI-VERSION
+*"     REFERENCE(ERROR) TYPE  FLAG
+*"  TABLES
+*"      T_MENSAJES STRUCTURE  BAPIRET2 OPTIONAL
+*"      GTI_PI STRUCTURE  ZTINV_PI
+*"----------------------------------------------------------------------
+  REFRESH t_mensajes.
+  CLEAR error.
+  DATA: wa_fich     TYPE zsinv0001_pi,
+        n_reg       LIKE sy-tabix,
+        wa_pi_tabix LIKE sy-tabix,
+        max_pos     LIKE ztinv_pi-posicion,
+        wa_pi       TYPE ztinv_pi,
+        sw_error.
+  SELECT * UP TO 1 ROWS FROM ztinv_ci
+             WHERE docum EQ docum
+             ORDER BY version DESCENDING.
+  ENDSELECT.
+  version = ztinv_ci-version.
+  ADD 1 TO version.
+  max_pos = 0.
+* siempre se compara contra la versión cero del inventario
+  SELECT * INTO CORRESPONDING FIELDS OF TABLE gti_pi
+      FROM ztinv_pi WHERE docum   EQ docum
+                      AND version EQ '000'.
+  LOOP AT gti_pi INTO wa_pi.
+    CHECK wa_pi-posicion > max_pos.
+    MOVE wa_pi-posicion TO max_pos.
+  ENDLOOP.
+*  add 1 to posicion.
+  n_reg = 0.
+  LOOP AT lt_fich INTO wa_fich WHERE tipo_reg = '1'.
+    ADD 1 TO n_reg.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = wa_fich-matnr
+      IMPORTING
+        output = wa_fich-matnr.
+*   Miro si existe la docificación del material
+    PERFORM get_mara TABLES t_mensajes USING wa_fich-matnr
+                                             wa_fich-charg
+                                             ztinv_ci
+                                             n_reg
+                                       CHANGING sw_error.
+    IF sw_error EQ 'X'.
+      MOVE 'X' TO error.
+    ENDIF.
+    CHECK sw_error NE 'X'.
+
+*    A  Materiales/lotes dados de alta en otro almacén <> inventario
+*    B  Materiales/lotes en el almacen de inventario
+*    C  Materiales/lotes que han aflorado en  almacén de inventario
+*    D  Materiales/lotes que no hemos encontrado en almacen de inven
+*    E  Materiales/lotes de otro almacén que no hemos contado
+    DATA: long_lote(2) TYPE n,
+          sw_subrc     LIKE sy-subrc,
+          charg_aux    LIKE mch1-charg.
+    long_lote = strlen( wa_fich-charg ).
+
+    READ TABLE gti_pi INTO wa_pi WITH KEY matnr = wa_fich-matnr
+                                          charg = wa_fich-charg.
+    MOVE sy-subrc TO sw_subrc.
+    IF sw_subrc NE 0
+    AND long_lote < 10.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wa_fich-charg
+        IMPORTING
+          output = charg_aux.
+      READ TABLE gti_pi INTO wa_pi WITH KEY matnr = wa_fich-matnr
+                                            charg = charg_aux.
+      IF sy-subrc EQ 0.
+        MOVE 0 TO sw_subrc.
+        wa_fich-charg = charg_aux.
+      ELSE.
+        MOVE 9 TO sw_subrc.
+      ENDIF.
+    ENDIF.
+    CASE sw_subrc.
+      WHEN 0.
+*       El registro es un registro que se mando a fichero
+        MOVE sy-tabix TO wa_pi_tabix.
+*        wa_pi-read = 'X'.
+        wa_pi-version = version.
+        wa_pi-contado = wa_fich-contado.
+        CASE wa_fich-contado.
+          WHEN 'X'.
+            CASE wa_fich-lgort.
+              WHEN ztinv_ci-lgort.
+                wa_pi-casuistica = 'B'. " no habrá que hacer nada
+              WHEN OTHERS.
+                wa_pi-casuistica = 'A'. " 311
+            ENDCASE.
+          WHEN OTHERS.
+            CASE wa_fich-lgort.
+              WHEN ztinv_ci-lgort.
+                wa_pi-casuistica = 'D'. " dar de baja MI10
+                wa_pi-zero       = 'X'.
+              WHEN OTHERS.
+                wa_pi-casuistica = 'E'. " no hay que hacer nada
+            ENDCASE.
+        ENDCASE.
+        wa_pi-erdat_mod = sy-datum.
+        wa_pi-erzeit_mod = sy-uzeit.
+        wa_pi-ernam_mod = sy-uname.
+        MODIFY gti_pi FROM wa_pi INDEX wa_pi_tabix.
+      WHEN OTHERS.
+        ADD 1 TO max_pos.
+        CLEAR wa_pi.
+        wa_pi-mandt     = sy-mandt.
+        wa_pi-docum     = docum.
+        wa_pi-version   = version.
+        wa_pi-posicion  = max_pos.
+        wa_pi-werks     = wa_fich-werks.
+        wa_pi-matnr     = wa_fich-matnr.
+        wa_pi-charg     = wa_fich-charg.
+        wa_pi-bstar     = '1'. " libre disposicón
+        wa_pi-menge     = wa_fich-menge.
+        wa_pi-longitud  = wa_fich-longitud.
+        wa_pi-contado   = wa_fich-contado.
+        SELECT SINGLE meins INTO wa_pi-meins FROM mara WHERE matnr EQ wa_fich-matnr.
+        CASE wa_fich-contado.
+          WHEN 'X'.
+            IF wa_fich-existe EQ ztinv_ci-lgort
+            OR wa_fich-existe EQ '9999'.
+              wa_pi-lgort  = ztinv_ci-lgort.
+              wa_pi-zlgort = ztinv_ci-lgort.
+              wa_pi-casuistica = 'C'.
+            ENDIF.
+          WHEN OTHERS.
+            wa_pi-lgort = wa_fich-lgort.
+            MOVE 'X' TO error.
+*          El material & lote & no estaba en el fichero original y no CONTADO.
+            mensaje 'E' 'ZINV' '021' wa_fich-matnr wa_fich-charg '' '' t_mensajes.
+            CONTINUE.
+        ENDCASE.
+        IF wa_pi-contado EQ 'X' AND wa_pi-casuistica IS INITIAL.
+*          El material/lote &/& no tiene una casuistica clasificable
+          MOVE 'X' TO error.
+          mensaje 'E' 'ZINV' '025' wa_fich-matnr wa_fich-charg '' '' t_mensajes.
+          CONTINUE.
+        ENDIF.
+        wa_pi-erdat     =
+        wa_pi-erdat_mod = sy-datum.
+        wa_pi-erzeit    =
+        wa_pi-erzeit    = sy-uzeit.
+        wa_pi-ernam     =
+        wa_pi-ernam_mod = sy-uname.
+        APPEND wa_pi TO gti_pi.
+    ENDCASE.
+  ENDLOOP.
+  IF sy-subrc NE 0.
+    MOVE 'X' TO error.
+*         Fichero de inventario & sin registros
+    mensaje 'E' 'ZINV' '023'  docum '' '' '' t_mensajes.
+
+  ELSE.
+    LOOP AT gti_pi INTO wa_pi WHERE version NE version.
+      MOVE 'X' TO error.
+*          El material/lote &/& fue enviado al fichero y no aparece en el inventario
+      mensaje 'E' 'ZINV' '022' wa_pi-matnr wa_pi-charg '' '' t_mensajes.
+      DELETE gti_pi.
+    ENDLOOP.
+  ENDIF.
+ENDFUNCTION.

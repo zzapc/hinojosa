@@ -1,0 +1,622 @@
+FUNCTION zspp_idoc_orders_stopcodes.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(I_MATNR) TYPE  MATNR
+*"     REFERENCE(I_STATUS) TYPE  CHAR20
+*"     VALUE(I_AUFNR) TYPE  AUFNR OPTIONAL
+*"     VALUE(IT_MAFS) TYPE  COBAI_T_PRT_ALLOCATION OPTIONAL
+*"     VALUE(IT_OPERATION) TYPE  COBAI_T_OPERATION OPTIONAL
+*"     VALUE(IT_HEADER) TYPE  COBAI_T_HEADER OPTIONAL
+*"----------------------------------------------------------------------
+  "MODIFICACIONES 17/10/2023
+*Envío STOPCODES:
+*Excluir envío de OFS con CTEC/PTBO para todos los casos, Liberación y Bloqueo.
+*
+*Envío STOPCODES BLOQUEO:
+*Enviar BLOQUEO cuando se bloquea el útil, para todas las OF's afectadas, es decir, para todas las
+*OF's que contengan el útil y su status sea válido.
+*Enviar BLOQUEO si se genera una OF nueva posteriormente, en este caso únicamente la OF en cuestión.
+*
+*Envío FECHA LIBERACIÓN STOPCODES BLOQUEO:
+*Fecha de pedido/solicitud si esta es a futuro.
+*Si no tiene, enviar fecha actual + días en tabla TVARVC (ZOMP_DISPO_UTILES).
+*
+*Envío STOPCODES DESBLOQUEO
+*No se envía desde la OF, se enviará únicamente desde el material/tooling portal cuando se pase a status YREL.
+*
+*Queda pendiente de confirmar la fecha de disponibilidad cuando se realiza una reparación interna, cambio a
+*status YREI, de momento se enviará fecha actual + días.
+  DATA(li_aufnr) = i_aufnr.
+  IF i_aufnr IS NOT INITIAL OR it_header[] IS NOT INITIAL.
+    SELECT SINGLE autyp, werks FROM aufk WHERE aufnr EQ @i_aufnr INTO @DATA(lv_autyp).
+    IF sy-subrc = 0.
+      CHECK lv_autyp-autyp EQ '10'.
+      CHECK lv_autyp-werks EQ '2001' OR lv_autyp-werks EQ '2003'
+      OR lv_autyp-werks EQ '2000'."JVM - ADD 11/05/2023 Adaptaciones para Xátiva.
+    ELSE.
+      TRY.
+          CHECK it_header[ 1 ]-autyp EQ '10' AND ( it_header[ 1 ]-werks EQ '2001' OR it_header[ 1 ]-werks EQ '2003'
+          OR it_header[ 1 ]-werks EQ '2000' )."JVM - ADD 11/05/2023 Adaptaciones para Xátiva
+        CATCH cx_root.
+          RETURN.
+      ENDTRY.
+    ENDIF.
+  ENDIF.
+
+  PERFORM clear_global.
+
+  DATA it_util TYPE tty_util.
+  CLEAR: it_util, it_util[].
+
+  IF i_aufnr IS INITIAL.
+    "Buscamos si el útil está asignado en alguna operación de alguna OF que esté VIVA
+    SELECT t2~vornr, t3~aufnr, t4~matnr, t4~werks INTO TABLE @it_util
+      FROM affh AS t1 INNER JOIN afvc AS t2 ON t1~aufpl EQ t2~aufpl AND t1~aplzl EQ t2~aplzl
+      INNER JOIN afko AS t3 ON t2~aufpl EQ t3~aufpl
+      INNER JOIN aufk AS t5 ON t3~aufnr EQ t5~aufnr
+      INNER JOIN crvm_b AS t4 ON t1~objid EQ t4~objid AND t1~objty EQ t4~objty AND t5~werks EQ t4~werks
+      WHERE t4~matnr EQ @i_matnr
+      AND t5~autyp EQ '10'
+      AND t5~werks IN ( '2001', '2003' , '2000' ). "JVM - ADD 11/05/2023 Adaptaciones para Xátiva
+
+*APC20250204 No queremos tratar ordenes cerradas
+    IF NOT it_util IS INITIAL.
+      SELECT DISTINCT aufnr FROM aufk JOIN jest  ON jest~objnr  = aufk~objnr
+                                      JOIN tj02t ON tj02t~istat = jest~stat
+                                                AND tj02t~spras = 'S'
+        INTO TABLE @DATA(i_ordenes_cerradas)
+       FOR ALL ENTRIES IN @it_util
+       WHERE aufnr = @it_util-aufnr
+         AND txt04 IN ('CERR', 'CTEC', 'PTBO')
+         AND inact = ''.
+      LOOP AT i_ordenes_cerradas ASSIGNING FIELD-SYMBOL(<oc>).
+        DELETE it_util WHERE aufnr = <oc>.
+      ENDLOOP.
+    ENDIF.
+  ELSE.
+    "Leemos de BBDD y lo que nos llega, ya que si estamos en creación de OF, no existirá nada en BBDD
+    "en creación si que llega la tabla IT_MAFS llena, pero cuando se modifica porque se añade o borra un MAF
+    "sólo llega lo que se ha modificado, no todo
+    PERFORM get_utils TABLES it_util it_operation it_mafs USING i_aufnr.
+*    SELECT t2~vornr, t3~aufnr, t4~matnr, t4~werks INTO TABLE @it_util
+*          FROM affh AS t1 INNER JOIN afvc AS t2 ON t1~aufpl EQ t2~aufpl AND t1~aplzl EQ t2~aplzl
+*          INNER JOIN afko AS t3 ON t2~aufpl EQ t3~aufpl
+*          INNER JOIN aufk AS t5 ON t3~aufnr EQ t5~aufnr
+*          INNER JOIN crvm_b AS t4 ON t1~objid EQ t4~objid AND t1~objty EQ t4~objty AND t5~werks EQ t4~werks
+*          WHERE t3~aufnr EQ @i_aufnr.
+*
+*    LOOP AT it_operation INTO DATA(wa_oper).
+*      LOOP AT it_mafs INTO DATA(wa_res) WHERE aufpl EQ wa_oper-aufpl AND aplzl EQ wa_oper-aplzl.
+*
+*        APPEND INITIAL LINE TO it_util ASSIGNING FIELD-SYMBOL(<util>).
+*        <util>-vornr = wa_oper-vornr.
+*        <util>-aufnr = i_aufnr.
+*        SELECT SINGLE matnr INTO @<util>-matnr FROM crvm_b WHERE objid EQ @wa_res-objid AND objty EQ @wa_res-objty AND werks EQ @wa_oper-werks.
+*        <util>-werks = wa_oper-werks.
+*
+*      ENDLOOP.
+*    ENDLOOP.
+*
+*    SORT it_util ASCENDING.
+*    DELETE ADJACENT DUPLICATES FROM it_util.
+*
+*    LOOP AT it_operation INTO wa_oper.
+*      LOOP AT it_mafs INTO wa_res WHERE aufpl EQ wa_oper-aufpl AND aplzl EQ wa_oper-aplzl AND modkz EQ 'D'.
+*
+*        "Eliminamos aquel maf que se ha eliminado
+*        SELECT SINGLE matnr INTO @DATA(lv_maf) FROM crvm_b WHERE objid EQ @wa_res-objid AND objty EQ @wa_res-objty AND werks EQ @wa_oper-werks.
+*        READ TABLE it_util WITH KEY vornr = wa_oper-vornr matnr = lv_maf TRANSPORTING NO FIELDS.
+*        IF sy-subrc = 0.
+*          DELETE it_util INDEX sy-tabix.
+*        ENDIF.
+*
+*      ENDLOOP.
+*    ENDLOOP.
+
+  ENDIF.
+
+
+
+  DELETE it_util WHERE werks <> 2001 AND werks <> 2003
+                   AND werks <> 2000. "JVM - ADD 11/05/2023 Adaptaciones para Xátiva
+*          CHECK it_header[ 1 ]-autyp EQ '10' AND ( it_header[ 1 ]-werks EQ '2001' OR it_header[ 1 ]-werks EQ '2003' ).
+
+  "PREMISA: Un duplicado NO puede estar en una OF, es decir, sólo los "principales" podran aparecer en las
+  "LMAT de las OF, los que sean "secundarios" NUNCA. De este modo sólo revisaremos cuando venga un ppal para ver si su
+  "duplicado está también bloqueado o no, cuando pase de bloqueado a libre, entendemos que se ha de enviar siempre
+
+  "MODIFICACIONES 17/10/2023
+  IF it_util[] IS NOT INITIAL.
+    SELECT t1~objnr, t1~stat, t1~inact, aufnr
+      FROM jest AS t1 INNER JOIN caufv AS t2 ON t1~objnr = t2~objnr
+      FOR ALL ENTRIES IN @it_util
+      WHERE aufnr = @it_util-aufnr
+      AND t1~stat IN ( 'I0043', 'I0045', 'I0076' )
+      AND t1~inact = @space
+      INTO TABLE @DATA(it_objnr).
+
+    LOOP AT it_objnr ASSIGNING FIELD-SYMBOL(<status>).
+      DELETE it_util WHERE aufnr = <status>-aufnr.
+    ENDLOOP.
+
+  ENDIF.
+  "FMODIFICACIONES 17/10/2023
+
+  "Hemos de ver si los útiles tienen un útil duplicado ya que si
+  "tienen útil duplicado solo enviaremos el stop code en el caso que
+  "ambos estén bloqueados
+  LOOP AT it_util INTO DATA(wa_util).
+    DATA(lv_idx) = sy-tabix.
+
+    "Continuamos si es desbloqueo, solo chequeamos si es bloqueo
+    IF i_status <> 'BLOQ' AND i_status <> space.
+      CONTINUE.
+    ELSEIF i_status EQ space.
+      "Si el status viene en blanco lo que hacemos es ir a buscar su status
+*      SELECT SINGLE mmsta INTO @DATA(lv_status_check) FROM marc WHERE matnr EQ @wa_util-matnr AND werks EQ @wa_util-werks. "JVM - cambio para mirar status global
+      SELECT SINGLE mstae INTO @DATA(lv_status_check) FROM mara WHERE matnr EQ @wa_util-matnr. "JVM - cambio para mirar status global
+      IF ( lv_status_check IS INITIAL OR lv_status_check EQ '00' OR lv_status_check EQ 'Z1' ) AND sy-subrc = 0.
+        "Desbloqueo si lo enviamos
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    "Buscamos si tiene duplicado mediante las características
+    "Obtenemos el nº de objeto de configuración
+    SELECT SINGLE cuobj INTO @DATA(lv_cuobj2) FROM marc WHERE matnr EQ @wa_util-matnr AND werks EQ @wa_util-werks.
+    IF sy-subrc = 0.
+      DATA it_config TYPE TABLE OF conf_out.
+      REFRESH it_config.
+      CALL FUNCTION 'VC_I_GET_CONFIGURATION'
+        EXPORTING
+          instance            = lv_cuobj2
+*         BUSINESS_OBJECT     =
+*         LANGUAGE            = SY-LANGU
+*         PRINT_SALES         = ' '
+*         PRINT_PURCHASE      = ' '
+*         PRINT_ENGINEERING   = ' '
+*         IDOC_MODE           = ' '
+*         ANW_SICHT           = ' '
+*         EXCL_IND            = ' '
+*         IV_INVALID_POSSIBLE = ' '
+*         IV_MAX_MASSPROCESSING       = 0
+*         IV_EXPLICIT_ORGAREA = ' '
+*         IV_NO_DESCRIPTION   = ' '
+*         IV_USER             = ' '
+*         IV_NO_VALUE_CHECK   = 'X'
+*         IV_NO_DIALOG        = ' '
+*         IV_DISPLAY_WARNING  = ' '
+        TABLES
+          configuration       = it_config
+*         CONFIGURATION_IDOC  =
+        EXCEPTIONS
+          instance_not_found  = 1
+          internal_error      = 2
+          no_class_allocation = 3
+          instance_not_valid  = 4
+          OTHERS              = 5.
+      IF sy-subrc <> 0.
+* Implement suitable error handling here
+        CONTINUE.
+      ELSE.
+        DATA lv_bloqdupl TYPE xfeld.
+        CLEAR lv_bloqdupl.
+        LOOP AT it_config INTO DATA(confi) WHERE "( atnam EQ 'HP_ALTO1' OR atnam EQ 'HP_ALTO2' OR
+                                                 ( atnam EQ 'HP_DUTO1' OR atnam EQ 'HP_DUTO2' )
+                                             AND atwtb IS NOT INITIAL.
+          "Verificamos si el duplicado está también bloqueado, ya que sólo en este caso enviaremos el stopcode para bloquear la operación
+          "Si el status viene en blanco lo que hacemos es ir a buscar su status
+*          SELECT SINGLE mmsta INTO @DATA(lv_statusdupl) FROM marc WHERE matnr EQ @confi-atwrt AND werks EQ @wa_util-werks."JVM - cambio para mirar status global
+          SELECT SINGLE mstae INTO @DATA(lv_statusdupl) FROM mara WHERE matnr EQ @confi-atwrt."JVM - cambio para mirar status global
+*          IF NOT ( lv_statusdupl IS INITIAL OR lv_statusdupl EQ '00' OR lv_statusdupl EQ 'Z1' ).
+          IF  lv_statusdupl EQ 'ZZ' OR
+              lv_statusdupl EQ 'Z2' OR
+              lv_statusdupl EQ '99' OR
+              lv_statusdupl EQ '03'.
+            lv_bloqdupl = 'X'.
+          ENDIF.
+        ENDLOOP.
+        IF lv_bloqdupl IS INITIAL AND sy-subrc = 0.
+          DELETE it_util INDEX lv_idx.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+  IF it_util[] IS NOT INITIAL.
+    SELECT matnr, mtart INTO TABLE @DATA(ti_mtarts)
+      FROM mara
+      FOR ALL ENTRIES IN @it_util
+      WHERE matnr EQ @it_util-matnr.
+  ENDIF.
+
+  DATA: wa_stopcode     TYPE zccstopcode,
+        wa_stopcodedata TYPE zccstopcodedata,
+        wa_werks        TYPE zccwerks, "ADD JVM - 15/06/2023 - Añadimos segmento para centro y poder filtrar en PI la salida
+        wa_zdummy       TYPE zdummy, "ADD JVM - 15/06/2023 - Añadimos segmento para centro y poder filtrar en PI la salida
+        lv_fecha        TYPE datum.
+
+  LOOP AT it_util INTO wa_util.
+
+    IF i_aufnr IS INITIAL.
+      DATA(lv_modif_auf) = 'X'.
+    ENDIF.
+    IF lv_modif_auf EQ 'X'.
+      i_aufnr = wa_util-aufnr.
+    ENDIF.
+
+    DATA: et_rte   TYPE  yhp_omp_tt_rte.
+    CLEAR: et_rte.
+    REFRESH: et_rte.
+    SELECT SINGLE plnbez AS matnr, werks FROM afko AS t1 INNER JOIN aufk AS t2 ON t2~aufnr EQ t1~aufnr
+    WHERE t1~aufnr EQ @i_aufnr INTO ( @DATA(lv_matnr), @DATA(lv_werks) ).
+    IF sy-subrc <> 0.
+      IF it_header[] IS NOT INITIAL.
+        lv_matnr = it_header[ 1 ]-plnbez.
+        lv_werks = it_header[ 1 ]-werks.
+      ENDIF.
+    ENDIF.
+    SELECT SINGLE cuobj INTO @DATA(lv_cuobj) FROM marc WHERE matnr EQ @lv_matnr AND werks EQ @lv_werks.
+
+
+    CALL FUNCTION 'YHP_OMP_INTERFACE'
+      EXPORTING
+        if_cuobj = lv_cuobj
+      IMPORTING
+        et_rte   = et_rte.
+
+    DATA: it_num_opers     TYPE TABLE OF ty_num_opers,
+          it_rutas         TYPE TABLE OF ty_ruta,
+          ruta_ppal        TYPE yhp_omp_route,
+          it_operation_all TYPE cobai_t_operation.
+
+    CLEAR: it_num_opers, it_rutas, ruta_ppal, it_operation_all.
+    REFRESH: it_num_opers, it_rutas, it_operation_all.
+
+    SELECT * INTO CORRESPONDING FIELDS OF TABLE it_operation_all
+        FROM afko INNER JOIN afvc ON afko~aufpl EQ afvc~aufpl
+        INNER JOIN afvv ON afvc~aufpl EQ afvv~aufpl AND afvc~aplzl EQ afvv~aplzl
+        WHERE loekz EQ space
+        AND aufnr EQ wa_util-aufnr.
+    IF sy-subrc <> 0.
+      it_operation_all[] = it_operation[].
+    ENDIF.
+
+*    PERFORM check_alt_routes_2 TABLES it_num_opers
+*                                      it_rutas
+*                                      et_rte
+*                                      it_operation_all
+*                             CHANGING ruta_ppal.
+*    IF 1 = 2.
+
+      PERFORM check_alt_routes_3 TABLES it_num_opers
+                                        it_rutas
+                                        et_rte
+                                        it_operation_all
+                               CHANGING ruta_ppal.
+*    ENDIF.
+
+
+    CLEAR: l_edidd.
+    CLEAR: wa_stopcode, wa_stopcodedata.
+    IF i_status <> 'BLOQ' AND i_status <> space.
+      wa_stopcode-operation = c_delete.
+    ELSEIF i_status <> space.
+      wa_stopcode-operation = c_update.
+    ELSE.
+      "Si el status viene en blanco lo que hacemos es ir a buscar su status
+*      SELECT SINGLE mmsta INTO @DATA(lv_status) FROM marc WHERE matnr EQ @wa_util-matnr AND werks EQ @wa_util-werks."JVM - cambio para mirar status global
+      SELECT SINGLE mstae INTO @DATA(lv_status) FROM mara WHERE matnr EQ @wa_util-matnr."JVM - cambio para mirar status global
+      IF lv_status IS INITIAL OR lv_status EQ '00' OR lv_status EQ 'Z1'.
+        wa_stopcode-operation = c_delete.
+      ELSE.
+        wa_stopcode-operation = c_update.
+      ENDIF.
+
+    ENDIF.
+    l_edidd-sdata = wa_stopcode.
+    l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_stopcode )->get_relative_name( ).
+    APPEND l_edidd TO t_edidd.
+
+    IF wa_stopcode-operation = c_delete.
+      lv_fecha = sy-datum.
+    ELSE.
+      CALL FUNCTION 'ZSPP_GET_FECHA_DISPO'
+        EXPORTING
+          i_matnr  = wa_util-matnr
+        IMPORTING
+          o_fdispo = lv_fecha
+*         O_HDISPO =
+        .
+    ENDIF.
+    CLEAR: l_edidd.
+    wa_stopcodedata-activeflag = space.
+    wa_stopcodedata-comments = ''.
+    wa_stopcodedata-erplocked = 'NO'.
+    wa_stopcodedata-fromoperationnr = wa_util-vornr.
+
+    READ TABLE ti_mtarts WITH KEY matnr = wa_util-matnr INTO DATA(wa_mtart).
+
+    IF wa_stopcode-operation = c_update.
+      IF wa_mtart-mtart EQ 'ZTRO'.
+        wa_stopcodedata-label = |BLOQUEO TROQUEL { wa_util-matnr }|.
+      ELSEIF wa_mtart-mtart EQ 'ZCLI'.
+        wa_stopcodedata-label = |BLOQUEO CLICHÉ { wa_util-matnr }|.
+      ENDIF.
+    ELSE.
+      IF wa_mtart-mtart EQ 'ZTRO'.
+        wa_stopcodedata-label = |DESBLOQUEO TROQUEL { wa_util-matnr }|.
+      ELSEIF wa_mtart-mtart EQ 'ZCLI'.
+        wa_stopcodedata-label = |DESBLOQUEO CLICHÉ { wa_util-matnr }|.
+      ENDIF.
+    ENDIF.
+    wa_stopcodedata-removaldate = lv_fecha.
+    "MODIFICACIONES 17/10/2023
+    IF li_aufnr IS NOT INITIAL AND wa_stopcodedata-label CS 'DESBLOQUEO'.
+      "No enviamos el desbloqueo cuando vinee de OF
+      DESCRIBE TABLE t_edidd LINES DATA(linea_borrar).
+      DELETE t_edidd INDEX linea_borrar.
+      CONTINUE.
+    ENDIF.
+    "FMODIFICACIONES 17/10/2023
+    WRITE lv_fecha TO wa_stopcodedata-removaldate DD/MM/YYYY.
+    CONDENSE wa_stopcodedata-removaldate.
+    CONCATENATE wa_stopcodedata-removaldate '18:00:00' INTO wa_stopcodedata-removaldate SEPARATED BY space.
+*    wa_stopcodedata-orderid = |{ wa_util-aufnr ALPHA = IN }|.
+    SELECT SINGLE auart, aufnr INTO @DATA(wa_datos_of) FROM aufk WHERE aufnr = @wa_util-aufnr.
+    IF ( wa_datos_of-auart EQ 'ZPAC' AND wa_datos_of-aufnr < 40024195 ) OR ( wa_datos_of-auart EQ 'ZSAR' AND wa_datos_of-aufnr  < 50006649 ).
+      wa_stopcodedata-orderid = wa_util-aufnr.
+    ELSE.
+      wa_stopcodedata-orderid = |{ wa_util-aufnr ALPHA = OUT }|.
+    ENDIF.
+    CONDENSE wa_stopcodedata-orderid NO-GAPS.
+**    wa_stopcodedata-processid = |{ wa_util-aufnr }_1|.
+    wa_stopcodedata-processid = |{ wa_stopcodedata-orderid ALPHA = OUT }|. "concatenar "_1" a CCORDERDATA-ORDERID #¡VALOR!  Este concepto no existe en AS400, por eso lo hacemos así. No existe este concepto en SAP?
+    CONDENSE wa_stopcodedata-processid NO-GAPS.
+    DATA lv_number TYPE char3.
+    lv_number = |{ ruta_ppal ALPHA = OUT }|.
+    CONDENSE lv_number.
+*      CONCATENATE wa_stopcodedata-processid '_1' INTO wa_stopcodedata-processid.
+    CONCATENATE wa_stopcodedata-processid '_' lv_number INTO wa_stopcodedata-processid.
+
+    wa_stopcodedata-stopcodeid = |{  wa_util-aufnr ALPHA = OUT }_{ lv_number }_{ wa_util-vornr }_{ wa_util-matnr }|.
+    CONDENSE wa_stopcodedata-stopcodeid NO-GAPS.
+
+    l_edidd-sdata = wa_stopcodedata.
+    l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_stopcodedata )->get_relative_name( ).
+    APPEND l_edidd TO t_edidd.
+
+    "INI ADD JVM - 15/06/2023 - Añadimos segmento para centro y poder filtrar en PI la salida
+*    wa_zdummy-dummy = lv_werks.
+*    l_edidd-sdata = wa_zdummy.
+*    l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_zdummy )->get_relative_name( ).
+*    APPEND l_edidd TO t_edidd.
+
+    wa_werks-werks = lv_werks.
+    l_edidd-sdata = wa_werks.
+    l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_werks )->get_relative_name( ).
+    APPEND l_edidd TO t_edidd.
+    "FIN ADD JVM - 15/06/2023 - Añadimos segmento para centro y poder filtrar en PI la salida
+
+    LOOP AT it_rutas ASSIGNING FIELD-SYMBOL(<ruta_alt>) WHERE ruta_alt EQ 'X' GROUP BY ( route = <ruta_alt>-route ).
+
+      CLEAR: l_edidd.
+      CLEAR: wa_stopcode, wa_stopcodedata.
+      IF i_status <> 'BLOQ' AND i_status <> space.
+        wa_stopcode-operation = c_delete.
+      ELSEIF i_status <> space.
+        wa_stopcode-operation = c_update.
+      ELSE.
+        "Si el status viene en blanco lo que hacemos es ir a buscar su status
+*        SELECT SINGLE mmsta INTO @lv_status FROM marc WHERE matnr EQ @wa_util-matnr AND werks EQ @wa_util-werks. "JVM - cambio para mirar status global
+        SELECT SINGLE mstae INTO @lv_status FROM mara WHERE matnr EQ @wa_util-matnr."JVM - cambio para mirar status global
+        IF lv_status IS INITIAL OR lv_status EQ '00' OR lv_status EQ 'Z1'.
+          wa_stopcode-operation = c_delete.
+        ELSE.
+          wa_stopcode-operation = c_update.
+        ENDIF.
+
+      ENDIF.
+      l_edidd-sdata = wa_stopcode.
+      l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_stopcode )->get_relative_name( ).
+      APPEND l_edidd TO t_edidd.
+
+      IF wa_stopcode-operation = c_delete.
+        lv_fecha = sy-datum.
+      ELSE.
+        CALL FUNCTION 'ZSPP_GET_FECHA_DISPO'
+          EXPORTING
+            i_matnr  = wa_util-matnr
+          IMPORTING
+            o_fdispo = lv_fecha
+*           O_HDISPO =
+          .
+      ENDIF.
+      CLEAR: l_edidd.
+      wa_stopcodedata-activeflag = space.
+      wa_stopcodedata-comments = ''.
+      wa_stopcodedata-erplocked = 'NO'.
+      wa_stopcodedata-fromoperationnr = wa_util-vornr.
+
+      READ TABLE ti_mtarts WITH KEY matnr = wa_util-matnr INTO wa_mtart.
+
+      IF wa_stopcode-operation = c_update.
+        IF wa_mtart-mtart EQ 'ZTRO'.
+          wa_stopcodedata-label = |BLOQUEO TROQUEL { wa_util-matnr }|.
+        ELSEIF wa_mtart-mtart EQ 'ZCLI'.
+          wa_stopcodedata-label = |BLOQUEO CLICHÉ { wa_util-matnr }|.
+        ENDIF.
+      ELSE.
+        IF wa_mtart-mtart EQ 'ZTRO'.
+          wa_stopcodedata-label = |DESBLOQUEO TROQUEL { wa_util-matnr }|.
+        ELSEIF wa_mtart-mtart EQ 'ZCLI'.
+          wa_stopcodedata-label = |DESBLOQUEO CLICHÉ { wa_util-matnr }|.
+        ENDIF.
+      ENDIF.
+
+      IF li_aufnr IS NOT INITIAL AND wa_stopcodedata-label CS 'DESBLOQUEO'.
+        "No enviamos el desbloqueo cuando vinee de OF
+        DESCRIBE TABLE t_edidd LINES linea_borrar.
+        DELETE t_edidd INDEX linea_borrar.
+        CONTINUE.
+      ENDIF.
+
+      wa_stopcodedata-removaldate = lv_fecha.
+
+      WRITE lv_fecha TO wa_stopcodedata-removaldate DD/MM/YYYY.
+      CONDENSE wa_stopcodedata-removaldate.
+      CONCATENATE wa_stopcodedata-removaldate '18:00:00' INTO wa_stopcodedata-removaldate SEPARATED BY space.
+*      wa_stopcodedata-orderid = |{ wa_util-aufnr ALPHA = IN }|.
+      CLEAR wa_datos_of.
+      SELECT SINGLE auart, aufnr INTO @wa_datos_of FROM aufk WHERE aufnr = @wa_util-aufnr.
+      IF ( wa_datos_of-auart EQ 'ZPAC' AND wa_datos_of-aufnr < 40024195 ) OR ( wa_datos_of-auart EQ 'ZSAR' AND wa_datos_of-aufnr  < 50006649 ).
+        wa_stopcodedata-orderid = wa_util-aufnr.
+      ELSE.
+        wa_stopcodedata-orderid = |{ wa_util-aufnr ALPHA = OUT }|.
+      ENDIF.
+*      IF ( it_header[ 1 ]-auart EQ 'ZPAC' AND it_header[ 1 ]-aufnr < 40024195 ) OR ( it_header[ 1 ]-auart EQ 'ZSAR' AND it_header[ 1 ]-aufnr < 50006649 ).
+*        wa_stopcodedata-orderid = wa_util-aufnr.
+*      ELSE.
+*        wa_stopcodedata-orderid = |{ wa_util-aufnr ALPHA = OUT }|.
+*      ENDIF.
+      CONDENSE wa_stopcodedata-orderid NO-GAPS.
+**    wa_stopcodedata-processid = |{ wa_util-aufnr }_1|.
+      wa_stopcodedata-processid = |{ wa_stopcodedata-orderid ALPHA = OUT }|. "concatenar "_1" a CCORDERDATA-ORDERID #¡VALOR!  Este concepto no existe en AS400, por eso lo hacemos así. No existe este concepto en SAP?
+      CONDENSE wa_stopcodedata-processid NO-GAPS.
+*      DATA lv_number TYPE char3.
+      lv_number = |{ <ruta_alt>-route ALPHA = OUT }|.
+      CONDENSE lv_number.
+*      CONCATENATE wa_stopcodedata-processid '_1' INTO wa_stopcodedata-processid.
+      CONCATENATE wa_stopcodedata-processid '_' lv_number INTO wa_stopcodedata-processid.
+
+      wa_stopcodedata-stopcodeid = |{  wa_util-aufnr ALPHA = OUT }_{ lv_number }_{ wa_util-vornr }_{ wa_util-matnr }|.
+      CONDENSE wa_stopcodedata-stopcodeid NO-GAPS.
+
+      l_edidd-sdata = wa_stopcodedata.
+      l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_stopcodedata )->get_relative_name( ).
+      APPEND l_edidd TO t_edidd.
+
+      "INI ADD JVM - 15/06/2023 - Añadimos segmento para centro y poder filtrar en PI la salida
+*      wa_zdummy-dummy = lv_werks.
+*      l_edidd-sdata = wa_zdummy.
+*      l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_zdummy )->get_relative_name( ).
+*      APPEND l_edidd TO t_edidd.
+
+      wa_werks-werks = lv_werks.
+      l_edidd-sdata = wa_werks.
+      l_edidd-segnam = cl_abap_typedescr=>describe_by_data( p_data = wa_werks )->get_relative_name( ).
+      APPEND l_edidd TO t_edidd.
+      "FIN ADD JVM - 15/06/2023 - Añadimos segmento para centro y poder filtrar en PI la salida
+    ENDLOOP.
+
+  ENDLOOP.
+*<?xml version="1.0" encoding="UTF-8"?>
+*<Message>
+*<Name>Order Update</Name>
+*<Action>
+*<stopcode>
+*<Operation>Update</Operation>
+*<stopcodedata>
+*<Stopcodeid>OF22-02594_1_40_-UT-B1274</Stopcodeid>
+*<Removaldate>29/03/2022 16:20:28</Removaldate>
+*<ERPLocked>NO</ERPLocked>
+*<FromOperationnr>40</FromOperationnr>
+*<Label>BLOQUEO TROQUEL -UT-B1274</Label>
+*<ProcessID>OF22-02594_1</ProcessID>
+*</stopcodedata>
+*</stopcode>
+*</Action>
+*</Message>
+
+
+  CHECK t_edidd[] IS NOT INITIAL.
+
+  DATA: ls_idoc_header       TYPE edidc,
+        lt_idoc_comm_control TYPE TABLE OF edidc,
+        ls_idoc_comm_control TYPE edidc,
+        lt_return            TYPE bapiret2_t,
+        ls_return            TYPE bapiret2.
+***        ls_return1           TYPE bapiret1,
+****        t_edidd              TYPE edidd_tt,
+****        t_edidd_aux          TYPE edidd_tt.
+
+  CLEAR: ls_idoc_header, lt_idoc_comm_control, ls_idoc_comm_control, lt_return, ls_return.
+  REFRESH: lt_idoc_comm_control, lt_return.
+
+  ls_idoc_header-mandt = sy-mandt.
+  ls_idoc_header-direct = '1'.
+  ls_idoc_header-rcvpor = c_edi_extern.
+  ls_idoc_header-rcvprt = c_ls_d.
+  ls_idoc_header-rcvprn = c_rcvprn.
+  ls_idoc_header-sndprt = c_ls_r.
+  ls_idoc_header-sndprn = sy-uname.
+  ls_idoc_header-mestyp = c_zmsg_order_stopcode.
+  ls_idoc_header-idoctp = c_zstpm_order_stopcode.
+
+
+  CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE' "IN UPDATE TASK
+    EXPORTING
+      master_idoc_control            = ls_idoc_header
+    TABLES
+      communication_idoc_control     = lt_idoc_comm_control
+      master_idoc_data               = t_edidd
+    EXCEPTIONS
+      error_in_idoc_control          = 1
+      error_writing_idoc_status      = 2
+      error_in_idoc_data             = 3
+      sending_logical_system_unknown = 4
+      OTHERS                         = 5.
+  IF sy-subrc <> 0.
+    "KO
+    ls_return-type        = sy-msgty.
+    ls_return-number      = sy-msgno.
+    ls_return-id          = sy-msgid.
+    ls_return-message_v1  = sy-msgv1.
+    ls_return-message_v2  = sy-msgv2.
+    ls_return-message_v3  = sy-msgv3.
+    ls_return-message_v4  = sy-msgv4.
+    APPEND ls_return TO lt_return.
+
+    data l_msg type bapi_msg.
+    message id sy-msgid type 'S' NUMBER sy-msgno with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 into l_msg.
+    set PARAMETER ID 'ZIDOC_ERROR' FIELD l_msg.
+  ELSE.
+    "OK
+    READ TABLE lt_idoc_comm_control INTO DATA(ls_control_record_out) INDEX 1.
+    CHECK sy-subrc = 0.
+    DATA(docnum) = ls_control_record_out-docnum.
+    ls_return-type        = 'S'.
+    ls_return-number      = '398'.
+    ls_return-id          = '00'.
+    ls_return-message_v1  = docnum.
+    APPEND ls_return TO lt_return.
+
+    set PARAMETER ID 'ZIDOC_DOCNUM' FIELD docnum.
+  ENDIF.
+
+* Hacemos un COMMIT para el Idoc
+*  CALL FUNCTION 'DEQUEUE_ALL'.
+*  COMMIT WORK AND WAIT.
+
+  DATA: l_subrc TYPE sy-subrc.
+  CLEAR l_subrc.
+  CALL FUNCTION 'TH_IN_UPDATE_TASK'
+    IMPORTING
+      in_update_task = l_subrc.
+
+  IF l_subrc = 1.
+    EXIT.
+  ENDIF.
+
+  CALL FUNCTION 'DB_COMMIT'.
+  CALL FUNCTION 'DEQUEUE_ALL'.
+*  COMMIT WORK.
+
+
+
+
+
+ENDFUNCTION.

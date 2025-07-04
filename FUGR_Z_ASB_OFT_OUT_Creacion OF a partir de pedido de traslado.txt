@@ -1,0 +1,183 @@
+FUNCTION z_asb_oft_out.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     REFERENCE(OBJKEY) TYPE  ZWHS_CLAVE
+*"     REFERENCE(MENSAJE) TYPE  ZWHS_MENSAJE
+*"     REFERENCE(SIMULAR) TYPE  OAF_AGENT_SIMULATION_RUN DEFAULT ''
+*"     REFERENCE(VAR1) TYPE  ANY DEFAULT ''
+*"     REFERENCE(VAR2) TYPE  ANY DEFAULT ''
+*"     REFERENCE(MODO_CT) TYPE  BDCMODE DEFAULT 'N'
+*"  EXPORTING
+*"     REFERENCE(CONTENIDO) TYPE  ZCONTENIDO_FICHERO
+*"     REFERENCE(MESSAGE) TYPE  BAPI_MSG
+*"  CHANGING
+*"     REFERENCE(COLA) TYPE  ZWHS_COLA
+*"----------------------------------------------------------------------
+
+  break_simular.
+
+  IF objkey IS INITIAL.
+    message = 'Indique nº de pedido de traslado'.
+    RETURN.
+  ENDIF.
+
+  SPLIT objkey AT '-' INTO cola-ebeln cola-posnr cola-matnr.
+  __poner_ceros: cola-ebeln, cola-posnr, cola-matnr.
+
+  SELECT SINGLE ebeln FROM ekko
+    INTO cola-ebeln
+   WHERE ebeln = cola-ebeln.
+  IF sy-subrc NE 0.
+    message = |No existe el pedido { objkey }|.
+    RETURN.
+  ENDIF.
+
+  SELECT SINGLE ebeln FROM ekko
+    INTO cola-ebeln
+   WHERE ebeln = cola-ebeln.
+  IF sy-subrc NE 0.
+    message = |No existe el pedido { objkey }|.
+    RETURN.
+  ENDIF.
+
+  IF NOT cola-posnr IS INITIAL AND cola-posnr NE '' AND cola-posnr NE '000000'.
+    SELECT SINGLE werks, lgort, menge AS cantidad, meins FROM ekpo
+      INTO CORRESPONDING FIELDS OF @cola
+     WHERE ebeln = @cola-ebeln
+       AND ebelp = @cola-posnr+1.
+    IF sy-subrc NE 0.
+      message = |No existe la posición { cola-posnr+1 }|.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+  IF cola-tcode IS INITIAL.
+    SELECT tcode username FROM cdhdr
+      INTO (cola-tcode, cola-usuario)
+     UP TO 1 ROWS
+     WHERE objectclas = 'EINKBELEG'
+        AND objectid  = cola-ebeln
+        AND udate     = sy-datum
+     ORDER BY changenr DESCENDING.
+    ENDSELECT.
+  ENDIF.
+
+  SELECT vbeln FROM ekkn
+    INTO cola-pedido
+    UP TO 1 ROWS
+   WHERE ebeln = cola-ebeln
+     AND ebelp = cola-posnr+1
+     AND vbeln NE ''.
+  ENDSELECT.
+
+  IF cola-tcode IS INITIAL AND cola-usuario = 'SAPJOB' AND NOT cola-pedido IS INITIAL.
+    cola-tcode = 'VA01'.
+  ENDIF.
+
+  IF NOT ( cola-posnr IS INITIAL OR cola-posnr = '' ).
+    DATA r_ebelp TYPE RANGE OF ekpo-ebelp.
+    r_ebelp = VALUE #( ( option = 'EQ' sign = 'I' low = cola-posnr+1 ) ).
+  ENDIF.
+  IF NOT cola-matnr IS INITIAL.
+    DATA r_matnr TYPE RANGE OF matnr.
+    r_matnr = VALUE #( ( option = 'EQ' sign = 'I' low = cola-matnr ) ).
+  ENDIF.
+
+  SELECT ebeln, ebelp, vbeln, posnr, matnr, paso, aufnr, idcola FROM zsppt_ofpedsubco
+    INTO TABLE @DATA(i_ord)
+   WHERE ebeln = @cola-ebeln
+     AND ebelp IN @r_ebelp
+     AND matnr IN @r_matnr.
+  IF sy-subrc NE 0.
+    cola-estado = 'E'.
+    message = 'No se encuentran entraas en tabla ZSPPT_OFPEDSUBCO'.
+    RETURN.
+  ENDIF.
+
+
+  READ TABLE i_ord INTO DATA(l_ord) INDEX 1.
+  cola-posnr = '0' && l_ord-ebelp.
+  cola-matnr = l_ord-matnr.
+  cola-objkey = |{ cola-ebeln }-{ cola-posnr+1 }-{ cola-matnr }|.
+
+  LOOP AT i_ord ASSIGNING FIELD-SYMBOL(<ord>).
+    IF <ord>-idcola NE cola-idcola.
+      UPDATE zsppt_ofpedsubco
+        SET idcola = cola-idcola
+             WHERE  ebeln  = <ord>-ebeln
+             AND    ebelp  = <ord>-ebelp
+             AND    vbeln  = <ord>-vbeln
+             AND    posnr  = <ord>-posnr
+             AND    matnr  = <ord>-matnr.
+    ENDIF.
+
+    IF <ord>-aufnr IS INITIAL.
+      zwhs=>inserta_log( idcola = cola-idcola tipo = 'S' mensaje = |Paso { <ord>-paso } | ).
+    ELSE.
+      zwhs=>inserta_log( idcola = cola-idcola tipo = 'S' mensaje = |Paso { <ord>-paso }  Orden { <ord>-aufnr ALPHA = OUT } | ).
+    ENDIF.
+  ENDLOOP.
+
+  SELECT SINGLE mmsta FROM marc
+    INTO @DATA(l_mmsta)
+   WHERE matnr = @l_ord-matnr
+     AND werks = @cola-werks.
+  IF NOT l_mmsta IS INITIAL AND l_mmsta NE '00'.
+    SELECT SINGLE mtstb FROM t141t
+      INTO @DATA(l_mtstb)
+     WHERE spras = @sy-langu
+       AND mmsta = @l_mmsta.
+    IF l_mmsta = 'Z4'.
+      zwhs=>inserta_log( idcola = cola-idcola tipo = 'W' mensaje = |Material { l_ord-matnr ALPHA = OUT } tiene bloqueo { l_mmsta } { l_mtstb }. NO SE CREA ORDEN Y SE MARCA MENSAJE COMO PROCESADO| ).
+      cola-estado = 'X'.
+      RETURN.
+    ELSE.
+      zwhs=>inserta_log( idcola = cola-idcola tipo = 'W' mensaje = |Material { l_ord-matnr ALPHA = OUT } tiene bloqueo { l_mmsta } { l_mtstb }| ).
+    ENDIF.
+  ENDIF.
+
+* Espera activa si el material está bloqueado
+  DO 10 TIMES.
+    IF zcl_ap_material=>esta_bloqueado( matnr = cola-matnr werks = cola-werks ).
+      WAIT UP TO 1 SECONDS.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDDO.
+
+  SUBMIT zspp_crear_of_ped
+    AND RETURN
+    WITH s_ebeln = l_ord-ebeln
+    WITH s_ebelp = l_ord-ebelp
+    WITH s_matnr = l_ord-matnr
+    WITH p_idcola = cola-idcola.
+
+  SELECT aufnr, paso, texto_return, texto_paso FROM zsppt_ofpedsubco
+    INTO (@cola-aufnr, @cola-aux1, @message, @cola-otros)
+    UP TO 1 ROWS
+   WHERE ebeln = @cola-ebeln
+     AND ebelp = @cola-posnr+1
+     AND matnr = @cola-matnr
+   ORDER BY PRIMARY KEY.
+  ENDSELECT.
+  IF NOT cola-aufnr IS INITIAL.
+    SELECT SINGLE auart FROM caufv
+      INTO cola-auart
+     WHERE aufnr = cola-aufnr.
+  ENDIF.
+  IF cola-aux1 = '40' OR cola-aux1 = '99'.
+    cola-estado = 'X'.
+    IF NOT message IS INITIAL.
+      zwhs=>inserta_log( idcola = cola-idcola tipo = 'W' mensaje = message ).
+      CLEAR message.
+    ENDIF.
+  ELSE.
+    cola-estado = 'E'.
+    IF message CS 'xito' AND NOT cola-otros IS INITIAL.
+      message = cola-otros.
+    ENDIF.
+  ENDIF.
+
+
+ENDFUNCTION.

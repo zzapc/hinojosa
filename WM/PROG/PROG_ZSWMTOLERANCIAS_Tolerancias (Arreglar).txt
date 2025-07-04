@@ -1,0 +1,177 @@
+*&---------------------------------------------------------------------*
+*& Report  ZSWMTOLERANCIAS
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+REPORT ZSWMTOLERANCIAS.
+data error type flag.
+PARAMETERS: p_vbeln like likp-vbeln,
+            p_lgnum like likp-lgnum.
+PARAMETERS: p_kostk like vbuk-kostk,
+            p_lvstk like vbuk-lvstk.
+PARAMETERS: p_test type flag DEFAULT 'X'.
+at SELECTION-SCREEN on p_vbeln.
+   clear: p_kostk, p_lvstk, p_lgnum.
+   select SINGLE kostk lvstk into (p_kostk, p_lvstk) from vbuk where vbeln eq p_vbeln.
+   select SINGLE lgnum into p_lgnum                  from likp where vbeln eq p_vbeln.
+at SELECTION-SCREEN OUTPUT.
+   loop at SCREEN.
+      if screen-name eq 'P_KOSTK'
+      or screen-name eq 'P_LVSTK'
+      or screen-name eq 'P_LGNUM'.
+         screen-input = 0.
+      endif.
+      modify SCREEN.
+   endloop.
+START-OF-SELECTION.
+   clear error.
+*   delete from ZSWMTOLER where vbeln eq p_vbeln.
+   write:/ '1 de 3', 'Revisamos estado picking' color 4.
+   if p_lvstk eq 'C'.
+      move abap_true to error.
+      write:/5 'Entrega:', p_vbeln, 'Entrega cerrada, no hay nada que hacer' color 6.
+   endif.
+   check error ne abap_true.
+*  Busco OFS
+   write:/ '2 de 3', 'Revisamos proceso CIERRE' color 4.
+
+   select * into TABLE @data(tt_vbfa) from vbfa where vbelv eq @p_vbeln
+                                                  and vbtyp_n eq 'Q'
+                                                  and vbtyp_v eq 'J'.
+   if tt_vbfa[] is not INITIAL.
+      sort tt_vbfa by vbeln.
+      delete ADJACENT DUPLICATES FROM tt_vbfa COMPARING vbeln.
+      data t_ltak like ltak occurs 0 WITH HEADER LINE.
+      clear t_ltak[].
+      loop at tt_vbfa into data(Rt_vbfa).
+           select * into TABLE t_ltak from ltak where lgnum eq p_lgnum
+                                                  and tanum eq Rt_vbfa-vbeln.
+      endloop.
+      delete t_ltak where kquit eq abap_true.
+      if t_ltak[] is not INITIAL.
+         loop at t_ltak.
+             write:/5 'OT:' ,t_ltak-lgnum, t_ltak-tanum.
+             check p_test ne abap_true.
+             data tT_ltap_c type LTAP_CANCL_TT.
+             CLEAR: tT_ltap_c[].
+             select * into CORRESPONDING FIELDS OF TABLE tT_ltap_c from ltap where lgnum eq t_ltak-lgnum
+                                                                               and tanum eq t_ltak-tanum.
+             CALL FUNCTION 'L_TO_CANCEL'
+               EXPORTING
+                 i_lgnum                            = t_ltak-lgnum
+                 i_tanum                            = t_ltak-tanum
+*                I_SOLEX                            = 0
+                 I_CANCL                            = 'X'
+                 I_SUBST                            = 'X'
+*                I_QNAME                            = SY-UNAME
+*                I_UPDATE_TASK                      = ' '
+*                I_COMMIT_WORK                      = 'X'
+               TABLES
+                 t_ltap_cancl                       = tT_ltap_c[]
+               EXCEPTIONS
+                  TO_CONFIRMED                       = 1
+                  TO_DOESNT_EXIST                    = 2
+                  ITEM_CONFIRMED                     = 3
+                  ITEM_DOESNT_EXIST                  = 4
+                  FOREIGN_LOCK                       = 5
+                  DOUBLE_LINES                       = 6
+                  NOTHING_TO_DO                      = 7
+                  XFELD_WRONG                        = 8
+                  SU_MOVEMENT_PARTLY_CONFIRMED       = 9
+                  UPDATE_WITHOUT_COMMIT              = 10
+                  NO_AUTHORITY                       = 11
+                  OTHERS                             = 12
+                       .
+               case sy-subrc.
+               when 0.
+                  write:/10 'Cancelada OT con éxito'.
+                  wait up to 1 SECONDS.
+               when OTHERS.
+                  data msg type bapiret2-MESSAGE.
+                  MESSAGE id sy-msgid type 'I' NUMBER sy-msgno with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 into msg.
+                  write:/10 msg color 6.
+                  move abap_true to error.
+               endcase.
+         endloop.
+      endif.
+   endif.
+   check error ne abap_true.
+   data sw_hay_cambiar_ctd.
+   write:/ '3 de 3', 'Revisamos cantidades entrega' color 4.
+
+   PERFORM cantidades USING p_vbeln p_test CHANGING sw_hay_cambiar_ctd.
+   if sw_hay_cambiar_ctd eq abap_true.
+     write:/10 '- Hay que cambiar las cantidades'.
+   endif.
+   if sw_hay_cambiar_ctd eq abap_true and p_test ne abap_true.
+    data tT_log type bapiret2_t.
+    clear tT_log[].
+
+    CALL FUNCTION 'ZSWMMM_ARREGLAR_ENTREGA'
+      EXPORTING
+        vbeln         = p_vbeln
+     IMPORTING
+        ERROR         = error
+        TT_MEN        = tT_log
+              .
+    if error eq abap_true.
+       write:/10 'Error al igualar cantidades'.
+
+       loop at tT_log into data(Rt_log).
+           write:/15 rT_log-message.
+       endloop.
+    endif.
+    PERFORM cantidades USING p_vbeln p_test CHANGING sw_hay_cambiar_ctd.
+    if sw_hay_cambiar_ctd ne abap_true.
+       write:/10 '- Problemas actualizando cantidades'.
+    else.
+       WRITE:/10 '- cantidades arregladas correctamente'.
+    endif.
+   endif.
+
+   check error ne abap_true.
+*&---------------------------------------------------------------------*
+*&      Form  CANTIDADES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_VBELN  text
+*      <--P_SW_HAY_CAMBIAR_CTD  text
+*----------------------------------------------------------------------*
+FORM cantidades  USING    p_vbeln p_test
+                 CHANGING p_hay_cambiar_ctd.
+  data ZSWMTOLER type ZSWMTOLER.
+   move abap_false to p_hay_cambiar_ctd.
+   data n_pasos type i.
+   select * into TABLE @data(tt_lips) from lips where vbeln eq @p_vbeln.
+   select * into table @data(tT_pick) from ZSWM_UI5_PICK where vbeln eq @p_vbeln
+                                                           and lvorm ne @abap_true.
+   delete tt_lips where posnr+0(1) eq '9'.
+   n_pasos = 0.
+   loop at tt_lips into data(rt_lips).
+       data lfimg type lips-lfimg.
+       lfimg = 0.
+       loop at tT_pick into data(rT_pick) where posnr eq rt_lips-posnr.
+          add rT_pick-menge to lfimg.
+       endloop.
+       check lfimg ne rt_lips-lfimg
+         and sy-subrc eq 0.
+       move abap_true to p_hay_cambiar_ctd.
+       check p_test ne abap_true.
+       clear ZSWMTOLER.
+       ZSWMTOLER-mandt = sy-mandt.
+       ZSWMTOLER-vbeln = rt_lips-vbeln.
+       ZSWMTOLER-posnr = rt_lips-posnr.
+       ZSWMTOLER-erdat = sy-datum.
+       ZSWMTOLER-erzet = sy-uzeit.
+       ZSWMTOLER-ernam = sy-uname.
+       insert into ZSWMTOLER VALUES ZSWMTOLER.
+       add 1 to n_pasos.
+   endloop.
+   check n_pasos > 0.
+   COMMIT WORK and WAIT.
+   WAIT Up to 1 SECONDS.
+
+ENDFORM.
