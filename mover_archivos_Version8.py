@@ -31,10 +31,10 @@ for archivo in os.listdir(directorio_origen):
         destino = os.path.join(directorio_destino_root, 'VCXI', prefijo, archivo)
         mover_archivo(ruta_archivo, destino)
     # Si contiene ZCL_RF o YZCL_RF, va a RF
-    elif "ZCL_RF" in archivo or "YCL_RF" in archivo or "YCL_HP" in archivo or "YRF" in archivo or "YHP" in archivo:
+    elif "ZCL_RF" in archivo or "YCL_RF" in archivo or "YCL_HP" in archivo or "YRF" in archivo or "YHP" in archivo or "YCX" in archivo:
         destino = os.path.join(directorio_destino_root, 'RF', prefijo, archivo)
         mover_archivo(ruta_archivo, destino)
-    elif "_AP" in archivo or "ZAP_" in archivo:
+    elif "_AP" in archivo or "ZAP_" in archivo or "ZAPC" in archivo:
         destino = os.path.join('', 'APC', prefijo, archivo)
         mover_archivo(ruta_archivo, destino)
     elif "EXCEL" in archivo:
